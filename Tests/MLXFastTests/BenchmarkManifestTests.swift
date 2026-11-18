@@ -49,8 +49,8 @@ private func loadJSONObject(atRepoPath path: String) throws -> [String: Any] {
     return dict
 }
 
-@Suite("Gemma4 benchmark.json manifest")
-struct Gemma4BenchmarkManifestTests {
+@Suite("benchmark.json manifest")
+struct BenchmarkManifestTests {
 
     @Test
     func manifestParsesAndCarriesRequiredKeys() throws {

@@ -21,26 +21,27 @@ import MLXFastCore
 // THIS FILE IS TRUSTED CODE. It parses the declaration and applies the size
 // gate; it never decides whether a run passes.
 //
-// ONE DECODER (bonsai2-9b-mlx-v1). `spec.decoder` names the decoder a
-// submission arms, and this track declares one: `"mtp"`, the MTP head. The key
-// is optional and defaults to `"mtp"`. No DFlash 2 drafter exists for the Qwen
-// 3.5 9B geometry, so `"dflash"` is an unknown decoder here and is refused by
-// name. The MTP head's cap is 2 GiB; `max_bytes` may lower it and may not raise
-// it.
+// ONE DECODER (muse-glimmer-30b-mlx-v1). `spec.decoder` names the decoder a
+// submission arms. This track serves the pinned DFlash drafter and nothing
+// else: the contract fixture declares `dflash`, and an absent key means
+// `dflash` too, so the declaration defaults to the one decoder the track has.
+// Any other name -- including the older `mtp` slot spelling -- is REFUSED by
+// name, because this track has no MTP layer to serve. `max_bytes` may lower
+// the 2 GiB cap and may not raise it.
 //
 // THERE IS NO `arm` SELECTION KEY. `spec.decoder` is the selection, and it
 // lives beside the depth it goes with. `arm` is an unread key like any other
 // unknown key.
 //
-// THE HEAD IS NOT STAGED OR MEASURED HERE. It is a separate pinned export (its
-// pin is pending until a head for the Bonsai 2 9B pack is published), staged
-// beside the target by `./setup-mtp-head.sh`, so `source: "pinned"` means "the
-// export this track pins". A submission carries no head weights, so this file
-// has no directory to digest and no artifact to fetch. It parses the
-// declaration and applies the size gate.
+// THE HEAD IS NOT STAGED OR MEASURED HERE. It is a separate pinned export (the
+// quantized DFlash drafter, pinned in the contract fixture's `mtp_head`
+// block), staged beside the target by `./setup-mtp-head.sh`, so
+// `source: "pinned"` means "the export this track pins". A submission carries
+// no head weights, so this file has no directory to digest and no artifact to
+// fetch. It parses the declaration and applies the size gate.
 
 /// One parsed head declaration (`mtp-head.manifest.json`).
-public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
+public struct MTPHeadDeclaration: Equatable, Sendable {
     public enum Source: String, Equatable, CaseIterable, Sendable {
         /// The head embedded in the organizer's pinned target checkpoint. The
         /// default, and what an ABSENT manifest means.
@@ -54,22 +55,27 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     }
 
     /// Which speculative decoder the declaration arms.
+    ///
+    /// ONE case, because this track declares one decoder: the pinned DFlash
+    /// drafter. The contract fixture's `mtp_head.decoder` is `dflash` and its
+    /// `allowed_modes` is serial + dflash, so a declaration that asks for any
+    /// other decoder is refused BY NAME rather than quietly served.
     public enum Decoder: String, Equatable, CaseIterable, Sendable {
-        /// The pinned MTP head (pending for the Bonsai 2 9B pack).
-        case mtp
+        /// The DFlash drafter, this track's decoder, and every default here.
+        case dflash
 
         /// The track cap on what this decoder's declaration may bound. A
         /// declaration may lower it and may not raise it.
         public var trackMaxBytes: Int {
             switch self {
-            case .mtp: return 2_147_483_648
+            case .dflash: return 2_147_483_648
             }
         }
 
         /// How a refusal names this decoder's drafter.
         public var declarationNoun: String {
             switch self {
-            case .mtp: return "MTP"
+            case .dflash: return "DFlash"
             }
         }
     }
@@ -84,7 +90,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
 
     public init(
         source: Source,
-        decoder: Decoder = .mtp,
+        decoder: Decoder = .dflash,
         sourceURL: String? = nil,
         path: String? = nil,
         sha256: String? = nil,
@@ -100,19 +106,19 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         self.maxBytes = maxBytes ?? decoder.trackMaxBytes
     }
 
-    /// 2 GiB, the MTP head's cap. Mirrored in `mtp-head.manifest.json`
+    /// 2 GiB, the head cap. Mirrored in `mtp-head.manifest.json`
     /// (`max_bytes`) and in the contract manifest's
     /// `editableSurfaceByteBudget.exemptPathMaxBytes`; a declaration may lower
     /// it and may not raise it.
-    public static let defaultMaxBytes = Decoder.mtp.trackMaxBytes
+    public static let defaultMaxBytes = Decoder.dflash.trackMaxBytes
 
     /// The default when no manifest exists at all.
-    public static let pinnedDefault = Gemma4MTPHeadDeclaration(source: .pinned)
+    public static let pinnedDefault = MTPHeadDeclaration(source: .pinned)
 
     public static let relativePath = "mtp-head.manifest.json"
 
     /// How a refusal names the head when no declaration has been parsed yet.
-    public static let declarationNoun = Decoder.mtp.declarationNoun
+    public static let declarationNoun = Decoder.dflash.declarationNoun
 
     /// Parse a declaration, FAILING CLOSED on anything malformed.
     ///
@@ -124,7 +130,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     /// leaderboard number unattributable.
     public static func parse(
         contentsOf url: URL
-    ) throws -> Gemma4MTPHeadDeclaration {
+    ) throws -> MTPHeadDeclaration {
         guard let data = FileManager.default.contents(atPath: url.path) else {
             throw MLXFastError.invalidInput(
                 "the \(declarationNoun) head declaration at \(url.path) "
@@ -137,7 +143,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     public static func parse(
         data: Data,
         origin: String
-    ) throws -> Gemma4MTPHeadDeclaration {
+    ) throws -> MTPHeadDeclaration {
         guard let root = (try? JSONSerialization.jsonObject(with: data))
             as? [String: Any]
         else {
@@ -147,9 +153,9 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         }
         // The decoder is read FIRST: it names the drafter every later refusal
         // talks about, and it selects the size cap the declaration is bounded
-        // by. An absent key is `mtp`.
+        // by. An absent key is `dflash`.
         let spec = root["spec"] as? [String: Any]
-        let rawDecoder = (spec?["decoder"] as? String) ?? Decoder.mtp.rawValue
+        let rawDecoder = (spec?["decoder"] as? String) ?? Decoder.dflash.rawValue
         guard let decoder = Decoder(rawValue: rawDecoder) else {
             throw MLXFastError.invalidInput(
                 "the head declaration at \(origin) names an unknown decoder "
@@ -198,14 +204,14 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
                 "the \(noun) head declaration at \(origin) selects source "
                     + "'remote'; this track accepts source 'pinned' only. The "
                     + "\(noun) drafter is a separate pinned export "
-                    + "(fixtures/bonsai2_9b_mlx_v1_track.json), and custom "
+                    + "(fixtures/muse_glimmer_30b_mlx_v1_track.json), and custom "
                     + "drafter weights are not accepted. Declare a "
                     + "re-quantization of the pinned head instead")
         case .inBranch:
             throw MLXFastError.invalidInput(
                 "the \(noun) head declaration at \(origin) selects source "
                     + "'in_branch'; this track accepts source 'pinned' only. A "
-                    + "submission carries no drafter weights -- both drafters "
+                    + "submission carries no drafter weights -- both the drafter and its source artifact "
                     + "are staged from their own pins -- so there is nothing an "
                     + "in-branch path could name. Declare a re-quantization of "
                     + "the pinned head instead")
@@ -232,7 +238,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
                         + "\(maxBytes)-byte cap in \(origin)")
             }
         }
-        return Gemma4MTPHeadDeclaration(
+        return MTPHeadDeclaration(
             source: source,
             decoder: decoder,
             sourceURL: sourceURL,
@@ -247,7 +253,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     /// pinned default and everything else as parse-or-refuse.
     public static func resolve(
         contractRoot: URL
-    ) throws -> Gemma4MTPHeadDeclaration {
+    ) throws -> MTPHeadDeclaration {
         let url = contractRoot.appendingPathComponent(relativePath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             return pinnedDefault

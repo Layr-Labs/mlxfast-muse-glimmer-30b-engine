@@ -22,7 +22,7 @@ import Testing
 // half is sufficient alone, so both land together.
 //
 // FIX-BAR / mutation to kill: restoring `case .remote` or `case .inBranch` to a
-// non-throwing branch in `Gemma4MTPHeadDeclaration.parse` must turn
+// non-throwing branch in `MTPHeadDeclaration.parse` must turn
 // `inBranchSourceIsRefused` and `remoteSourceIsRefused` RED.
 
 private let validDigest = String(repeating: "a", count: 64)
@@ -32,7 +32,7 @@ private let mixedCaseDigest = String(repeating: "Ab", count: 32)
 
 private func refusalMessage(_ json: String) -> String {
     do {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
         return "<accepted>"
     } catch let error as MLXFastError {
         return "\(error)"
@@ -49,7 +49,7 @@ func inBranchSourceIsRefused() throws {
     // before this ruling (safe path, positive bytes, under the 2 GiB cap).
     let json = #"{"source":"in_branch","path":"heads/mtp","bytes":1024}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
     let message = refusalMessage(json)
     #expect(message.contains("in_branch"), "the refusal must name the retired source: \(message)")
@@ -71,7 +71,7 @@ func remoteSourceIsRefused() throws {
     // exists. It is refused before `source_url` is looked at.
     let json = #"{"source":"remote","source_url":"hf:acme/head@abc","bytes":2048}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
     let message = refusalMessage(json)
     #expect(message.contains("remote"), "the refusal must name the retired source: \(message)")
@@ -87,7 +87,7 @@ func aWellFormedRemoteRedirectIsStillRefused() throws {
     let json =
         #"{"source":"remote","source_url":"hf:attacker/better-head@deadbeef","bytes":2048}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
     // And the organizer's OWN url is refused too: the rule is "pinned only",
     // not "pinned or a url we happen to like". This is the checked-in
@@ -96,7 +96,7 @@ func aWellFormedRemoteRedirectIsStillRefused() throws {
     let organizerJSON =
         #"{"source":"remote","source_url":"\#(organizerURL)","bytes":247463936}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(
+        _ = try MTPHeadDeclaration.parse(
             data: Data(organizerJSON.utf8), origin: "test")
     }
 }
@@ -111,7 +111,7 @@ func retiredSourcesAreRefused() throws {
         #"{"source":"remote","source_url":"hf:acme/head@abc","bytes":1024}"#,
     ] {
         #expect(throws: MLXFastError.self) {
-            _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+            _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
         }
     }
 }
@@ -130,7 +130,7 @@ func anUnknownSourceIsStillRefusedAsUnknown() throws {
 @Test
 func pinnedSourceIsAccepted() throws {
     let json = #"{"source":"pinned"}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     #expect(decl.source == .pinned)
 }
 
@@ -140,7 +140,7 @@ func pinnedDeclarationMayStateTheStagedSize() throws {
     // expected size is how a participant records what the box should produce.
     // A stated size is accepted under the cap.
     let json = #"{"source":"pinned","bytes":123456789}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     #expect(decl.source == .pinned)
     #expect(decl.bytes == 123_456_789)
 }
@@ -150,10 +150,10 @@ func statedSizeOverTheCapIsStillRefused() throws {
     // THE SIZE GATE SURVIVED THE NARROWING. Before this change the bytes check
     // was reachable only for a non-pinned source, so retiring those sources
     // would have made it dead code. It now binds on any STATED size.
-    let overCap = Gemma4MTPHeadDeclaration.defaultMaxBytes + 1
+    let overCap = MTPHeadDeclaration.defaultMaxBytes + 1
     let json = #"{"source":"pinned","bytes":\#(overCap)}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
 }
 
@@ -163,17 +163,17 @@ func statedSizeOverALoweredCapIsStillRefused() throws {
     // max_bytes still refuses.
     let json = #"{"source":"pinned","max_bytes":1000,"bytes":1001}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
 }
 
 @Test
 func maxBytesAboveTrackCapStillRefused() throws {
     // The max_bytes ceiling (may lower, may not raise) is unchanged.
-    let raised = Gemma4MTPHeadDeclaration.defaultMaxBytes + 1
+    let raised = MTPHeadDeclaration.defaultMaxBytes + 1
     let json = #"{"source":"pinned","max_bytes":\#(raised),"bytes":1}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
 }
 
@@ -187,7 +187,7 @@ func pinnedHeadWithDeclaredDigestUnchanged() throws {
     // ruling: nothing in the repository binds staged head bytes to the
     // organizer's pinned digests at run time.
     let json = #"{"source":"pinned","sha256":"\#(validDigest)"}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     #expect(decl.source == .pinned)
     #expect(decl.sha256 == validDigest)
 }
@@ -195,7 +195,7 @@ func pinnedHeadWithDeclaredDigestUnchanged() throws {
 @Test
 func declaredDigestIsLowercased() throws {
     let json = #"{"source":"pinned","sha256":"\#(mixedCaseDigest)","bytes":1024}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     #expect(decl.sha256 == mixedCaseDigest.lowercased())
     #expect(decl.bytes == 1024)
 }
@@ -204,8 +204,8 @@ func declaredDigestIsLowercased() throws {
 func absentManifestStaysPinnedDefault() throws {
     // A source-less manifest still means pinned, still requires no digest.
     let json = #"{}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
-    #expect(decl == Gemma4MTPHeadDeclaration.pinnedDefault)
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    #expect(decl == MTPHeadDeclaration.pinnedDefault)
 }
 
 @Test
@@ -213,43 +213,67 @@ func theCheckedInMTPDeclarationParsesAndSelectsThePinnedHead() throws {
     // The shipped declaration must itself be legal under the rule it states.
     // It named `source: "remote"` until this ruling, which the parser now
     // refuses -- so this assertion is what catches a half-landed change.
-    let decl = try Gemma4MTPHeadDeclaration.parse(
+    let decl = try MTPHeadDeclaration.parse(
         contentsOf: URL(fileURLWithPath: "mtp-head.manifest.json"))
     #expect(decl.source == .pinned)
 }
 
 // --- One decoder ----------------------------------------------------------------
 //
-// This track declares the MTP head only. An absent decoder key is the MTP head
-// at its 2 GiB cap, and `dflash` is an unknown decoder here: no DFlash 2 drafter
-// exists for the Qwen 3.5 9B geometry.
+// This track declares ONE decoder: the DFlash drafter. An absent decoder key is
+// DFlash at its 2 GiB cap, the older `mtp` slot spelling is refused by name
+// (there is no MTP layer to serve), and so is any other name. A declaration
+// that switches the drafter off stays valid: the stock tree runs serial.
 
 @Test
-func anAbsentDecoderKeyIsTheMTPHead() throws {
+func anAbsentDecoderKeyIsTheDFlashDrafter() throws {
     let json = #"{"source":"pinned","spec":{"enabled":true,"num_speculative_tokens":1}}"#
-    let decl = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
-    #expect(decl.decoder == .mtp)
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    #expect(decl.decoder == .dflash)
     #expect(decl.maxBytes == 2_147_483_648)
 }
 
 @Test
-func aDFlashDeclarationIsRefusedByName() throws {
+func aDFlashDeclarationIsAcceptedAtTheTrackCap() throws {
     let json = #"{"source":"pinned","spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":7}}"#
-    var refusal: String?
-    do {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
-    } catch {
-        refusal = "\(error)"
-    }
-    let message = try #require(refusal, "a dflash declaration was accepted")
-    #expect(message.contains("unknown decoder 'dflash'"))
+    let decl = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+    #expect(decl.decoder == .dflash)
+    #expect(decl.maxBytes == 2_147_483_648)
+}
+
+@Test
+func theOlderMTPSlotNameIsRefusedByName() throws {
+    // One decoder means one name. `mtp` was the slot's older spelling and this
+    // track has no MTP layer, so it is a NAMED refusal rather than a quiet
+    // alias -- and it cannot buy a cap either.
+    let json = #"{"source":"pinned","spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}"#
+    let message = refusalMessage(json)
+    #expect(message.contains("unknown decoder 'mtp'"), "a mtp declaration was accepted: \(message)")
+    #expect(message.contains("dflash"), "the refusal must name what IS declarable: \(message)")
+}
+
+@Test
+func thePinnedDefaultAndTheAbsentDecoderAgree() throws {
+    // The two reader-side defaults must be the fixture's decoder: the
+    // initializer's default (what `pinnedDefault` builds) and the parse
+    // default for an absent key.
+    #expect(MTPHeadDeclaration.pinnedDefault.decoder == .dflash)
+    #expect(MTPHeadDeclaration.pinnedDefault.maxBytes == 2_147_483_648)
+    // PLAIN DECODE STAYS VALID: no manifest at all, and a declaration that
+    // switches the drafter off, both parse as the same decoder with the
+    // drafter unused.
+    let serial = #"{"source":"pinned","spec":{"enabled":false,"num_speculative_tokens":0}}"#
+    let decl = try MTPHeadDeclaration.parse(data: Data(serial.utf8), origin: "test")
+    #expect(decl.decoder == .dflash)
+    #expect(decl.source == .pinned)
+    #expect(MTPHeadDeclaration.pinnedDefault.source == .pinned)
 }
 
 @Test
 func theMTPHeadCapCannotBeRaised() throws {
     let json = #"{"source":"pinned","max_bytes":4294967296,"bytes":1}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
 }
 
@@ -257,6 +281,6 @@ func theMTPHeadCapCannotBeRaised() throws {
 func anUnknownDecoderIsRefusedByName() throws {
     let json = #"{"source":"pinned","spec":{"decoder":"dspark"}}"#
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
+        _ = try MTPHeadDeclaration.parse(data: Data(json.utf8), origin: "test")
     }
 }

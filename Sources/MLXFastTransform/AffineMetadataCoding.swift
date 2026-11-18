@@ -14,11 +14,11 @@ struct GeneratedAffineMetadataReport {
     }
 }
 
-/// Gemma 4 (dense, tied-head) projection metadata sidecar generator. Invoked
-/// only on the `.gemma4` transform family path: this track's Bonsai 2 target
-/// has an untied head and its runtime reads the pack's own packed tensors
-/// directly, so a sidecar there would be a derived artifact nothing loads. Its
-/// tensor set is validated by `PrismHadamardCheckpointValidation` instead.
+/// Projection metadata sidecar generator for the legacy `.gemma4` family.
+/// Invoked only on that transform family path: the packed family has an untied
+/// head and its runtime reads the pack's own packed tensors directly, so a
+/// sidecar there would be a derived artifact nothing loads. Its tensor set is
+/// validated by `PrismHadamardCheckpointValidation` instead.
 enum AffineMetadataCoding {
     static let shardName = "mlxfast-projection-metadata.safetensors"
 
