@@ -148,17 +148,6 @@ do {
 let buildIdentity = helloBuildIdentity(for: runner, weights: launch.weights)
 
 switch launch.subcommand {
-case .diagParity:
-    do {
-        try BenchWorkerLegacyParity.run(
-            runner: runner, golden: launch.golden!, steps: launch.steps,
-            output: FileHandle.standardOutput)
-    } catch {
-        fail(error)
-    }
-    BenchWorkerTeardown.synchronizeMLX()
-    exit(0)
-
 case .resident:
     guard let socket = launch.socket else { fail(WorkerLaunchError.missingSocket) }
     let listener: BenchWorkerSocketListener

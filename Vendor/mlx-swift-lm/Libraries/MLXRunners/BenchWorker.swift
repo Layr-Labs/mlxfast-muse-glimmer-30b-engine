@@ -691,7 +691,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 maxAutomaticRectangularTokens: batch * (1 + depth))
         }
         return EngineBuild(
-            kvBackend: .contiguous,
+            // The RUNNER's declaration picks the backend. A family that
+            // serves only paged storage refuses a contiguous build by name,
+            // and a worker that overrode that would be inventing policy for
+            // the family it was handed.
+            kvBackend: Self.kvBackend(for: runner.manifest),
             kvBytesCapacity: kvBytesCapacity,
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: batch,
@@ -707,15 +711,32 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 // and reproduce through nine tokens with one). So a free run
                 // prefills its whole seed in one chunk. The diagnostic knob
                 // still overrides, by name, for shape experiments.
+                //
+                // A model that cuts prompts on a grid also needs a chunk that
+                // can hold one cell, or the paged pool refuses the model at
+                // engine start.
                 prefillChunkSize: Self.diagnosticPrefillChunk
-                    ?? max(CBv2SchedulerConfig().prefillChunkSize, seedLength),
+                    ?? max(
+                        CBv2SchedulerConfig().prefillChunkSize, seedLength,
+                        runner.manifest.engine.prefillChunkAlignment ?? 0),
                 maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
             prefixCache: nil,
             decoder: decoderID,
             mtpConfig: mtpConfig,
+            // Ignored by a contiguous build; the pool a paged build plans is
+            // sized for the longest row the worker will be handed.
+            pagedPool: PagedPoolPlan(
+                nominalMaxSequenceLength: max(
+                    RunnerEngineAssembly.nominalMaxSequenceLength, seedLength)),
             environment: [:])
+    }
+
+    /// The backend the fixed build asks for: the runner's own declaration,
+    /// contiguous only when the runner serves it.
+    static func kvBackend(for manifest: RunnerManifest) -> KVBackendKind {
+        manifest.kvBackends.contains(.contiguous) ? .contiguous : (manifest.kvBackends.first ?? .contiguous)
     }
 
     /// `correctness`: free-run greedy through the engine, tokens only.
