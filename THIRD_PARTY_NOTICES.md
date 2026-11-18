@@ -8,24 +8,36 @@ the setup script (`setup.sh`) downloads the pinned artifacts
 from their upstream repositories and verifies them against checked-in SHA256
 manifests.
 
-## Bonsai 2 models
+## Model artifacts
 
-The target model is the Bonsai 2 9B MLX pack of `Qwen/Qwen3.5-9B`. prism-ml has
-not published it, so its license, its pin and its attribution are pending. The
-MTP head is pending too. This file names the pack, the head and their licenses
-when they are pinned.
+The engine loads two model repositories, both Apache-2.0, public and ungated, at
+the pinned revisions below. The target is read as published: its NVFP4, FP8 and
+BF16 tensors load per module and nothing is re-quantized. The drafter is not
+downloaded: it is produced from the pinned assistant repository by the pinned
+artifact writer, and its identity is a hash pin made at
+`Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/MuseGlimmer/DFlash/MuseGlimmerDFlashLoading.swift`
+(weights `38f92e9ada069615c24d89768fa6148336c6608880b1ddf825ae5228e1ea6a87`,
+config `af24b73c299bffe7537846e42dfd54e43828b0a5f02a06327e168d70db06e2fd`,
+1,968,222,936 bytes, inside the declaration's 2 GiB cap).
 
 Artifacts referenced by this repository:
 
 | Artifact | Upstream | License |
 |---|---|---|
-| `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` (the backbone; its `config.json` is checked in as `fixtures/qwen35_9b_base_config.json`) | Qwen | Apache-2.0 |
-| `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` (the packing reference; its `config.json` is checked in as `fixtures/bonsai2_27b_config.json`) | Prism ML | Apache-2.0 |
-| The Bonsai 2 9B pack (the track's target) | Prism ML | Pending |
-| The MTP head | Pending | Pending |
+| `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6` (the track's target; its `config.json` is checked in as `fixtures/muse_glimmer_30b_nvfp4_config.json`) | `nvidia` | Apache-2.0 |
+| `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7` (the drafter source; the quantized DFlash drafter above is produced from this snapshot) | `meta-models` | Apache-2.0 |
+| `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` (not loaded by this engine; its `config.json` is checked in as `fixtures/qwen35_9b_base_config.json`) | Qwen | Apache-2.0 |
+| `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` (not loaded by this engine; its `config.json` is checked in as `fixtures/bonsai2_27b_config.json`) | Prism ML | Apache-2.0 |
+
+The two rows marked as not loaded are checked-in configuration fixtures only; the
+`reference_bonsai2_*` and `mtp-head.manifest.json` file names are slots inherited
+from the source track, and the records in them name the two Muse Glimmer
+repositories above.
 
 Attribution statement: "Qwen3.5-9B © Qwen, licensed Apache-2.0. Ternary Bonsai
-2 27B configuration by Prism ML, licensed Apache-2.0."
+2 27B configuration by Prism ML, licensed Apache-2.0. Muse-Glimmer-30B-NVFP4
+by `nvidia` and Muse-Glimmer-30B-assistant by `meta-models`, licensed
+Apache-2.0, at the revisions pinned in the table above."
 
 Compliance notes for anyone redistributing these models or derivative
 weights obtained through this harness (for example a transformed `weights/`
@@ -90,8 +102,10 @@ vendors in the same way. `Vendor/mlx-swift/Source/Cmlx/vendor-README.md` names
 the sources: `nlohmann/json` v3.11.3 (MIT), Apple `metal-cpp` for macOS 15 /
 iOS 18 (Apache-2.0), and `fmtlib/fmt` tag 12.1.0 (MIT).
 
-The vendored `Vendor/mlx-swift-lm` tree is a fresh cut at that merge and is
-byte-identical to it, with no commits of this repository on top. The changes the
+The vendored `Vendor/mlx-swift-lm` tree is a fresh cut at that merge — upstream
+tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, otherwise unchanged — plus the
+engine-local changes the section below lists: the three record-only files in the
+MTP path and `Package.swift`, four files in all. The changes the
 earlier base carried -- the merge of fork `main` `0607011`, two build fixes, and
 the Bonsai 2 support files taken from fork `main`
 `fd0eaac7b5ec5c199f1595d29be011f66343f1db` (pull requests 154 and 155) -- were
@@ -101,20 +115,23 @@ fork is trusted.
 
 ### Engine-local changes to the vendored SDK
 
-One change sits on top of the cut, in the MTP path. It is **record-only**: it
-stores numbers the round driver already computes at its finalize boundary and
-changes neither the tokens a window emits, their order, the work inside a round,
-nor any default. Retention is a ring of 8192 records: a full ring overwrites its
-oldest entry in constant time and counts the evictions, so a reader can tell a
-full log (nothing lost) from a truncated one.
+Four changes sit on top of the cut. Three are in the MTP path and are
+**record-only**: they store numbers the round driver already computes at its
+finalize boundary and change neither the tokens a window emits, their order, the
+work inside a round, nor any default. Retention is a ring of 8192 records: a full
+ring overwrites its oldest entry in constant time and counts the evictions, so a
+reader can tell a full log (nothing lost) from a truncated one. The fourth is
+`Package.swift`: it declares the runner library product and its two targets. Each
+count below is that file's line change against the upstream tree.
 
 | File | Added | Removed | What |
 |---|---|---|---|
 | `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/MTPContractsV2.swift` | 66 | 0 | one per-round record type, the bounded log that holds it, and one counter for the engine steps that seeded a row |
 | `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/CBv2MTPRoundDriver.swift` | 8 | 1 | `recordRound` accepts the record and appends it to the log under the lock it already takes; `recordSeedSteps` also counts the STEP |
 | `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/EngineLoopV2+MTPFinalize.swift` | 5 | 1 | the finalize boundary passes `(requestID, drafted, accepted, committed)` |
+| `Vendor/mlx-swift-lm/Package.swift` | 39 | 2 | the `MLXRunners` library product, the `MLXRunners` target over `Libraries/MLXRunners`, and the `MLXRunnersTests` test target with its two processed resources; the 2 removed lines are the two-line comment that sat above the bench test target |
 
-Each changed block carries the comment line
+Each changed block in the MTP path carries the comment line
 `// engine-local: per-round audit record (benchmark free-run audit)`. The runner
 layer reads the records through `Vendor/mlx-swift-lm/Libraries/MLXRunners/RunnerRoundJournal.swift`.
 
