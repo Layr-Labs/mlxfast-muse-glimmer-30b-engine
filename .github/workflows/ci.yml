@@ -36,7 +36,7 @@
 # The ranked pipeline is NOT in this file and must never be. This track's
 # ranked pipeline is .github/workflows/benchmark.yml (workflow_dispatch only,
 # self-hosted, no credential).
-# .github/workflows/bonsai2-9b-ranked-benchmark.yml is a fail-closed stub
+# .github/workflows/muse-glimmer-30b-ranked-benchmark.yml is a fail-closed stub
 # and stays one: it is the landing pad for a dispatch that aims at a per-track
 # ranked workflow name. A ranked dispatch does not consult this file.
 
@@ -213,7 +213,7 @@ jobs:
         # that MLXFAST_QWEN_MTP_TRACK_ID reaches benchd equal to
         # benchmark.json's trackId in every mode, and that a manifest without
         # one refuses before benchd is spawned. It also drives the REAL
-        # tools/bonsai2-9b-measure-and-score.sh with a stub bench-worker
+        # tools/muse-glimmer-30b-measure-and-score.sh with a stub bench-worker
         # and asserts the ranked path boots NO resident and exports NO
         # BENCH_WORKER_RESIDENT_SOCKET (benchd boots one per leg, from that
         # leg's own tree) while still taking the GPU lock, that an inherited

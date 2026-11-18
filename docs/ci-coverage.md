@@ -66,7 +66,7 @@ mechanically** — not a merge, not a dispatch:
   review either;
 - no ranked workflow invokes the suite: `.github/workflows/benchmark.yml`
   measures and scores, and
-  `.github/workflows/bonsai2-9b-ranked-benchmark.yml` is a fail-closed
+  `.github/workflows/muse-glimmer-30b-ranked-benchmark.yml` is a fail-closed
   stub;
 - a **ranked** `workflow_dispatch` does not consult `ci.yml`, so dispatching a
   benchmark does not consult the gate. (This file carries its own
@@ -155,7 +155,7 @@ that a returning gated test is inventoried rather than running unseen.
 
 | Not run in CI | Why | Where it runs |
 | --- | --- | --- |
-| ~~The two `benchd/scripts/benchmark.sh` command targets in `benchmark.json`~~ | **No longer applicable.** benchd stopped being a source dependency; every `benchmark.json` command target now lives in this repository (`./setup.sh`, `./tools/fetch-benchd.sh`, `./tools/bonsai2-9b-measure-and-score.sh`), so CI verifies all three and the linter downgrades nothing | CI, fully verified |
+| ~~The two `benchd/scripts/benchmark.sh` command targets in `benchmark.json`~~ | **No longer applicable.** benchd stopped being a source dependency; every `benchmark.json` command target now lives in this repository (`./setup.sh`, `./tools/fetch-benchd.sh`, `./tools/muse-glimmer-30b-measure-and-score.sh`), so CI verifies all three and the linter downgrades nothing | CI, fully verified |
 | `tools/build-mlx-metallib.sh` (the AOT `mlx.metallib`) | needs the Metal toolchain component and produces a GPU artifact CI cannot exercise | box, via `./setup.sh` |
 | `swift build -c release` into the two production scratch roots (`.build`, `.build-worker`) | the scored binary layout; CI proves the code compiles, not that the release layout is staged | box, before a benchd pass |
 | Correctness gates, token fidelity, the timed paired measurement, scoring | measurement authority is benchd's, on the ranked M5 box, behind a thermal gate | the ranked pipeline; nothing in this repository times or scores anything |
@@ -189,7 +189,7 @@ that a returning gated test is inventoried rather than running unseen.
 - **No ranked measurement.** The ranked pipeline is
   `.github/workflows/benchmark.yml`. It is `workflow_dispatch` only and
   self-hosted, and CI never dispatches it.
-  `.github/workflows/bonsai2-9b-ranked-benchmark.yml` is a fail-closed
+  `.github/workflows/muse-glimmer-30b-ranked-benchmark.yml` is a fail-closed
   stub and stays one: a `workflow_dispatch` of it exits 1 by design.
 - **No submodule.** This repository has none. Both vendored trees are plain
   files that an ordinary checkout carries, and benchd is a fetched binary. See

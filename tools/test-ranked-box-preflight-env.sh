@@ -51,7 +51,7 @@ fail() {
 command -v jq >/dev/null 2>&1 || { echo "test-ranked-box-preflight-env.sh: jq is required" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "test-ranked-box-preflight-env.sh: git is required" >&2; exit 1; }
 
-TRACK_ID="$(jq -r '.track_id' "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")"
+TRACK_ID="$(jq -r '.track_id' "${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")"
 BOX_NAME="synthetic-ranked-box"
 
 # --- the synthetic root: the real script, the real contract, the real goldens
@@ -59,7 +59,7 @@ ROOT="${WORK}/root"
 mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
 cp "${REPO_ROOT}/tools/ranked-box-preflight.sh" "${ROOT}/tools/"
 chmod +x "${ROOT}/tools/ranked-box-preflight.sh"
-cp "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${ROOT}/fixtures/"
 
 # The staged golden pool: the pinned cohort and nothing else (the preflight
 # refuses an unpinned *.json beside it, so the staging is pin-driven).
@@ -83,7 +83,7 @@ cp "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${ROOT}/fixtures/"
 # is never written.
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
-python3 - "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'REPINEOF'
+python3 - "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'REPINEOF'
 import hashlib, json, os, sys
 
 contract_path, golden_dir = sys.argv[1:3]
@@ -197,8 +197,8 @@ stage_reference_worker
 
 # The synthetic contract pins the synthetic tree.
 jq --arg c "${REF_COMMIT}" '.baseline_reference_commit = $c' \
-  "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" > "${WORK}/contract.tmp"
-mv "${WORK}/contract.tmp" "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+  "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" > "${WORK}/contract.tmp"
+mv "${WORK}/contract.tmp" "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 # --- the calibration file ---------------------------------------------------
 # A healthy file, and a mutator so each case states its ONE difference.
@@ -216,7 +216,7 @@ write_calibration() {
     --arg box "${BOX_NAME}" \
     --arg commit "${REF_COMMIT}" \
     --arg captured "${CAPTURED_AT}" \
-    --argjson live "$(jq -c '.live_goldens' "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")" \
+    --argjson live "$(jq -c '.live_goldens' "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")" \
     '{
       version: 3,
       track_id: $track,
@@ -442,8 +442,8 @@ mkdir -p "${UNARMED_ROOT}/tools" "${UNARMED_ROOT}/fixtures"
 cp "${ROOT}/tools/ranked-box-preflight.sh" "${UNARMED_ROOT}/tools/"
 chmod +x "${UNARMED_ROOT}/tools/ranked-box-preflight.sh"
 jq '.official_scoring_enabled = false' \
-  "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" \
-  > "${UNARMED_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+  "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" \
+  > "${UNARMED_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 env -i PATH="${PATH}" HOME="${HOME}" \
   MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
   MLXFAST_MACMON="${MACMON}" \
@@ -622,8 +622,8 @@ run_live_goldens_case() {
   mkdir -p "${case_root}/tools" "${case_root}/fixtures"
   cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
   chmod +x "${case_root}/tools/ranked-box-preflight.sh"
-  jq "${filter}" "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" \
-    > "${case_root}/fixtures/bonsai2_9b_mlx_v1_track.json"
+  jq "${filter}" "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" \
+    > "${case_root}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
   env -i PATH="${PATH}" HOME="${HOME}" \
     MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
     MLXFAST_MACMON="${MACMON}" \
@@ -660,9 +660,9 @@ jq --arg path "correctness_prompts/${TRACK_ID}/synthetic-extra.golden.json" \
   --arg sha "$(shasum -a 256 "${extra_tape}" | awk '{print $1}')" \
   --argjson bytes "$(wc -c < "${extra_tape}" | tr -d '[:space:]')" \
   '.timed_prompt_pool += [{r2_path: $path, sha256: $sha, bytes: $bytes}]' \
-  "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" \
-  > "${case_root}/fixtures/bonsai2_9b_mlx_v1_track.json"
-pool_size="$(jq '.timed_prompt_pool | length' "${case_root}/fixtures/bonsai2_9b_mlx_v1_track.json")"
+  "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" \
+  > "${case_root}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
+pool_size="$(jq '.timed_prompt_pool | length' "${case_root}/fixtures/muse_glimmer_30b_mlx_v1_track.json")"
 env -i PATH="${PATH}" HOME="${HOME}" \
   MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
   MLXFAST_MACMON="${MACMON}" \

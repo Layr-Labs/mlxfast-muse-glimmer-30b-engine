@@ -149,9 +149,9 @@ fi
 REPO_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
   if [[ "${LOCAL_SUBMIT}" == "1" ]]; then
-    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/bonsai2-9b-mlx-v1/public-local-submit.golden.json"
+    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-submit.golden.json"
   elif [[ "${LOCAL_ITERATE}" == "1" ]]; then
-    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/bonsai2-9b-mlx-v1/public-local-iterate.golden.json"
+    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-iterate.golden.json"
   else
     cat >&2 <<'EOF'
 benchmark.sh: --official requires an explicit correctness golden.
@@ -159,9 +159,9 @@ benchmark.sh: --official requires an explicit correctness golden.
 Set MLXFAST_CORRECTNESS_GOLDEN_PATH to the organizer-provisioned hidden
 golden. An official run never defaults to a shipped capture. The local modes
 do: --local-iterate uses
-  correctness_prompts/bonsai2-9b-mlx-v1/public-local-iterate.golden.json
+  correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-iterate.golden.json
 and --local-submit uses
-  correctness_prompts/bonsai2-9b-mlx-v1/public-local-submit.golden.json
+  correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-submit.golden.json
 Both are captures against the pinned target (model_type
 prism_hadamard_qwen35). The target is pending, so neither ships yet.
 EOF
@@ -186,7 +186,7 @@ fi
 # run work (ref 100-106).
 if [[ ! -f "${GOLDEN_PATH}" ]]; then
   echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
-  echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH, or unset it: the local modes default to the shipped captures under correctness_prompts/bonsai2-9b-mlx-v1/." >&2
+  echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH, or unset it: the local modes default to the shipped captures under correctness_prompts/muse-glimmer-30b-mlx-v1/." >&2
   exit 1
 fi
 
@@ -375,7 +375,7 @@ FACADE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # official baseline pair and the acceptance bands, and the official path resolves it
 # BEFORE the gates-only branch, so `--local-iterate` and `--official` alike refused with
 # "no track_id" while this repository exported it nowhere. The value is the trusted
-# manifest's `trackId` (the PLATFORM id, bonsai2-9b-mlx-v1 -- NOT the bench
+# manifest's `trackId` (the PLATFORM id, muse-glimmer-30b-mlx-v1 -- NOT the bench
 # channel branch, which names the channel; see tools/fetch-benchd.sh).
 # It is read from benchmark.json beside this file's parent, never taken from the
 # caller: benchd treats env != contract as a hard error, so a caller that pre-set a
@@ -442,8 +442,8 @@ fi
 # THE CONTRACT, ON EVERY MODE. benchd reads the measurement window, the model
 # identity and the scoring values from the track fixture and refuses a run it
 # was not given one for (WINDOW-SHAPE-UNDECLARED-FOR-TRACK), local modes
-# included. The fixture is fixtures/bonsai2_9b_mlx_v1_track.json.
-CONTRACT_FIXTURE="${FACADE_DIR}/../fixtures/bonsai2_9b_mlx_v1_track.json"
+# included. The fixture is fixtures/muse_glimmer_30b_mlx_v1_track.json.
+CONTRACT_FIXTURE="${FACADE_DIR}/../fixtures/muse_glimmer_30b_mlx_v1_track.json"
 if [[ ! -f "${CONTRACT_FIXTURE}" ]]; then
   echo "benchmark.sh: every run requires the track contract fixture at ${CONTRACT_FIXTURE}" >&2
   exit 1

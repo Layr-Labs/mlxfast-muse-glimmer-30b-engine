@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# bonsai2-9b-yukon-run.sh -- benchmark.json's benchmarkCommand.
+# muse-glimmer-30b-yukon-run.sh -- benchmark.json's benchmarkCommand.
 #
 # `yukon run` executes benchmarkCommand on the participant's machine. The
-# ranked script, tools/bonsai2-9b-measure-and-score.sh, needs inputs
+# ranked script, tools/muse-glimmer-30b-measure-and-score.sh, needs inputs
 # that only a ranked box has: the staged goldens, the reference workspace and
 # the box calibration. Off a ranked box it can only refuse. This script picks
 # the path:
@@ -41,19 +41,19 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" \
   || -n "${MLXFAST_QWEN38_GOLDEN_DIR:-}" \
   || -n "${MLXFAST_BASELINE_WORKSPACE:-}" \
   || -n "${MLXFAST_BASELINE_CALIBRATION:-}" ]]; then
-  exec "${ROOT}/tools/bonsai2-9b-measure-and-score.sh" "$@"
+  exec "${ROOT}/tools/muse-glimmer-30b-measure-and-score.sh" "$@"
 fi
 
 if [[ $# -ne 0 ]]; then
-  echo "bonsai2-9b-yukon-run.sh: the local path takes no arguments (got: $*)." >&2
+  echo "muse-glimmer-30b-yukon-run.sh: the local path takes no arguments (got: $*)." >&2
   exit 2
 fi
 
-echo "bonsai2-9b-yukon-run.sh: no ranked inputs. This is a LOCAL run. It has no score; the ranked runner gives the score." >&2
+echo "muse-glimmer-30b-yukon-run.sh: no ranked inputs. This is a LOCAL run. It has no score; the ranked runner gives the score." >&2
 
 if [[ ! -f weights/config.json ]]; then
   reference="${MLXFAST_REFERENCE_DIR:-reference_weights/bonsai2-9b-target}"
-  echo "bonsai2-9b-yukon-run.sh: weights/ is absent. Transforming ${reference} into weights/." >&2
+  echo "muse-glimmer-30b-yukon-run.sh: weights/ is absent. Transforming ${reference} into weights/." >&2
   .build/release/mlxfast-swift transform --reference "${reference}" --output weights
 fi
 
@@ -62,7 +62,7 @@ depth_args=()
 if [[ "${depth}" != "0" ]]; then
   depth_args=(--mtp-depth "${depth}")
 fi
-echo "bonsai2-9b-yukon-run.sh: declared MTP depth ${depth}." >&2
+echo "muse-glimmer-30b-yukon-run.sh: declared MTP depth ${depth}." >&2
 
 # The local mode defaults to the shipped long capture, so no golden variable
 # is set here.

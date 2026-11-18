@@ -2,7 +2,7 @@ import Foundation
 import Testing
 
 // Structural checks on the Yukon track manifest (benchmark.json) for track
-// bonsai2-9b-mlx-v1. This is NOT a re-implementation of Yukon's zod
+// muse-glimmer-30b-mlx-v1. This is NOT a re-implementation of Yukon's zod
 // schema (src/benchmark/manifest.ts, RawBenchmarkConfigSchema /
 // parseRepositoryBenchmarkManifest) -- that schema was validated directly by
 // running `bun run` against the real yukon checkout
@@ -71,7 +71,7 @@ struct Gemma4BenchmarkManifestTests {
         #expect(manifest["schemaVersion"] as? Int == 1)
         #expect(manifest["direction"] as? String == "+")
         #expect(manifest["category"] as? String == "swift")
-        #expect(manifest["trackId"] as? String == "bonsai2-9b-mlx-v1")
+        #expect(manifest["trackId"] as? String == "muse-glimmer-30b-mlx-v1")
 
         #expect(manifest["editablePaths"] is [String])
         #expect((manifest["editablePaths"] as? [String])?.isEmpty == false)

@@ -41,7 +41,7 @@ ROOT="${WORK}/root"
 mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
 cp "${REPO_ROOT}/tools/calibrate-box.sh" "${ROOT}/tools/"
 chmod +x "${ROOT}/tools/calibrate-box.sh"
-cp "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${ROOT}/fixtures/"
 cp "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
 
 TRACK_ID="$(jq -r '.trackId' "${ROOT}/benchmark.json")"
@@ -52,7 +52,7 @@ TRACK_ID="$(jq -r '.trackId' "${ROOT}/benchmark.json")"
 # in ${ROOT} therefore gets a synthetic live_goldens list and the pool entry
 # that pins it; the shipped fixture is never written, and a fixture that
 # already carries a list is left exactly as it is.
-python3 - "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" <<'SYNTHEOF'
+python3 - "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" <<'SYNTHEOF'
 import json, sys
 
 contract_path = sys.argv[1]
@@ -73,7 +73,7 @@ SYNTHEOF
 LIVE_GOLDEN_NAMES=()
 while IFS= read -r name; do
   LIVE_GOLDEN_NAMES+=("${name}")
-done < <(jq -r '.live_goldens[]' "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")
+done < <(jq -r '.live_goldens[]' "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")
 
 # --- the synthetic reference tree, and the contract that pins it ------------
 REF_WS="${WORK}/reference"
@@ -92,8 +92,8 @@ printf '#!/bin/sh\nexit 0\n' > "${REF_WS}/.build/release/bench-worker"
 chmod +x "${REF_WS}/.build/release/bench-worker"
 printf '{}\n' > "${REF_WS}/weights/config.json"
 jq --arg c "${REF_COMMIT}" '.baseline_reference_commit = $c' \
-  "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" > "${WORK}/contract.tmp"
-mv "${WORK}/contract.tmp" "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+  "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" > "${WORK}/contract.tmp"
+mv "${WORK}/contract.tmp" "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
@@ -213,7 +213,7 @@ else
     || fail "case 1: argv does not carry the channel manifest's --benchd-source-commit"
   argv_has_pair "${WORK}/case1.argv" --passes 3 \
     || fail "case 1: argv does not carry --passes 3 (the contract's pass count)"
-  argv_has_pair "${WORK}/case1.argv" --contract "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" \
+  argv_has_pair "${WORK}/case1.argv" --contract "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" \
     || fail "case 1: argv does not carry --contract (benchd reads the model shape and the window from the fixture)"
   argv_has_pair "${WORK}/case1.argv" --box "${BOX_NAME}" \
     || fail "case 1: argv does not carry --box ${BOX_NAME}"
@@ -372,10 +372,10 @@ if [[ -f "${WORK}/case11.argv" ]]; then
 fi
 
 # --- case 14: a fixture with no live goldens is refused by name -------------
-cp "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${WORK}/contract.saved"
-jq '.live_goldens = []' "${WORK}/contract.saved" > "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+cp "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${WORK}/contract.saved"
+jq '.live_goldens = []' "${WORK}/contract.saved" > "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 run_calibrate case14 -- "${BOX_NAME}" "${WORK}/case14.out.json"
-cp "${WORK}/contract.saved" "${ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+cp "${WORK}/contract.saved" "${ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 if [[ "${rc}" -eq 0 ]]; then
   fail "case 14: calibrate-box.sh ran with an empty live_goldens list"
 elif ! grep -q "declares no live_goldens" "${WORK}/case14.log"; then

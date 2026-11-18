@@ -1,14 +1,16 @@
-# mlxfast — Bonsai 2 9B MLX
+# mlxfast — Muse Glimmer 30B MLX
 
-This repository is the engine for the Bonsai 2 9B MLX speedup benchmark. The
-track identifier is `bonsai2-9b-mlx-v1`.
+This repository is the engine for the Muse Glimmer 30B MLX speedup benchmark.
+The track identifier is `muse-glimmer-30b-mlx-v1`.
 
-> **NOTE — the target is pending.**
-> prism-ml has not published the Bonsai 2 9B MLX pack. The pack is built on
-> Qwen/Qwen3.5-9B. Every pin that names the pack's bytes or the MTP head's
-> bytes carries the exact sentinel `BONSAI-MLX-PENDING-ORGANIZER`.
-> `./setup.sh` refuses the pending reference by name. Section
-> [Current status](#current-status) states each fact.
+> **NOTE — the target is pinned; this track's goldens are not recorded yet.**
+> The target is `nvidia/Muse-Glimmer-30B-NVFP4` at `47818374`, served through
+> the paged engine with the quantized DFlash drafter pinned in the contract
+> fixture's `mtp_head` block. `./setup.sh` provisions exactly that checkpoint
+> and the drafter beside it. Official scoring is NOT armed: the contract's
+> `timed_prompt_pool` and `live_goldens` are empty and
+> `official_scoring_enabled` is false until the organizer records this track's
+> goldens on its own box.
 
 ## What this repository is
 
@@ -36,7 +38,7 @@ cost is measured in that same session. No file stores it.
 > the contract's `{sha256, bytes}` and refuses an extra `*.json`. They are
 > never in git, so your clone does not carry them. The two public captures for
 > the local modes are different material: they ship in this repository under
-> `correctness_prompts/bonsai2-9b-mlx-v1/`.
+> `correctness_prompts/muse-glimmer-30b-mlx-v1/`.
 >
 > This track has no goldens yet, and no public captures ship yet. Section
 > [Current status](#current-status) states what that blocks.
@@ -179,15 +181,15 @@ export](#the-mtp-head-is-a-separate-export).
 
 The local test checks correctness against a public capture. The two public
 captures ship in this repository under
-`correctness_prompts/bonsai2-9b-mlx-v1/`. The organizer records them on the
+`correctness_prompts/muse-glimmer-30b-mlx-v1/`. The organizer records them on the
 track's box against the pinned target, in one recording, so the short capture
 is the long capture truncated. The target is pending, so the organizer has not
 recorded them yet, and none ship.
 
 | Capture | Path | Use |
 |---|---|---|
-| Short | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-iterate.golden.json` | `--local-iterate`. The drift tripwire. |
-| Long | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-submit.golden.json` | `--local-submit`. The long capture. |
+| Short | `correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-iterate.golden.json` | `--local-iterate`. The drift tripwire. |
+| Long | `correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-submit.golden.json` | `--local-submit`. The long capture. |
 
 Nothing fetches them, and no environment variable is needed to use them. The
 hidden goldens are different material: they live in R2 and on the ranked box.
@@ -408,7 +410,7 @@ emitted token. Both legs load the head; only the candidate leg drafts with it.
 > engine's `effective_spec` echo.
 >
 > A declared depth is scored against the oracle recorded AT THAT DEPTH for each
-> live golden (`fixtures/bonsai2_9b_mlx_v1_track.json`
+> live golden (`fixtures/muse_glimmer_30b_mlx_v1_track.json`
 > `live_golden_speculative`, keyed by depth and then by live golden name). The
 > runner verifies a draft window in one target forward, and the multi-row
 > kernels round differently from the single-row ones, so a speculative run is
@@ -676,7 +678,7 @@ tree's own MTP head. Nothing crosses between the two trees.
 `tools/stage-baseline-workspace.sh` stages the MTP head into the reference
 tree from `MLXFAST_MTP_HEAD_REFERENCE_DIR`.
 
-`tools/bonsai2-9b-measure-and-score.sh` boots nothing. It takes the box GPU
+`tools/muse-glimmer-30b-measure-and-score.sh` boots nothing. It takes the box GPU
 lock `/tmp/mtplx-gpu-exclusive.lock` and holds it for the whole measurement,
 because a resident holds the whole checkpoint in unified memory whoever booted
 it, and the box needs exactly one loader. `tools/resident-up.sh` refuses
@@ -755,7 +757,7 @@ Six statements are true right now.
    `BONSAI-MLX-PENDING-ORGANIZER`. `fixtures/reference_bonsai2_9b_2bit.sha256`
    and `fixtures/reference_bonsai2_9b_mtp_head.sha256` hold no record.
    `./setup.sh` refuses the pending reference by name.
-2. `fixtures/bonsai2_9b_mlx_v1_track.json` sets
+2. `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets
    `official_scoring_enabled` to `false`. That flag is the single authority on
    the arm state, and the benchmarker enforces it. It refuses to seal an
    official scoring artifact while the flag is false.
@@ -765,7 +767,7 @@ Six statements are true right now.
    Bonsai coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token
    seed.
 4. No runner advertises the ranked label set
-   `[self-hosted, macOS, bonsai2-9b-mlx-v1]`, and no box is staged
+   `[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`, and no box is staged
    with the goldens, the reference tree or a calibration file.
    `tools/stage-baseline-workspace.sh` builds the reference tree, and
    `tools/calibrate-box.sh` writes the calibration file, when a box is ready.
@@ -822,7 +824,7 @@ yukon run
 ```
 
 This command runs `benchmarkCommand`, which is
-`tools/bonsai2-9b-yukon-run.sh`. Off a ranked box it transforms the weights
+`tools/muse-glimmer-30b-yukon-run.sh`. Off a ranked box it transforms the weights
 when `weights/` is absent, then runs `./benchmark.sh --local-submit` at the
 declared MTP depth. The result has `"score": null`. Only the ranked runner
 gives a score.
@@ -854,7 +856,7 @@ No local run blocks the upload. Run the local test yourself before you submit.
 | Geometry source | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` `config.json`, checked in as `fixtures/qwen35_9b_base_config.json` |
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, checked in as `fixtures/bonsai2_27b_config.json` |
 | Benchmarker | The bench repository's `main` dist channel, resolved at run time (`benchd.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
-| Track id | `bonsai2-9b-mlx-v1` — the PLATFORM name: leaderboard namespace, runner labels, R2 prefix |
+| Track id | `muse-glimmer-30b-mlx-v1` — the PLATFORM name: leaderboard namespace, runner labels, R2 prefix |
 | Engine fork upstream base | tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, the merge of `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `443789360ddbf804d55d063ca9cda4ea2d3013a9` (a local merge branch, not pushed upstream; engine-local changes on top) |
 
 ### The target model
@@ -950,7 +952,7 @@ and runs no GPU test. The GPU tests and the checkpoint tests are box-only.
 
 `.github/workflows/benchmark.yml` is the ranked pipeline. It triggers on
 `workflow_dispatch` only. It holds no secret. Its ranked job runs on
-`[self-hosted, macOS, bonsai2-9b-mlx-v1]`. Before it measures, it verifies
+`[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`. Before it measures, it verifies
 every box-staged asset against the contract's `{sha256, bytes}` pins. It
 publishes no score until the runner is registered, the box is staged, and the
 benchmarker emits a composite. Each of those gaps gives a non-zero exit and no
@@ -961,7 +963,7 @@ artifact.
 | Question | Authority |
 |---|---|
 | What the track measures, path by path | `benchmark.json` |
-| Pins, the timed pool, scoring values | `fixtures/bonsai2_9b_mlx_v1_track.json` |
+| Pins, the timed pool, scoring values | `fixtures/muse_glimmer_30b_mlx_v1_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
 | The engineering record for this port | `docs/bonsai2-9b-port-notes.md` |
 | What CI covers | `docs/ci-coverage.md` |
@@ -969,7 +971,7 @@ artifact.
 
 > **NOTE — the order of authority.**
 > The ranked M5 run is the authority on any score. The contract fixture
-> `fixtures/bonsai2_9b_mlx_v1_track.json` wins over this document. This document
+> `fixtures/muse_glimmer_30b_mlx_v1_track.json` wins over this document. This document
 > only explains; it never overrides. If either disagrees with the benchmarker
 > about measurement, the benchmarker wins.
 

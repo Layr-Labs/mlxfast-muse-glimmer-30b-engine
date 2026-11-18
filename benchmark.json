@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "name": "mlxfast-bonsai2-9b",
-  "trackId": "bonsai2-9b-mlx-v1",
-  "description": "Bonsai 2 9B MLX inference speedup track. The target is PENDING: prism-ml has not published the Bonsai 2 9B MLX pack, so every pin that names its bytes carries the sentinel BONSAI-MLX-PENDING-ORGANIZER. The pack is built on Qwen/Qwen3.5-9B and is expected to use the Ternary Bonsai 2 27B packing: 2-bit affine group-128 MLX codes with a signed block Walsh-Hadamard transform, block 1024, on the input of every packed projection. The text tower is 32 layers on a four-layer repeat: 8 full-attention layers (16 query heads over 4 KV heads at head_dim 256, at every index % 4 == 3) and 24 gated-delta-net linear-attention layers (16 key heads and 32 value heads of dim 128, conv kernel 4, FP32 state). Hidden size 4096, vocabulary 248320, untied embeddings. The speculative decoder is one qwen3_5_mtp MTP layer for this geometry at draft depth 1 to 7; its pin is PENDING too. mtp-head.manifest.json is a DECLARATION only: it is editable and optional, and it accepts source 'pinned' only. The decoder is single-stream (maximum speculative batch 1). The KV backend is pinned contiguous. The target model may never be re-quantized. Optimize the Bonsai 2 and Qwen 3.5 model files, the offline transform, and the vendored MLX/Metal kernel families the forward pass dispatches. Scoring is paired single-stream on the same box: a serial control leg on the organizer's reference tree versus the declared depth, composite = prefill_gain^0.25 * decode_gain^0.75. docs/participant-contract.md section 5 is the authority.",
+  "name": "mlxfast-muse-glimmer-30b",
+  "trackId": "muse-glimmer-30b-mlx-v1",
+  "description": "Muse Glimmer 30B NVFP4 MLX inference speedup track. The target is nvidia/Muse-Glimmer-30B-NVFP4 at 47818374517751c48c55cde2621594926b1888b6: one 23.0 GiB checkpoint of mixed precision modelopt weights (4-bit NVFP4 group-16 on 213 modules, float8 on 180 modules) with a 52-layer text decoder (39 sliding-attention layers at window 2048 and 13 full-attention NoPE layers), hidden size 6656, dense MLP, vocabulary 202048, untied head, Apache 2.0. The checkpoint also carries a 50-layer vision tower; this track serves text only and the loader drops that namespace, exactly as the model's own loader does. There are TWO decoders, serial and dflash: dflash is the quantized DFlash drafter produced deterministically from meta-models/Muse-Glimmer-30B-assistant at c676cce91658f9568aaf264a416211e2782735b7, under the 2 GiB cap. The KV backend is paged: the model's own engine build refuses a contiguous cache. The target model may never be re-quantized or re-represented. Optimize the model files, the paged ContinuousBatchingV2 engine, the KV-cache path, the exact-window kernels and the vendored MLX/Metal kernel families the forward pass dispatches. Scoring is paired single-stream on the same box: a serial control leg on the organizer's reference tree versus the candidate, composite = prefill_gain^0.25 * decode_gain^0.75, the mean over three pairs. docs/participant-contract.md section 5 is the authority.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
     "mtp-head.manifest.json",
     "Sources/MLXFastTransform",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/DFlash2Draft.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35DFlash2Assistant.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/MuseGlimmer/MuseGlimmerTextModel+CBv2.swift",
+    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/MuseGlimmer/DFlash/MuseGlimmerDFlashDrafter.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/PrismHadamardQwen35.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35+CompleteCheckpoint.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
@@ -114,7 +114,7 @@
     "maxFileBytes": 524288,
     "maxGrowthBytes": 262144
   },
-  "contractPath": "fixtures/bonsai2_9b_mlx_v1_track.json",
+  "contractPath": "fixtures/muse_glimmer_30b_mlx_v1_track.json",
   "setupCommand": [
     "bash",
     "-c",
@@ -123,12 +123,12 @@
   "preSubmitCommand": [
     "bash",
     "-c",
-    "./tools/bonsai2-9b-measure-and-score.sh --preflight-only"
+    "./tools/muse-glimmer-30b-measure-and-score.sh --preflight-only"
   ],
   "benchmarkCommand": [
     "bash",
     "-c",
-    "MLXFAST_SCORE_PATH=score.json ./tools/bonsai2-9b-yukon-run.sh"
+    "MLXFAST_SCORE_PATH=score.json ./tools/muse-glimmer-30b-yukon-run.sh"
   ],
   "runner": {
     "provider": "github-actions",
@@ -138,22 +138,22 @@
   "scoreArtifact": "benchmark-results-<run_id>/score.json",
   "scorePath": "score.json",
   "scoring": {
-    "mode": "bonsai2-native-mtp-paired-composite",
+    "mode": "muse-glimmer-native-dflash-paired-composite",
     "formula": "composite = prefill_gain^0.25 * decode_gain^0.75",
     "scoredExponents": {
       "prefillGainExponent": 0.25,
       "decodeGainExponent": 0.75
     },
     "scoredBatchSize": 1,
-    "kvBackend": "contiguous",
+    "kvBackend": "paged",
     "pairsPerCohort": 3,
     "minPairsPerCohort": 3,
     "decodeSpeedupFloor": 0.95,
     "decodeSpeedupCeiling": 5.0
   },
   "leaderboard": {
-    "namespace": "bonsai2-9b-mlx-v1"
+    "namespace": "muse-glimmer-30b-mlx-v1"
   },
-  "staticReviewTrackId": "bonsai2-9b-mlx-v1",
+  "staticReviewTrackId": "muse-glimmer-30b-mlx-v1",
   "commands": null
 }

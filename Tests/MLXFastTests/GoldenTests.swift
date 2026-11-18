@@ -1488,7 +1488,7 @@ private func arrayJSON(_ values: [Int]) -> String {
 
 /// THE PUBLIC CAPTURES WAIT FOR THE TARGET. `--local-iterate` and
 /// `--local-submit` check correctness against two captures under
-/// `correctness_prompts/bonsai2-9b-mlx-v1/`. The organizer records them on the
+/// `correctness_prompts/muse-glimmer-30b-mlx-v1/`. The organizer records them on the
 /// track's box against the pinned target. While the target is PENDING there is
 /// nothing to record against, so the directory must not exist, and the strict
 /// loader must refuse any golden that names a checkpoint. When the captures
@@ -1496,7 +1496,7 @@ private func arrayJSON(_ values: [Int]) -> String {
 @Test
 func thePublicCapturesWaitForThePendingTarget() throws {
     #expect(ReferenceModelPin.pinned.isPending)
-    #expect(!FileManager.default.fileExists(atPath: "correctness_prompts/bonsai2-9b-mlx-v1"))
+    #expect(!FileManager.default.fileExists(atPath: "correctness_prompts/muse-glimmer-30b-mlx-v1"))
 
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }

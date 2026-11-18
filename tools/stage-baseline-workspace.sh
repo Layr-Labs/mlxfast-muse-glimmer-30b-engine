@@ -74,7 +74,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONTRACT="${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 die() {
   echo "stage-baseline-workspace.sh: $*" >&2

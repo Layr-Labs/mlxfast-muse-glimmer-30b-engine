@@ -2,7 +2,7 @@
 
 Make the Bonsai 2 9B model run faster on Apple Silicon.
 
-The ranked track is `bonsai2-9b-mlx-v1`. Read [README.md](README.md) for the
+The ranked track is `muse-glimmer-30b-mlx-v1`. Read [README.md](README.md) for the
 setup steps and the repository structure. Read
 [`docs/participant-contract.md`](docs/participant-contract.md) for the reasons
 behind the rules.
@@ -207,7 +207,7 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 ## The current state
 
 > **NOTE — the track is NOT armed.**
-> `fixtures/bonsai2_9b_mlx_v1_track.json` sets `official_scoring_enabled` to
+> `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets `official_scoring_enabled` to
 > `false`, and the benchmarker refuses to seal an official scoring artifact
 > while it is. The timed prompt pool and the `live_goldens` list are empty,
 > and the hidden correctness oracle carries the sentinel
@@ -236,7 +236,7 @@ signal, not as a prediction. The ranked M5 run is the authority.
 | Question | File |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, the timed pool, scoring semantics | `fixtures/bonsai2_9b_mlx_v1_track.json` |
+| Pins, the timed pool, scoring semantics | `fixtures/muse_glimmer_30b_mlx_v1_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
 | What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`, verified against the dist `benchd.manifest.json`) |
 

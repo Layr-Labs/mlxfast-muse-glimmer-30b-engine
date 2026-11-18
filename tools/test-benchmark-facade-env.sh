@@ -22,7 +22,7 @@
 #   5. a caller pre-sets the SAME value: accepted.
 #
 # It then pins the RANKED path's WINDOW wiring on
-# tools/bonsai2-9b-measure-and-score.sh, with a stub bench-worker that
+# tools/muse-glimmer-30b-measure-and-score.sh, with a stub bench-worker that
 # binds a socket and answers a hello the way the real resident does:
 #   6. THE RANKED PATH BOOTS NO RESIDENT AND EXPORTS NO SOCKET. It used to boot
 #      one from the CANDIDATE tree and hand benchd the socket; under the paired
@@ -215,7 +215,7 @@ fi
 # paths inside the sandbox. Nothing loads: the bench-worker is a stub that
 # binds the socket and answers the hello, and benchd is a stub too.
 # ---------------------------------------------------------------------------
-MEASURE_REL="tools/bonsai2-9b-measure-and-score.sh"
+MEASURE_REL="tools/muse-glimmer-30b-measure-and-score.sh"
 RES_ROOT="${WORK}/measure-root"
 mkdir -p "${RES_ROOT}/tools" "${RES_ROOT}/fixtures" "${RES_ROOT}/weights"
 cp "${REPO_ROOT}/${MEASURE_REL}" "${RES_ROOT}/tools/"
@@ -225,7 +225,7 @@ cp "${REPO_ROOT}/tools/resident-up.sh" "${RES_ROOT}/tools/"
 cp "${REPO_ROOT}/tools/spec-declaration.sh" "${RES_ROOT}/tools/"
 chmod +x "${RES_ROOT}/tools/"*.sh
 cp "${REPO_ROOT}/benchmark.json" "${RES_ROOT}/benchmark.json"
-cp "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${RES_ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${RES_ROOT}/fixtures/"
 
 # THE GOLDEN MATERIAL, SYNTHESIZED INTO THIS SUITE'S OWN COPY OF THE FIXTURE.
 #
@@ -243,7 +243,7 @@ cp "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${RES_ROOT}/fixtures/"
 # wiring these cases pin.
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
-python3 - "${RES_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'SYNTHEOF'
+python3 - "${RES_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'SYNTHEOF'
 import hashlib, json, os, sys
 
 contract_path, golden_dir = sys.argv[1:3]
@@ -282,7 +282,7 @@ SYNTHEOF
 LIVE_GOLDEN_NAMES=()
 while IFS= read -r name; do
   LIVE_GOLDEN_NAMES+=("${name}")
-done < <(jq -r '.live_goldens[]' "${RES_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")
+done < <(jq -r '.live_goldens[]' "${RES_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")
 for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   [[ -f "${GOLDEN_DIR}/${name}.golden.json" ]] \
     || echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"
@@ -582,7 +582,7 @@ fi
 # ---------------------------------------------------------------------------
 # Cases 16-19: the live_goldens list.
 # ---------------------------------------------------------------------------
-MEASURE_CONTRACT="${RES_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+MEASURE_CONTRACT="${RES_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 # argv_values FILE FLAG -- every value that follows FLAG, one per line, in argv
 # order.
@@ -665,13 +665,13 @@ expect_measure_refusal case18 "live golden 'no-such-prompt' has no timed_prompt_
 # Case 19: a declared depth with no oracle for one live golden is refused by
 # name. The last live golden loses its mtp3 oracle.
 SPEC_MANIFEST="${WORK}/mtp3.manifest.json"
-printf '{"version":1,"source":"pinned","spec":{"enabled":true,"num_speculative_tokens":3}}\n' > "${SPEC_MANIFEST}"
+printf '{"version":1,"source":"pinned","spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}\n' > "${SPEC_MANIFEST}"
 # The refusal names the FIRST live golden with no mtp3 oracle after the
 # mutation. That is the last live golden when the fixture carries an oracle
 # for every live golden; a serial-only armed fixture carries none, so the
 # first live golden is refused. Read the name from the fixture, never a literal.
 CASE19_MUTATION='del(.live_golden_speculative.mtp3[.live_goldens[-1]])'
-LAST_LIVE="$(jq -er "${CASE19_MUTATION}"' | . as $f | [.live_goldens[] as $n | select((($f.live_golden_speculative.mtp3 // {}) | has($n)) | not) | $n][0]' "${RES_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")"
+LAST_LIVE="$(jq -er "${CASE19_MUTATION}"' | . as $f | [.live_goldens[] as $n | select((($f.live_golden_speculative.mtp3 // {}) | has($n)) | not) | $n][0]' "${RES_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")"
 run_measure_with_contract case19 "${CASE19_MUTATION}" \
   "SPEC_DECLARATION_MANIFEST=${SPEC_MANIFEST}"
 expect_measure_refusal case19 "declared spec 'mtp3' has no live_golden_speculative entry for live golden '${LAST_LIVE}'"

@@ -1,4 +1,4 @@
-# bonsai2-9b-mlx-v1 RANKED BENCHMARK -- STUB, NOT PROVISIONED.
+# muse-glimmer-30b-mlx-v1 RANKED BENCHMARK -- STUB, NOT PROVISIONED.
 #
 # The REAL ranked pipeline for this track is .github/workflows/benchmark.yml,
 # and that is what benchmark.json's runner.workflow names. This file is kept
@@ -16,7 +16,7 @@
 # There is no `push`, `pull_request` or `schedule` trigger: workflow_dispatch
 # only, so nothing runs by accident.
 
-name: Bonsai 2 9B ranked benchmark (NOT PROVISIONED)
+name: Muse Glimmer 30B ranked benchmark (NOT PROVISIONED)
 
 on:
   workflow_dispatch:
@@ -35,16 +35,16 @@ jobs:
           cat >&2 <<'EOF2'
           This workflow is a stub. Nothing was measured and nothing was scored.
 
-          The ranked pipeline for bonsai2-9b-mlx-v1 is
+          The ranked pipeline for muse-glimmer-30b-mlx-v1 is
           .github/workflows/benchmark.yml, which benchmark.json names in
           runner.workflow. Dispatch that one.
 
           That pipeline is itself not runnable yet. Still to land:
             1. the track goldens, recorded on the track's box, published in
-               R2 and pinned in fixtures/bonsai2_9b_mlx_v1_track.json. The
+               R2 and pinned in fixtures/muse_glimmer_30b_mlx_v1_track.json. The
                timed_prompt_pool[] is empty today and scoring is not armed.
             2. a self-hosted runner advertising the
-               [self-hosted, macOS, bonsai2-9b-mlx-v1] label set.
+               [self-hosted, macOS, muse-glimmer-30b-mlx-v1] label set.
 
           Refusing with exit 1.
           EOF2

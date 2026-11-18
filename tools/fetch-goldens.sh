@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
 # fetch-goldens.sh -- fetch pin-verified golden objects from the track's R2
-# bucket for track bonsai2-9b-mlx-v1.
+# bucket for track muse-glimmer-30b-mlx-v1.
 #
 # THE SCRIPT HAS TWO MODES, both organizer-side. A participant never needs it:
 # the two public captures for --local-iterate and --local-submit ship in this
-# repository under correctness_prompts/bonsai2-9b-mlx-v1/.
+# repository under correctness_prompts/muse-glimmer-30b-mlx-v1/.
 #
 #   1. ONE OBJECT:
 #        tools/fetch-goldens.sh --r2-path KEY --sha256 HEX --bytes N --out FILE
 #      It fetches one object and keeps it only when the bytes match the pin.
-#      A pin that fixtures/bonsai2_9b_mlx_v1_track.json declares hidden is
+#      A pin that fixtures/muse_glimmer_30b_mlx_v1_track.json declares hidden is
 #      refused, by key and by digest, so a pin copied out of the contract
 #      cannot pull organizer material onto a participant machine.
 #
@@ -61,7 +61,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-CONTRACT="${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 R2_PATH=""
 WANT_SHA=""
@@ -79,7 +79,7 @@ Fetch one object from the track's R2 bucket and accept it only if it matches
 the supplied {sha256, bytes} pin exactly. The file is removed on any mismatch,
 so a failed run never leaves half-verified bytes behind.
 
-  --r2-path KEY   Object key, e.g. correctness_prompts/bonsai2-9b-mlx-v1/NAME.json
+  --r2-path KEY   Object key, e.g. correctness_prompts/muse-glimmer-30b-mlx-v1/NAME.json
                   The BUCKET IS NOT PART OF THIS -- it is in R2_BUCKET_ENDPOINT.
   --sha256 HEX    64 lowercase hex characters. Required: there is no unpinned fetch.
   --bytes N       Exact byte count. Required, and checked before the hash.
@@ -94,9 +94,9 @@ It is secret-tier material. It is deliberately absent from this repository and
 must stay that way -- keep it in your .env, never in a file you commit.
 
 The public captures for --local-iterate and --local-submit ship in this
-repository under correctness_prompts/bonsai2-9b-mlx-v1/; nothing here fetches them.
+repository under correctness_prompts/muse-glimmer-30b-mlx-v1/; nothing here fetches them.
 
-THE HIDDEN GUARD: every pin in fixtures/bonsai2_9b_mlx_v1_track.json (the
+THE HIDDEN GUARD: every pin in fixtures/muse_glimmer_30b_mlx_v1_track.json (the
 timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
 is organizer material. This script refuses to fetch any of them by key OR by
 digest, so a copy-pasted pin from the contract cannot quietly pull that
@@ -234,7 +234,7 @@ fetch-goldens.sh: REFUSING -- that pin is hidden, box-only material.
   requested sha : ${WANT_SHA}
 
 It matches a timed_prompt_pool[] tape or hidden_correctness_golden in
-fixtures/bonsai2_9b_mlx_v1_track.json. Those objects are organizer-side: the GETs
+fixtures/muse_glimmer_30b_mlx_v1_track.json. Those objects are organizer-side: the GETs
 are credentialed, the tapes are a benchd format local --golden modes cannot
 load, and the anti-lottery cohort stops being hidden the moment a participant
 holds all eight.
@@ -243,7 +243,7 @@ If you are the organizer staging a box, use --all --out DIR, which stages the
 whole pinned set (credentials are required as well); --allow-hidden lifts this
 refusal for one object. If you are looking for a golden to iterate against
 locally, use the shipped public captures under
-correctness_prompts/bonsai2-9b-mlx-v1/.
+correctness_prompts/muse-glimmer-30b-mlx-v1/.
 EOF
   exit 1
 fi

@@ -54,7 +54,7 @@
 #                       THE BRANCH IS THE CHANNEL, NOT THE TRACK. The MLX and
 #                       CUDA tracks of one model share ONE dist channel,
 #                       because they share one benchmarker. The TRACK id stays
-#                       platform-specific (bonsai2-9b-mlx-v1) and is what
+#                       platform-specific (muse-glimmer-30b-mlx-v1) and is what
 #                       names the leaderboard namespace, the runner labels and
 #                       the R2 prefix. Do not conflate the two: this variable
 #                       and the manifest branch check are the only places the
