@@ -14,8 +14,9 @@
 # future fixture edit ever WIDENS mtp_head.permitted_draft_depths past 7, the
 # matching case below turns this test red -- that is the tripwire.
 #
-# ONE DECODER. This track declares the MTP head only; a `dflash` declaration is
-# refused by name, enabled or not when it asks for a depth.
+# ONE SPECULATIVE DECODER. This track declares the DFlash drafter; `dflash` is
+# accepted and derives its depth from the same contract envelope. An unknown
+# decoder name is still refused by name.
 #
 # Usage: tools/test-spec-declaration.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)
@@ -23,7 +24,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DECL="${SCRIPT_DIR}/tools/spec-declaration.sh"
-CONTRACT="${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -74,8 +75,8 @@ if [[ "${permitted}" != "[1,2,3,4,5,6,7]" ]]; then
   echo "FAIL contract envelope: mtp_head.permitted_draft_depths is ${permitted}, expected [1,2,3,4,5,6,7] -- the track's draft-depth envelope changed; update this test deliberately or revert the fixture"
   fails=$((fails + 1))
 fi
-if [[ "$(jq -c '.dflash_drafter' "${CONTRACT}")" != "null" ]]; then
-  echo "FAIL contract envelope: the contract declares a dflash_drafter block; this track declares the MTP head only"
+if [[ "$(jq -r '.mtp_head.decoder // ""' "${CONTRACT}")" != "dflash" ]]; then
+  echo "FAIL contract envelope: mtp_head.decoder is not \"dflash\"; this track declares the DFlash drafter"
   fails=$((fails + 1))
 fi
 
@@ -85,34 +86,38 @@ expect_ok  "disabled-is-serial"           '{"spec":{"enabled":false,"num_specula
 expect_ok  "enabled-zero-is-serial"       '{"spec":{"enabled":true,"num_speculative_tokens":0}}'  describe serial
 
 # --- the decoder defaults to mtp, so an older declaration keeps its meaning ---
-expect_ok  "absent-decoder-is-mtp"        '{}' decoder mtp
+expect_ok  "absent-decoder-is-dflash"     '{}' decoder dflash
 expect_ok  "explicit-mtp-decoder"         '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}' decoder   mtp
 expect_ok  "explicit-mtp-describe"        '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}' describe  mtp3
-expect_refuse "dflash-decoder-refused"   '{"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":7}}' "this track declares mtp only"
-expect_refuse "dflash-disabled-refused"  '{"spec":{"decoder":"dflash","enabled":false,"num_speculative_tokens":0}}' "this track declares mtp only"
+expect_ok  "explicit-dflash-decoder"     '{"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":7}}' decoder  dflash
+expect_ok  "explicit-dflash-describe"    '{"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":7}}' describe dflash7
+expect_ok  "dflash3-speculative"         '{"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":3}}' speculative 1
+expect_ok  "dflash-disabled-is-serial"   '{"spec":{"decoder":"dflash","enabled":false,"num_speculative_tokens":0}}' describe serial
+expect_refuse "unknown-decoder-refused"  '{"spec":{"decoder":"dspark","enabled":true,"num_speculative_tokens":7}}' "this track declares dflash and mtp"
+expect_refuse "dflash8-refused"          '{"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":8}}' "not a contract-permitted dflash draft depth"
 
-# --- the seven permitted mtp depths -----------------------------------------
-expect_ok  "mtp1-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":1}}' describe  mtp1
-expect_ok  "mtp1-draftlen"   '{"spec":{"enabled":true,"num_speculative_tokens":1}}' draft-len 1
-expect_ok  "mtp2-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":2}}' describe  mtp2
-expect_ok  "mtp3-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":3}}' describe  mtp3
-expect_ok  "mtp3-speculative" '{"spec":{"enabled":true,"num_speculative_tokens":3}}' speculative 1
-expect_ok  "mtp4-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":4}}' describe  mtp4
-expect_ok  "mtp5-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":5}}' describe  mtp5
-expect_ok  "mtp6-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":6}}' describe  mtp6
-expect_ok  "mtp7-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":7}}' describe  mtp7
-expect_ok  "mtp7-draftlen"   '{"spec":{"enabled":true,"num_speculative_tokens":7}}' draft-len 7
+# --- the seven permitted depths on the mtp slot name (declared explicitly) --
+expect_ok  "mtp1-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":1}}' describe  mtp1
+expect_ok  "mtp1-draftlen"   '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":1}}' draft-len 1
+expect_ok  "mtp2-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":2}}' describe  mtp2
+expect_ok  "mtp3-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}' describe  mtp3
+expect_ok  "mtp3-speculative" '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}' speculative 1
+expect_ok  "mtp4-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":4}}' describe  mtp4
+expect_ok  "mtp5-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":5}}' describe  mtp5
+expect_ok  "mtp6-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":6}}' describe  mtp6
+expect_ok  "mtp7-permitted"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":7}}' describe  mtp7
+expect_ok  "mtp7-draftlen"   '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":7}}' draft-len 7
 
 # --- the restriction: depths ABOVE 7 are refused, never clamped -------------
 # 8 is inside the structural 0..8 ceiling but OUTSIDE permitted_draft_depths,
 # so it must be refused by the contract-membership check. This is the tripwire
 # for "cap mtp at 7": widening permitted_draft_depths reddens it.
-expect_refuse "mtp8-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":8}}' "not a contract-permitted mtp draft depth"
+expect_refuse "mtp8-refused"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":8}}' "not a contract-permitted mtp draft depth"
 # 9 is beyond the structural ceiling and refuses there, before the membership check.
-expect_refuse "mtp9-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":9}}' "outside the permitted range 0..8"
+expect_refuse "mtp9-refused"  '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":9}}' "outside the permitted range 0..8"
 
 # --- the structural ceiling ------------------------------------------------
-expect_refuse "mtp16-refused" '{"spec":{"enabled":true,"num_speculative_tokens":16}}' "outside the permitted range 0..8 for decoder mtp"
+expect_refuse "mtp16-refused" '{"spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":16}}' "outside the permitted range 0..8 for decoder mtp"
 
 # --- malformed declarations refuse ------------------------------------------
 expect_refuse "negative-refused"    '{"spec":{"enabled":true,"num_speculative_tokens":-1}}' "outside the permitted range 0..8"

@@ -2,7 +2,7 @@ import Foundation
 import MLXFastCore
 import Testing
 
-// Contract tests for `fixtures/bonsai2_9b_mlx_v1_track.json`.
+// Contract tests for `fixtures/muse_glimmer_30b_mlx_v1_track.json`.
 //
 // The track is STAMPED, NOT ARMED, AND ITS TARGET IS PENDING. prism-ml has not
 // published the Bonsai 2 9B pack or an MTP head for it. So:
@@ -35,7 +35,7 @@ struct Bonsai2TrackFixtureTests {
     @Test("track_id is pinned to the leaderboard / R2-prefix identity")
     func trackIdIsPinned() throws {
         let object = try bonsai2TrackContractObject()
-        #expect(object["track_id"] as? String == "bonsai2-9b-mlx-v1")
+        #expect(object["track_id"] as? String == "muse-glimmer-30b-mlx-v1")
     }
 
     @Test("benchmark_name matches the Yukon manifest name")

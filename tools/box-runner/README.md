@@ -5,7 +5,7 @@ ranked benchmark: mint a just-in-time (JIT), single-use runner registration,
 run exactly one job with it, verify the job's whole process tree is gone,
 repeat. This directory owns the **runner side** only. The workflow file that
 dispatches jobs against it is `.github/workflows/benchmark.yml`
-(`runs-on: [self-hosted, macOS, bonsai2-9b-mlx-v1]`); the coupling between
+(`runs-on: [self-hosted, macOS, muse-glimmer-30b-mlx-v1]`); the coupling between
 the two sides is exactly the `RUNNER_LABELS` value described below, and
 nothing else.
 
@@ -84,7 +84,7 @@ of these (fail-closed):**
 | Var | Meaning |
 |---|---|
 | `RUNNER_DIR` | Path to the actions-runner install (`install.sh` creates it). |
-| `RUNNER_LABELS` | JIT registration labels. **Must match** the `runs-on:` list in `.github/workflows/benchmark.yml` — `macOS,bonsai2-9b-mlx-v1` (`self-hosted` is force-included by `gh-app-mint.sh`). This is the entire coupling surface between the two sides — get it wrong and every dispatched job silently finds no runner. The seeded `box-runner.env` ships it empty and `supervisor.sh` refuses to start until an operator sets it. |
+| `RUNNER_LABELS` | JIT registration labels. **Must match** the `runs-on:` list in `.github/workflows/benchmark.yml` — `macOS,muse-glimmer-30b-mlx-v1` (`self-hosted` is force-included by `gh-app-mint.sh`). This is the entire coupling surface between the two sides — get it wrong and every dispatched job silently finds no runner. The seeded `box-runner.env` ships it empty and `supervisor.sh` refuses to start until an operator sets it. |
 | `GH_APP_ID`, `GH_APP_KEY`, `GH_RUNNER_REPO` | Required by `gh-app-mint.sh` (see its own header); set via env or `BOX_RUNNER_APP_ENV`. |
 
 **Optional (sane defaults, see `box-runner.env.example` for every one):**

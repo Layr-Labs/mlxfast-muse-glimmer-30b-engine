@@ -1,13 +1,19 @@
-# SHA256 manifest for BONSAI-MLX-PENDING-ORGANIZER.
+# SHA256 manifest for the DFlash drafter slot of track muse-glimmer-30b-mlx-v1.
 # Revision: BONSAI-MLX-PENDING-ORGANIZER
 #
-# The MTP HEAD for track bonsai2-9b-mlx-v1. PENDING: no MTP head is published
-# for the Bonsai 2 9B pack. The head is a qwen3_5_mtp layer for the Qwen 3.5 9B
-# geometry. When one is published, this file pins it unmodified: nothing here
-# re-quantizes, mirrors or re-uploads it. If the pack ships its own mtp.*
-# block, the head comes from the target manifest and this file names that.
+# The speculative decoder for this track is `dflash`. The drafter artifact is
+# PRODUCED, not downloaded: the pinned writer converts
+# meta-models/Muse-Glimmer-30B-assistant at c676cce91658f9568aaf264a416211e2782735b7
+# into the quantized artifact (model.safetensors and config.json,
+# 1,968,222,936 bytes), and the artifact's own identity lives in the contract
+# fixture's mtp_head block (weightsSHA256 38f92e9a..., configurationSHA256
+# af24b73c...). Nothing here re-quantizes, mirrors or re-uploads any of it.
 #
-# setup-mtp-head.sh refuses this manifest while it carries the sentinel.
+# NO RECORD IS PINNED HERE YET. The Revision line keeps the organizer sentinel,
+# so ./setup.sh and ./setup-mtp-head.sh refuse this slot by name until the
+# artifact is produced and staged on the track's own box. The sentinel spelling
+# is the one setup.sh compares against; that script lies outside this part's
+# editable set, so the spelling is inherited rather than renamed here.
 #
 #   MLXFAST_REFERENCE_MANIFEST_RECORDS: 0
 #   MLXFAST_REFERENCE_MANIFEST_BYTES:   0

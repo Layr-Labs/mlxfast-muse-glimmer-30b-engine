@@ -1654,7 +1654,7 @@ done
 #
 # It read SEVEN until 2026-08-25, stale since `fixtures` and `benchmark.json`
 # joined the roster on 2026-08-24 (folding a reviewer blocker into the
-# bonsai2-9b-mlx-v1 manifest PR). Note which way that staleness pointed:
+# muse-glimmer-30b-mlx-v1 manifest PR). Note which way that staleness pointed:
 # this assertion goes red when the roster GROWS as well as when it shrinks, so
 # it cannot silently bless a widened trust boundary either -- re-count it
 # deliberately, entry by entry, rather than matching it to whatever the roster

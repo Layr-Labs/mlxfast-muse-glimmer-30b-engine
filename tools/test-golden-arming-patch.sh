@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TOOL="${SCRIPT_DIR}/tools/golden-arming-patch.py"
-CONTRACT="${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -48,7 +48,7 @@ q() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sy
 LIVES=(--live alpha --live bravo --live charlie)
 if python3 "${TOOL}" --dir "${WORK}/set" "${LIVES[@]}" > "${WORK}/patch.json" 2> "${WORK}/case1.err"; then
   P="${WORK}/patch.json"
-  pre="correctness_prompts/bonsai2-9b-mlx-v1"
+  pre="correctness_prompts/muse-glimmer-30b-mlx-v1"
   ok1=1
   [[ "$(q "${P}" 'd["official_scoring_enabled"]')" == "True" ]] || { fail "case 1: official_scoring_enabled is not true"; ok1=0; }
   [[ "$(q "${P}" 'len(d["timed_prompt_pool"])')" == "3" ]] || { fail "case 1: the pool is not 3 tapes"; ok1=0; }
@@ -139,7 +139,7 @@ UNPENDEOF
 if python3 "${TOOL}" --dir "${WORK}/set" "${LIVES[@]}" --apply --contract "${WORK}/contract.json" 2> "${WORK}/case5.err"; then
   if grep -q "PENDING-ORGANIZER" "${WORK}/contract.json"; then
     fail "case 5: the applied contract still carries a pending sentinel"
-  elif [[ "$(q "${WORK}/contract.json" 'd["track_id"]')" != "bonsai2-9b-mlx-v1" ]]; then
+  elif [[ "$(q "${WORK}/contract.json" 'd["track_id"]')" != "muse-glimmer-30b-mlx-v1" ]]; then
     fail "case 5: --apply lost a fixture key it does not own"
   else
     pass "--apply arms the contract and leaves no pending sentinel"

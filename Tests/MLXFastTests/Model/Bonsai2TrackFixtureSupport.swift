@@ -4,7 +4,7 @@ import MLXFastCore
 import Testing
 
 /// Fixture locations and pins for the track target,
-/// `bonsai2-9b-mlx-v1`.
+/// `muse-glimmer-30b-mlx-v1`.
 ///
 /// THE TARGET AND THE HEAD ARE PENDING. prism-ml has not published the Bonsai 2
 /// 9B pack or a head for it, so every pin that names their bytes carries this
@@ -47,7 +47,7 @@ let bonsai2PackingConfigFixtureURL = bonsai2RepositoryRoot
     .appendingPathComponent("fixtures/bonsai2_27b_config.json")
 
 let bonsai2TrackContractURL = bonsai2RepositoryRoot
-    .appendingPathComponent("fixtures/bonsai2_9b_mlx_v1_track.json")
+    .appendingPathComponent("fixtures/muse_glimmer_30b_mlx_v1_track.json")
 
 let bonsai2ReferenceManifestURL = bonsai2RepositoryRoot
     .appendingPathComponent("fixtures/reference_bonsai2_9b_2bit.sha256")

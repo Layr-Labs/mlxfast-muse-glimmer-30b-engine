@@ -1,4 +1,4 @@
-# SHA256 manifest for the bonsai2-9b-mlx-v1 rehearsal target checkpoint (Qwen/Qwen3.8-27B @ 37561816e66b5b9153b1b64c10968c18c1e6f4a0).
+# SHA256 manifest for the muse-glimmer-30b-mlx-v1 rehearsal target checkpoint (Qwen/Qwen3.8-27B @ 37561816e66b5b9153b1b64c10968c18c1e6f4a0).
 # REHEARSAL-ONLY measured provenance (R9-F99, owner-authorized standing, F45/F69/F71 precedent:
 # IN A REAL CHALLENGE THIS MATERIAL COMES FROM THE ORGANIZER). Measured from the reference
 # workspace weights staged on this box at commit 7cfd76a7dd0e265f6c5ec167d5e5ee90836688de.

@@ -7,7 +7,7 @@ set -euo pipefail
 # BONSAI-MLX-PENDING-ORGANIZER, in lockstep with
 # MLXFastConstants.referenceModelRepository / _Revision in
 # Sources/MLXFastCore/Constants.swift, the artifact fixture support under
-# Tests/MLXFastTests/Model/, and fixtures/bonsai2_9b_mlx_v1_track.json's
+# Tests/MLXFastTests/Model/, and fixtures/muse_glimmer_30b_mlx_v1_track.json's
 # target.upstream_model_id / target.upstream_revision -- four independent
 # sources that must agree byte-for-byte on this pin. Until the pack is pinned,
 # this script refuses the reference download by name;

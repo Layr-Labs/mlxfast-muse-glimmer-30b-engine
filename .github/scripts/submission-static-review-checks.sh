@@ -234,6 +234,12 @@ resolve_cap() { # resolve_cap VAR_NAME CONTRACT_KEY FALLBACK
 # UNCHANGED 2026-09-16, when the fork became a VENDORED TREE and its ten
 # Nemotron 3.5 Lightning model files joined the surface. At rest: 3896035 bytes
 # over 265 files. The margin is 4053628 bytes.
+#
+# UNCHANGED 2026-11-18, at the track stamp: the cap holds with room to spare.
+# At rest the stamped surface is 5986056 bytes over 372 files (margin
+# 1963607), because the two DFlash entries that named files the vendored tree
+# no longer carries were replaced with the Muse Glimmer model files. Measured,
+# not estimated: sum of the regular files under every editablePaths entry.
 resolve_cap MAX_BYTES maxTotalBytes 7949663
 resolve_cap MAX_FILE_BYTES maxFileBytes 524288
 resolve_cap MAX_GROWTH_BYTES maxGrowthBytes 262144

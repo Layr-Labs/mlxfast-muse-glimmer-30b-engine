@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ranked-box-preflight.sh -- the fail-closed gate the ranked job runs BEFORE
-# ./setup.sh and before any measurement, for track bonsai2-9b-mlx-v1.
+# ./setup.sh and before any measurement, for track muse-glimmer-30b-mlx-v1.
 #
 # WHAT IT IS FOR. The ranked job holds NO CREDENTIAL by design (bundles-no-keys:
 # a box receives staged bundles, never keys), so the hidden material this track
@@ -17,7 +17,7 @@
 #
 # THE STAGING CONVENTION IS THE EXISTING ONE, not a new one. The golden path
 # comes from the runner process environment under the name
-# tools/bonsai2-9b-measure-and-score.sh already reads:
+# tools/muse-glimmer-30b-measure-and-score.sh already reads:
 #
 #   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the timed-pool tapes
 #                                      (the live goldens the run scores over
@@ -45,7 +45,7 @@
 # Section 6 holds both. Nothing here fetches or builds the reference tree: it is
 # staged on the box out of band, the same way the goldens are.
 #
-# WHAT THE PINS ARE. fixtures/bonsai2_9b_mlx_v1_track.json is trusted-side (not an
+# WHAT THE PINS ARE. fixtures/muse_glimmer_30b_mlx_v1_track.json is trusted-side (not an
 # editable path), and its timed_prompt_pool[] carries {r2_path, sha256, bytes}
 # per tape plus hidden_correctness_golden's {sha256, bytes}. A staged file is
 # accepted only when its byte count AND its sha256 equal the contract's -- byte
@@ -59,7 +59,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-CONTRACT="${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 fail() {
   echo "ranked-box-preflight: REFUSING -- $*" >&2
@@ -71,14 +71,14 @@ ok() {
 }
 
 # --- 0. tools ---------------------------------------------------------------
-# jq is already a hard requirement of tools/bonsai2-9b-measure-and-score.sh
+# jq is already a hard requirement of tools/muse-glimmer-30b-measure-and-score.sh
 # (it reads the fixture pins and trackId), so a box that cannot run this cannot
 # finish a ranked run either.
 command -v jq >/dev/null 2>&1 || fail "jq is required to read the track contract"
 command -v shasum >/dev/null 2>&1 || fail "shasum is required to verify staged assets"
 [[ -r "${CONTRACT}" ]] || fail "cannot read the track contract at ${CONTRACT}"
 jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "the track contract is not valid JSON: ${CONTRACT}"
-ok "track contract readable and parses: fixtures/bonsai2_9b_mlx_v1_track.json"
+ok "track contract readable and parses: fixtures/muse_glimmer_30b_mlx_v1_track.json"
 
 # --- 1. the job holds no credential -----------------------------------------
 # The workflow references no secret (tools/ci-workflow-egress-scan.sh is the
@@ -98,7 +98,7 @@ ok "no R2 credential, signer, or dist token in the job environment"
 # ranked box any of them would silently change what is measured or what is
 # accepted, so their presence is a refusal rather than a warning.
 #
-#   BENCHD                          tools/bonsai2-9b-measure-and-score.sh honours a
+#   BENCHD                          tools/muse-glimmer-30b-measure-and-score.sh honours a
 #                                     caller-supplied benchd WITHOUT the
 #                                     channel-manifest hash check (deliberate, for
 #                                     benchd development) -- so on a ranked run
@@ -319,7 +319,7 @@ if [[ -n "${hidden_sha}" ]]; then
 fi
 
 # The staging directory must hold the cohort and NOTHING ELSE.
-# tools/bonsai2-9b-measure-and-score.sh passes EVERY *.json in this directory as a
+# tools/muse-glimmer-30b-measure-and-score.sh passes EVERY *.json in this directory as a
 # --golden, so an extra file there is an extra cohort member -- it would change
 # what is measured without failing anything downstream.
 unexpected=""
@@ -348,7 +348,7 @@ fi
 
 # --- 4b. the live goldens the ranked run scores over are staged -------------
 # The ranked run reads the fixture's live_goldens, each resolved by
-# tools/bonsai2-9b-measure-and-score.sh as <name>.golden.json. The loop above
+# tools/muse-glimmer-30b-measure-and-score.sh as <name>.golden.json. The loop above
 # already pin-verified each one AS a pool member; this asserts that every name
 # in live_goldens actually NAMES a pinned pool entry and is staged, so a list
 # that points at a golden absent from the pool -- or a box that staged the pool

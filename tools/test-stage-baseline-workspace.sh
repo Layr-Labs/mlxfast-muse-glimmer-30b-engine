@@ -26,7 +26,7 @@ fail() {
 
 command -v jq >/dev/null 2>&1 || { echo "test-stage-baseline-workspace.sh: jq is required" >&2; exit 1; }
 
-REFERENCE_COMMIT="$(jq -r '.baseline_reference_commit' "${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json")"
+REFERENCE_COMMIT="$(jq -r '.baseline_reference_commit' "${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json")"
 TARGET="${WORK}/reference"
 
 run_stage() {

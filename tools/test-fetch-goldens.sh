@@ -38,7 +38,7 @@ pass() { echo "ok: $1"; }
 
 # --- a stand-in bucket ------------------------------------------------------
 # Mirrors the real key convention: correctness_prompts/<track_id>/<name>.json.
-KEY="correctness_prompts/bonsai2-9b-mlx-v1/test-object.json"
+KEY="correctness_prompts/muse-glimmer-30b-mlx-v1/test-object.json"
 mkdir -p "${WORK}/bucket/$(dirname "${KEY}")"
 printf '{"version":1,"note":"synthetic fetch-goldens test object"}\n' \
   > "${WORK}/bucket/${KEY}"
@@ -149,11 +149,11 @@ fi
 # shipped fixture.
 mkdir -p "${WORK}/armed/tools" "${WORK}/armed/fixtures"
 ARMED_SHA="f8eb3e0faf960154eacef498aa5f1c0be19d11e08054af37cc59a4f28ca5911b"
-cat > "${WORK}/armed/fixtures/bonsai2_9b_mlx_v1_track.json" <<ARMEDJSON
+cat > "${WORK}/armed/fixtures/muse_glimmer_30b_mlx_v1_track.json" <<ARMEDJSON
 {
   "timed_prompt_pool": [
     {
-      "r2_path": "correctness_prompts/bonsai2-9b-mlx-v1/armed-pool-object.json",
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/armed-pool-object.json",
       "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "bytes": 1
     }
@@ -180,7 +180,7 @@ fi
 
 # --- case 4b: the same guard refuses a declared POOL key ---------------------
 out="${WORK}/case4b.json"
-ARMED_KEY="correctness_prompts/bonsai2-9b-mlx-v1/armed-pool-object.json"
+ARMED_KEY="correctness_prompts/muse-glimmer-30b-mlx-v1/armed-pool-object.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" "${WORK}/armed/tools/fetch-goldens-loopback.sh" \
      --r2-path "${ARMED_KEY}" --sha256 "${GOOD_SHA}" --bytes "${GOOD_BYTES}" \
      --out "${out}" >"${WORK}/case4b.log" 2>&1; then
@@ -209,7 +209,7 @@ SENTINEL_KEY="$(awk '
     print value
     exit
   }
-' "${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json")"
+' "${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json")"
 if [[ -z "${SENTINEL_KEY}" ]]; then
   # A track pending its goldens declares no pool entry, so the shipped fixture
   # names no key for this case to drive. Case 4 already proves the guard on a
@@ -279,7 +279,7 @@ fi
 # --- case 9: a missing object is refused, with no file left ------------------
 out="${WORK}/case9.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" "${RELAXED}" \
-     --r2-path "correctness_prompts/bonsai2-9b-mlx-v1/absent.json" \
+     --r2-path "correctness_prompts/muse-glimmer-30b-mlx-v1/absent.json" \
      --sha256 "${GOOD_SHA}" --bytes "${GOOD_BYTES}" \
      --out "${out}" >"${WORK}/case9.log" 2>&1; then
   fail "case 9: accepted a 404"
@@ -315,9 +315,9 @@ fi
 # STUB signer -- the vendored one speaks SigV4 to real R2, which this test must
 # never do -- so what is under test here is the staging loop: what it fetches,
 # what it verifies, what it refuses, and what it leaves behind.
-ALL_KEY_A="correctness_prompts/bonsai2-9b-mlx-v1/all-pool-a.golden.json"
-ALL_KEY_B="correctness_prompts/bonsai2-9b-mlx-v1/all-pool-b.golden.json"
-ALL_KEY_C="correctness_prompts/bonsai2-9b-mlx-v1/all-oracle-mtp1.golden.json"
+ALL_KEY_A="correctness_prompts/muse-glimmer-30b-mlx-v1/all-pool-a.golden.json"
+ALL_KEY_B="correctness_prompts/muse-glimmer-30b-mlx-v1/all-pool-b.golden.json"
+ALL_KEY_C="correctness_prompts/muse-glimmer-30b-mlx-v1/all-oracle-mtp1.golden.json"
 printf '{"version":1,"case":"all-pool-a"}\n' > "${WORK}/bucket/${ALL_KEY_A}"
 printf '{"version":1,"case":"all-pool-b"}\n' > "${WORK}/bucket/${ALL_KEY_B}"
 printf '{"version":1,"case":"all-oracle-mtp1"}\n' > "${WORK}/bucket/${ALL_KEY_C}"
@@ -360,7 +360,7 @@ all_root() { # all_root DIR B_BYTES -- a stand-in repo root with the copy + cont
   mkdir -p "$1/tools" "$1/fixtures"
   cp "${RELAXED}" "$1/tools/fetch-goldens-loopback.sh"
   chmod +x "$1/tools/fetch-goldens-loopback.sh"
-  write_all_contract "$1/fixtures/bonsai2_9b_mlx_v1_track.json" "$2"
+  write_all_contract "$1/fixtures/muse_glimmer_30b_mlx_v1_track.json" "$2"
 }
 
 # --- case 11: --all stages and verifies the whole pinned set -----------------

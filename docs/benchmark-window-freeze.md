@@ -9,7 +9,7 @@
 > ranked baseline pair. `Sources/MLXFastCore/Constants.swift` and
 > `Sources/MLXFastCore/Golden.swift` cite this document for those three things.
 >
-> The LIVE ranked track is `bonsai2-9b-mlx-v1`. Its window is a single
+> The LIVE ranked track is `muse-glimmer-30b-mlx-v1`. Its window is a single
 > stream over a 512-token seed and a 128-step decode window, scored as
 > `composite = prefill_gain^0.25 * decode_gain^0.75`. For the live window and
 > the live scoring, read `docs/participant-contract.md` section 5 and
