@@ -1,0 +1,15 @@
+# SHA256 manifest for BONSAI-MLX-PENDING-ORGANIZER.
+# Revision: BONSAI-MLX-PENDING-ORGANIZER
+#
+# The target checkpoint for track bonsai2-9b-mlx-v1. PENDING: prism-ml has not
+# published the Bonsai 2 9B MLX pack. When it is published, tools/new-track.sh
+# writes this file from the published tree (LFS-backed entries use the LFS
+# object's own sha256), and the contract fixture's target pins move with it.
+#
+# setup.sh refuses this manifest while it carries the sentinel. It holds no
+# record, so nothing is downloaded and nothing is verified against it.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 0
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   0
+#
+# Format: <sha256> <byte_count> <relative_path>

@@ -1,0 +1,15 @@
+# SHA256 manifest for BONSAI-MLX-PENDING-ORGANIZER.
+# Revision: BONSAI-MLX-PENDING-ORGANIZER
+#
+# The MTP HEAD for track bonsai2-9b-mlx-v1. PENDING: no MTP head is published
+# for the Bonsai 2 9B pack. The head is a qwen3_5_mtp layer for the Qwen 3.5 9B
+# geometry. When one is published, this file pins it unmodified: nothing here
+# re-quantizes, mirrors or re-uploads it. If the pack ships its own mtp.*
+# block, the head comes from the target manifest and this file names that.
+#
+# setup-mtp-head.sh refuses this manifest while it carries the sentinel.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 0
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   0
+#
+# Format: <sha256> <byte_count> <relative_path>
