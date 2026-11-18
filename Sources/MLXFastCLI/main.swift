@@ -147,8 +147,8 @@ private enum MLXFastCLI {
         try requireFile(goldenPath, description: "correctness golden file")
         // Strict-validate the INPUT before any write. --output defaults to the
         // input path, so a malformed input must fail here -- never after the
-        // original has been replaced on disk. Through the Qwen loader: the
-        // oracle it derives is what a ranked Qwen run is scored against.
+        // original has been replaced on disk. Through the identity-checking
+        // loader: the oracle it derives is what a ranked run is scored against.
         _ = try loadQwenGoldenFixture(from: goldenPath)
         let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
         let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
@@ -187,9 +187,10 @@ private enum MLXFastCLI {
             try? FileManager.default.removeItem(at: temporaryURL)
         }
         try outputData.write(to: temporaryURL, options: [.atomic])
-        // Qwen loader on the staged bytes: every caller of this helper is an
-        // attach verb writing a Qwen golden, so an attach can never land a
-        // document that has lost (or never carried) the model identity.
+        // Identity-checking loader on the staged bytes: every caller of this
+        // helper is an attach verb writing a golden for this track, so an
+        // attach can never land a document that has lost (or never carried)
+        // the model identity.
         _ = try loadQwenGoldenFixture(from: temporaryURL.path)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             _ = try FileManager.default.replaceItemAt(outputURL, withItemAt: temporaryURL)
@@ -284,7 +285,7 @@ private enum MLXFastCLI {
               mlxfast-swift checkpoint-shards --index PATH
               mlxfast-swift mtp-verify  (deferred: refuses; returns with the follow-up increment)
 
-            Swift-only Bonsai 2 9B 2-bit harness entrypoint.
+            Swift-only Muse Glimmer 30B NVFP4 harness entrypoint.
             """
         )
     }

@@ -1,30 +1,42 @@
 import Foundation
 
-public enum Qwen38CheckpointError: Error, CustomStringConvertible, Equatable {
+public enum CheckpointIntakeError: Error, CustomStringConvertible, Equatable {
     case notDirectory(String)
+    case missingConfiguration(String)
     case shardCount(expected: Int, actual: Int)
     case unreadableShard(String)
 
     public var description: String {
         switch self {
         case .notDirectory(let path):
-            return "Qwen3.8 checkpoint is not a directory: \(path)"
+            return "checkpoint is not a directory: \(path)"
+        case .missingConfiguration(let path):
+            return "checkpoint carries no config.json: \(path)"
         case .shardCount(let expected, let actual):
-            return "Qwen3.8 checkpoint needs \(expected) safetensors shards; found \(actual)"
+            return "checkpoint needs \(expected) safetensors shards; found \(actual)"
         case .unreadableShard(let path):
-            return "Qwen3.8 checkpoint shard is not readable: \(path)"
+            return "checkpoint shard is not readable: \(path)"
         }
     }
 }
 
-/// A temporary checkpoint view for the fixed Qwen/Qwen3.8-27B intake.
+/// A temporary checkpoint view over the staged target's intake directory: the
+/// staged `config.json` copied beside links to the staged safetensors shards.
 ///
-/// The intake stages only 18 safetensors shards and `SHA256SUMS`. The model
-/// loader also needs `config.json`. This view writes the pinned config under
-/// `TMPDIR` and links the shards into it. It does not alter the staged files.
-public final class Qwen38CheckpointView: @unchecked Sendable {
-    public static let expectedShardCount = 18
-    public static let modelRevision = "37561816e66b5b9153b1b64c10968c18c1e6f4a0"
+/// WHAT IT CHECKS, AND WHY THE VALUES ARE NOT ARGUMENTS. The intake layout is
+/// part of the contract, so the shard count and the configuration bytes are
+/// pinned HERE, against the staged snapshot, rather than supplied by a caller:
+/// an intake that stages a different number of shards, or no configuration at
+/// all, is refused by name. A caller cannot ask for a looser check, and this
+/// type carries no model identity of its own -- the identity lives in the
+/// pinned snapshot's own `config.json`, which is copied verbatim.
+public final class CheckpointIntakeView: @unchecked Sendable {
+    /// The pinned target's safetensors shard count
+    /// (`raw_checkpoint_shard_count` in the contract fixture).
+    public static let expectedShardCount = 3
+
+    /// The file the loader reads beside the shards.
+    public static let configurationName = "config.json"
 
     public let source: URL
     public let directory: URL
@@ -38,7 +50,12 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
         guard fileManager.fileExists(atPath: source.path, isDirectory: &isDirectory),
             isDirectory.boolValue
         else {
-            throw Qwen38CheckpointError.notDirectory(source.path)
+            throw CheckpointIntakeError.notDirectory(source.path)
+        }
+
+        let configurationURL = source.appendingPathComponent(Self.configurationName)
+        guard let configuration = fileManager.contents(atPath: configurationURL.path) else {
+            throw CheckpointIntakeError.missingConfiguration(configurationURL.path)
         }
 
         let shards = try fileManager.contentsOfDirectory(
@@ -46,14 +63,14 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
             .filter { $0.pathExtension == "safetensors" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard shards.count == Self.expectedShardCount else {
-            throw Qwen38CheckpointError.shardCount(
+            throw CheckpointIntakeError.shardCount(
                 expected: Self.expectedShardCount, actual: shards.count)
         }
         for shard in shards {
             let values = try shard.resourceValues(forKeys: [.isRegularFileKey])
             guard values.isRegularFile == true, fileManager.isReadableFile(atPath: shard.path)
             else {
-                throw Qwen38CheckpointError.unreadableShard(shard.path)
+                throw CheckpointIntakeError.unreadableShard(shard.path)
             }
         }
 
@@ -68,7 +85,7 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
             }
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         self.directory = tempRoot.appendingPathComponent(
-            "mlxfast-qwen38-\(UUID().uuidString)", isDirectory: true)
+            "mlxfast-checkpoint-\(UUID().uuidString)", isDirectory: true)
         do {
             try fileManager.createDirectory(
                 at: directory, withIntermediateDirectories: false)
@@ -77,8 +94,8 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
             // allowed via (allow file-write* (subpath TMPDIR)); a plain
             // write passes. This is sandbox-private scratch, so atomicity
             // carries no weight here.
-            try Self.configuration.write(
-                to: directory.appendingPathComponent("config.json"))
+            try configuration.write(
+                to: directory.appendingPathComponent(Self.configurationName))
             for shard in shards {
                 try fileManager.createSymbolicLink(
                     at: directory.appendingPathComponent(shard.lastPathComponent),
@@ -93,60 +110,6 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
     deinit {
         try? FileManager.default.removeItem(at: directory)
     }
-
-    /// Qwen/Qwen3.8-27B `config.json` at ``modelRevision``, reduced to the
-    /// text fields the MLX model reads. A root EOS id supplies the runner's
-    /// token-id-only stop policy.
-    public static let configuration = Data(
-        #"""
-        {
-          "architectures": ["Qwen3_5ForConditionalGeneration"],
-          "eos_token_id": 248044,
-          "model_type": "qwen3_5",
-          "text_config": {
-            "attention_bias": false,
-            "attention_dropout": 0.0,
-            "attn_output_gate": true,
-            "bos_token_id": 248044,
-            "dtype": "bfloat16",
-            "eos_token_id": 248044,
-            "full_attention_interval": 4,
-            "head_dim": 256,
-            "hidden_act": "silu",
-            "hidden_size": 5120,
-            "initializer_range": 0.02,
-            "intermediate_size": 17408,
-            "linear_conv_kernel_dim": 4,
-            "linear_key_head_dim": 128,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 48,
-            "linear_value_head_dim": 128,
-            "mamba_ssm_dtype": "float32",
-            "max_position_embeddings": 262144,
-            "model_type": "qwen3_5_text",
-            "mtp_num_hidden_layers": 1,
-            "mtp_use_dedicated_embeddings": false,
-            "num_attention_heads": 24,
-            "num_hidden_layers": 64,
-            "num_key_value_heads": 4,
-            "output_gate_type": "swish",
-            "pad_token_id": null,
-            "partial_rotary_factor": 0.25,
-            "rms_norm_eps": 0.000001,
-            "rope_parameters": {
-              "mrope_interleaved": true,
-              "mrope_section": [11, 11, 10],
-              "partial_rotary_factor": 0.25,
-              "rope_theta": 10000000,
-              "rope_type": "default"
-            },
-            "tie_word_embeddings": false,
-            "use_cache": true,
-            "vocab_size": 248320
-          },
-          "tie_word_embeddings": false
-        }
-        """#.utf8)
 }
 
 /// The intake layout check above is all this file carries now.

@@ -41,20 +41,25 @@ public struct TransformReport: Equatable {
 }
 
 /// Model family of the source reference checkpoint, detected from its
-/// config.json. The transform supports this track's Bonsai 2 9B target
-/// (pending; `model_type` "prism_hadamard_qwen35", packed Hadamard modules,
-/// untied head, no embedded speculative head) and the legacy Gemma 4
-/// multimodal layout (nested `text_config`, tied head).
+/// config.json. The transform serves two packed families: the signed
+/// Hadamard-packed family (`model_type` "prism_hadamard_qwen35", packed
+/// Hadamard modules, untied head, no embedded speculative head) and the legacy
+/// Gemma 4 multimodal layout (nested `text_config`, tied head).
+///
+/// Neither is this engine's ranked target. That checkpoint ships in its own
+/// runtime layout (modelopt NVFP4, no Hadamard transform), so the transform is
+/// not on its load path. The two families stay because the transform is
+/// editable surface and these are the source shapes it knows how to unpack.
 ///
 /// The legacy `.gemma4` family no longer has a runtime consumer (the Gemma 4
 /// runtime and its MTP track were removed); it is retained here deliberately
 /// as the only source-config family whose full transform pipeline (staging,
 /// atomic install, revalidation, verifier) can be exercised end to end with
-/// small synthetic fixtures -- the Bonsai 2 family requires the exact pinned
+/// small synthetic fixtures -- the packed family requires the exact pinned
 /// 1,033-tensor inventory with real shapes.
 enum TransformModelFamily: Equatable {
     case gemma4
-    case prismHadamardQwen35
+    case prismHadamard
 }
 
 /// Offline transform for the pinned reference checkpoint: selects the tensors
@@ -65,16 +70,16 @@ enum TransformModelFamily: Equatable {
 /// Two source checkpoint families are supported, detected from the source
 /// config.json:
 ///
-/// - Bonsai 2 9B 2-bit (`model_type` "prism_hadamard_qwen35", pending): this
-///   track's target. The source is already MLX affine-quantized, so the
-///   transform validates and passes through -- byte-for-byte, source tensor
-///   names unchanged -- the 1,033-tensor `language_model.` set described by
+/// - The packed Hadamard family (`model_type` "prism_hadamard_qwen35"): the
+///   source is already MLX affine-quantized, so the transform validates and
+///   passes through -- byte-for-byte, source tensor names unchanged -- the
+///   1,033-tensor `language_model.` set described by
 ///   `PrismHadamardCheckpointValidation`: the packed embedding, the 32 hybrid
 ///   linear-attention / full-attention layers, the final norm and the untied
-///   `lm_head` quadruple. The Qwen 3.5 9B backbone also declares a vision tower; this
-///   track serves text only, so that namespace is DROPPED here the same way
-///   the model's own weight filter drops it at load. No metadata sidecars are
-///   emitted: the runtime reads the pack's own packed tensors directly. The
+///   `lm_head` quadruple. That backbone also declares a vision tower; the
+///   transform serves text only, so that namespace is DROPPED here the same
+///   way the model's own weight filter drops it at load. No metadata sidecars
+///   are emitted: the runtime reads the pack's own packed tensors directly. The
 ///   runtime config.json is the source config whole, because the loader reads
 ///   its `modules`, `hadamard_config` and `components` blocks as the artifact
 ///   contract.
@@ -175,10 +180,10 @@ public enum SwiftTransform {
         // Fail before the multi-GB copy if the selected tensor set is
         // structurally inconsistent with the quantization spec the emitted
         // config.json declares (the runtime re-validates the full geometry
-        // against its own config type at load). Gemma 4 is the legacy
-        // synthetic-fixture family and has no hardcoded public inventory.
+        // against its own config type at load). The legacy `.gemma4` family
+        // is the synthetic-fixture one and has no hardcoded public inventory.
         switch modelFamily {
-        case .prismHadamardQwen35:
+        case .prismHadamard:
             try PrismHadamardCheckpointValidation.validateSelectedTensors(
                 selectedKeys: textKeys,
                 index: index,
@@ -254,11 +259,11 @@ public enum SwiftTransform {
                 selectedKeys: textKeys,
                 destinationDirectory: stagingDirectory
             )
-        case .prismHadamardQwen35:
-            // Bonsai 2 has an untied `lm_head` and the runtime reads the
-            // pack's own packed tensors directly, so neither the Gemma
-            // projection sidecar nor the tied-head packed13 sidecar means
-            // anything on this family. Emitting one would publish a derived
+        case .prismHadamard:
+            // That family has an untied `lm_head` and the runtime reads the
+            // pack's own packed tensors directly, so neither the projection
+            // sidecar nor the tied-head packed13 sidecar of the `.gemma4`
+            // family means anything here. Emitting one would publish a derived
             // artifact nothing loads, so emit nothing beyond the pass-through
             // tensor set.
             generatedProjectionMetadata = GeneratedAffineMetadataReport(
@@ -490,17 +495,17 @@ public enum SwiftTransform {
         key.hasPrefix(textTowerPrefix)
     }
 
-    /// Both families select the `language_model.*` namespace. Bonsai 2 drops
-    /// the pack's `vision_tower.*` tensors with the same test.
+    /// Both families select the `language_model.*` namespace. The packed
+    /// family drops the pack's `vision_tower.*` tensors with the same test.
     static func isSelectedTextTowerKey(_ key: String, family: TransformModelFamily) -> Bool {
         switch family {
         case .gemma4:
             return isTextTowerKey(key)
-        case .prismHadamardQwen35:
+        case .prismHadamard:
             // The pack holds 1,033 tensors under `language_model.` and the
-            // tensors of a vision tower. This track
-            // serves text only, so the tower is dropped here and the
-            // exact-inventory pass below refuses any third namespace.
+            // tensors of a vision tower. This transform serves text only, so
+            // the tower is dropped here and the exact-inventory pass below
+            // refuses any third namespace.
             return PrismHadamardCheckpointValidation.isSelectedKey(key)
         }
     }
@@ -592,7 +597,7 @@ public enum SwiftTransform {
         return root
     }
 
-    /// Model-type prefix of this track's target. The pinned pack declares
+    /// Model-type prefix of the packed family. Its published packs declare
     /// `prism_hadamard_qwen35`; the prefix is matched (rather than the exact
     /// string) so a point revision of the same architecture family is still
     /// routed to the packed path instead of being refused outright.
@@ -601,14 +606,14 @@ public enum SwiftTransform {
     static func detectModelFamily(
         sourceConfigRoot root: [String: Any]
     ) throws -> TransformModelFamily {
-        // THIS TRACK'S TARGET declares `prism_hadamard_qwen35` at the top
-        // level AND carries a `text_config`, so it is checked FIRST: the
-        // `text_config`-means-legacy-Gemma fallthrough below is unconditional
-        // and would otherwise swallow it.
+        // A packed config declares `prism_hadamard_qwen35` at the top level
+        // AND carries a `text_config`, so it is checked FIRST: the
+        // `text_config`-means-legacy-`.gemma4` fallthrough below is
+        // unconditional and would otherwise swallow it.
         if let modelType = root["model_type"] as? String,
            modelType.hasPrefix(prismHadamardModelTypePrefix)
         {
-            return .prismHadamardQwen35
+            return .prismHadamard
         }
         if root["text_config"] is [String: Any] {
             return .gemma4
@@ -636,9 +641,9 @@ public enum SwiftTransform {
     /// architecture/tokenizer metadata duplicated from
     /// `tokenizer_config.json`.
     ///
-    /// Bonsai 2: the source config is the artifact contract the packed loader
-    /// reads, so it is passed through whole. The one edit is the duplicate
-    /// quantization block, below.
+    /// The packed family: the source config is the artifact contract the
+    /// packed loader reads, so it is passed through whole. The one edit is the
+    /// duplicate quantization block, below.
     static func makeRuntimeConfigData(
         sourceConfigRoot root: [String: Any],
         family: TransformModelFamily
@@ -655,7 +660,7 @@ public enum SwiftTransform {
             } else if let quantizationConfig = root["quantization_config"] {
                 runtimeConfig["quantization"] = quantizationConfig
             }
-        case .prismHadamardQwen35:
+        case .prismHadamard:
             // The source config is passed through WHOLE. It is the artifact
             // contract, not just a geometry: `PrismHadamardCheckpoint` reads
             // its `modules`, `components`, `hadamard_config`,

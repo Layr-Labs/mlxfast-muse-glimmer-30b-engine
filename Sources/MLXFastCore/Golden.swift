@@ -229,7 +229,7 @@ public struct BenchmarkGolden: Codable, Equatable {
 public struct GoldenDocument: Codable, Equatable {
     public let version: Int?
     /// The reference schema's model identity key (`model_type`, e.g.
-    /// `qwen3_5_text`). The upstream Swift loader and benchd both name the
+    /// `muse_glimmer`). The upstream Swift loader and benchd both name the
     /// pinned model with this key and the whole existing golden corpus carries
     /// it, so it is the key the schema is defined by -- never optional in
     /// spirit, only in type.
@@ -324,11 +324,13 @@ public struct BenchmarkTokenComparison: Equatable {
 /// The reference checkpoint a golden's `model_provenance` must name.
 ///
 /// `.pinned` is the compiled constants, and every golden consumer in `Sources/`
-/// uses it. While the track's target is PENDING the constants carry the
-/// organizer sentinel, so `.pinned` is pending and the loader refuses every
-/// golden that names a checkpoint: no published capture can match a pin that
-/// does not exist yet. Tests pass their own synthetic pin to exercise the
-/// accepting path.
+/// uses it. The constants now name the track's pinned checkpoint, so `.pinned`
+/// ACCEPTS a golden recorded against that checkpoint and refuses one recorded
+/// against any other. The pending state is still reachable and still fails
+/// closed: a build whose constants carry the organizer sentinel refuses every
+/// golden by name, because a pin that does not exist yet cannot match a
+/// published capture. Tests pass their own synthetic pin to exercise the
+/// accepting path without depending on the tracked values.
 public struct ReferenceModelPin: Equatable, Sendable {
     public let repository: String
     public let revision: String
@@ -362,16 +364,20 @@ public func loadGoldenCases(
     ).cases
 }
 
-/// Loads a golden and holds it to the QWEN model identity: `model_type` must be
-/// present and must equal `MLXFastConstants.requiredGoldenModelType`. This is
-/// the ONLY consumer of that constant, and it is the wrapper every Qwen-facing
-/// entry point should call -- `loadGoldenFixture` on its own is deliberately
-/// model-agnostic, exactly as in the reference.
+/// Loads a golden and holds it to the target model identity: `model_type` must
+/// be present and must equal `MLXFastConstants.requiredGoldenModelType`. This is
+/// the ONLY consumer of that constant, and it is the wrapper every
+/// identity-checking entry point should call -- `loadGoldenFixture` on its own
+/// is deliberately model-agnostic, exactly as in the reference.
 ///
-/// Adoption is COMPLETE as of issue #14: no Qwen-facing entry point in
+/// The wrapper's NAME is a cross-side contract and keeps its spelling: it is
+/// the entry point the runner service and the fleet's golden loader call by
+/// name. What it ENFORCES is this track's identity, read from the constant.
+///
+/// Adoption is COMPLETE as of issue #14: no identity-checking entry point in
 /// `Sources/` reaches `loadGoldenFixture` directly any more. Its only remaining
 /// in-tree callers are this wrapper and `loadGoldenCases`, the schema-level
-/// helper the loader tests exercise. A new call site that names Qwen -- a
+/// helper the loader tests exercise. A new call site that checks a model -- a
 /// runtime verb, a CLI verb over a golden, a golden writer -- belongs here, not
 /// there; a direct `loadGoldenFixture` call from such a site is the delta this
 /// issue closed and should be read as a regression.
@@ -418,12 +424,13 @@ public func loadGoldenFixture(
         throw MLXFastError.invalidInput("correctness golden file version must be 1")
     }
     // The reference's model-identity gate, restored VALUE and all. `model_type`
-    // is optional to the schema (a Gemma-era golden carries none) but REQUIRED
-    // the moment a caller names the model it expects: absent is a reject too,
-    // not a pass, because "this golden names no model" is not "this golden
-    // names mine". The diagnostic is the reference's string byte-for-byte,
-    // `String(describing:)` and all, so `nil` and `Optional("gemma_text")`
-    // print exactly as they do there -- benchd emits the same via `{:?}`.
+    // is optional to the schema (a golden from an older track carries none) but
+    // REQUIRED the moment a caller names the model it expects: absent is a
+    // reject too, not a pass, because "this golden names no model" is not
+    // "this golden names mine". The diagnostic is the reference's string
+    // byte-for-byte, `String(describing:)` and all, so `nil` and
+    // `Optional("muse_glimmer")` print exactly as they do there -- benchd
+    // emits the same via `{:?}`.
     if let requiredModelType {
         guard decoded.modelType == requiredModelType else {
             throw MLXFastError.invalidInput(
@@ -753,7 +760,7 @@ private func validateBenchmarkGoldenBaselines(_ benchmark: BenchmarkGolden) thro
 // Derive the timed-benchmark oracle a ranked golden must carry from the
 // golden's OWN hidden base case, and return the document with it attached.
 //
-// WHY THIS EXISTS. Gemma4Runtime.benchmark requires `.benchmark` unconditionally
+// WHY THIS EXISTS. The ranked runtime requires `.benchmark` unconditionally
 // -- including on the gates-only phase (checkGates=1, skipTimedBenchmark=1),
 // where the oracle supplies only the baseline seconds-per-token placeholders.
 // `generate-golden` writes `benchmark: nil` and both attach verbs pass the
@@ -857,7 +864,7 @@ private func validateGoldenFixtureKeys(_ data: Data) throws {
 /// held byte-for-byte with the reference loader: an explicit `null` is
 /// rejected (as for every other optional section here), the value must be a
 /// string, and it must be non-empty and already trimmed -- a padded
-/// `" qwen "` is a corpus defect, not something to normalize away.
+/// `" muse_glimmer "` is a corpus defect, not something to normalize away.
 private func validateGoldenModelType(_ modelType: Any) throws {
     guard !(modelType is NSNull) else {
         throw MLXFastError.invalidInput("model_type must not be null")
@@ -1170,7 +1177,7 @@ private func validateTokens(_ tokens: [Int], field: String) throws {
     for (index, token) in tokens.enumerated() {
         if token < 0 || token >= MLXFastConstants.vocabSize {
             throw MLXFastError.invalidInput(
-                "\(field)[\(index)]=\(token) is outside Gemma 4 vocab range 0..<\(MLXFastConstants.vocabSize)"
+                "\(field)[\(index)]=\(token) is outside the target vocab range 0..<\(MLXFastConstants.vocabSize)"
             )
         }
     }

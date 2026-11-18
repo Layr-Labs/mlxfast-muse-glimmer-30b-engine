@@ -275,11 +275,30 @@ _BONSAI2_27B_MLX_V1_SCORING = {
     "minPairsPerCohort": 3,
 }
 
-# bonsai2-9b-mlx-v1: THIS TRACK. Stamped from bonsai2-27b-mlx-v1; the scoring
+# bonsai2-9b-mlx-v1: the source track. Stamped from bonsai2-27b-mlx-v1; the scoring
 # block is the family's (composite prefill^0.25 * decode^0.75, 3 pairs), and
 # the pairs combine by the mean (official_pair_combine in the contract, David
 # 2026-10-06). benchd reads the contract fixture, not this block.
 _BONSAI2_9B_MLX_V1_SCORING = dict(_BONSAI2_27B_MLX_V1_SCORING)
+
+# muse-glimmer-30b-mlx-v1: THIS TRACK. The scoring block states the same numbers
+# the contract fixture enforces -- 3 pairs combined by the mean, the family's
+# composite prefill^0.25 * decode^0.75, single-stream width, a 0.95 floor on
+# both axes. The one value that moved is `kvBackend`: this model's own engine
+# build refuses a contiguous cache, so the track serves `paged` and no mode may
+# ask for anything else. benchd reads the contract fixture, not this block; the
+# block is the manifest's statement of the same numbers and this registry keeps
+# the two in step.
+_MUSE_GLIMMER_30B_MLX_V1_SCORING = {
+    "mode": "muse-glimmer-native-dflash-paired-composite",
+    "scoredBatchSize": 1,
+    "kvBackend": "paged",
+    "decodeSpeedupFloor": 0.95,
+    "decodeSpeedupCeiling": 5.0,
+    "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
+    "pairsPerCohort": 3,
+    "minPairsPerCohort": 3,
+}
 
 EXPECTED_SCORING_BY_TRACK = {
     "qwen3.8-27b-mtp-v1": _QWEN_MTP_V1_SCORING,
@@ -287,6 +306,7 @@ EXPECTED_SCORING_BY_TRACK = {
     "nemotron3.5-30b-a3b-mlx-v1": _NEMOTRON35_30B_A3B_MLX_V1_SCORING,
     "bonsai2-27b-mlx-v1": _BONSAI2_27B_MLX_V1_SCORING,
     "bonsai2-9b-mlx-v1": _BONSAI2_9B_MLX_V1_SCORING,
+    "muse-glimmer-30b-mlx-v1": _MUSE_GLIMMER_30B_MLX_V1_SCORING,
 }
 
 # Tracks whose scoring.seriesNote must document non-comparability against a

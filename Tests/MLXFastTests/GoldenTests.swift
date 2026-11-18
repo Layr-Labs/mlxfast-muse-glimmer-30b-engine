@@ -3,25 +3,24 @@ import CryptoKit
 import Testing
 @testable import MLXFastCore
 
-/// THE NEGATIVE CONTROL, kept from the era when the public goldens WERE
-/// Gemma files and this was the only thing standing between a Gemma golden and
-/// a Qwen run.
+/// THE NEGATIVE CONTROL: a golden recorded against ANOTHER model must never
+/// load as this track's golden.
 ///
-/// A golden whose `model_provenance` names the Gemma checkpoint must refuse,
+/// A golden whose `model_provenance` names another checkpoint must refuse,
 /// and must refuse on the PROVENANCE -- not merely on the model type -- so
 /// that the model-agnostic loader refuses it too. Losing this would let a
 /// checkpoint swap go unnoticed the next time these files are regenerated.
 
-/// A synthetic reference pin for the tests that need a golden the strict loader
-/// accepts. The track's own pin is pending (`ReferenceModelPin.pinned`), so
-/// no real checkpoint can stand here.
+/// A synthetic reference pin, distinct from the track's own. Several tests need
+/// a golden whose provenance is NOT the pinned target (to prove the check
+/// refuses it); this is that second pin.
 private let testReferencePin = ReferenceModelPin(
-    repository: "synthetic/bonsai2-9b-test-checkpoint",
+    repository: "synthetic/muse-glimmer-30b-test-checkpoint",
     revision: "0123456789abcdef0123456789abcdef01234567"
 )
 
 @Test
-func aGemmaGoldenIsRefusedAgainstTheQwenTarget() throws {
+func aForeignGoldenIsRefusedAgainstTheTarget() throws {
     let gemmaDocument = Data(
         """
         {
@@ -65,13 +64,13 @@ func aGemmaGoldenIsRefusedAgainstTheQwenTarget() throws {
         agnostic.contains("model_provenance does not match"),
         "expected a provenance refusal, got: \(agnostic)")
 
-    // The QWEN loader refuses earlier and more cheaply, on the model identity.
-    // Asserting the provenance wording here would be asserting the ORDER of
-    // two checks rather than the refusal, so this asserts what it actually
-    // guarantees: it does not accept the file.
+    // The identity-checking loader refuses earlier and more cheaply, on the
+    // model identity. Asserting the provenance wording here would be asserting
+    // the ORDER of two checks rather than the refusal, so this asserts what it
+    // actually guarantees: it does not accept the file.
     let strict = try #require(
         refusal { try loadQwenGoldenFixture(from: $0, referenceModel: testReferencePin) },
-        "the Qwen loader accepted a Gemma golden")
+        "the identity-checking loader accepted a foreign golden")
     #expect(strict.contains("gemma4_text") || strict.contains("model_provenance does not match"))
 }
 
@@ -1282,13 +1281,13 @@ func goldenLoaderAcceptsReferenceSchemaModelType() throws {
         """
 
     // 1. A corpus-shaped golden (model_type, no provenance) loads.
-    let corpusShaped = try load(documentJSON("\"model_type\": \"qwen3_5_text\","))
-    #expect(corpusShaped.modelType == "qwen3_5_text")
+    let corpusShaped = try load(documentJSON("\"model_type\": \"muse_glimmer_text\","))
+    #expect(corpusShaped.modelType == "muse_glimmer_text")
     #expect(corpusShaped.cases.count == 1)
 
     // 2. A golden carrying BOTH keys loads, and both survive the load.
-    let both = try load(documentJSON("\"model_type\": \"qwen3_5_text\",\n\(provenanceJSON)"))
-    #expect(both.modelType == "qwen3_5_text")
+    let both = try load(documentJSON("\"model_type\": \"muse_glimmer_text\",\n\(provenanceJSON)"))
+    #expect(both.modelType == "muse_glimmer_text")
     #expect(both.cases.count == 1)
 
     // 3. Provenance-only (what this fork generates) still loads -- additive,
@@ -1299,12 +1298,12 @@ func goldenLoaderAcceptsReferenceSchemaModelType() throws {
     // 4. Unknown top-level keys are still rejected: the restore widens the
     //    schema by exactly one known key, it does not loosen the loader.
     #expect(throws: MLXFastError.self) {
-        _ = try load(documentJSON("\"model_kind\": \"qwen3_5_text\","))
+        _ = try load(documentJSON("\"model_kind\": \"muse_glimmer_text\","))
     }
 
     // model_type keeps the reference loader's value semantics.
     #expect(throws: MLXFastError.self) {
-        _ = try load(documentJSON("\"model_type\": \" qwen3_5_text \","))
+        _ = try load(documentJSON("\"model_type\": \" muse_glimmer_text \","))
     }
     #expect(throws: MLXFastError.self) {
         _ = try load(documentJSON("\"model_type\": \"\","))
@@ -1361,7 +1360,7 @@ func goldenModelIdentityFailsClosedWhenRequired() throws {
         }
     }
 
-    let qwen: (String) throws -> GoldenFixture = { try loadQwenGoldenFixture(from: $0, referenceModel: testReferencePin) }
+    let identity: (String) throws -> GoldenFixture = { try loadQwenGoldenFixture(from: $0, referenceModel: testReferencePin) }
     let agnostic: (String) throws -> GoldenFixture = { try loadGoldenFixture(from: $0, referenceModel: testReferencePin) }
 
     let provenanceJSON = """
@@ -1374,34 +1373,34 @@ func goldenModelIdentityFailsClosedWhenRequired() throws {
     // 1. ABSENT model_type is a REJECT once a caller names the model it wants.
     //    "This golden names no model" is not "this golden names mine".
     #expect(
-        try rejection(documentJSON(""), qwen)
-            == "correctness golden file model_type=nil expected prism_hadamard_qwen35"
+        try rejection(documentJSON(""), identity)
+            == "correctness golden file model_type=nil expected muse_glimmer"
     )
 
     // 2. A golden naming the WRONG model is rejected, Optional-wrapped exactly
     //    as the reference prints it (benchd's `{:?}` renders the same shape).
     #expect(
-        try rejection(documentJSON("\"model_type\": \"gemma_text\","), qwen)
+        try rejection(documentJSON("\"model_type\": \"gemma_text\","), identity)
             == "correctness golden file model_type=Optional(\"gemma_text\") "
-                + "expected prism_hadamard_qwen35"
+                + "expected muse_glimmer"
     )
 
     // 3. The pinned identity is accepted, and it is the constant that decides
     //    -- no call site respells the literal. The provenance block rides
-    //    along because the Qwen loader demands one. This leg is about the
+    //    along because the identity-checking loader demands one. This leg is about the
     //    model identity; absence of the block has its own test.
     let accepted = try rejection(
         documentJSON(
             "\"model_type\": \"\(MLXFastConstants.requiredGoldenModelType)\",\n"
                 + provenanceJSON
         ),
-        qwen
+        identity
     )
     #expect(accepted == nil)
-    #expect(MLXFastConstants.requiredGoldenModelType == "prism_hadamard_qwen35")
+    #expect(MLXFastConstants.requiredGoldenModelType == "muse_glimmer")
 
     // 4. `requiredModelType` is opt-in: the model-agnostic loader is unchanged,
-    //    so every non-Qwen caller and the whole existing corpus keep loading.
+    //    so every model-agnostic caller and the whole existing corpus keep loading.
     //    `requireModelProvenance` is opt-in the same way, which is why neither
     //    document below is asked for a provenance block.
     #expect(try rejection(documentJSON(""), agnostic) == nil)
@@ -1412,8 +1411,8 @@ func goldenModelIdentityFailsClosedWhenRequired() throws {
     //    message, so the identity check did not swallow the pin check.
     #expect(
         try rejection(
-            documentJSON("\"model_type\": \"prism_hadamard_qwen35\",\n\(provenanceJSON)"),
-            qwen
+            documentJSON("\"model_type\": \"muse_glimmer\",\n\(provenanceJSON)"),
+            identity
         ) == nil
     )
     // ...and a mismatched provenance still rejects on ITS own message, so the
@@ -1422,14 +1421,14 @@ func goldenModelIdentityFailsClosedWhenRequired() throws {
         try rejection(
             documentJSON(
                 """
-                "model_type": "prism_hadamard_qwen35",
+                "model_type": "muse_glimmer",
                 "model_provenance": {
                     "repository": "mlx-community/Laguna-XS-2.1-4bit",
                     "revision": "c42e0a8f8d504ceacde015a535dcb286d65c8799"
                 },
                 """
             ),
-            qwen
+            identity
         ) == "correctness golden model_provenance does not match the pinned reference model"
     )
 }
@@ -1441,7 +1440,7 @@ func goldenModelIdentityFailsClosedWhenRequired() throws {
 func attachingBenchmarkOraclePreservesModelType() throws {
     let document = GoldenDocument(
         version: 1,
-        modelType: "qwen3_5_text",
+        modelType: "muse_glimmer_text",
         cases: [
             GoldenCase(
                 name: "preserve-model-type",
@@ -1458,11 +1457,11 @@ func attachingBenchmarkOraclePreservesModelType() throws {
     )
 
     let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(document)
-    #expect(merged.modelType == "qwen3_5_text")
+    #expect(merged.modelType == "muse_glimmer_text")
 
     let encoded = try JSONEncoder().encode(merged)
     let root = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
-    #expect(root?["model_type"] as? String == "qwen3_5_text")
+    #expect(root?["model_type"] as? String == "muse_glimmer_text")
 }
 
 private func temporaryDirectory() throws -> URL {
@@ -1486,46 +1485,62 @@ private func arrayJSON(_ values: [Int]) -> String {
     "[\(values.map(String.init).joined(separator: ","))]"
 }
 
-/// THE PUBLIC CAPTURES WAIT FOR THE TARGET. `--local-iterate` and
-/// `--local-submit` check correctness against two captures under
-/// `correctness_prompts/muse-glimmer-30b-mlx-v1/`. The organizer records them on the
-/// track's box against the pinned target. While the target is PENDING there is
-/// nothing to record against, so the directory must not exist, and the strict
-/// loader must refuse any golden that names a checkpoint. When the captures
-/// are recorded this test is replaced by the one that pins their digests.
+/// THE PIN IS CONCRETE AND THE CAPTURES ARE NOT RECORDED YET.
+///
+/// `--local-iterate` and `--local-submit` check correctness against two
+/// captures under `correctness_prompts/muse-glimmer-30b-mlx-v1/`. The organizer
+/// records them on the track's box against the pinned target, so the directory
+/// does not exist yet -- but the PIN does, and it must be the fixture's target:
+/// a golden recorded there has to be ACCEPTED, and one recorded against any
+/// other checkpoint refused. A pin left pending would refuse every capture the
+/// box produces.
 @Test
-func thePublicCapturesWaitForThePendingTarget() throws {
-    #expect(ReferenceModelPin.pinned.isPending)
+func thePinnedGoldenPinAcceptsTheTarget() throws {
+    #expect(!ReferenceModelPin.pinned.isPending)
     #expect(!FileManager.default.fileExists(atPath: "correctness_prompts/muse-glimmer-30b-mlx-v1"))
 
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let path = directory.appendingPathComponent("golden.json")
-    let root: [String: Any] = [
-        "version": 1,
-        "model_type": MLXFastConstants.requiredGoldenModelType,
-        "model_provenance": [
-            "repository": testReferencePin.repository,
-            "revision": testReferencePin.revision,
-        ],
-        "cases": [
-            [
-                "name": "pending-control",
-                "prompt_tokens": correctnessPrompt(),
-                "expected_tokens": Array(repeating: 7, count: MLXFastConstants.correctnessSteps),
-            ]
-        ],
-    ]
-    try JSONSerialization.data(withJSONObject: root).write(to: path)
-    // The same document loads against a real pin and is refused against the
-    // pending one, by name.
-    _ = try loadQwenGoldenFixture(from: path.path, referenceModel: testReferencePin)
+
+    func document(repository: String, revision: String) -> [String: Any] {
+        [
+            "version": 1,
+            "model_type": MLXFastConstants.requiredGoldenModelType,
+            "model_provenance": ["repository": repository, "revision": revision],
+            "cases": [
+                [
+                    "name": "pinned-control",
+                    "prompt_tokens": correctnessPrompt(),
+                    "expected_tokens": Array(
+                        repeating: 7, count: MLXFastConstants.correctnessSteps),
+                ]
+            ],
+        ]
+    }
+
+    // The pinned checkpoint's own provenance loads through the strict loader.
+    let pinnedPath = directory.appendingPathComponent("pinned-golden.json")
+    try JSONSerialization.data(
+        withJSONObject: document(
+            repository: ReferenceModelPin.pinned.repository,
+            revision: ReferenceModelPin.pinned.revision)
+    ).write(to: pinnedPath)
+    _ = try loadQwenGoldenFixture(from: pinnedPath.path)
+
+    // A golden from ANY other checkpoint is refused on the provenance, by the
+    // loader's own message -- not silently accepted because the pin was lax.
+    let foreignPath = directory.appendingPathComponent("foreign-golden.json")
+    try JSONSerialization.data(
+        withJSONObject: document(
+            repository: testReferencePin.repository,
+            revision: testReferencePin.revision)
+    ).write(to: foreignPath)
     var refusal: String?
     do {
-        _ = try loadQwenGoldenFixture(from: path.path)
+        _ = try loadQwenGoldenFixture(from: foreignPath.path)
     } catch {
         refusal = "\(error)"
     }
-    let message = try #require(refusal, "a pending reference pin accepted a golden")
-    #expect(message.contains("pending"))
+    let message = try #require(refusal, "a foreign provenance was accepted against the pin")
+    #expect(message.contains("does not match"))
 }

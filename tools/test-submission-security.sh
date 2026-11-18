@@ -1879,7 +1879,7 @@ assert_equal "requant-only/overlay still carries the head DECLARATION across" \
 #
 # Read straight off the real manifest, in all three buckets an overlay writes
 # from. The Swift twin is `headWeightDirectoriesAreNotEditable` in
-# Tests/MLXFastTests/Gemma4BenchmarkManifestTests.swift; this one binds in CI's
+# Tests/MLXFastTests/BenchmarkManifestTests.swift; this one binds in CI's
 # shell job as well, and it is the assertion that goes red the moment someone
 # re-adds a head directory for convenience.
 head_dir_entries="$(python3 - "${REPO_ROOT}/benchmark.json" <<'PY'
@@ -1969,7 +1969,7 @@ for count_site in README.md TASK.md docs/participant-contract.md; do
     "$(grep -c 'lists 97 entries' "${REPO_ROOT}/${count_site}")" "1"
 done
 assert_equal "head-surface/the Swift count pin states 97" \
-  "$(grep -c 'editablePaths.count == 97' "${REPO_ROOT}/Tests/MLXFastTests/Gemma4BenchmarkManifestTests.swift")" \
+  "$(grep -c 'editablePaths.count == 97' "${REPO_ROOT}/Tests/MLXFastTests/BenchmarkManifestTests.swift")" \
   "1"
 
 # --- J. the docs may not describe a DISK re-quantization -------------------

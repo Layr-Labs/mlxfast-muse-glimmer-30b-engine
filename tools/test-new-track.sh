@@ -271,7 +271,14 @@ else
 fi
 
 # the source track id is gone everywhere but the exemptions
-mapfile -t leftovers < <(cd "${SEED}" && git grep -l -F "${OLD_TRACK}" -- . 2>/dev/null || true)
+# NOTE: no `mapfile` here. macOS ships bash 3.2, which has no mapfile, so the
+# read used to fail with a shell error while the case still printed "ok" --
+# a check that silently checked nothing. A read loop works on every bash the
+# toolchain has.
+leftovers=()
+while IFS= read -r path; do
+  [[ -n "${path}" ]] && leftovers+=("${path}")
+done < <(cd "${SEED}" && git grep -l -F "${OLD_TRACK}" -- . 2>/dev/null || true)
 unexpected=()
 for path in ${leftovers[@]+"${leftovers[@]}"}; do
   keep=0
@@ -285,7 +292,10 @@ else
 fi
 
 # the old fixture stem is gone everywhere but the same exempted records
-mapfile -t stem_left < <(cd "${SEED}" && git grep -l -F "$(basename "${OLD_CONTRACT}" .json)" -- . 2>/dev/null || true)
+stem_left=()
+while IFS= read -r path; do
+  [[ -n "${path}" ]] && stem_left+=("${path}")
+done < <(cd "${SEED}" && git grep -l -F "$(basename "${OLD_CONTRACT}" .json)" -- . 2>/dev/null || true)
 stem_unexpected=()
 for path in ${stem_left[@]+"${stem_left[@]}"}; do
   keep=0

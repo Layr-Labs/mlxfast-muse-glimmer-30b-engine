@@ -2,10 +2,10 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Quantization expectations parsed from the Bonsai 2 9B pack's
+/// Quantization expectations parsed from the packed checkpoint's
 /// `quantization` block.
 ///
-/// The pack is expected UNIFORM, as the Ternary Bonsai 2 27B pack is: MLX
+/// The pack is expected UNIFORM, as the family's published 27B pack is: MLX
 /// affine, 2 bits, group size 128, and the contract
 /// fixture records `mixed_precision: false`. There is no per-tensor override
 /// table, so the three scalars ARE the whole block and a fourth key is
@@ -16,10 +16,11 @@ struct PrismHadamardQuantizationSpec: Equatable {
     let mode: String
 }
 
-/// Transform-side structural validation of the Bonsai 2 9B tensor set.
+/// Transform-side structural validation of the packed tensor set.
 ///
-/// The source pack is PENDING (prism-ml has not published it). It is built on
-/// Qwen/Qwen3.5-9B and is expected to use the Ternary Bonsai 2 27B packing.
+/// The 9B member of this family is not published, so the transform tests build
+/// a synthetic one. It is built on the family's published backbone and uses
+/// the published 27B pack's packing.
 /// A pack that differs fails here by name. The pack is already MLX
 /// affine-quantized, so the transform passes tensors through unchanged. This
 /// pass fails fast -- before the multi-gigabyte copy -- when the set it would
@@ -39,20 +40,19 @@ struct PrismHadamardQuantizationSpec: Equatable {
 ///   rejected outright;
 /// - the `lm_head.*` quadruple MUST appear. `tie_word_embeddings` is false,
 ///   so a pack without its own output projection is a different artifact;
-/// - NO `mtp.*` tensor may appear in the selected namespace. The track's head
-///   is pinned by `fixtures/reference_bonsai2_9b_mtp_head.sha256` (pending)
-///   and is named to the engine with `--drafter`.
+/// - NO `mtp.*` tensor may appear in the selected namespace. The speculative
+///   head is a separate pinned export, named to the engine with `--drafter`.
 ///
 /// THE TOWER IS HYBRID, and that is the fact this file is built around. 32
 /// layers on a fixed schedule: every fourth layer is full attention and the
 /// other three are gated-delta-net linear attention. Both kinds carry the
 /// same two layer norms and the same dense MLP; they differ in the mixer.
 ///
-/// THE VISION TOWER IS NOT SELECTED. The Qwen 3.5 9B backbone declares one,
-/// and the pack is expected to ship it. This track serves text only, the runner declares
-/// `multimodal: false`, and the model's own weight filter drops the same
-/// prefix at load, so the transform drops it here and the tower never reaches
-/// `weights/`.
+/// THE VISION TOWER IS NOT SELECTED. The family's backbone declares one, and
+/// the pack is expected to ship it. The transform serves text only, the runner
+/// declares `multimodal: false`, and the model's own weight filter drops the
+/// same prefix at load, so the transform drops it here and the tower never
+/// reaches `weights/`.
 ///
 /// Deliberately independent of shard placement: this pass pins the complete
 /// tensor namespace, dtype and shape. The pack's tensor inventory fixture,
@@ -69,7 +69,7 @@ enum PrismHadamardCheckpointValidation {
         case fullAttention = "full_attention"
     }
 
-    /// Frozen geometry of the Qwen 3.5 9B backbone
+    /// Frozen geometry of the family's published backbone
     /// (`fixtures/qwen35_9b_base_config.json`). Kept as literals rather than read
     /// from the config under validation: a validator that derives its
     /// expectations from the artifact it is checking cannot detect a changed
@@ -164,7 +164,7 @@ enum PrismHadamardCheckpointValidation {
             guard let value = root[key], !(value is NSNull) else { return nil }
             guard let block = value as? [String: Any] else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 config \(key) must be an object")
+                    "packed config \(key) must be an object")
             }
             let allowedKeys: Set<String> = ["group_size", "bits", "mode"]
             // UNIFORM. Every extra key is a per-tensor override this transform
@@ -174,7 +174,7 @@ enum PrismHadamardCheckpointValidation {
             let unexpectedKeys = Set(block.keys).subtracting(allowedKeys).sorted()
             guard unexpectedKeys.isEmpty else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 config \(key) carries \(unexpectedKeys.count) "
+                    "packed config \(key) carries \(unexpectedKeys.count) "
                         + "unsupported entr(ies) and this pack is uniform, "
                         + "first: \(unexpectedKeys[0])")
             }
@@ -182,7 +182,7 @@ enum PrismHadamardCheckpointValidation {
                 block["mode"] != nil
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 config \(key) must explicitly define group_size, "
+                    "packed config \(key) must explicitly define group_size, "
                         + "bits, and mode")
             }
             let groupSize = try intField("group_size", in: block)
@@ -193,7 +193,7 @@ enum PrismHadamardCheckpointValidation {
                 bits == PinnedGeometry.quantizationBits
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 quantization must be affine 2-bit group_size 128")
+                    "the packed quantization must be affine 2-bit group_size 128")
             }
             return PrismHadamardQuantizationSpec(
                 groupSize: groupSize, bits: bits, mode: mode)
@@ -204,14 +204,14 @@ enum PrismHadamardCheckpointValidation {
         if let quantization, let quantizationConfig {
             guard quantization == quantizationConfig else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 config quantization and quantization_config must "
+                    "packed config quantization and quantization_config must "
                         + "match exactly")
             }
             return quantization
         }
         guard let spec = quantization ?? quantizationConfig else {
             throw MLXFastError.invalidInput(
-                "Bonsai 2 config is missing both quantization and "
+                "packed config is missing both quantization and "
                     + "quantization_config")
         }
         return spec
@@ -235,7 +235,7 @@ enum PrismHadamardCheckpointValidation {
         func add(_ name: String, _ dtype: TensorDType, _ shape: [Int]) {
             precondition(
                 inventory[name] == nil,
-                "duplicate expected Bonsai 2 tensor \(name)")
+                "duplicate expected packed tensor \(name)")
             inventory[name] = ExpectedTensorMetadata(
                 dtype: dtype.rawValue, shape: shape)
         }
@@ -248,7 +248,7 @@ enum PrismHadamardCheckpointValidation {
                 inFeatures.isMultiple(of: groupSize)
                     && inFeatures.isMultiple(of: PinnedGeometry.hadamardBlockSize)
                     && (inFeatures * bits).isMultiple(of: 32),
-                "Bonsai 2 tensor \(stem) is not packable at \(bits) bits")
+                "packed tensor \(stem) is not packable at \(bits) bits")
             add("\(stem).weight", .u32, [outFeatures, inFeatures * bits / 32])
             add("\(stem).scales", .f16, [outFeatures, inFeatures / groupSize])
             add("\(stem).biases", .f16, [outFeatures, inFeatures / groupSize])
@@ -356,7 +356,7 @@ enum PrismHadamardCheckpointValidation {
             forbiddenSuffixes.contains { suffix in name.hasSuffix(suffix) }
         }) {
             throw MLXFastError.invalidInput(
-                "Bonsai 2 MLX transform rejects compressed-tensors/global-scale "
+                "the packed MLX transform rejects compressed-tensors/global-scale "
                     + "and FP8 KV-scale tensor \(forbiddenName)")
         }
         // The head is UNTIED on this pack, so `lm_head.*` is a real quadruple
@@ -365,10 +365,10 @@ enum PrismHadamardCheckpointValidation {
             let name = "language_model.lm_head.\(component)"
             guard selectedKeys.contains(name) else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 has an untied output head and must select \(name)")
+                    "the packed family has an untied output head and must select \(name)")
             }
         }
-        // The Ternary Bonsai 2 27B pack declares `mtp_num_hidden_layers: 0`
+        // The published 27B pack declares `mtp_num_hidden_layers: 0`
         // and ships no head, and the 9B pack is expected to match. The
         // track's head is named to the engine separately, so a pack that
         // carries one is a different artifact and is refused rather than
@@ -378,7 +378,7 @@ enum PrismHadamardCheckpointValidation {
             $0.contains(".mtp.") || $0.hasPrefix("mtp.")
         }) {
             throw MLXFastError.invalidInput(
-                "Bonsai 2 declares no embedded multi-token-prediction head, but "
+                "the pack declares no embedded multi-token-prediction head, but "
                     + "the checkpoint carries \(embedded); this track's head is a "
                     + "separate pinned export")
         }
@@ -399,7 +399,7 @@ enum PrismHadamardCheckpointValidation {
                 selectedKeys.contains(signsName)
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 packed module \(stem) must ship .scales, .biases "
+                    "packed module \(stem) must ship .scales, .biases "
                         + "and .signs")
             }
             let weightInfo = try tensorInfo(named: name, index: index, headers: headers)
@@ -420,7 +420,7 @@ enum PrismHadamardCheckpointValidation {
                 signsInfo.shape.allSatisfy({ $0 > 0 })
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 packed module \(stem) has incompatible weight, "
+                    "packed module \(stem) has incompatible weight, "
                         + "scale, bias or sign metadata")
             }
 
@@ -432,13 +432,13 @@ enum PrismHadamardCheckpointValidation {
                 packedWidth.multipliedReportingOverflow(by: 32)
             guard !inputOverflow, !packedOverflow else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 module \(stem) packed width overflows Int")
+                    "packed module \(stem) packed width overflows Int")
             }
             let (expectedPackedBits, expectedOverflow) =
                 inputFeatures.multipliedReportingOverflow(by: quantization.bits)
             guard !expectedOverflow, packedBits == expectedPackedBits else {
                 throw MLXFastError.invalidInput(
-                    "packed Bonsai 2 module \(stem) stored width \(packedWidth) "
+                    "packed module \(stem) stored width \(packedWidth) "
                         + "does not match config quantization group_size "
                         + "\(quantization.groupSize) bits \(quantization.bits) for "
                         + "input dimension \(inputFeatures)")
@@ -451,7 +451,7 @@ enum PrismHadamardCheckpointValidation {
                 inputFeatures.isMultiple(of: PinnedGeometry.hadamardBlockSize)
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 module \(stem) declares \(signsInfo.shape[0]) signs "
+                    "packed module \(stem) declares \(signsInfo.shape[0]) signs "
                         + "for input dimension \(inputFeatures); the sign vector "
                         + "covers the whole contracted axis, in whole "
                         + "\(PinnedGeometry.hadamardBlockSize)-wide blocks")
@@ -486,7 +486,7 @@ enum PrismHadamardCheckpointValidation {
             let unindexed = expectedNames
                 .subtracting(Set(index.weightMap.keys)).sorted()
             throw MLXFastError.invalidInput(
-                "Bonsai 2 checkpoint tensor inventory must match the exact public "
+                "packed checkpoint tensor inventory must match the exact public "
                     + "\(expectedTensorCount)-tensor contract "
                     + "(missing: \(missing.prefix(8).joined(separator: ", ")); "
                     + "extra: \(extra.prefix(8).joined(separator: ", ")); "
@@ -496,14 +496,14 @@ enum PrismHadamardCheckpointValidation {
 
         for name in expected.keys.sorted() {
             guard let expectedMetadata = expected[name] else {
-                preconditionFailure("missing expected Bonsai 2 metadata for \(name)")
+                preconditionFailure("missing expected packed metadata for \(name)")
             }
             let actual = try tensorInfo(named: name, index: index, headers: headers)
             guard actual.dtype == expectedMetadata.dtype,
                 actual.shape == expectedMetadata.shape
             else {
                 throw MLXFastError.invalidInput(
-                    "Bonsai 2 tensor \(name) is \(actual.dtype) \(actual.shape); "
+                    "packed tensor \(name) is \(actual.dtype) \(actual.shape); "
                         + "the pinned inventory declares \(expectedMetadata.dtype) "
                         + "\(expectedMetadata.shape)")
             }
@@ -533,7 +533,7 @@ enum PrismHadamardCheckpointValidation {
             let integer = Int(number.stringValue)
         else {
             throw MLXFastError.invalidInput(
-                "Bonsai 2 quantization field \(key) must be a finite integer in "
+                "packed quantization field \(key) must be a finite integer in "
                     + "Int range")
         }
         return integer
@@ -544,7 +544,7 @@ enum PrismHadamardCheckpointValidation {
     ) throws -> String {
         guard let string = object[key] as? String else {
             throw MLXFastError.invalidInput(
-                "Bonsai 2 quantization field \(key) must be a string")
+                "packed quantization field \(key) must be a string")
         }
         return string
     }
