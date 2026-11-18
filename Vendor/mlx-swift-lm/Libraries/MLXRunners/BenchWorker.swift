@@ -95,10 +95,12 @@ extension EngineV2: CBv2MTPCountersReporting {}
 /// tokens the worker happened to drain.
 /// One verify round as the journal states it, across the cohort's streams.
 public struct FreeRunRound: Sendable, Equatable {
-    /// The committed width, common to every active stream.
-    public var width: Int
-    /// Per stream, whether it was still generating in this round.
-    public var active: [Bool]
+    /// Per stream, the tokens this round committed. `0` means the stream was
+    /// not generating in this round. A cohort's rows can commit DIFFERENT
+    /// widths in one round (a drafter that finalizes each row on its own
+    /// accepted prefix), so the width is stated per row rather than as one
+    /// number the rows are forced to share.
+    public var widths: [Int]
     /// Per stream, the PRE-min natural accept-walk length (0 when inactive).
     public var naturalAccepted: [Int]
     /// Draft tokens proposed across the streams.
@@ -106,12 +108,26 @@ public struct FreeRunRound: Sendable, Equatable {
     /// Drafts that passed verification AND were committed, across the streams.
     public var accepted: Int
 
-    public init(width: Int, active: [Bool], naturalAccepted: [Int], drafted: Int, accepted: Int) {
-        self.width = width
-        self.active = active
+    /// Tokens this round committed across every stream: the round's entry in
+    /// `acceptance_lengths`.
+    public var width: Int { widths.reduce(0, +) }
+    /// Per stream, whether it was still generating in this round.
+    public var active: [Bool] { widths.map { $0 > 0 } }
+    /// Streams still generating in this round.
+    public var activeStreams: Int { widths.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } }
+
+    public init(widths: [Int], naturalAccepted: [Int], drafted: Int, accepted: Int) {
+        self.widths = widths
         self.naturalAccepted = naturalAccepted
         self.drafted = drafted
         self.accepted = accepted
+    }
+
+    /// A round whose active rows share one committed width.
+    public init(width: Int, active: [Bool], naturalAccepted: [Int], drafted: Int, accepted: Int) {
+        self.init(
+            widths: active.map { $0 ? width : 0 }, naturalAccepted: naturalAccepted,
+            drafted: drafted, accepted: accepted)
     }
 }
 
@@ -142,30 +158,30 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// Refusals from journal assembly. Each is a refusal to publish an
     /// audit, never a partial one.
     public enum AuditError: Error, CustomStringConvertible, Equatable {
-        /// The journal reached its retention cap, so its head was evicted. A
-        /// TRUNCATED head cannot prove coverage of the window, and an audit
-        /// assembled from what survives would look complete while missing
-        /// rounds. Same rule the 125B worker applies.
-        case journalTruncated(records: Int, cap: Int)
+        /// The journal evicted records this window still needed, so its head
+        /// no longer covers the window. An audit assembled from what survives
+        /// would look complete while missing rounds. Same rule the 125B worker
+        /// applies. A journal that is merely FULL has dropped nothing and is
+        /// not refused: only a position that fell off the head is.
+        case journalTruncated(dropped: UInt64, cursor: UInt64, cap: Int)
         /// A record names a row this window never submitted.
         case unknownRow(requestID: UInt64)
-        /// Two rows report different committed widths for the same round.
-        /// The cohort commits ONE common width per round, so this means the
-        /// window boundary or the row grouping is wrong.
-        case widthDisagreement(round: Int, widths: [Int])
+        /// The journal's own account of the window disagrees with the tokens
+        /// the worker drained. One of the two is wrong, so neither is
+        /// published.
+        case committedTotalDisagreement(audit: Int, drained: Int)
 
         public var description: String {
             switch self {
-            case .journalTruncated(let records, let cap):
-                return "mtp round journal truncated at its \(cap)-record cap "
-                    + "(\(records) retained): coverage cannot be proven"
+            case .journalTruncated(let dropped, let cursor, let cap):
+                return "mtp round journal evicted \(dropped) records past the "
+                    + "window's cursor \(cursor) (cap \(cap)): coverage cannot be proven"
             case .unknownRow(let requestID):
                 return "mtp round journal names row \(requestID), which this "
                     + "window did not submit"
-            case .widthDisagreement(let round, let widths):
-                return "mtp round \(round) reports committed widths "
-                    + "\(widths.map(String.init).joined(separator: ", ")); a cohort "
-                    + "commits one common width"
+            case .committedTotalDisagreement(let audit, let drained):
+                return "mtp round journal accounts for \(audit) tokens, "
+                    + "but this window returned \(drained)"
             }
         }
     }
@@ -190,6 +206,11 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     }
 
     /// The window's rounds, in order, from the journal. See `assemble`.
+    ///
+    /// Each row states ITS own committed width for the round. Two rows of a
+    /// cohort may commit different widths — that is what a per-row finalize
+    /// produces — so a disagreement is data, not a refusal; refusing it would
+    /// drop the truth rather than state it.
     public static func assembleRounds(
         records: [RunnerRoundRecord],
         slotForRequestID: [UInt64: Int],
@@ -208,35 +229,44 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
         let roundCount = byRow.map(\.count).max() ?? 0
         var rounds: [FreeRunRound] = []
         for round in 0 ..< roundCount {
-            let present = byRow.map { row in round < row.count ? row[round] : nil }
-            let widths = present.compactMap { $0?.committed }
-            guard let width = widths.first else { continue }
-            guard widths.allSatisfy({ $0 == width }) else {
-                throw AuditError.widthDisagreement(round: round, widths: widths)
+            var widths = [Int](repeating: 0, count: streamCount)
+            var naturalAccepted = [Int](repeating: 0, count: streamCount)
+            var drafted = 0
+            var accepted = 0
+            var any = false
+            for slot in 0 ..< streamCount where round < byRow[slot].count {
+                let record = byRow[slot][round]
+                widths[slot] = record.committed
+                naturalAccepted[slot] = record.accepted
+                drafted += record.drafted
+                accepted += min(record.accepted, record.committed)
+                any = true
             }
+            guard any else { continue }
             rounds.append(
                 FreeRunRound(
-                    width: width,
-                    active: present.map { $0 != nil },
-                    naturalAccepted: present.map { $0?.accepted ?? 0 },
-                    drafted: present.reduce(0) { $0 + ($1?.drafted ?? 0) },
-                    accepted: present.reduce(0) { $0 + min($1?.accepted ?? 0, $1?.committed ?? 0) }
-                ))
+                    widths: widths, naturalAccepted: naturalAccepted,
+                    drafted: drafted, accepted: accepted))
         }
         return rounds
     }
 
     /// Build the wire audit from rounds. Totals are sums over rounds; the
     /// per-stream natural walk is transposed to the wire's `[stream][round]`.
+    ///
+    /// `acceptanceLengths` states, per round, the tokens that round committed
+    /// across every stream — so its sum is `committedTotal` on a cohort as
+    /// well as on a single stream, which is the arithmetic benchd checks
+    /// against the tokens the window returned.
     public init(rounds: [FreeRunRound], streamCount: Int) {
         self.acceptanceLengths = rounds.map(\.width)
         self.naturalAcceptedByStream = (0 ..< streamCount).map { stream in
             rounds.map { $0.naturalAccepted[stream] }
         }
-        self.activeStreamsByRound = rounds.map { $0.active.filter { $0 }.count }
+        self.activeStreamsByRound = rounds.map(\.activeStreams)
         self.draftedTotal = rounds.reduce(0) { $0 + $1.drafted }
         self.acceptedTotal = rounds.reduce(0) { $0 + $1.accepted }
-        self.committedTotal = rounds.reduce(0) { $0 + $1.width * $1.active.filter { $0 }.count }
+        self.committedTotal = rounds.reduce(0) { $0 + $1.width }
     }
 
     /// Split the rounds at the drain boundary.
@@ -245,79 +275,139 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// depth + 1 tokens at once, and the journal may already hold rounds whose
     /// tokens are still in the stream. A window must state EXACTLY the
     /// tokens it returned (benchd: `sum(acceptance_lengths) == N`,
-    /// `committed_total == N`), so the rounds are cut at `drainedPerStream`:
-    /// whole rounds inside the boundary stay; the round that straddles it is
-    /// CLIPPED — this window states the width it returned, the drafts that
-    /// round proposed, and the accepts that fit (`min(accepted, width - 1)`;
-    /// the bonus token is the one past the accepts) — and the remainder
-    /// carries into the next window as a round with no drafts and no
-    /// accepts, because those were already stated. Rounds wholly past the
-    /// boundary carry intact. Nothing is dropped and nothing is counted
-    /// twice; a box saw the alternative, a refusal whenever a round did not
-    /// land on the count.
-    /// The rounds that state `count` plain SEED steps: width one, every stream
-    /// active, nothing drafted, nothing accepted. See `FreeRunSession.seedCursor`.
-    public static func seedRounds(count: Int, streamCount: Int) -> [FreeRunRound] {
-        guard count > 0 else { return [] }
-        return Array(
-            repeating: FreeRunRound(
-                width: 1,
-                active: Array(repeating: true, count: streamCount),
-                naturalAccepted: Array(repeating: 0, count: streamCount),
-                drafted: 0,
-                accepted: 0),
-            count: count)
-    }
-
+    /// `committed_total == N`), so the rounds are cut at the stream's token
+    /// positions: each round covers `widths[stream]` tokens of one stream,
+    /// and this window states the tokens whose positions fall in
+    /// `[statedPerStream, statedPerStream + drainedPerStream)`.
+    ///
+    /// - A round wholly inside that span is stated intact, drafts and accepts
+    ///   included.
+    /// - A round that straddles the END is CLIPPED: this window states the
+    ///   width it returned, the drafts that round proposed, and the accepts
+    ///   that fit (`min(accepted, width - 1)`; the bonus token is the one past
+    ///   the accepts). Its remainder carries into the next window with no
+    ///   drafts and no accepts, because those were already stated.
+    /// - A round wholly past the end carries intact.
+    /// - A round whose head falls BEFORE `statedPerStream` has already had
+    ///   that head stated (the `free_decode_begin` seed token), so only its
+    ///   in-span part is stated here and its drafts stay with the window that
+    ///   saw them.
+    ///
+    /// Nothing is dropped and nothing is counted twice; a box saw the
+    /// alternative, a refusal whenever a round did not land on the count.
+    /// The positions are per STREAM, so rows that commit different widths are
+    /// cut at each row's own boundary rather than at one shared number.
     public static func split(
-        rounds: [FreeRunRound], drainedPerStream: Int
+        rounds: [FreeRunRound], statedPerStream stated: Int, drainedPerStream drained: Int
     ) -> (window: [FreeRunRound], carry: [FreeRunRound]) {
         var window: [FreeRunRound] = []
         var carry: [FreeRunRound] = []
-        var seen = 0
+        let streams = rounds.map { $0.widths.count }.max() ?? 0
+        let low = stated
+        let high = stated + drained
+        // The list starts where this window starts: a carried round is the
+        // continuation of the last stated position, and the rounds after it
+        // follow in order. Positions are ABSOLUTE within the session, so a round
+        // carried out of one window lands at the same place in the next.
+        var cursor = [Int](repeating: low, count: streams)
         for round in rounds {
-            if !carry.isEmpty || seen >= drainedPerStream {
-                carry.append(round)
-                continue
+            var headWidths = [Int](repeating: 0, count: streams)
+            var tailWidths = [Int](repeating: 0, count: streams)
+            var headNatural = [Int](repeating: 0, count: streams)
+            var headLostTokens = false
+            for stream in 0 ..< streams {
+                let width = stream < round.widths.count ? round.widths[stream] : 0
+                let start = cursor[stream]
+                let end = start + width
+                cursor[stream] = end
+                let headStart = max(start, low)
+                let headEnd = min(end, high)
+                if headEnd > headStart { headWidths[stream] = headEnd - headStart }
+                let tailStart = max(start, high)
+                if end > tailStart { tailWidths[stream] = end - tailStart }
+                if start < min(end, low) { headLostTokens = true }
+                let natural = stream < round.naturalAccepted.count ? round.naturalAccepted[stream] : 0
+                headNatural[stream] = max(0, min(natural, headWidths[stream] - 1))
             }
-            let room = drainedPerStream - seen
-            if round.width <= room {
-                window.append(round)
-                seen += round.width
-                continue
+            let headStated = headWidths.contains { $0 > 0 }
+            let tailStated = tailWidths.contains { $0 > 0 }
+            // Clipped only when this window returned LESS of the round than it
+            // committed on some stream. An unclipped round keeps its own
+            // drafts and accepts untouched.
+            let headClipped = (0 ..< streams).contains { stream in
+                let width = stream < round.widths.count ? round.widths[stream] : 0
+                return headWidths[stream] < width
             }
-            var head = round
-            head.width = room
-            head.accepted = min(round.accepted, room - 1)
-            head.naturalAccepted = round.naturalAccepted.map { min($0, room - 1) }
-            window.append(head)
-            seen = drainedPerStream
-            var tail = round
-            tail.width = round.width - room
-            tail.drafted = 0
-            tail.accepted = 0
-            tail.naturalAccepted = round.naturalAccepted.map { _ in 0 }
-            carry.append(tail)
+            if headStated {
+                var head = round
+                head.widths = headWidths
+                if headLostTokens {
+                    // The front of this round was stated by an earlier window.
+                    head.drafted = 0
+                    head.accepted = 0
+                    head.naturalAccepted = headNatural
+                } else if headClipped {
+                    head.accepted = min(
+                        round.accepted,
+                        max(0, headWidths.reduce(0, +) - headWidths.filter { $0 > 0 }.count))
+                    head.naturalAccepted = headNatural
+                }
+                window.append(head)
+            }
+            if tailStated {
+                var tail = round
+                tail.widths = tailWidths
+                tail.naturalAccepted = [Int](repeating: 0, count: streams)
+                // Intact only when the whole round is past the boundary;
+                // otherwise this is a straddling remainder and its drafts
+                // were stated with the head.
+                if headStated || headLostTokens {
+                    tail.drafted = 0
+                    tail.accepted = 0
+                }
+                carry.append(tail)
+            }
         }
         return (window, carry)
     }
 
+    /// The rounds that state plain SEED steps: each is one engine step that
+    /// committed one token in `tokens` different rows, so the round count and
+    /// the token count are stated separately. A batched reseed of `b` rows is
+    /// ONE round of `b` tokens, not `b` rounds of `b` — which is what counting
+    /// rows as rounds overstated. See `FreeRunSession.seedCursor`.
+    public static func seedRounds(
+        tokens: Int, rounds: Int, streamCount: Int
+    ) -> [FreeRunRound] {
+        guard tokens > 0, streamCount > 0 else { return [] }
+        let roundCount = max(1, min(rounds, tokens))
+        let base = tokens / roundCount
+        let extra = tokens % roundCount
+        return (0 ..< roundCount).map { round in
+            let count = min(streamCount, base + (round < extra ? 1 : 0))
+            var widths = [Int](repeating: 0, count: streamCount)
+            for stream in 0 ..< count { widths[stream] = 1 }
+            return FreeRunRound(
+                widths: widths,
+                naturalAccepted: [Int](repeating: 0, count: streamCount),
+                drafted: 0, accepted: 0)
+        }
+    }
+
     /// The audit of a serial window: one round of width one per committed
     /// token, nothing drafted, nothing accepted. `rounds` is the longest
-    /// stream; a stream that stopped early leaves the later rounds.
+    /// stream; a stream that stopped early leaves the later rounds — and only
+    /// that row's own width drops, so the per-round entry is the tokens the
+    /// round committed across the rows still generating.
     public static func serial(committedByStream: [[Int]]) -> FreeRunRoundAudit {
         let rounds = committedByStream.map(\.count).max() ?? 0
-        return FreeRunRoundAudit(
-            acceptanceLengths: Array(repeating: 1, count: rounds),
-            naturalAcceptedByStream: committedByStream.map {
-                Array(repeating: 0, count: $0.count)
-            },
-            activeStreamsByRound: (0 ..< rounds).map { round in
-                committedByStream.filter { round < $0.count }.count
-            },
-            draftedTotal: 0,
-            acceptedTotal: 0,
-            committedTotal: committedByStream.reduce(0) { $0 + $1.count })
+        let roundList = (0 ..< rounds).map { round in
+            FreeRunRound(
+                widths: committedByStream.map { round < $0.count ? 1 : 0 },
+                naturalAccepted: [Int](repeating: 0, count: committedByStream.count),
+                drafted: 0, accepted: 0)
+        }
+        return FreeRunRoundAudit(rounds: roundList, streamCount: committedByStream.count)
     }
 
     public init(
@@ -771,19 +861,32 @@ public final class BenchWorkerServer: @unchecked Sendable {
         /// Request id -> cohort slot, in SLOT ORDER. The journal names rows
         /// by request id; the wire names them by slot.
         let slotForRequestID: [UInt64: Int]
-        /// Records already reported. The seed forward is not a verify round,
-        /// but a row CAN finalize one before `free_decode_run` is called, so
-        /// the window starts where the journal stood after the seed drain.
-        var journalCursor = 0
+        /// Position in the journal's own numbering (see `RunnerRoundJournal`):
+        /// the sequence number of the next record this session has not yet
+        /// stated. Taken BEFORE the seed forward is submitted, so a round that
+        /// finalizes while the seed drains cannot fall between the seed and the
+        /// cursor and vanish from every window.
+        var journalCursor: UInt64 = 0
         /// `CBv2MTPMetrics.seedSteps` at the same boundary. A SEED step is the
         /// plain forward the planner runs when a row has no carry (the first
         /// step of every window, and after a stale carry): it commits ONE token
-        /// and writes no round record, so the drain states it as a round itself.
+        /// in ONE row and writes no round record, so the drain states it as a
+        /// round itself. `seedCursor` counts ROWS; `seedRoundCursor` counts the
+        /// engine STEPS those rows were seeded in.
         var seedCursor = 0
+        var seedRoundCursor = 0
+        /// Tokens already returned to the harness, per stream: the seed token
+        /// `free_decode_begin` returned, plus every token a run has drained.
+        /// The audit's cut is taken at this position, per stream.
+        var statedPerStream = 0
         /// Rounds the journal already stated whose tokens this session has
         /// not yet returned: the clipped remainder and any run-ahead rounds.
         /// See `FreeRunRoundAudit.split`.
         var carriedRounds: [FreeRunRound] = []
+        /// Tokens read off a stream but not yet returned: a delta can carry
+        /// more than the count a run asked for, and dropping the rest would
+        /// lose them.
+        var pending: [[Int]]
         /// Controller clamp counts as they stood at that same boundary.
         var clampBaseline: [String: Int] = [:]
         var streams: [AsyncStream<CBv2Event>.Iterator]
@@ -798,6 +901,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             self.spec = spec
             self.cohort = cohort
             self.slotForRequestID = slotForRequestID
+            self.pending = Array(repeating: [], count: batch)
             self.streams = streams
         }
     }
@@ -862,18 +966,28 @@ public final class BenchWorkerServer: @unchecked Sendable {
         let session = FreeRunSession(
             engine: engine, batch: batch, spec: spec, cohort: cohort,
             slotForRequestID: slotForRequestID, streams: iterators)
+        // The audit's starting position is taken BEFORE the seed is submitted:
+        // the journal is empty at engine build, and every record it writes from
+        // here on belongs to a token this session will return. Taking it after
+        // the seed drain used to drop the rounds that finalized in between —
+        // their tokens arrived in the first run while their records were
+        // skipped by the cursor.
+        if let journal = engine as? any RunnerRoundJournaling {
+            session.journalCursor = journal.roundJournal().dropped
+        }
+        if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
+            session.seedCursor = metrics.seedSteps
+            session.seedRoundCursor = metrics.seedRounds
+            session.clampBaseline = Self.clampReasons(metrics)
+        }
         var seedTokens: [Int] = []
         for slot in 0 ..< batch {
             seedTokens.append(
                 contentsOf: try await drain(session: session, slot: slot, count: 1))
         }
-        // The audit window opens HERE, after the seed forward: whatever the
-        // journal already holds belongs to the seed, not to the timed run.
-        if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
-            session.journalCursor = (engine as? any RunnerRoundJournaling)?.roundRecords().count ?? 0
-            session.seedCursor = metrics.seedSteps
-            session.clampBaseline = Self.clampReasons(metrics)
-        }
+        // The seed token `free_decode_begin` returns is not part of any run
+        // window, so the first window's cut starts after it.
+        session.statedPerStream = 1
         self.freeRun = session
 
         var response = WorkerResponse(id: request.id, ok: true, nonce: nonce)
@@ -922,38 +1036,60 @@ public final class BenchWorkerServer: @unchecked Sendable {
             .mtpMetricsSnapshot()
         {
             if let journal {
-                let records = journal.roundRecords()
-                guard records.count < journal.roundRecordCap
-                else {
+                let view = journal.roundJournal()
+                // A cursor still inside the retained range is covered even when
+                // the ring is exactly FULL: only a cursor the ring has dropped
+                // PAST cannot be proven.
+                guard session.journalCursor >= view.dropped else {
                     throw FreeRunRoundAudit.AuditError.journalTruncated(
-                        records: records.count,
+                        dropped: view.dropped, cursor: session.journalCursor,
                         cap: journal.roundRecordCap)
                 }
-                let window = Array(records.dropFirst(session.journalCursor))
+                let firstNew = Int(session.journalCursor - view.dropped)
+                let records = Array(
+                    view.records.dropFirst(min(firstNew, view.records.count)))
                 let fresh = try FreeRunRoundAudit.assembleRounds(
-                    records: window,
+                    records: records,
                     slotForRequestID: session.slotForRequestID,
                     streamCount: session.batch)
-                session.journalCursor = records.count
+                // Everything retained has now been stated, including the rounds
+                // that ran ahead of the drain; those carry below.
+                session.journalCursor = view.nextSequence
                 // Seed steps taken inside this window (see `seedCursor`): each
-                // is one committed token with nothing drafted, stated as a
-                // width-one round ahead of the rounds it seeded, so the window
-                // states every token it returned (benchd: sum of the widths
-                // == N).
+                // is one engine step that committed one token in one row with
+                // nothing drafted, stated as a round ahead of the rounds it
+                // seeded, so the window states every token it returned (benchd:
+                // sum of the widths == N). The engine counts ROWS seeded and
+                // STEPS taken separately, because a batched reseed seeds
+                // several rows in one step.
                 let seedDelta = max(0, metrics.seedSteps - session.seedCursor)
+                let seedRoundDelta = max(0, metrics.seedRounds - session.seedRoundCursor)
                 session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
                 let seeded = FreeRunRoundAudit.seedRounds(
-                    count: seedDelta, streamCount: session.batch)
+                    tokens: seedDelta, rounds: seedRoundDelta, streamCount: session.batch)
                 let cut = FreeRunRoundAudit.split(
-                    rounds: session.carriedRounds + seeded + fresh, drainedPerStream: count)
+                    rounds: session.carriedRounds + seeded + fresh,
+                    statedPerStream: session.statedPerStream, drainedPerStream: count)
                 session.carriedRounds = cut.carry
                 if !cut.window.isEmpty {
-                    audit = FreeRunRoundAudit(rounds: cut.window, streamCount: session.batch)
+                    let assembled = FreeRunRoundAudit(
+                        rounds: cut.window, streamCount: session.batch)
+                    // The journal's own account is the authority for
+                    // `committed_total`. A disagreement with the tokens this
+                    // window returned means one of the two is wrong, so
+                    // neither is published.
+                    guard assembled.committedTotal == drained else {
+                        throw FreeRunRoundAudit.AuditError.committedTotalDisagreement(
+                            audit: assembled.committedTotal, drained: drained)
+                    }
+                    audit = assembled
                 }
             } else {
                 // No journal: the seed cursor still advances, so a build that
                 // gains a journal mid-run cannot restate these steps as rounds.
                 session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
             }
 
             var clamps = Self.clampReasons(metrics)
@@ -976,6 +1112,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
             }
         }
 
+        // The tokens are now the harness's: the next window's cut starts here.
+        // Advanced for every window, journaled or not, so a build that gains a
+        // journal mid-run still cuts at the right position.
+        session.statedPerStream += count
+
         // A SERIAL window journals no verify rounds, but the protocol carries
         // the audit triple on EVERY free_decode_run (PROTOCOL.md: benchd
         // refuses a reply without `acceptance_lengths`, and the box saw the
@@ -993,6 +1134,10 @@ public final class BenchWorkerServer: @unchecked Sendable {
             response.acceptanceLengths = audit.acceptanceLengths
             response.draftedTotal = audit.draftedTotal
             response.acceptedTotal = audit.acceptedTotal
+            // The journal's own token account, not a second count of the
+            // drained stream: the two were proven equal above, and the audit
+            // is the one that carries the per-round evidence.
+            response.committedTotal = audit.committedTotal
             // `rounds`, `natural_accepted_by_stream` and
             // `active_streams_by_round` are the v1.2 COHORT trio; the
             // single-stream form carries `acceptance_lengths` alone, whose
@@ -1015,10 +1160,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
     }
 
     /// Drain exactly `count` committed tokens from one stream.
+    ///
+    /// A delta carries as many tokens as the engine committed at once (up to a
+    /// whole verify round), which can be MORE than the count this window asked
+    /// for. The surplus is kept in the session's per-stream buffer and returned
+    /// ahead of anything read next, so no token is lost and none is returned
+    /// twice.
     private func drain(
         session: FreeRunSession, slot: Int, count: Int
     ) async throws -> [Int] {
-        var out: [Int] = []
+        var out = session.pending[slot]
+        session.pending[slot] = []
         // The iterator is moved out and back rather than mutated in place:
         // a mutating call across an `await` on `session.streams[slot]` would
         // hold an exclusive access over a suspension point.
@@ -1039,7 +1191,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 }
             }
         }
-        return Array(out.prefix(count))
+        let delivered = Array(out.prefix(count))
+        session.pending[slot] = Array(out.dropFirst(count))
+        return delivered
     }
 
     /// Trusted-build oracle: teacher-forced replay of the candidate's own

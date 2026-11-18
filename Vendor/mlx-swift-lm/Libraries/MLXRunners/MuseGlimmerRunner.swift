@@ -85,7 +85,12 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
             supportsCompiledDecode: false,
             supportsPackedPrefill: false,
             supportsMTP: true,
-            supportsCompactRecurrentMTPReplay: false),
+            supportsCompactRecurrentMTPReplay: false,
+            // The tower cuts every prompt into 1,024-token cells, and a paged
+            // pool that cannot hold one cell refuses the model at engine
+            // start. Read off the model's own constant rather than repeated
+            // here as a number that could drift from the library.
+            prefillChunkAlignment: MuseGlimmerTextModel.defaultPrefillChunkAlignment),
         // PAGED ONLY, and segmented paged at that: the model requires native
         // paged KV, so a contiguous build is not a slower arm of this family,
         // it is a different family's serving shape.
@@ -121,6 +126,15 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
     private let drafter: (any CBv2MTPDrafter)?
     private let kvBytesCapacity: Int
     private let maxSequenceLength: Int
+
+    /// A drafter this runner built from its pinned artifact, and the directory
+    /// the pin was verified against. The pair travels together so the hello's
+    /// provenance hash is always taken over the artifact the bound module came
+    /// from.
+    struct VerifiedDrafter {
+        var drafter: any CBv2MTPDrafter
+        var directory: URL
+    }
 
     private init(
         model: MuseGlimmerTextModel,
@@ -165,16 +179,27 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
         try enableExactWindows(installed.model)
         let tokenizer = try await MuseGlimmerTokenizerLoader.shared.load(from: directory)
 
-        var options = options
-        options.preloadedDrafter = try await loadDrafter(
+        // The drafter enters through the same door `adopt` refuses: it is built
+        // HERE, from its own artifact, and it rides in with the directory the
+        // pin was checked against, so the hello's provenance hash describes the
+        // drafter that is actually in use.
+        var drafter: VerifiedDrafter?
+        if let built = try await loadDrafter(
             options: options, directory: directory, target: installed.model)
+        {
+            guard let drafterDirectory = options.drafterDirectory else {
+                throw RunnerError.drafterUnavailable(
+                    "a loaded drafter needs the artifact directory it was read from")
+            }
+            drafter = VerifiedDrafter(drafter: built, directory: drafterDirectory)
+        }
 
-        return try adopt(
+        return try assemble(
             model: installed.model,
             tokenizer: tokenizer,
-            configuration: ModelConfiguration(directory: directory),
             directory: directory,
-            options: options)
+            options: options,
+            drafter: drafter)
     }
 
     /// Adopt a tower the caller already holds.
@@ -184,12 +209,43 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
     /// drafter directory's own files. The exact-window switch is the one
     /// change made to the module, and it is the same switch `load` makes, so
     /// an adopted tower and a loaded one serve the same bytes.
+    ///
+    /// A DRAFTER is refused here. One handed in as a module has no verified
+    /// artifact behind it: the pin, the assistant size cap, the artifact type
+    /// and the target binding are all checked while the artifact is read, and a
+    /// module already in memory was read somewhere else. Binding it on trust —
+    /// and hashing an unrelated directory for the hello — is what this refusal
+    /// replaces. Name `--drafter <directory>` and the load path checks it.
     public static func adopt(
         model: any LanguageModel,
         tokenizer: any MLXLMCommon.Tokenizer,
         configuration: ModelConfiguration,
         directory: URL,
         options: RunnerLoadOptions
+    ) throws -> MuseGlimmerRunner {
+        if let refusal = preloadedDrafterRefusal(options) { throw refusal }
+        return try assemble(
+            model: model, tokenizer: tokenizer, directory: directory, options: options,
+            drafter: nil)
+    }
+
+    /// The refusal a drafter handed in as a module earns, on its own so a test
+    /// can prove it without staging a checkpoint.
+    static func preloadedDrafterRefusal(_ options: RunnerLoadOptions) -> RunnerError? {
+        guard options.preloadedDrafter != nil else { return nil }
+        return .drafterUnavailable(
+            "a preloaded drafter carries no verified artifact: name its directory, so this "
+                + "runner checks the pin, the assistant size cap and the target binding")
+    }
+
+    /// The one construction path: `load` and `adopt` both funnel through it, so
+    /// the derived state cannot drift between them.
+    private static func assemble(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        directory: URL,
+        options: RunnerLoadOptions,
+        drafter: VerifiedDrafter?
     ) throws -> MuseGlimmerRunner {
         let modelType = try RunnerCheckpoint.modelType(at: directory)
         let eosTokenIDs = RunnerCheckpoint.eosTokenIDs(at: directory, tokenizer: tokenizer)
@@ -201,18 +257,13 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
         try enableExactWindows(model)
 
         // The drafter is a SEPARATE published export, so its provenance is the
-        // shards in its own directory, in name order.
+        // shards in the directory its pin was verified against, in name order.
         //
-        // FAIL CLOSED: the provenance rides the hello, so a drafter that
-        // cannot be hashed must stop the adoption rather than be served
-        // unattributed.
+        // FAIL CLOSED: the provenance rides the hello, so a drafter that cannot
+        // be hashed must stop the adoption rather than be served unattributed.
         var provenance: HeadProvenance?
-        if options.preloadedDrafter != nil {
-            guard let drafterDirectory = options.drafterDirectory else {
-                throw RunnerError.drafterUnavailable(
-                    "a loaded drafter needs its artifact directory, to be attributed on the hello")
-            }
-            provenance = try RunnerCheckpoint.provenance(ofHeadAt: drafterDirectory)
+        if let drafter {
+            provenance = try RunnerCheckpoint.provenance(ofHeadAt: drafter.directory)
         }
 
         return MuseGlimmerRunner(
@@ -220,7 +271,7 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
             tokenizer: tokenizer,
             eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,
-            drafter: options.preloadedDrafter,
+            drafter: drafter?.drafter,
             headProvenance: provenance,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
@@ -261,7 +312,10 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
         directory: URL,
         target: any LanguageModel
     ) async throws -> (any CBv2MTPDrafter)? {
-        if let preloaded = options.preloadedDrafter { return preloaded }
+        // A module the caller already holds went around the pin, the size cap,
+        // the artifact type and the target binding. Refused before a byte of it
+        // is bound.
+        if let refusal = preloadedDrafterRefusal(options) { throw refusal }
         guard let drafterDirectory = options.drafterDirectory else { return nil }
         guard let target = target as? MuseGlimmerTextModel else {
             throw RunnerError.unexpectedModel(
@@ -365,7 +419,27 @@ public final class MuseGlimmerRunner: Runner, @unchecked Sendable {
             // residual stream. The generic adapter carries none of that.
             steppable: MuseGlimmerCBv2Adapter(model),
             mtpDrafter: drafter,
-            build: build)
+            // The paged pool must hold one prompt cell, or the engine refuses
+            // the model at start for ANY caller whose chunk is below the grid.
+            // Raised here, off the LOADED model's own declaration, so no
+            // caller carries a number that has to be kept in step by hand.
+            build: Self.aligningPromptGrid(build, alignment: model.cbv2Capabilities.prefillChunkAlignment))
+    }
+
+    /// The build with its prefill chunk raised to the model's prompt grid.
+    ///
+    /// A grid model cuts every prompt into `alignment`-token cells and a paged
+    /// pool shorter than one cell refuses the model. A build that asks for less
+    /// is not wrong about what it wants — it is a caller that does not know the
+    /// grid — so the runner lifts it to the grid instead of letting the engine
+    /// terminate the process.
+    static func aligningPromptGrid(_ build: EngineBuild, alignment: Int?) -> EngineBuild {
+        guard let alignment, alignment > 0,
+            build.schedulerConfig.prefillChunkSize < alignment
+        else { return build }
+        var build = build
+        build.schedulerConfig.prefillChunkSize = alignment
+        return build
     }
 
     /// One teacher-forced row over the same forward the engine drives. The

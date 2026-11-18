@@ -40,9 +40,31 @@ public struct RunnerRoundRecord: Sendable, Equatable {
 /// Records are delivered in finalize order, one per (row, round), oldest
 /// first. A row that finished early simply has no record past its last one.
 public protocol RunnerRoundJournaling: AnyObject {
-    /// Every record the journal still retains, oldest first.
-    func roundRecords() -> [RunnerRoundRecord]
-    /// The journal's retention cap. A journal AT the cap has evicted its head,
-    /// so coverage of a window can no longer be proven from it.
+    /// The log as it stands: every record still retained, oldest first, and
+    /// how many older ones it has evicted.
+    func roundJournal() -> RunnerRoundJournal
+    /// The journal's retention cap.
     var roundRecordCap: Int { get }
+}
+
+/// One reading of a journal: what it still holds, and what it dropped.
+///
+/// `dropped` is the count of records evicted BEFORE `records.first`, so the
+/// record at index `i` was appended as number `dropped + i`. A reader that
+/// tracks its position in that numbering can tell a FULL journal (nothing
+/// lost: the position is still inside the retained range) from a TRUNCATED
+/// one (the position fell off the head, and coverage can no longer be
+/// proven). Comparing the retained COUNT against the cap cannot tell the
+/// two apart, and refuses a window that lost nothing.
+public struct RunnerRoundJournal: Sendable, Equatable {
+    public var records: [RunnerRoundRecord]
+    public var dropped: UInt64
+
+    public init(records: [RunnerRoundRecord] = [], dropped: UInt64 = 0) {
+        self.records = records
+        self.dropped = dropped
+    }
+
+    /// The sequence number of the next record the journal will append.
+    public var nextSequence: UInt64 { dropped + UInt64(records.count) }
 }

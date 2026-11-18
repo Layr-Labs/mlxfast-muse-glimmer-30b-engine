@@ -1091,6 +1091,8 @@ final class CBv2MTPRoundDriver {
         guard count > 0 else { return }
         metricsLock.lock()
         metrics.seedSteps += count
+        // engine-local: per-round audit record (benchmark free-run audit)
+        metrics.seedRounds += 1
         metricsLock.unlock()
     }
 
@@ -1112,10 +1114,6 @@ final class CBv2MTPRoundDriver {
         // engine-local: per-round audit record (benchmark free-run audit)
         if let audit {
             metrics.roundAudits.append(audit)
-            if metrics.roundAudits.count > CBv2MTPRoundAuditRecord.retainedRecordCap {
-                metrics.roundAudits.removeFirst(
-                    metrics.roundAudits.count - CBv2MTPRoundAuditRecord.retainedRecordCap)
-            }
         }
         if metrics.perPositionAccepted.count < drafted {
             metrics.perPositionAccepted.append(

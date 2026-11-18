@@ -71,7 +71,10 @@ struct RunnerRoundJournalTests {
                 records: records, slotForRequestID: [1: 0], streamCount: 1) == nil)
         let serial = FreeRunRoundAudit.serial(
             committedByStream: [[51, 52, 53], [54, 55]])
-        #expect(serial.acceptanceLengths == [1, 1, 1])
+        // Per round, the tokens the round committed across the rows still
+        // generating: two rows for two rounds, then one.
+        #expect(serial.acceptanceLengths == [2, 2, 1])
+        #expect(serial.acceptanceLengths.reduce(0, +) == 5)
         #expect(serial.draftedTotal == 0)
         #expect(serial.acceptedTotal == 0)
         #expect(serial.committedTotal == 5)

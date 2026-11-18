@@ -93,6 +93,57 @@ struct MuseGlimmerRunnerTests {
                 manifest: MuseGlimmerRunner.manifest, build: build) == nil)
     }
 
+    @Test("The manifest declares the prompt grid the model cuts prompts on")
+    func manifestDeclaresPromptGrid() {
+        // Read off the model's own constant: a number written here could drift
+        // from the library that enforces it.
+        #expect(
+            MuseGlimmerRunner.manifest.engine.prefillChunkAlignment
+                == MuseGlimmerTextModel.defaultPrefillChunkAlignment)
+        #expect(MuseGlimmerRunner.manifest.engine.prefillChunkAlignment ?? 0 > 0)
+    }
+
+    // MARK: - Prompt grid
+
+    /// A build whose chunk is shorter than one prompt cell would make the engine
+    /// refuse the model at start. The runner lifts the chunk to the LOADED
+    /// model's grid, and leaves a wider one alone.
+    @Test("A prefill chunk below the model's grid is raised to the grid")
+    func chunkRaisedToGrid() {
+        let grid = MuseGlimmerTextModel.defaultPrefillChunkAlignment
+        let narrow = EngineBuild(
+            kvBackend: .paged, kvBytesCapacity: 1 << 30,
+            schedulerConfig: CBv2SchedulerConfig(prefillChunkSize: 128))
+        let raised = MuseGlimmerRunner.aligningPromptGrid(narrow, alignment: grid)
+        #expect(raised.schedulerConfig.prefillChunkSize == grid)
+
+        let wide = EngineBuild(
+            kvBackend: .paged, kvBytesCapacity: 1 << 30,
+            schedulerConfig: CBv2SchedulerConfig(prefillChunkSize: grid * 4))
+        #expect(
+            MuseGlimmerRunner.aligningPromptGrid(wide, alignment: grid)
+                .schedulerConfig.prefillChunkSize == grid * 4)
+
+        // A model that declares no grid is untouched.
+        #expect(
+            MuseGlimmerRunner.aligningPromptGrid(narrow, alignment: nil)
+                .schedulerConfig.prefillChunkSize == 128)
+    }
+
+    // MARK: - Drafter provenance
+
+    /// A drafter handed in as a live module never passed the pin, the assistant
+    /// size cap, the artifact type or the target binding, and the hello's hash
+    /// would describe whatever directory was named beside it. Refused by name.
+    @Test("A preloaded drafter is refused, and no drafter is not")
+    func preloadedDrafterRefused() {
+        #expect(MuseGlimmerRunner.preloadedDrafterRefusal(RunnerLoadOptions()) == nil)
+        let refusal = MuseGlimmerRunner.preloadedDrafterRefusal(
+            RunnerLoadOptions(preloadedDrafter: StubDrafter()))
+        #expect(refusal != nil)
+        #expect(refusal?.description.contains("no verified artifact") == true)
+    }
+
     @Test("A drafter over the assistant bound is refused")
     func drafterOverCapRefused() throws {
         let directory = try Self.makeTemporaryDirectory()

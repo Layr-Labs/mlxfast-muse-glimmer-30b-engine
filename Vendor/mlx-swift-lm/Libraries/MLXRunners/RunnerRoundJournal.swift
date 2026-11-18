@@ -16,12 +16,13 @@ extension EngineV2: RunnerRoundJournaling {
     /// writer enforces.
     public var roundRecordCap: Int { CBv2MTPRoundAuditRecord.retainedRecordCap }
 
-    /// Every record the engine still retains, in finalize order, oldest first.
-    /// A free-run window opens on a fresh engine, and its session reads the
-    /// records after the seed forward once, so the records a window reads are
-    /// that window's.
-    public func roundRecords() -> [RunnerRoundRecord] {
-        Self.runnerRoundRecords(from: mtpMetricsSnapshot()?.roundAudits ?? [])
+    /// The log as it stands: the records still retained and how many older
+    /// ones it evicted. Read from ONE snapshot, so a record finalized between
+    /// two reads cannot make the pair disagree.
+    public func roundJournal() -> RunnerRoundJournal {
+        guard let log = mtpMetricsSnapshot()?.roundAudits else { return RunnerRoundJournal() }
+        return RunnerRoundJournal(
+            records: Self.runnerRoundRecords(from: log.records), dropped: log.dropped)
     }
 
     /// The field mapping, one for one. Static so a test can check it without a

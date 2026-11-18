@@ -90,6 +90,16 @@ struct MockRoundScript: Sendable {
     /// Rows the rounds are attributed to, in SLOT ORDER. bench-worker submits
     /// slot s as request id s + 1.
     var requestIDs: [UInt64] = [1]
+    /// Rounds already finalized when `free_decode_begin` reads the journal:
+    /// the engine ran ahead while the seed drained.
+    var journalAtBegin: [Round] = []
+    /// Records the journal has evicted. Reported on the read a RUN makes, and
+    /// never on the one `free_decode_begin` makes, so a test can put a cursor
+    /// behind the retained range.
+    var dropped: UInt64 = 0
+    /// Tokens the scripted engine yields in ONE delta. Above 1, a run can be
+    /// handed more tokens than the count it asked for.
+    var deltaWidth: Int = 1
 
     /// The fixture's window: three rounds at depth 2, committing 3, 1 and 2
     /// tokens, with accept walks of 2, 1 and 1. That gives the fixture's
@@ -103,6 +113,17 @@ struct MockRoundScript: Sendable {
 
     /// The journal in finalize order: one record per (row, round).
     var journal: [RunnerRoundRecord] {
+        Self.records(for: journalAtBegin + rounds, requestIDs: requestIDs)
+    }
+
+    /// The records the run's read sees.
+    var journalAfterBegin: [RunnerRoundRecord] {
+        Self.records(for: rounds, requestIDs: requestIDs)
+    }
+
+    static func records(
+        for rounds: [Round], requestIDs: [UInt64]
+    ) -> [RunnerRoundRecord] {
         rounds.flatMap { round in
             requestIDs.map { requestID in
                 RunnerRoundRecord(
@@ -130,10 +151,14 @@ final class MockEngine:
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
         let start = MockTokens.freeRunStart(request.promptTokens)
         let maxTokens = request.maxTokens
+        let deltaWidth = max(1, script?.deltaWidth ?? 1)
         return AsyncStream { continuation in
-            for index in 0 ..< maxTokens {
-                continuation.yield(
-                    .delta(text: "", tokens: [start + index], logprobs: nil))
+            var index = 0
+            while index < maxTokens {
+                let width = min(deltaWidth, maxTokens - index)
+                let tokens = (0 ..< width).map { start + index + $0 }
+                continuation.yield(.delta(text: "", tokens: tokens, logprobs: nil))
+                index += width
             }
             continuation.yield(
                 .finished(
@@ -172,17 +197,32 @@ final class MockEngine:
     }
 
     /// The journal, with the same first-read-is-empty rule as the counters:
-    /// the seed forward has finalized no round when the window opens.
-    func roundRecords() -> [RunnerRoundRecord] {
-        guard let script else { return [] }
+    /// the seed forward has finalized no round when the window opens. The
+    /// FIRST read (the one `free_decode_begin` makes, before its seed drain)
+    /// reports whatever the script says had already finalized, and no
+    /// eviction; every read after it reports the window's records plus the
+    /// script's eviction count.
+    func roundJournal() -> RunnerRoundJournal {
+        guard let script else { return RunnerRoundJournal() }
         lock.lock()
         defer { lock.unlock() }
         defer { journalReads += 1 }
-        return journalReads > 0 ? script.journal : []
+        guard journalReads > 0 else {
+            return RunnerRoundJournal(
+                records: MockRoundScript.records(
+                    for: script.journalAtBegin, requestIDs: script.requestIDs),
+                dropped: 0)
+        }
+        return RunnerRoundJournal(
+            records: MockRoundScript.records(
+                for: script.journalAtBegin + script.rounds,
+                requestIDs: script.requestIDs),
+            dropped: script.dropped)
     }
 
-    /// A cap large enough that no scripted window reaches it, unless a test
-    /// builds one at the cap to prove truncation is refused.
+    /// The library's retention cap, so a test can build a journal that is
+    /// exactly full (which states the window) or one that has evicted past the
+    /// cursor (which refuses it).
     static let retainedRecordCap = 8192
     var roundRecordCap: Int { Self.retainedRecordCap }
 }

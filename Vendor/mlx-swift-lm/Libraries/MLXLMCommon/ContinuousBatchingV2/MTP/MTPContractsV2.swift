@@ -814,6 +814,11 @@ public struct CBv2MTPMetrics: Sendable {
     /// Seed steps (eligible rows that decoded eagerly with hidden capture
     /// to establish the drafter carry — no drafts yet).
     public var seedSteps: Int = 0
+    // engine-local: per-round audit record (benchmark free-run audit)
+    /// Engine STEPS that seeded at least one row. `seedSteps` counts ROWS, so a
+    /// step that seeds several rows adds several there and one here; the
+    /// audit needs the round count, which is one per step.
+    public var seedRounds: Int = 0
     /// Nonblocking assistant graph submissions before target verification.
     public var earlyDraftSubmissions: Int = 0
     /// Total draft tokens proposed across all rounds.
@@ -843,9 +848,9 @@ public struct CBv2MTPMetrics: Sendable {
     public var totalRoundWallTimeNanos: UInt64 = 0
 
     // engine-local: per-round audit record (benchmark free-run audit)
-    /// Per-verify-round records in finalize order, bounded at
-    /// `CBv2MTPRoundAuditRecord.retainedRecordCap` (oldest dropped first).
-    public var roundAudits: [CBv2MTPRoundAuditRecord] = []
+    /// Per-verify-round records in finalize order. A bounded ring: a full log
+    /// overwrites its OLDEST entry instead of shifting the array.
+    public var roundAudits = CBv2MTPRoundAuditLog()
 
     public init() {}
 
@@ -873,5 +878,44 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.drafted = drafted
         self.accepted = accepted
         self.committed = committed
+    }
+}
+
+// engine-local: per-round audit record (benchmark free-run audit)
+/// The round log as a fixed-capacity ring.
+///
+/// `append` is O(1): a full ring overwrites its oldest slot and advances the
+/// head, so a long window costs no shift per round. `dropped` counts the
+/// records evicted since the engine was built, which is what lets a reader
+/// tell "the head was evicted" (a real truncation) from "the ring is exactly
+/// full" (nothing lost).
+public struct CBv2MTPRoundAuditLog: Sendable {
+    private var storage: [CBv2MTPRoundAuditRecord] = []
+    /// Index of the OLDEST record once the ring has wrapped.
+    private var head = 0
+    /// Records evicted. The record at index `i` of ``records`` was appended
+    /// as number `dropped + i`.
+    public private(set) var dropped: UInt64 = 0
+
+    public var capacity: Int { CBv2MTPRoundAuditRecord.retainedRecordCap }
+    public var count: Int { storage.count }
+
+    public init() {}
+
+    public mutating func append(_ record: CBv2MTPRoundAuditRecord) {
+        if storage.count < capacity {
+            if storage.isEmpty { storage.reserveCapacity(capacity) }
+            storage.append(record)
+            return
+        }
+        storage[head] = record
+        head = (head + 1) % capacity
+        dropped &+= 1
+    }
+
+    /// Retained records, oldest first.
+    public var records: [CBv2MTPRoundAuditRecord] {
+        guard head > 0 else { return storage }
+        return Array(storage[head...]) + Array(storage[..<head])
     }
 }

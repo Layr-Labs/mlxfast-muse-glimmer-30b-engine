@@ -104,12 +104,14 @@ fork is trusted.
 One change sits on top of the cut, in the MTP path. It is **record-only**: it
 stores numbers the round driver already computes at its finalize boundary and
 changes neither the tokens a window emits, their order, the work inside a round,
-nor any default. Retention is bounded at 8192 records, oldest dropped first.
+nor any default. Retention is a ring of 8192 records: a full ring overwrites its
+oldest entry in constant time and counts the evictions, so a reader can tell a
+full log (nothing lost) from a truncated one.
 
 | File | Added | Removed | What |
 |---|---|---|---|
-| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/MTPContractsV2.swift` | 22 | 0 | one per-round record type, and the metrics array that holds it |
-| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/CBv2MTPRoundDriver.swift` | 10 | 1 | `recordRound` accepts the record and appends it under the lock it already takes |
+| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/MTPContractsV2.swift` | 66 | 0 | one per-round record type, the bounded log that holds it, and one counter for the engine steps that seeded a row |
+| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/CBv2MTPRoundDriver.swift` | 8 | 1 | `recordRound` accepts the record and appends it to the log under the lock it already takes; `recordSeedSteps` also counts the STEP |
 | `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/EngineLoopV2+MTPFinalize.swift` | 5 | 1 | the finalize boundary passes `(requestID, drafted, accepted, committed)` |
 
 Each changed block carries the comment line
