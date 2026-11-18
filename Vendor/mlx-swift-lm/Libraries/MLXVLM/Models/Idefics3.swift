@@ -651,7 +651,9 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         self._connector.wrappedValue = Idefics3Connector(config)
     }
 
-    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?) -> MLXArray {
+    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?) throws
+        -> MLXArray
+    {
         if pixelValues == nil {
             guard let inputIds = inputIds else {
                 fatalError("inputIds required if no pixelValues")
@@ -674,7 +676,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
             pooler_output.asType(inputs_embeds.dtype)
         )
 
-        let final = prepareInputsForMultimodal(
+        let final = try prepareInputsForMultimodal(
             imageFeatures: image_features,
             inputs_embeds: inputs_embeds,
             inputIds: inputIds
@@ -685,7 +687,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     // inputs_merger
     private func prepareInputsForMultimodal(
         imageFeatures: MLXArray, inputs_embeds: MLXArray, inputIds: MLXArray
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         // Assumes bs == 1
         // inputIds shape: (1, seq_len)
         // asArray(Int.self) -> [[Int]], take [0] to get [Int]
@@ -703,6 +705,18 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
 
         let chunkSize = imageFeatures.dim(1)  // 64
         let chunkCount = imagePositions.count / chunkSize  // Should be imageFeatures.dim(0)
+
+        // Each image must have one image token per feature. Another count
+        // reads the features of an image that does not exist, or drops
+        // features. mlx-vlm `_prepare_inputs_for_multimodal` raises the same
+        // error.
+        let imageCount = imageFeatures.dim(0)
+        guard imagePositions.count == imageCount * chunkSize else {
+            throw VLMError.processing(
+                "Idefics3: the prompt has \(imagePositions.count) image tokens, but "
+                    + "\(imageCount) images x \(chunkSize) features per image need "
+                    + "\(imageCount * chunkSize). Set image_seq_len to \(chunkSize).")
+        }
         let chunks = (0 ..< chunkCount).map { startIndex in
             let start = startIndex * chunkSize
             let end = start + chunkSize
@@ -729,39 +743,33 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         return finalEmbeds.expandedDimensions(axis: 0)
     }
 
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
-        let inputIds = input.text.tokens
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 { inputIds = inputIds.expandedDimensions(axis: 0) }
         let pixelValues = input.image?.pixels
-        var embeddings = getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues
         )
 
-        // Prefill the merged image+text embeddings in windowSize-sized chunks,
-        // matching mlx-vlm (and `LLMModel.prepare`'s token chunking): evaluate
-        // the KV cache between chunks, leaving the last embedding for the logits.
-        let prefillStepSize = windowSize ?? 512
+        // Prefill the merged image+text embeddings in chunks, matching mlx-vlm
+        // (and `LLMModel.prepare`'s token chunking): evaluate the KV cache
+        // between chunks, leaving the last embedding for the logits.
         let totalTokens = embeddings.dim(1)
-
-        var processed = 0
-        while embeddings.dim(1) > 1 {
-            let nToProcess = min(prefillStepSize, embeddings.dim(1) - 1)
-            let chunk = embeddings[0..., ..<nToProcess]
-            _ = languageModel(nil, cache: cache, inputs_embeds: chunk)
+        let processed = try prefill.forEachChunk(total: totalTokens) { range in
+            _ = languageModel(nil, cache: cache, inputs_embeds: embeddings[0..., range])
             eval(cache)
-            embeddings = embeddings[0..., nToProcess...]
-            processed += nToProcess
         }
 
-        // The prefix is now in the KV cache; the final embedding yields the
+        // The prefix is now in the KV cache; the final embedding(s) yield the
         // first-token logits.
-        precondition(
-            processed == totalTokens - 1,
-            "Idefics3 chunked prefill: expected one residual embedding, processed "
-                + "\(processed) of \(totalTokens)")
-        let result = languageModel(nil, cache: cache, inputs_embeds: embeddings)
+        let result = languageModel(
+            nil, cache: cache, inputs_embeds: embeddings[0..., processed...])
+        prefill.progress?(totalTokens, totalTokens)
         return .logits(result)
     }
 
@@ -771,6 +779,9 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
+
         // Rename keys to match Python logic
         var renamed = [String: MLXArray]()
         for (k, v) in weights {
@@ -874,12 +885,23 @@ public struct Idefics3Processor: UserInputProcessor {
             guard input.images.count == 1 else {
                 throw VLMError.singleImageAllowed
             }
+            let imageSequenceLength = config.imageSequenceLength ?? 169
+            guard imageSequenceLength > 0 else {
+                throw VLMError.processing(
+                    "image_seq_len must be positive: \(imageSequenceLength)")
+            }
 
             // Encode only the text part of the prompt, without <image>
             var promptTokens = tokenizer.encode(text: prompt)
 
+            // One image token per image feature: `image_seq_len` tokens, as
+            // in mlx-vlm and transformers. The default 169 is the fixed
+            // default of mlx-vlm and transformers, used when no config file
+            // has `image_seq_len`; the model throws when the count is wrong.
             let imageTokenIndex = promptTokens.count / 2
-            promptTokens.insert(imageTokenId, at: imageTokenIndex)
+            let imageTokens = Array(
+                repeating: imageTokenId, count: imageSequenceLength)
+            promptTokens.insert(contentsOf: imageTokens, at: imageTokenIndex)
 
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)

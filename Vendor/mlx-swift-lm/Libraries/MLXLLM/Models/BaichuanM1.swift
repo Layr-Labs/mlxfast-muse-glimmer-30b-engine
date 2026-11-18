@@ -130,8 +130,9 @@ class BaichuanM1Attention: Module {
         keys = customConvolution(keys, convK, state: lastK)
         values = customConvolution(values, convV, state: lastV)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: kvSubCache)
-        keys = applyRotaryPosition(rope, to: keys, cache: kvSubCache)
+        let offset = kvSubCache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         if let cache = cache as? CacheList {
             let kvCache = cache[1]
@@ -214,15 +215,27 @@ public class BaichuanM1ModelInner: Module {
         norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
-    func callAsFunction(
-        _ inputs: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        cache: [KVCache]?
-    ) -> MLXArray {
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var x = embedTokens(inputs)
 
-        let mask = mask ?? createAttentionMask(h: x, cache: cache?.first)
+        // The KV cache of layer `index`: the second cache of its CacheList.
+        func kvCache(_ index: Int?) -> KVCache? {
+            guard let index, let cache, index < cache.count else { return nil }
+            return (cache[index] as? CacheList)?[1]
+        }
+
+        // The sliding-window layers get a mask with the window, so that a
+        // prompt attends to the same tokens as the decode steps with the
+        // RotatingKVCache (mlx-lm baichuan_m1.py).
+        let windowLayers = Set(args.slidingWindowLayers)
+        let globalMask = createAttentionMask(
+            h: x, cache: kvCache(layers.indices.first { !windowLayers.contains($0) }))
+        let windowMask = createAttentionMask(
+            h: x, cache: kvCache(layers.indices.first { windowLayers.contains($0) }),
+            windowSize: args.slidingWindow)
 
         for (i, layer) in layers.enumerated() {
+            let mask = windowLayers.contains(i) ? windowMask : globalMask
             x = layer(x, mask: mask, cache: cache?[i])
         }
 
@@ -252,21 +265,43 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var outputs = model(inputs, cache: cache)
+        let outputs = model(inputs, cache: cache)
 
         if let lmHead {
-            outputs = lmHead(outputs)
+            return lmHead(outputs)
         }
-
-        return outputs
+        // With tied embeddings there is no lm_head. The embedding matrix is
+        // the head. The original model always L2-normalizes the head rows
+        // (NormHead), and `sanitize(weights:)` does the same for an untied
+        // lm_head, so the embedding rows are normalized here with the same
+        // formula. mlx-lm baichuan_m1.py has no tied path.
+        return matmul(outputs, tiedHeadWeight().T)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.enumerated().map { (i, _) in
+    /// The embedding matrix with each row divided by its L2 norm, as in
+    /// `sanitize(weights:)`. A quantized embedding is dequantized first.
+    func tiedHeadWeight() -> MLXArray {
+        var w: MLXArray
+        if let quantized = model.embedTokens as? QuantizedEmbedding {
+            w = dequantized(
+                quantized.weight, scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        } else {
+            w = model.embedTokens.weight
+        }
+        w = w.asType(.float32)
+        let norm = sqrt(sum(w * w, axes: [-1], keepDims: true))
+        return w / (norm + 1e-7)
+    }
+
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try model.layers.enumerated().map { (i, _) in
             let isSWA = configuration.slidingWindowLayers.contains(i)
             let convCache = MambaCache()
-            let kvCache: KVCache =
-                isSWA ? RotatingKVCache(maxSize: configuration.slidingWindow) : KVCacheSimple()
+            let kvCache = try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: configuration.slidingWindow,
+                usesSlidingWindow: isSWA)
             return CacheList(convCache, kvCache)
         }
     }
@@ -286,9 +321,8 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
             weights["lm_head.weight"] = w
         }
 
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
     }

@@ -37,10 +37,11 @@ struct CBv2MTPStepMeasurement {
     var workloadGeneration: UInt64? = nil
 
     func excludingAssistantPrefill(_ includesPrefill: Bool) -> Self {
-        .init(decision: decision, actualDepth: actualDepth,
-              costEligible: costEligible && !includesPrefill,
-              chained: chained, seedOnly: seedOnly,
-              workloadGeneration: workloadGeneration)
+        .init(
+            decision: decision, actualDepth: actualDepth,
+            costEligible: costEligible && !includesPrefill,
+            chained: chained, seedOnly: seedOnly,
+            workloadGeneration: workloadGeneration)
     }
 }
 
@@ -66,7 +67,8 @@ final class CBv2MTPDepthController {
                 ewmaNanos = sample
             } else {
                 let limit = SelfLimit.fraction * ewmaNanos
-                let innovation = clampInnovation
+                let innovation =
+                    clampInnovation
                     ? min(max(sample - ewmaNanos, -limit), limit) : sample - ewmaNanos
                 ewmaNanos += CBv2MTPDepthController.costAlpha * innovation
             }
@@ -167,6 +169,8 @@ final class CBv2MTPDepthController {
 
     let maxDepth: Int
     let fixedDepth: Int?
+    /// Fixed depth by planned decode rows (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`).
+    let fixedDepthByDecodeRows: [Int]?
     let usesCommittedDecodeBaseline: Bool
     private var buckets: [Int: BucketState] = [:]
     private struct VerificationShape: Hashable {
@@ -179,17 +183,18 @@ final class CBv2MTPDepthController {
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
 
-    /// `ceiling` is the decoder's own depth ceiling, which the configuration
-    /// has already clamped `maxDepth` to. It is a parameter rather than the
-    /// chain constant because a block decoder's ceiling is larger; clamping
-    /// here to the chain constant would undo that silently.
     init(
-        maxDepth: Int, fixedDepth: Int?, useCommittedDecodeBaseline: Bool = false,
-        ceiling: Int = CBv2MTPConfig.testedMaxDraftTokens
+        maxDepth: Int, fixedDepth: Int?, fixedDepthByDecodeRows: [Int]? = nil,
+        useCommittedDecodeBaseline: Bool = false
     ) {
-        let resolvedMax = min(max(maxDepth, 0), max(ceiling, 0))
+        let resolvedMax = min(max(maxDepth, 0), CBv2MTPConfig.testedMaxDraftTokens)
         self.maxDepth = resolvedMax
         self.fixedDepth = fixedDepth.map { min(max($0, 0), resolvedMax) }
+        // Only a fixed depth takes a width table; an empty table is none.
+        let table =
+            fixedDepth == nil || fixedDepthByDecodeRows?.isEmpty != false
+            ? nil : fixedDepthByDecodeRows
+        self.fixedDepthByDecodeRows = table.map { $0.map { min(max($0, 0), resolvedMax) } }
         self.usesCommittedDecodeBaseline = useCommittedDecodeBaseline && fixedDepth == nil
     }
 
@@ -259,7 +264,8 @@ final class CBv2MTPDepthController {
             return false
         }
         var state = buckets[decision.decodeRowBucket] ?? BucketState()
-        var window = state.committedWindow
+        var window =
+            state.committedWindow
             ?? CBv2MTPCommittedWindow(decision: decision, rowCount: rowCount)
         guard window.decision.depth == decision.depth, window.rowCount == rowCount else {
             state.committedWindow = nil
@@ -269,7 +275,8 @@ final class CBv2MTPDepthController {
         // Buckets group costs, but Metal verifies the exact physical row count.
         // Three and four rows share a bucket without sharing their first compile.
         let warmup = warmedVerificationShapes.insert(
-            VerificationShape(rowCount: rowCount, depth: decision.depth)).inserted
+            VerificationShape(rowCount: rowCount, depth: decision.depth)
+        ).inserted
         window.observe(
             wallTimeNanos: wallTimeNanos, committedTokens: committedTokens, warmup: warmup)
         guard window.isComplete else {
@@ -433,10 +440,13 @@ final class CBv2MTPDepthController {
                 mutate: mutate)
         }
         if let fixedDepth {
+            let depth = fixedDepthByDecodeRows.map { table in
+                min(fixedDepth, table[min(plannedDecodeRows, table.count) - 1])
+            }
             return finish(
                 CBv2MTPDepthDecision(
-                    depth: fixedDepth, decodeRowBucket: bucket, reason: "fixed",
-                    isExploration: false),
+                    depth: depth ?? fixedDepth, decodeRowBucket: bucket,
+                    reason: depth == nil ? "fixed" : "fixed_by_rows", isExploration: false),
                 mutate: mutate)
         }
 
@@ -547,7 +557,9 @@ final class CBv2MTPDepthController {
         {
             return tokens / cost.ewmaNanos
         }
-        guard let cost = effectiveCost(depth: depth, state: state), cost.ewmaNanos > 0 else { return 0 }
+        guard let cost = effectiveCost(depth: depth, state: state), cost.ewmaNanos > 0 else {
+            return 0
+        }
         return state.acceptance.expectedCommitted(depth: depth) / cost.ewmaNanos
     }
 
@@ -562,11 +574,6 @@ final class CBv2MTPDepthController {
 /// Request-owned conditional acceptance estimates for the stateful MTP marginal
 /// depth policy. Hardware cost observations deliberately do not live here.
 struct CBv2MTPRequestAcceptanceState: Equatable {
-    /// Positions the marginal policy keeps an acceptance estimate for, and
-    /// so the deepest chain it can ever select. The round driver clamps a
-    /// request-stateful recurrent drafter's `maxDraftTokens` to this, so it
-    /// must reach the deepest served depth (Qwen4Exp: 6, Nemotron 3.5: 7)
-    /// or the manifest would promise a depth the engine silently clamps.
     /// Bounded by each drafter's qualified captured-window contract.
     static let maximumDepth = 7
     private static let alpha = 0.15

@@ -15,10 +15,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
 import MLXLMCommon
 import MLXNN
 import Testing
+
+@_spi(GemmaEncoder) @testable import MLXLLM
 
 // MARK: - Mocks
 
@@ -199,11 +200,11 @@ private final class CBv2ModelMockLayerCache: CBv2AttendingLayerCache, KVCache {
 
     var state: [MLXArray] {
         get { [] }
-        set { }
+        set {}
     }
     var metaState: [String] {
         get { [] }
-        set { }
+        set {}
     }
     var isTrimmable: Bool { false }
 
@@ -347,7 +348,7 @@ struct CBv2ModelLayerKindTests {
             Gemma4TextConfiguration.self, from: Data(json.utf8))
         let model = Gemma4TextModel(config)
 
-        let sources = Gemma4CBv2LayerKindDerivation.sharedKVSources(
+        let sources = CBv2LayerKindDerivation.gemma4SharedKVSources(
             layerTypes: config.layerTypes, numKvSharedLayers: config.numKvSharedLayers)
         #expect(sources.count == model.model.previousKvs.count)
         for (j, prev) in model.model.previousKvs.enumerated() {
@@ -375,7 +376,7 @@ struct CBv2ModelLayerKindTests {
     }
 
     @Test func gemma4KeqVWithoutGlobalHeadsFallsBack() {
-        let kinds = Gemma4CBv2LayerKindDerivation.layerKinds(
+        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
             layerTypes: ["sliding_attention", "full_attention"],
             slidingWindow: 512,
             numKvSharedLayers: 0,
@@ -389,8 +390,24 @@ struct CBv2ModelLayerKindTests {
         #expect(kinds[1].kvHeads == 4)
     }
 
+    @Test func gemma4LegacyLayerKindOverloadRemainsSourceCompatible() {
+        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
+            layerTypes: ["sliding_attention", "full_attention"],
+            slidingWindow: 512,
+            numKvSharedLayers: 0,
+            headDim: 256,
+            globalHeadDim: 512,
+            numAttentionHeads: 8,
+            numKeyValueHeads: 4,
+            numGlobalKeyValueHeads: 2,
+            attentionKeqV: false)
+
+        #expect(kinds[1].kvHeads == 2)
+        #expect(kinds.allSatisfy { !$0.isBidirectional })
+    }
+
     @Test func gemma4NoSharedLayers() {
-        let sources = Gemma4CBv2LayerKindDerivation.sharedKVSources(
+        let sources = CBv2LayerKindDerivation.gemma4SharedKVSources(
             layerTypes: CBv2LayerKindDerivation.layerTypes(
                 slidingWindowPattern: 5, numLayers: 10),
             numKvSharedLayers: 0)
@@ -435,7 +452,7 @@ struct CBv2ModelLayerKindTests {
     }
 
     @Test func gptossExplicitLayerTypesRespected() {
-        let kinds = GPTOSSCBv2LayerKindDerivation.layerKinds(
+        let kinds = CBv2LayerKindDerivation.gptossLayerKinds(
             layerTypes: ["full_attention", "full_attention", "sliding_attention"],
             numHiddenLayers: 3,
             slidingWindow: 128,
@@ -891,7 +908,8 @@ struct CBv2Gemma4ScheduledPrefillTests {
         #expect(scheduled.shape == [1, 64])
         #expect(
             submissionCount() == expectedSubmissionCount,
-            "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count")
+            "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count"
+        )
 
         let ordinaryCaches: [KVCache] = try caches(for: model)
         let ordinary = model(inputs, cache: ordinaryCaches)
@@ -920,7 +938,6 @@ struct CBv2Gemma4ScheduledPrefillTests {
         #expect(submissionCount() == 0, "MTP verification must not use scheduled prefill")
     }
 }
-
 
 // MARK: - GPT-OSS forward smoke tests (v2 branch)
 
@@ -1094,7 +1111,7 @@ struct CBv2ModelGPTOSSForwardTests {
         // (Standard for full, Rotating for sliding) and the forward works.
         let model = GPTOSSModel(try tinyConfig())
         eval(model)
-        let caches = model.newCache(parameters: nil)
+        let caches = try model.newCache(parameters: nil)
         #expect(caches.count == 4)
         #expect(caches[0] is RotatingKVCache)
         #expect(caches[1] is StandardKVCache)

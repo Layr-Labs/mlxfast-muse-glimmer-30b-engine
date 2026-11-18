@@ -51,40 +51,85 @@ enum PagedSegmentTransfers {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
-    private static func kernel(reading: Bool, dtype: DType) -> MLXFast.MLXFastKernel {
-        let key = "cbv2_segment_\(reading ? "read" : "write")_\(dtype)"
+    private static func kernel(
+        reading: Bool, dtype: DType,
+        quantization: PagedKVQuantizationConfig? = nil
+    ) -> MLXFast.MLXFastKernel {
+        let key =
+            "cbv2_segment_\(reading ? "read" : "write")_\(dtype)"
+            + (quantization.map {
+                "_k\($0.keyBits)v\($0.valueBits)g\($0.groupSize)r\($0.rotationBlockSize)"
+            } ?? "")
         return lock.withLock {
             if let existing = kernels[key] { return existing }
             let made = MLXFast.metalKernel(
                 name: key,
-                inputNames: reading
+                inputNames: (reading
                     ? ["storage", "records", "output", "previous"]
-                    : ["keys", "values", "storage", "records", "previous"],
-                outputNames: ["fence"], source: reading ? readBody : writeBody,
-                ensureRowContiguous: true,
+                    : ["keys", "values", "storage", "records", "previous"])
+                    + (quantization == nil ? [] : ["value_base"]),
+                outputNames: ["fence"],
+                source: quantization == nil
+                    ? (reading ? readBody : writeBody)
+                    : (reading
+                        ? PagedQuantizedTransfers.readBody : PagedQuantizedTransfers.writeBody),
+                header: quantization == nil ? "" : PagedQuantizedMetal.header,
+                ensureRowContiguous: quantization == nil,
                 mutableInputs: [reading ? "output" : "storage"])
             kernels[key] = made
             return made
         }
     }
 
-    private static func records(_ triples: [Int32]) -> MLXArray {
+    static func records(_ triples: [Int32]) -> MLXArray {
         precondition(triples.count % 3 == 0)
         return MLXArray(triples + Array(repeating: 0, count: max(0, 24 - triples.count)))
     }
 
+    /// Runtime byte metadata follows the transfer fence's input ownership.
+    /// Allocation length must never become a packed shader specialization.
+    static func quantizedValueBase(_ segment: PagedKVSegment) -> MLXArray {
+        precondition(segment.valueOffset >= 0 && segment.valueOffset <= segment.storage.nbytes)
+        return MLXArray([Int64(segment.valueOffset)])
+    }
+
     /// Each record is (input/output token index, local page, slot).
-    private static func buckets(group: PagedKVGroup, slots: [Int32]) -> [(PagedKVSegment, [Int32])] {
+    /// Pages are resolved once per page, not once per token, and records are
+    /// appended in place: a whole-history gather at a 30K context used to
+    /// allocate a temporary array per token, on every layer of every prompt
+    /// chunk. Same records, same order (ascending tokens within a segment).
+    static func buckets(group: PagedKVGroup, slots: [Int32]) -> [(PagedKVSegment, [Int32])] {
         let layout = group.segmentLayout!
+        let pageSize = Int32(group.pageSize)
         var records: [Int: [Int32]] = [:]
+        var run: [Int32] = []
+        run.reserveCapacity(slots.count * 3)
+        var index = -1
+        var local: Int32 = 0
+        var lastPage: Int32 = -1
+        func flush() {
+            guard index >= 0, !run.isEmpty else { return }
+            records[index, default: []].append(contentsOf: run)
+            run.removeAll(keepingCapacity: true)
+        }
         for (token, position) in slots.enumerated() {
             precondition(position >= 0)
-            let page = position / Int32(group.pageSize)
-            precondition(group.isAllocatable(page))
-            let index = layout.segmentIndex(page: page)
-            records[index, default: []].append(contentsOf: [
-                Int32(token), Int32(layout.localPage(page)), position % Int32(group.pageSize)])
+            let page = position / pageSize
+            if page != lastPage {
+                precondition(group.isAllocatable(page))
+                let next = layout.segmentIndex(page: page)
+                if next != index {
+                    flush()
+                    index = next
+                }
+                local = Int32(layout.localPage(page))
+                lastPage = page
+            }
+            run.append(Int32(token))
+            run.append(local)
+            run.append(position % pageSize)
         }
+        flush()
         return records.keys.sorted().map { index in
             guard let segment = group.segments[index] else {
                 preconditionFailure("transfer names an uncommitted segment")
@@ -93,27 +138,59 @@ enum PagedSegmentTransfers {
         }
     }
 
+    private static func quantizationTemplate(_ group: PagedKVGroup) -> [(
+        String, any KernelTemplateArg
+    )] {
+        guard let q = group.key.quantization else { return [] }
+        return [
+            ("G", q.groupSize), ("KB", q.keyBits), ("VB", q.valueBits),
+            ("R", q.resolvedRotationBlockSize(headDim: group.key.headDim)),
+        ]
+    }
+
     static func write(group: PagedKVGroup, slots: [Int32], keys: MLXArray, values: MLXArray) {
-        guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype) else { return }
+        guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype)
+        else { return }
+        guard
+            group.writeValidation.validateShape(
+                keys: keys, values: values, group: group.key,
+                rank: 3, batch: nil, tokens: slots.count)
+        else { return }
+        if group.key.isAsymmetric {
+            PagedAsymmetricTransfers.writeSegmented(
+                group: group, slots: slots, keys: keys, values: values)
+            return
+        }
         precondition(keys.shape == [group.key.kvHeads, slots.count, group.key.headDim])
         precondition(values.shape == keys.shape)
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            group.writeFence = kernel(reading: false, dtype: group.dtype)(
-                [k, v, segment.storage, records(triples), group.writeFence],
-                template: [("T", group.dtype), ("H", group.key.kvHeads),
-                           ("D", group.key.headDim), ("S", group.pageSize),
-                           ("VBASE", segment.valueOffset)],
-                grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                threadGroup: (min(256, group.key.headDim), 1, 1),
-                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
+            group.writeFence =
+                kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
+                    [k, v, segment.storage, records(triples), group.writeFence] + offset,
+                    template: [
+                        ("T", group.dtype), ("H", group.key.kvHeads),
+                        ("D", group.key.headDim), ("S", group.pageSize),
+                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
+                        + quantizationTemplate(group),
+                    grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
+                    threadGroup: (
+                        group.key.quantization == nil
+                            ? min(256, group.key.headDim) : group.key.headDim, 1, 1
+                    ),
+                    outputShapes: [[1]], outputDTypes: [.int32])[0]
         }
     }
 
     static func gather(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int)
         -> (keys: MLXArray, values: MLXArray)
     {
+        if group.key.isAsymmetric {
+            return PagedAsymmetricTransfers.gatherSegmented(
+                group: group, pages: pages, firstSlot: firstSlot, count: count)
+        }
         let ordered = gatherCombined(group: group, pages: pages, firstSlot: firstSlot, count: count)
         return (ordered[0], ordered[1])
     }
@@ -123,9 +200,14 @@ enum PagedSegmentTransfers {
     /// before calling and keeps its charge until the captured owner retires.
     /// `publishReadFence: false` requires the owning engine step to block all
     /// successor writes until the private read has completed or drained.
-    static func gatherCombined(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
-                               publishReadFence: Bool = true, stream: StreamOrDevice = .default) -> MLXArray {
-        let h = group.key.kvHeads, d = group.key.headDim
+    static func gatherCombined(
+        group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
+        publishReadFence: Bool = true, stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        precondition(
+            !group.key.isAsymmetric, "legacy combined gather cannot represent asymmetric roles")
+        let h = group.key.kvHeads
+        let d = group.key.headDim
         guard count > 0 else {
             return MLXArray.zeros([2, 1, h, 0, d], dtype: group.dtype, stream: stream)
         }
@@ -139,16 +221,23 @@ enum PagedSegmentTransfers {
         let output = MLXArray.zeros([2, 1, h, count, d], dtype: group.dtype, stream: stream)
         var fence = group.writeFence
         for (segment, triples) in buckets(group: group, slots: slots) {
-            fence = kernel(reading: true, dtype: group.dtype)(
-                [segment.storage, records(triples), output, fence],
-                template: [("T", group.dtype), ("H", h), ("D", d),
-                           ("S", group.pageSize), ("VBASE", segment.valueOffset)],
-                grid: (d, h, triples.count / 3), threadGroup: (min(256, d), 1, 1),
-                outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
+            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
+            fence =
+                kernel(reading: true, dtype: group.dtype, quantization: group.key.quantization)(
+                    [segment.storage, records(triples), output, fence] + offset,
+                    template: [
+                        ("T", group.dtype), ("H", h), ("D", d),
+                        ("S", group.pageSize),
+                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
+                        + quantizationTemplate(group),
+                    grid: (d, h, triples.count / 3),
+                    threadGroup: (group.key.quantization == nil ? min(256, d) : d, 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         }
-        fence = completionKernel(
-            [fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
+        fence =
+            completionKernel(
+                [fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         // Keep the final destination; no second whole-gather allocation.
         if publishReadFence { group.writeFence = fence }
         // MLX Depends inherits its input primitive stream (ops.cpp); host

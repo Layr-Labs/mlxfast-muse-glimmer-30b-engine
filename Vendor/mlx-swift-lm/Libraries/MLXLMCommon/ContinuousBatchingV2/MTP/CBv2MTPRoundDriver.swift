@@ -16,6 +16,31 @@
 import Foundation
 import MLX
 
+/// Explicit attention-only opt-in: while native request-stateful text MTP is
+/// installed, media rows can use this SAME target's ordinary causal path. This
+/// does not qualify media drafting or change other models' cohort policy.
+public protocol CBv2MTPRequestScopedMediaFallback:
+    CBv2MultimodalSteppableModel, CBv2MTPSteppableModel
+{}
+
+/// Recurrent counterpart of `CBv2MTPRequestScopedMediaFallback` for a target
+/// served through `CBv2SteppableLanguageModelAdapter`. Media requests run this
+/// same target's ordinary recurrent token and embedding forwards for their
+/// whole lifetime: they never draft, verify, carry or own assistant state,
+/// while text requests keep speculating. A decode step with both kinds of rows
+/// splits them into two groups; the result is exact only because the target's
+/// decode is row-exact (no row depends on the other rows of its forward), so
+/// adopt this only on such a target. It does not qualify media drafting.
+public protocol CBv2RecurrentMTPRequestScopedMediaFallback:
+    CBv2RecurrentMTPForwardable, CBv2PositionedRecurrentEmbeddingForwardable
+{}
+
+/// Steppable view of `CBv2RecurrentMTPRequestScopedMediaFallback`, answered
+/// at runtime by adapters over arbitrary language models.
+protocol CBv2RecurrentMTPRequestScopedMediaFallbackProviding: CBv2RecurrentMTPSteppableModel {
+    var supportsRecurrentRequestScopedMediaFallback: Bool { get }
+}
+
 // MARK: - Drafter carry
 
 /// One row's drafter carry: the newest confirmed-but-unfed token (the round
@@ -50,6 +75,17 @@ struct CBv2MTPCarry {
     let kvOffset: Int
 }
 
+/// Scalar-only observation of an actual stored carry. No arrays, state owners
+/// or replacement values escape through this test seam.
+struct CBv2MTPCarryObservationForTesting {
+    let id: CBv2RequestID
+    let token: Int
+    let previousTopTwoMargin: Double?
+    let tokensCount: Int
+    let kvOffset: Int
+    let hiddenShape: [Int]
+}
+
 // MARK: - In-flight round payload
 
 /// MTP payload riding a `CBv2InFlightStep`. Its presence marks the step as
@@ -71,6 +107,7 @@ final class CBv2MTPRoundInFlight {
         /// driver for the duration of this in-flight round. This fences its
         /// release behind target/assistant evaluation on cancellation.
         let assistantState: (any CBv2MTPRequestState)?
+        var freeSpan: CBv2MTPFreeSpan? = nil
     }
 
     struct CommittedObservationRow {
@@ -85,9 +122,12 @@ final class CBv2MTPRoundInFlight {
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million.
-        /// One `asArray` at finalize reads everything, preserving the single
+        /// [B, 1+k] target argmaxes (`CBv2NonFiniteLogits.invalidTarget`
+        /// where that position's target logits were non-finite), then — iff
+        /// `shortlistIDs` is non-nil — all [B, 1+k] shortlist probability
+        /// masses in parts-per-million, then — iff `hasAcceptMask` — all
+        /// [B, k] typical-acceptance decisions (1 = keep the draft). One
+        /// `asArray` at finalize reads everything, preserving the single
         /// host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
@@ -96,6 +136,9 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Raw target window retained only when a row has a grammar. Its
+        /// committed prefix is sampled with the ordinary sampler at finalize.
+        var constraintLogits: MLXArray? = nil
         /// Lazy [B, 1+k, K] int32 target top-K ids per verify position, for
         /// shortlisted drafting next round. nil when the drafter did not opt
         /// in or verification ran on the serial oracle.
@@ -107,29 +150,41 @@ final class CBv2MTPRoundInFlight {
         /// IDs feed greedy scoring on device; values are read only after the
         /// existing acceptance-packet fence.
         let policyTopTwoValues: MLXArray?
-        /// Lazy `[B, 1+k, taps * H]` fused tapped context the target produced
-        /// for this verify window. A BLOCK drafter's next block reads columns
-        /// `0..<confirmed` of it; nil for every chain drafter.
-        let blockContext: MLXArray?
+        /// True when the packet ends with the [B, k] typical-acceptance mask
+        /// (`CBv2MTPAcceptance.typical` on a target-prefix batch). Finalize
+        /// then walks the mask instead of comparing drafts to targets.
+        let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).
     let verify: Verify?
-    /// Seed rows: (request, row index into the step's decode batch). Their
+    /// Seed rows: (request, row index into seedHidden/seedPolicyTopTwoValues).
+    /// The opt-in media fallback compacts these to REAL hidden-producing text
+    /// rows; ordinary legacy cohorts retain their original decode indices. Their
     /// bonus token rides the step's normal `sampledTokens`; the carry hidden
     /// is sliced from `seedHidden` at finalize.
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
-    /// Lazy [B_decode, 1, H] pre-norm hidden of the step's decode batch
+    /// Lazy [B_hidden, 1, H] native target hidden (MiMo: post-final-norm).
     /// (non-nil iff `seedRows` is non-empty).
     let seedHidden: MLXArray?
-    /// Lazy float32 [B_decode, 1, 2] policy values for adaptive seed and
+    /// Lazy float32 [B_hidden, 1, 2] policy values for adaptive seed and
     /// temporary depth-zero carries.
     let seedPolicyTopTwoValues: MLXArray?
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
+    /// Those observations' token and hidden arrays (and carries), all
+    /// evaluated with this step.
+    let committedObservationArrays: [MLXArray]
+    /// Final prompt chunks whose last pre-norm hidden row [1, 1, H] becomes
+    /// the request's first carry once its first token is confirmed.
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
+    /// Lazy float32 [N, 1, 2] policy values for `prefillCarries`, in order;
+    /// nil when no prefill carry is expected to speculate next.
+    let prefillCarryTopTwoValues: MLXArray?
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -147,13 +202,19 @@ final class CBv2MTPRoundInFlight {
         seedRows: [(id: CBv2RequestID, decodeIndex: Int)],
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
-        committedObservationRows: [CommittedObservationRow]
+        committedObservationRows: [CommittedObservationRow],
+        committedObservationArrays: [MLXArray],
+        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)],
+        prefillCarryTopTwoValues: MLXArray?
     ) {
         self.verify = verify
         self.seedRows = seedRows
         self.seedHidden = seedHidden
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
+        self.committedObservationArrays = committedObservationArrays
+        self.prefillCarries = prefillCarries
+        self.prefillCarryTopTwoValues = prefillCarryTopTwoValues
     }
 }
 
@@ -225,10 +286,22 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers?
+    /// Media requests run target-only beside speculating text. Fixed by the
+    /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
+    let supportsRequestScopedMediaFallback: Bool
+    /// Any MTP-ineligible row (stop strings, penalties, logit bias, logprobs)
+    /// decodes one ordinary target token per step beside speculating rows
+    /// instead of keeping every row target-only. Only the recurrent fallback
+    /// qualifies: its decode is row-exact, so the mixed step changes no row.
+    let ineligibleRowsDecodeBesideSpeculation: Bool
     /// True when acceptance may use target-prefix pre-sampling (drafter
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
     let targetPrefixAcceptance: Bool
+    /// The stateful drafter opted into ordinary-decode history without the
+    /// committed-observation fence, and the target exposes the recurrent
+    /// hidden-returning decode seam. Fixed at build.
+    private let supportsOrdinaryDecodeHistory: Bool
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -241,6 +314,10 @@ final class CBv2MTPRoundDriver {
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
     private var assistantStates: [CBv2RequestID: any CBv2MTPRequestState] = [:]
+    var admittedMTPBindingIssuer: CBv2MTPAdmissionIssuer?
+    /// Immutable request-lifetime exclusion, not the lifetime of evaluated
+    /// feature arrays. Kept through preemption; cleared at actual finish.
+    private var targetOnlyMediaRequests: Set<CBv2RequestID> = []
     /// Qwen acceptance is request-owned; raw nonchained wall cost is shared
     /// only within a compatible decode-row bucket.
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
@@ -267,10 +344,19 @@ final class CBv2MTPRoundDriver {
     private var metrics = CBv2MTPMetrics()
 
     private var pendingSeedCosts = CBv2MTPSeedCostLedger()
+    /// Install on the engine queue before submitting requests. Called only
+    /// after the real carry assignment; never performs an evaluation itself.
+    var carryStoredObserverForTesting: ((CBv2MTPCarryObservationForTesting) -> Void)?
+    /// Numeric-test-only, never lifecycle/residency/timing evidence. A test may
+    /// retain at most one genuine seed carry view and compare it AFTER engine
+    /// drain. The callback must not eval/read back/copy arrays or mutate state.
+    /// Nil in ordinary tests and production; no parameter/eligibility override.
+    var carryHiddenObserverForTesting: ((CBv2RequestID, MLXArray) -> Void)?
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
-        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?
+        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?,
+        supportsOrdinaryDecodeChaining: Bool
     ) {
         var config = config
         if let required = drafter.requiredVerificationMode {
@@ -289,11 +375,7 @@ final class CBv2MTPRoundDriver {
         let requestStatefulRecurrent =
             drafter is any CBv2MTPRequestStatefulDrafter
             && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
-        // The marginal-policy bound is the ADAPTIVE controller's table size,
-        // not a verification limit. A block drafter runs at one fixed depth
-        // and never consults that table, so the bound does not apply to it —
-        // applying it would clamp a declared depth of 5...16 to 4.
-        if requestStatefulRecurrent, !(drafter is any CBv2MTPBlockDrafter) {
+        if requestStatefulRecurrent {
             config.maxDraftTokens = min(
                 config.maxDraftTokens, CBv2MTPMarginalDepthPolicy.maximumDepth)
             config.fixedDraftTokens = config.fixedDraftTokens.map {
@@ -321,16 +403,29 @@ final class CBv2MTPRoundDriver {
             }
         }
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
+        // Ordinary steps have no committed-observation fence (only MTP steps
+        // run `finishStatefulMTPEvaluation`); drafters needing one keep MTP steps.
+        let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
+        self.supportsOrdinaryDecodeHistory =
+            requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
+            && stateful?.requiresCommittedObservationFence == false
         self.config = config
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
+        let requestScopedFallback = Self.requestScopedMediaFallback(model: model, drafter: drafter)
+        self.supportsRequestScopedMediaFallback = requestScopedFallback
+        self.ineligibleRowsDecodeBesideSpeculation =
+            requestScopedFallback
+            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
-            useCommittedDecodeBaseline: drafter.supportsTargetPrefixAcceptance
-                && !(drafter is any CBv2MTPRequestStatefulDrafter),
-            ceiling: self.config.draftTokenCeiling)
+            fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,
+            useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
+                && drafter.supportsTargetPrefixAcceptance
+                && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
+        self.metrics.acceptance = self.config.acceptance
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
     }
 
@@ -340,23 +435,28 @@ final class CBv2MTPRoundDriver {
     static func build(
         model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?,
         config: CBv2MTPConfig,
-        supportsRectangularCacheBank: Bool = true
+        supportsRectangularCacheBank: Bool = true,
+        supportsOrdinaryDecodeChaining: Bool = true
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
+        guard !drafter.requiresExactAcceptance || config.acceptance == .exact else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
-        let recurrent =
-            (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
+        let recurrentTarget = model as? any CBv2RecurrentMTPSteppableModel
+        let recurrent = recurrentTarget?.recurrentStateSpec != nil
         let captureLayers = mtpModel.mtpCaptureLayers
-        guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
-            || (!stateful && !recurrent && captureLayers != nil)
+        guard
+            (stateful && mtpModel.supportsRequestStatefulMTP
+                && (recurrentTarget == nil || recurrent))
+                || (!stateful && !recurrent && captureLayers != nil)
         else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
             modelTarget == drafterTarget
         else { return nil }
         var config = config
-        let effectiveVerification = drafter.requiredVerificationMode
+        let effectiveVerification =
+            drafter.requiredVerificationMode
             ?? config.verificationMode
         if stateful, effectiveVerification != .serialTarget,
             !supportsRectangularCacheBank
@@ -366,7 +466,8 @@ final class CBv2MTPRoundDriver {
             config.maxAutomaticRectangularTokens = 0
         }
         let driver = CBv2MTPRoundDriver(
-            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
+            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers,
+            supportsOrdinaryDecodeChaining: supportsOrdinaryDecodeChaining)
         if driver.usesMarginalPolicy {
             guard mtpModel is any CBv2MTPPolicyTopTwoProviding else { return nil }
             if let availability =
@@ -418,8 +519,8 @@ final class CBv2MTPRoundDriver {
                 reason: "marginal_offer",
                 isExploration: false)
             : controllerDecision
-        planDecision = verificationLimitedDecision(
-            offered, plannedDecodeRows: plannedDecodeRows)
+        planDecision = adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
         guard plannedDecodeRows > 0 else { return }
         metricsLock.lock()
         metrics.selectedDepth = planDecision.depth
@@ -433,10 +534,42 @@ final class CBv2MTPRoundDriver {
     func previewDecision(
         plannedDecodeRows: Int, canSpeculate: Bool
     ) -> CBv2MTPDepthDecision {
-        verificationLimitedDecision(
-            depthController.preview(
-                plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
-            plannedDecodeRows: plannedDecodeRows)
+        adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(
+                depthController.preview(
+                    plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
+                plannedDecodeRows: plannedDecodeRows))
+    }
+
+    /// See `CBv2MTPConfig.allowsAdaptiveSerialRounds`.
+    var suppressesAdaptiveSerialRounds: Bool {
+        !config.allowsAdaptiveSerialRounds && config.verificationMode == .serialTarget
+            && config.fixedDraftTokens == nil
+    }
+
+    /// Set once by the engine before any request when the configured strategy
+    /// cannot run exactly (for example, native MiMo rectangular verification
+    /// without its admitted scalar-dense scratch). Every plan, fixed or
+    /// adaptive, then stays target-only; persistent history stays live.
+    private(set) var speculativeRoundsSuppression: String?
+
+    func suppressSpeculativeRounds(reason: String) {
+        speculativeRoundsSuppression = reason
+    }
+
+    private func adaptiveSerialLimitedDecision(
+        _ decision: CBv2MTPDepthDecision
+    ) -> CBv2MTPDepthDecision {
+        guard decision.depth > 0 else { return decision }
+        if let reason = speculativeRoundsSuppression {
+            return CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: decision.decodeRowBucket,
+                reason: reason, isExploration: false)
+        }
+        guard suppressesAdaptiveSerialRounds else { return decision }
+        return CBv2MTPDepthDecision(
+            depth: 0, decodeRowBucket: decision.decodeRowBucket,
+            reason: "adaptive_serial_suppressed", isExploration: false)
     }
 
     func maximumAutomaticDepth(plannedDecodeRows: Int) -> Int {
@@ -445,6 +578,14 @@ final class CBv2MTPRoundDriver {
         }
         let maxWidth = config.maxAutomaticRectangularTokens / plannedDecodeRows
         return min(config.maxDraftTokens, max(0, maxWidth - 1))
+    }
+
+    /// Pure ceiling on any plan depth with `decodeRows` decode-ready rows:
+    /// zero beyond the batch gate, otherwise the automatic envelope. Deadline
+    /// projection mirrors it without touching controller state.
+    func speculationDepthCeiling(decodeRows: Int) -> Int {
+        decodeRows > config.maxSpeculativeBatch
+            ? 0 : maximumAutomaticDepth(plannedDecodeRows: decodeRows)
     }
 
     private func verificationLimitedDecision(
@@ -491,11 +632,16 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
-    func markRound(_ id: CBv2RequestID, k: Int) { roundMarks[id] = k }
-    func markSeed(_ id: CBv2RequestID) { seedMarks.insert(id) }
+    func markRound(_ id: CBv2RequestID, k: Int) {
+        guard !targetOnlyMediaRequests.contains(id) else { return }
+        roundMarks[id] = k
+    }
+    func markSeed(_ id: CBv2RequestID) {
+        guard !targetOnlyMediaRequests.contains(id) else { return }
+        seedMarks.insert(id)
+    }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
-
 
     func forceSynchronizedSeed() {
         forceSeedPlan = true
@@ -515,6 +661,7 @@ final class CBv2MTPRoundDriver {
 
     /// Pure check (no mutation) — the chained-path pre-check uses it.
     func hasValidCarry(for rec: CBv2ScheduledRequest) -> Bool {
+        guard !targetOnlyMediaRequests.contains(rec.id) else { return false }
         guard let carry = carries[rec.id] else { return false }
         return carryMatches(carry, rec: rec)
     }
@@ -522,6 +669,7 @@ final class CBv2MTPRoundDriver {
     /// Validate and return the row's carry; a stale carry is removed here
     /// (invalidate-on-mismatch — one seed step re-establishes it).
     func validatedCarry(for rec: CBv2ScheduledRequest) -> CarryStatus {
+        guard !targetOnlyMediaRequests.contains(rec.id) else { return .none }
         guard let carry = carries[rec.id] else { return .none }
         guard carryMatches(carry, rec: rec) else {
             carries.removeValue(forKey: rec.id)
@@ -540,7 +688,17 @@ final class CBv2MTPRoundDriver {
     /// Take the row's carry for a launching round (a fresh one is stored at
     /// the round's finalize, or the row seeds again).
     func consumeCarry(for id: CBv2RequestID) -> CBv2MTPCarry? {
-        carries.removeValue(forKey: id)
+        guard !targetOnlyMediaRequests.contains(id) else { return nil }
+        return carries.removeValue(forKey: id)
+    }
+
+    /// Return a carry taken by `consumeCarry` for a round refused before any
+    /// graph was built (`CBv2StepScratchRefusal`). The row's KV, tokens and
+    /// assistant history are unchanged, so the carry still describes it; the
+    /// next plan's `validatedCarry` drops it if that ever stops holding.
+    func restoreConsumedCarry(_ carry: CBv2MTPCarry, for id: CBv2RequestID) {
+        guard !targetOnlyMediaRequests.contains(id), carries[id] == nil else { return }
+        carries[id] = carry
     }
 
     func storeCarry(
@@ -549,6 +707,7 @@ final class CBv2MTPRoundDriver {
         needsHistoryTransition: Bool = false,
         tokensCount: Int, kvOffset: Int
     ) {
+        guard !targetOnlyMediaRequests.contains(id) else { return }
         if tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter,
             assistantStates[id] == nil
@@ -560,6 +719,13 @@ final class CBv2MTPRoundDriver {
             previousTopTwoMargin: previousTopTwoMargin,
             needsHistoryTransition: needsHistoryTransition,
             tokensCount: tokensCount, kvOffset: kvOffset)
+        if let observer = carryStoredObserverForTesting {
+            observer(
+                .init(
+                    id: id, token: token, previousTopTwoMargin: previousTopTwoMargin,
+                    tokensCount: tokensCount, kvOffset: kvOffset, hiddenShape: hidden.shape))
+        }
+        carryHiddenObserverForTesting?(id, hidden)
     }
 
     var tracksPersistentHistory: Bool {
@@ -567,16 +733,89 @@ final class CBv2MTPRoundDriver {
             && usesRequestStatefulDrafter && config.fixedDraftTokens != 0
     }
 
+    /// The drafter declared its request state advisory
+    /// (`CBv2MTPAdvisoryHistoryDrafter`) and acceptance is exact, so no
+    /// emitted token depends on that state.
+    var historyIsAdvisory: Bool {
+        config.acceptance == .exact
+            && (drafter as? any CBv2MTPAdvisoryHistoryDrafter)?.requestStateIsAdvisory == true
+    }
+
+    /// Persistent assistant history that a prefix checkpoint must carry for
+    /// the request that adopts it. Advisory history never has to.
+    var checkpointsRequireAssistantHistory: Bool {
+        tracksPersistentHistory && !historyIsAdvisory
+    }
+
+    /// Rows that cannot speculate may run ordinary chainable decode; the
+    /// engine feeds their trusted hidden rows to history at finalize.
+    var feedsHistoryFromOrdinaryDecode: Bool {
+        config.ordinaryDecodeHistory && tracksPersistentHistory && supportsOrdinaryDecodeHistory
+    }
+
+    /// The final prompt row seeds the first carry (no seed step).
+    var seedsCarryFromPrefill: Bool {
+        config.prefillCarry && tracksPersistentHistory && supportsOrdinaryDecodeHistory
+    }
+
+    /// Whether the current plan's decode rows passed the batch and
+    /// eligibility gates (controller depth may still be zero).
+    var planCanSpeculate: Bool { controllerMeasurementEligible }
+
+    /// Drop a carry made stale by an in-flight successor, or whose history
+    /// transition was just observed, without touching assistant history.
+    func dropCarry(_ id: CBv2RequestID) {
+        carries.removeValue(forKey: id)
+    }
+
+    /// A request-stateful drafter over an attention target that adopts
+    /// `CBv2MTPRequestScopedMediaFallback`, or over a recurrent target whose
+    /// adapter reports `CBv2RecurrentMTPRequestScopedMediaFallback`. A recurrent
+    /// target never qualifies through the attention-only protocol.
+    static func requestScopedMediaFallback(
+        model: any CBv2MTPSteppableModel, drafter: any CBv2MTPDrafter
+    ) -> Bool {
+        guard drafter is any CBv2MTPRequestStatefulDrafter else { return false }
+        guard (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil else {
+            return model is any CBv2MTPRequestScopedMediaFallback
+        }
+        return (model as? any CBv2RecurrentMTPRequestScopedMediaFallbackProviding)?
+            .supportsRecurrentRequestScopedMediaFallback == true
+    }
+    func requiresTargetOnlyMedia(_ request: CBv2Request) -> Bool {
+        supportsRequestScopedMediaFallback && request.multimodal?.spans.isEmpty == false
+    }
+    func registerTargetOnlyMedia(_ request: CBv2Request) {
+        guard requiresTargetOnlyMedia(request) else { return }
+        if targetOnlyMediaRequests.insert(request.id).inserted {
+            precondition(
+                assistantStates[request.id] == nil && carries[request.id] == nil,
+                "immutable media request acquired unobserved assistant history")
+        }
+    }
+    func isTargetOnlyMediaForTesting(_ id: CBv2RequestID) -> Bool {
+        targetOnlyMediaRequests.contains(id)
+    }
+
     func takeOrMakeAssistantState(
-        for id: CBv2RequestID, maximumSequenceLength: Int
+        for id: CBv2RequestID, maximumSequenceLength: Int,
+        historicalPrefixPromptTokens: [Int]? = nil
     ) throws -> (any CBv2MTPRequestState)? {
-        guard tracksPersistentHistory,
+        guard !targetOnlyMediaRequests.contains(id), tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
         else { return nil }
-        let state = assistantStates.removeValue(forKey: id) ?? stateful.makeRequestState()
+        let existing = assistantStates.removeValue(forKey: id)
+        let state = existing ?? stateful.makeRequestState()
         do {
-            try stateful.configureRequestState(
-                state, maximumSequenceLength: maximumSequenceLength)
+            try configureAssistantState(state, id: id, maximumSequenceLength: maximumSequenceLength)
+            if existing == nil, let historicalPrefixPromptTokens {
+                guard let historical = drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding
+                else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                try historical.installPrefixCaptureContext(
+                    requestState: state, promptTokens: historicalPrefixPromptTokens)
+            }
         } catch {
             // Configuration detached an existing owner from the map. Put it
             // back before propagating so the fenced cohort retirement path
@@ -587,24 +826,73 @@ final class CBv2MTPRoundDriver {
         return state
     }
 
+    func configureAssistantState(
+        _ state: any CBv2MTPRequestState, id: CBv2RequestID,
+        maximumSequenceLength: Int
+    ) throws {
+        guard let stateful = drafter as? any CBv2MTPRequestStatefulDrafter else { return }
+        if let admitted = stateful as? any CBv2AdmittedMTPRequestStatefulDrafter {
+            guard let issuer = admittedMTPBindingIssuer else {
+                throw CBv2MTPBindingError.missingAdmission
+            }
+            try admitted.configureRequestState(
+                state,
+                admission: issuer.context(id: id, maximumInputs: maximumSequenceLength))
+        } else {
+            try stateful.configureRequestState(state, maximumSequenceLength: maximumSequenceLength)
+        }
+    }
+
     var usesMarginalPolicy: Bool {
         config.maxDraftTokens > 0
             && usesRequestStatefulDrafter && config.fixedDraftTokens == nil
     }
 
-
     var shouldApplyMarginalPolicyToPlan: Bool {
         usesMarginalPolicy && !planDecision.isExploration
     }
+    /// `position` is the absolute target position of the observation's first
+    /// hidden row. Only an advisory drafter receives it.
     func observeCommittedTarget(
         id: CBv2RequestID,
         observation: CBv2MTPCommittedTargetObservation,
+        startingAt position: Int? = nil,
         detachedState: any CBv2MTPRequestState
     ) {
+        precondition(
+            !targetOnlyMediaRequests.contains(id),
+            "media must never observe trained assistant state")
         guard let stateful = drafter as? any CBv2MTPRequestStatefulDrafter else {
             preconditionFailure("CBv2 MTP committed observation reached a stateless drafter")
         }
-        stateful.observeCommittedTarget(observation, requestState: detachedState)
+        if let position, historyIsAdvisory,
+            let advisory = stateful as? any CBv2MTPAdvisoryHistoryDrafter
+        {
+            advisory.observeCommittedTarget(
+                observation, startingAt: position, requestState: detachedState)
+        } else {
+            stateful.observeCommittedTarget(observation, requestState: detachedState)
+        }
+    }
+
+    /// `observeCommittedTarget` for several requests in one batched call.
+    /// Positions reach only an advisory drafter, as above.
+    func observeCommittedTargets(
+        _ observations: [(id: CBv2RequestID, observation: CBv2MTPRequestObservation)],
+        drafter: any CBv2MTPBatchedRequestDrafter
+    ) {
+        precondition(
+            observations.allSatisfy { !targetOnlyMediaRequests.contains($0.id) },
+            "media must never observe trained assistant state")
+        let advisory = historyIsAdvisory && drafter is any CBv2MTPAdvisoryHistoryDrafter
+        drafter.observeCommittedTargets(
+            observations.map {
+                advisory || $0.observation.position == nil
+                    ? $0.observation
+                    : CBv2MTPRequestObservation(
+                        $0.observation.observation, startingAt: nil,
+                        requestState: $0.observation.requestState)
+            })
     }
 
     func marginalDepth(
@@ -654,6 +942,7 @@ final class CBv2MTPRoundDriver {
     }
 
     func pendingHistoryCarry(for id: CBv2RequestID) -> CBv2MTPCarry? {
+        guard !targetOnlyMediaRequests.contains(id) else { return nil }
         guard let carry = carries[id], carry.needsHistoryTransition else { return nil }
         return carry
     }
@@ -665,8 +954,15 @@ final class CBv2MTPRoundDriver {
     func restoreAssistantState(
         _ state: any CBv2MTPRequestState, for id: CBv2RequestID
     ) {
+        precondition(
+            !targetOnlyMediaRequests.contains(id), "media must never restore assistant state")
         precondition(assistantStates[id] == nil, "duplicate CBv2 MTP assistant state")
         assistantStates[id] = state
+    }
+
+    func canInstallHistoricalAssistant(for id: CBv2RequestID) -> Bool {
+        tracksPersistentHistory && !targetOnlyMediaRequests.contains(id)
+            && assistantStates[id] == nil && carries[id] == nil
     }
 
     func releaseDetachedAssistantState(_ state: any CBv2MTPRequestState) {
@@ -696,37 +992,12 @@ final class CBv2MTPRoundDriver {
         drafter is any CBv2MTPRequestStatefulDrafter
     }
 
-    /// The block drafter this driver speculates with, if any. One `propose`
-    /// per round replaces the k-step chain; everything else is the ordinary
-    /// request-stateful path.
-    var blockDrafter: (any CBv2MTPBlockDrafter)? {
-        drafter as? any CBv2MTPBlockDrafter
-    }
-
-    var usesBlockDrafter: Bool { drafter is any CBv2MTPBlockDrafter }
-
-    /// A verify-produced carry primes persistent assistant history for the
-    /// one position the round did NOT feed: a chain drafter's finalization
-    /// takes the ACCEPTED DRAFT columns, which stop one short of the
-    /// correction token. A block drafter's finalization takes every CONFIRMED
-    /// column, that one included, so it needs no transition — replaying it
-    /// would feed the same context row twice.
-    var carryNeedsHistoryTransition: Bool {
-        tracksPersistentHistory && !usesBlockDrafter
-    }
-
-    /// The hidden rows one committed-history observation carries. A chain
-    /// drafter takes the target's pre-norm last hidden; a BLOCK drafter takes
-    /// the fused tapped context the target produced for the SAME positions.
-    /// The caller must read this while the producing forward is still the
-    /// target's last one.
-    func committedObservationHidden(_ lastHidden: MLXArray) -> MLXArray {
-        guard let block = blockDrafter else { return lastHidden }
-        guard let context = block.blockContextHidden() else {
-            preconditionFailure(
-                "CBv2 block MTP: the target's context tap is not armed")
+    func hasUnmeasuredAssistantResidency(
+        detachedStates: [any CBv2MTPRequestState] = []
+    ) -> Bool {
+        (Array(assistantStates.values) + detachedStates).contains {
+            ($0 as? any CBv2MTPRequestResidencyReporting)?.hasUnmeasuredResidency == true
         }
-        return context
     }
 
     private func releaseAssistantState(_ id: CBv2RequestID) {
@@ -749,6 +1020,7 @@ final class CBv2MTPRoundDriver {
     /// The request left the engine for good — ids are legally reusable, so
     /// every per-id trace must go (a reused id must never inherit a carry).
     func requestDidFinish(_ id: CBv2RequestID) {
+        targetOnlyMediaRequests.remove(id)
         if goodputPlanRows.contains(id) { invalidateWorkload() }
         carries.removeValue(forKey: id)
         releaseAssistantState(id)
@@ -829,21 +1101,13 @@ final class CBv2MTPRoundDriver {
     }
 
     func recordRound(
-        drafted: Int, accepted: Int, emitted: Int,
-        audit: CBv2MTPRoundAuditRecord? = nil
+        drafted: Int, accepted: Int, emitted: Int
     ) {
         metricsLock.lock()
         metrics.rounds += 1
         metrics.draftedTokens += drafted
         metrics.acceptedTokens += accepted
         metrics.emittedTokens += emitted
-        if let audit {
-            metrics.roundAudits.append(audit)
-            if metrics.roundAudits.count > CBv2MTPRoundAuditRecord.retainedRecordCap {
-                metrics.roundAudits.removeFirst(
-                    metrics.roundAudits.count - CBv2MTPRoundAuditRecord.retainedRecordCap)
-            }
-        }
         if metrics.perPositionAccepted.count < drafted {
             metrics.perPositionAccepted.append(
                 contentsOf: Array(
@@ -858,7 +1122,8 @@ final class CBv2MTPRoundDriver {
 
     /// The controller optimizes the synchronized rectangular step, so it
     /// learns the minimum accepted prefix that every participating verify
-    /// row can commit together, once per step (not once per row).
+    /// row can commit together, once per step (not once per row), unless the
+    /// drafter commits each row's own prefix: then once per row.
     func recordStepAcceptance(
         drafted: Int, accepted: Int, observedDrafts: Int,
         decodeRowBucket: Int,
@@ -892,15 +1157,20 @@ final class CBv2MTPRoundDriver {
         hasChainedSuccessor: Bool
     ) {
         guard depthController.usesCommittedDecodeBaseline,
-            acceptsWorkloadMeasurement(measurement) else { return }
-        let eligible = measurement.map {
-            $0.costEligible && $0.chained && !$0.seedOnly
-                && $0.actualDepth == 0 && $0.decision.depth == 0
-                && $0.decision.decodeRowBucket == CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
-        } == true && hasChainedSuccessor && sampledRows.count == finalizedPlainRowCount
-        guard let elapsed = committedDecodeClock.observe(
-            completedAtNanos: completedAtNanos, rowIDs: sampledRows, eligible: eligible),
-            let measurement else { return }
+            acceptsWorkloadMeasurement(measurement)
+        else { return }
+        let eligible =
+            measurement.map {
+                $0.costEligible && $0.chained && !$0.seedOnly
+                    && $0.actualDepth == 0 && $0.decision.depth == 0
+                    && $0.decision.decodeRowBucket
+                        == CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
+            } == true && hasChainedSuccessor && sampledRows.count == finalizedPlainRowCount
+        guard
+            let elapsed = committedDecodeClock.observe(
+                completedAtNanos: completedAtNanos, rowIDs: sampledRows, eligible: eligible),
+            let measurement
+        else { return }
         depthController.observeCommittedDecodeInterval(
             decodeRowBucket: measurement.decision.decodeRowBucket, wallTimeNanos: elapsed)
     }
@@ -945,7 +1215,8 @@ final class CBv2MTPRoundDriver {
                 }
                 metricsLock.lock()
                 // Warmup is real work even when excluded from steady EWMA.
-                metrics.totalRoundWallTimeNanos &+= sample?.wallTimeNanos
+                metrics.totalRoundWallTimeNanos &+=
+                    sample?.wallTimeNanos
                     ?? (wallTimeNanos &+ claimedSeedCostNanos)
                 refreshControllerMetricsLocked()
                 metricsLock.unlock()
@@ -1049,20 +1320,5 @@ enum CBv2MTPHiddenIndex {
     static func carryColumn(targetOutputIndex: Int, draftDepth: Int) -> Int {
         precondition(targetOutputIndex >= 0 && targetOutputIndex <= draftDepth)
         return targetOutputIndex
-    }
-}
-
-/// A BLOCK drafter's next block reads the tapped context of exactly the
-/// columns the round CONFIRMED — the reference's
-/// `hidden = hidden[:, :accepted + 1, :]`. That is ONE column wider than the
-/// chain drafter's accepted-draft slice, because the correction token's own
-/// position is context for the next block. Kept as a pure seam so the width
-/// is deterministic and testable without a model.
-enum CBv2MTPBlockContextIndex {
-    static func confirmedColumns(confirmed: Int, verifyWidth: Int) -> Range<Int> {
-        precondition(
-            confirmed >= 1 && confirmed <= verifyWidth,
-            "CBv2 block MTP: \(confirmed) confirmed columns of a \(verifyWidth)-wide verify")
-        return 0 ..< confirmed
     }
 }

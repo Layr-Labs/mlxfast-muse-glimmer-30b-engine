@@ -2,28 +2,29 @@
 import Foundation
 import MLXLMCommon
 
-/// Text factory for Prism's folded Qwen 3.5-family packs: the Ternary Bonsai 2
-/// 27B pack, and the Bonsai 2 9B pack, which is expected to use the same packing.
-///
-/// The pack declares a vision tower. This track never serves an image, so the
-/// load filter drops the 333 `vision_tower.*` tensors and the tower is never
-/// built. `Qwen35Runner` declares `multimodal: false` for the same reason, so
-/// the LLM factory is the only factory that resolves this model type.
-///
-/// The pack carries no MTP head (`mtp_num_hidden_layers: 0`). The track
-/// attaches a separate, published head instead, so the speculative capability
-/// stays as `Qwen35Model` declares it and the runner decides whether a head is
-/// present. See `docs/bonsai2.md`.
+/// Text factory for Prism's folded Qwen3.8-27B pack. Vision remains a VLM-factory concern.
 public final class PrismHadamardQwen35TextModel: Qwen35Model, PrismHadamardLoading,
-    WeightNameFiltering
+    CheckpointWeightLoadFiltering
 {
     public let prismCheckpoint: PrismHadamardCheckpointConfiguration
+    private let textConfiguration: Qwen35TextConfiguration
 
     public init(configurationData: Data) throws {
         prismCheckpoint = try JSONDecoder().decode(PrismHadamardCheckpointConfiguration.self, from: configurationData)
-        super.init(try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData))
+        let config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData)
+        textConfiguration = config.textConfig
+        super.init(config)
     }
-    public func shouldLoadWeight(named name: String) -> Bool {
-        !name.hasPrefix("vision_tower.")
+    public override var cbv2Capabilities: CBv2ModelCapabilities {
+        var value = super.cbv2Capabilities
+        value.supportsMTP = false
+        return value
     }
+    public override var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        super.cbv2RecurrentStateSpec
+    }
+    public var checkpointWeightLoadFilter: CheckpointWeightLoadFilter {
+        { !$0.hasPrefix("vision_tower.") }
+    }
+    public var skipWholeShardPrefetch: Bool { true }
 }

@@ -13,10 +13,13 @@ struct PagedKVSegmentLayout: Sendable {
     private(set) var ranges: [Range<Int>] = []
     private var segmentForPage: [Int32] = []
 
-    init(pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int,
-         maximumAddressPages: Int = Int(Int32.max)) throws {
+    init(
+        pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int,
+        maximumAddressPages: Int = Int(Int32.max)
+    ) throws {
         guard pageBytes > 0, targetBytes > 0, maximumBufferBytes > 0,
-              maximumAddressPages >= 2, maximumAddressPages <= Int(Int32.max) else {
+            maximumAddressPages >= 2, maximumAddressPages <= Int(Int32.max)
+        else {
             throw CBv2KVError.backendIneligible(reason: "invalid paged segment geometry")
         }
         let physical = min(targetBytes, maximumBufferBytes) / pageBytes
@@ -31,8 +34,9 @@ struct PagedKVSegmentLayout: Sendable {
 
     /// Eager geometry used by diagnostics. Runtime pools start empty instead.
     init(pageCount: Int, pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int) throws {
-        try self.init(pageBytes: pageBytes, targetBytes: targetBytes,
-                      maximumBufferBytes: maximumBufferBytes)
+        try self.init(
+            pageBytes: pageBytes, targetBytes: targetBytes,
+            maximumBufferBytes: maximumBufferBytes)
         guard pageCount >= 2 else {
             throw CBv2KVError.backendIneligible(reason: "invalid paged segment page count")
         }
@@ -68,7 +72,8 @@ struct PagedKVSegmentLayout: Sendable {
     /// one poison page. Used by submit/deadline probes before any allocation.
     func physicalBytes(addingUsablePages usable: Int) -> Int? {
         guard usable >= 0 else { return nil }
-        let segments = usable / maximumUsablePages
+        let segments =
+            usable / maximumUsablePages
             + (usable % maximumUsablePages).nonzeroBitCount
         let (pages, pageOverflow) = usable.addingReportingOverflow(segments)
         let (bytes, byteOverflow) = pages.multipliedReportingOverflow(by: pageBytes)
@@ -92,7 +97,8 @@ struct PagedKVSegmentLayout: Sendable {
             var remaining = usable % maximumUsablePages
             while remaining > 0 {
                 let count = Self.sizeClass(atMost: remaining)
-                let (next, overflow) = total.addingReportingOverflow(try allocationBytes(usablePages: count))
+                let (next, overflow) = total.addingReportingOverflow(
+                    try allocationBytes(usablePages: count))
                 guard !overflow else { return nil }
                 total = next
                 remaining -= count
@@ -234,35 +240,114 @@ final class PagedKVSegment {
         self.byteCount = source.byteCount
     }
 
-    init(index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
-         pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
-         admission: AdmissionV2? = nil) throws {
+    /// `hostMaterialized` copies host zeros into a fresh allocator buffer
+    /// (`cbv2HostZeros`) for an evaluator that skips available arrays.
+    /// `hostZeroed` wraps zero-fill-on-demand pages without a copy and skips
+    /// the evaluator and fence; a size that is not page-granular falls back.
+    init(
+        index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
+        pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil, hostMaterialized: Bool = false,
+        hostZeroed: Bool = false
+    ) throws {
         self.index = index
         let pages = layout.range(index)
+        let packedKey = try key.quantization?.rowLayout(headDim: key.headDim)
+        guard key.geometry != nil, dtype == key.dtype,
+            (try key.bytesPerToken()) * pageSize == layout.pageBytes,
+            let logicalBytes = CBv2KVGeometry.multiply(pages.count, layout.pageBytes),
+            !key.isAsymmetric || logicalBytes / dtype.size <= Int(Int32.max),
+            let keyElements = CBv2KVGeometry.multiply(pages.count, key.kvHeads),
+            let keyRows = CBv2KVGeometry.multiply(keyElements, pageSize),
+            let keyCount = CBv2KVGeometry.multiply(keyRows, packedKey?.keyRowBytes ?? key.headDim)
+        else {
+            throw CBv2KVError.backendIneligible(reason: "invalid segmented native K/V byte layout")
+        }
         self.pages = pages
-        self.valueOffset = pages.count * key.kvHeads * pageSize * key.headDim
-        self.byteCount = pages.count * layout.pageBytes
+        self.valueOffset = keyCount
+        self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
-            let array = MLXArray.zeros(
-                [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
-                stream: allocationStream)
+            let shape =
+                packedKey != nil
+                ? [logicalBytes]
+                : (key.isAsymmetric
+                    ? [logicalBytes / dtype.size]
+                    : [2, pages.count, key.kvHeads, pageSize, key.headDim])
+            let storageType = packedKey != nil ? DType.uint8 : dtype
+            // Wrapped host pages arrive zeroed and available: nothing to
+            // evaluate or fence, so growth never waits behind queued GPU work
+            // or for the MLX eval lock that the pool's evaluator takes.
+            if hostZeroed, let array = MLXArray.cbv2ZeroFilledPages(shape, dtype: storageType) {
+                CBv2NativePagedOperation.constructing?.retain(array)
+                try fault.check()
+                return array
+            }
+            let array =
+                try hostMaterialized
+                ? MLXArray.cbv2HostZeros(shape, dtype: storageType)
+                : MLXArray.zeros(shape, dtype: storageType, stream: allocationStream)
+            // Only device work needs a completion fence; host data has none.
+            let fenced = !hostMaterialized
+            CBv2NativePagedOperation.constructing?.retain(array)
             do {
                 try fault.check()
                 try evaluate(array)
             } catch {
-                allocationStream.stream.synchronize()
+                if fenced { allocationStream.stream.synchronize() }
                 if error is MLXError { throw error }
                 try fault.check()
                 throw error
             }
             // Evaluation signals before Metal completion handlers drop temporary references.
-            allocationStream.stream.synchronize()
+            if fenced { allocationStream.stream.synchronize() }
             try fault.check()
             return array
         }
         self.backing = try PagedKVSegmentBacking(
             storage, allocationBound: layout.allocationBytes(forSegment: index))
+        CBv2NativePagedOperation.constructing?.retain(owner: backing)
         if let admission { try backing.cover(using: admission, bytes: byteCount) }
     }
+}
+
+extension MLXArray {
+    /// Zero-fill-on-demand anonymous pages wrapped as the array's Metal buffer
+    /// without a copy (MLX `make_buffer`; active memory counts the exact
+    /// length). Available on creation: no stream work, completion fence or
+    /// MLX eval lock. The kernel zeroes each page when it is first mapped.
+    /// Unlike `cbv2HostZeros`, nothing is copied and no transient host buffer
+    /// exists beside the one MLX counts. nil unless the byte size is
+    /// page-granular; MLX itself falls back to a copied allocation if Metal
+    /// refuses the wrap.
+    static func cbv2ZeroFilledPages(_ shape: [Int], dtype: DType) -> MLXArray? {
+        let byteCount = shape.reduce(dtype.size, *)
+        let page = Int(getpagesize())
+        let dims = shape.compactMap { Int32(exactly: $0) }
+        guard byteCount > 0, page > 0, byteCount % page == 0, dims.count == shape.count,
+            let base = mmap(nil, byteCount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
+            base != MAP_FAILED
+        else { return nil }
+        let owner = Unmanaged.passRetained(CBv2HostPages(base: base, byteCount: byteCount))
+        return MLXArray(
+            mlx_array_new_data_managed_payload(
+                base, dims, Int32(dims.count), dtype.cmlxDtype, owner.toOpaque()
+            ) { payload in
+                guard let payload else { return }
+                Unmanaged<CBv2HostPages>.fromOpaque(payload).release()
+            })
+    }
+}
+
+/// Owns one anonymous mapping until MLX releases the wrapping buffer.
+private final class CBv2HostPages {
+    let base: UnsafeMutableRawPointer
+    let byteCount: Int
+
+    init(base: UnsafeMutableRawPointer, byteCount: Int) {
+        self.base = base
+        self.byteCount = byteCount
+    }
+
+    deinit { precondition(munmap(base, byteCount) == 0) }
 }

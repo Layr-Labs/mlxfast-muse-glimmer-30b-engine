@@ -3,6 +3,10 @@ import MLX
 import MLXLMCommon
 
 extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
+    /// Requests that cannot speculate record prompt history too, so their
+    /// checkpoints are the ones a speculating request saves.
+    public var checkpointsNonSpeculatingRows: Bool { true }
+
     private final class PrefixCheckpoint: CBv2MTPPrefixCheckpoint {
         let owner: ObjectIdentifier
         let targetInputCount: Int
@@ -10,7 +14,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
         let tokens: MLXArray
         let frontier: MLXArray
 
-        init(owner: ObjectIdentifier, count: Int, hidden: MLXArray, tokens: MLXArray, frontier: MLXArray) {
+        init(
+            owner: ObjectIdentifier, count: Int, hidden: MLXArray, tokens: MLXArray,
+            frontier: MLXArray
+        ) {
             self.owner = owner
             self.targetInputCount = count
             self.hidden = hidden
@@ -61,6 +68,27 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
         return state
     }
 
+    /// Restore immutable trusted history into fresh request-owned pages.
+    /// Ordinary restore continues to use its existing contiguous cache factory.
+    public func restorePagedPrefixCheckpoint(
+        _ checkpoint: any CBv2MTPPrefixCheckpoint, maximumSequenceLength: Int
+    ) throws -> (any CBv2MTPRequestState)? {
+        guard let checkpoint = checkpoint as? PrefixCheckpoint,
+            checkpoint.owner == ObjectIdentifier(self),
+            checkpoint.targetInputCount <= maximumSequenceLength
+        else { return nil }
+        guard
+            let state = try makePagedRequestState(maximumSequenceLength: maximumSequenceLength)
+                as? RequestState
+        else {
+            return nil
+        }
+        state.backlogHidden = [checkpoint.hidden]
+        state.backlogTokens = [checkpoint.tokens]
+        state.targetHiddenFrontier = checkpoint.frontier
+        return state
+    }
+
     public var prefixCheckpointCodecID: String {
         "qwen-trusted-normalized-history-v1:\(prefixCheckpointGeometry.verification)"
     }
@@ -69,11 +97,15 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
         -> [CBv2CheckpointTensorDescriptor]?
     {
         let geometry = prefixCheckpointGeometry
-        guard targetInputCount > 1, let dtype = CBv2CheckpointDType(geometry.dtype), dtype != .int32 else {
+        guard targetInputCount > 1, let dtype = CBv2CheckpointDType(geometry.dtype),
+            dtype.isFloatingPoint
+        else {
             return nil
         }
         return try? [
-            .init(role: .assistantHidden, shape: [1, targetInputCount - 1, geometry.width], dtype: dtype),
+            .init(
+                role: .assistantHidden, shape: [1, targetInputCount - 1, geometry.width],
+                dtype: dtype),
             .init(role: .assistantTokens, shape: [1, targetInputCount - 1], dtype: .int32),
             .init(role: .assistantFrontier, shape: [1, 1, geometry.width], dtype: dtype),
         ]
@@ -89,7 +121,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
     public func decodePrefixCheckpoint(tensors: [MLXArray], prefixTokens: [Int])
         -> (any CBv2MTPPrefixCheckpoint)?
     {
-        guard let descriptors = prefixCheckpointTensorDescriptors(targetInputCount: prefixTokens.count),
+        guard
+            let descriptors = prefixCheckpointTensorDescriptors(
+                targetInputCount: prefixTokens.count),
             tensors.count == descriptors.count,
             zip(tensors, descriptors).allSatisfy({ pair in
                 pair.0.shape == pair.1.shape && pair.0.dtype == pair.1.dtype.mlxDType
@@ -110,8 +144,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
     /// may be constructed after the staging scratch owner has retired.
     private func tokensMatch(_ tokens: MLXArray, prefixTokens: [Int]) -> Bool {
         guard let info = try? tokens.evaluatedBufferInfo(), info.isRowContiguous,
-              info.dataElements == tokens.size,
-              let pointer = mlx_array_data_int32(tokens.ctx)
+            info.dataElements == tokens.size,
+            let pointer = mlx_array_data_int32(tokens.ctx)
         else { return false }
         return withExtendedLifetime(tokens) {
             for (index, expected) in prefixTokens.dropFirst().enumerated() {

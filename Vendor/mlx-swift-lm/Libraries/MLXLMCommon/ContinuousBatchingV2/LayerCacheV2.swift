@@ -49,8 +49,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
-    public var mtpSerializesRectangularAttention = false
-    public var mtpBatchesRectangularAttention = false
+    package var mtpSerializesRectangularAttention = false
+    package var mtpBatchesRectangularAttention = false
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
@@ -61,6 +61,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// config — identical plumbing on both backends (`PagedLayerCache` takes
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
+    let mimoV26NAXAttention: Bool
+    // Installed only on caches from the exact SDK-issued MiMo bundle.
+    package var mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget?
 
     /// Optional vision span context for each CURRENT prefill row. The engine
     /// binds this array immediately before graph construction and clears it
@@ -68,9 +71,16 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// text rows sharing a rectangular call.
     private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
+    /// Qwen4 QSA indexer side-state for the currently bound B1 row.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
-        attentionSoftcap: Float? = nil
+        attentionSoftcap: Float? = nil, mimoV26NAXAttention: Bool = false
     ) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -79,6 +89,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
+        self.mimoV26NAXAttention = mimoV26NAXAttention
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
@@ -89,11 +100,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             kind.sharesKVWithLayer == nil, "CBv2LayerCache: cannot add rows to a KV-shared layer")
         rows.append(row)
         rebuildPositionOffsets()
+        clearQwen4IndexerState()
     }
 
     public func removeRow(at index: Int) {
         rows.remove(at: index)
         rebuildPositionOffsets()
+        clearQwen4IndexerState()
     }
 
     /// Replace the whole row set (batch recomposition). Also the correct way
@@ -103,8 +116,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil || newRows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
+        if rows.count == 1 {
+            CBv2Qwen4IndexerBind.harvest(self, into: rows[0])
+        }
         rows = newRows
         rebuildPositionOffsets()
+        if newRows.count == 1, CBv2Qwen4IndexerBind.restore(self, from: newRows[0]) {
+            return
+        }
+        clearQwen4IndexerState()
     }
 
     // MARK: - CBv2AttendingLayerCache
@@ -113,47 +133,51 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
-        updateAndAttend(
-            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks,
-            keepMask: nil)
-    }
-
-    public func updateAndAttend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, keepMask: MLXArray?
-    ) -> MLXArray {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
-        // An observed forward receipt states a dense causal/window mask: the
-        // replay reference attends the whole retained KV. A keep mask removes
-        // keys that reference would attend, so its output can never replay.
-        // Refuse the capture BY NAME instead of recording a bad receipt.
-        var metadata: CBv2AttentionMetadataObservation?
-        var packet: CBv2AttentionPacketObservation?
-        if keepMask == nil {
-            let spans = boundSpanContexts?.contains(where: { $0 != nil }) ?? false
-            metadata = attentionMetadata?.begin(
-                cache: self, queries: queries, keys: keys, values: values, scale: scale,
-                sinks: sinks, softcap: attentionSoftcap, spans: spans)
-            packet = attentionPacket?.begin(
-                cache: self, queries: queries, keys: keys, values: values, scale: scale,
-                sinks: sinks, softcap: attentionSoftcap, spans: spans)
-        } else {
-            attentionMetadata?.state.refuse("keep_masked_attention_not_replayable")
-            attentionPacket?.state.refuse("keep_masked_attention_not_replayable")
-        }
+        let metadata = attentionMetadata?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
+        let packet = attentionPacket?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention,
-            keepMask: keepMask, metadata: metadata, packet: packet)
+            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet,
+            mimoV26NAXAttention: mimoV26NAXAttention,
+            mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return output
+    }
+
+    /// Write K/V and advance RoPE offsets without running dense SDPA.
+    /// Qwen4 gathered-QSA uses this so 50K prefills do not pay leftover dense
+    /// attention after the indexer has already selected blocks.
+    public func updateKVAndAdvanceOffsets(
+        keys: MLXArray, values: MLXArray
+    ) -> [(keys: MLXArray, values: MLXArray)] {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(rows.count == keys.dim(0), "CBv2LayerCache: K/V batch does not match rows")
+        var views: [(keys: MLXArray, values: MLXArray)] = []
+        views.reserveCapacity(rows.count)
+        for (rowIndex, row) in rows.enumerated() {
+            views.append(
+                row.update(
+                    keys: keys[rowIndex ..< rowIndex + 1],
+                    values: values[rowIndex ..< rowIndex + 1]))
+        }
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        return views
     }
 
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
@@ -209,18 +233,35 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 }
 
+extension CBv2LayerCache: CBv2Qwen4GatheredCache {
+    public var qwen4SerializesRectangularAttention: Bool { mtpSerializesRectangularAttention }
+}
+
+extension CBv2LayerCache: CBv2Qwen4BatchScopeProviding {
+    public func qwen4BeginBatchScope() -> CBv2Qwen4BatchScope {
+        precondition(kind.sharesKVWithLayer == nil && kind.attention == .full)
+        let owners = rows
+        let views = owners.enumerated().map { index, row -> CBv2LayerCache in
+            let view = CBv2LayerCache(
+                layerIndex: layerIndex, kind: kind,
+                attentionSoftcap: attentionSoftcap)
+            view.rows = [row]
+            view.cachedPositionOffsets = cachedPositionOffsets[index ..< index + 1]
+            view.mtpSerializesRectangularAttention = mtpSerializesRectangularAttention
+            _ = CBv2Qwen4IndexerBind.restore(view, from: row)
+            return view
+        }
+        return CBv2Qwen4BatchScope(rows: owners, caches: views) { [self] length in
+            precondition(rows.count == owners.count && zip(rows, owners).allSatisfy { $0 === $1 })
+            cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+            clearQwen4IndexerState()
+        }
+    }
+}
+
 // MARK: - Final-layer last-query prefill
 
 extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
-
-// MARK: - Keep-mask support
-
-/// The contiguous backend composes the keep mask with the causal or window
-/// mask in absolute coordinates, so it is exact on every layer this cache
-/// vends.
-extension CBv2LayerCache: CBv2KeepMaskCapableCache {
-    public var honorsKeepMask: Bool { true }
-}
 
 // MARK: - Vision span-mask binding
 
@@ -256,6 +297,9 @@ extension CBv2LayerCache: KVCache {
         for row in rows {
             if let provider = row as? CBv2InnerStateProviding {
                 arrays.append(contentsOf: provider.cbv2InnerState())
+            }
+            if rows.count > 1 {
+                arrays.append(contentsOf: CBv2Qwen4IndexerFrontier.evaluationState(row))
             }
         }
         return arrays

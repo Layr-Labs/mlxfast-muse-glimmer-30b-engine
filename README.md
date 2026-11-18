@@ -853,7 +853,7 @@ No local run blocks the upload. Run the local test yourself before you submit.
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, checked in as `fixtures/bonsai2_27b_config.json` |
 | Benchmarker | The bench repository's `main` dist channel, resolved at run time (`benchd.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
 | Track id | `bonsai2-9b-mlx-v1` — the PLATFORM name: leaderboard namespace, runner labels, R2 prefix |
-| Engine fork upstream base | `859f4d97e0d1ae9cce0883b044f764283841edfb` (+ fork `main` `0607011` merged; engine-local changes on top) |
+| Engine fork upstream base | tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, the merge of `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `443789360ddbf804d55d063ca9cda4ea2d3013a9` (a local merge branch, not pushed upstream; engine-local changes on top) |
 
 ### The target model
 

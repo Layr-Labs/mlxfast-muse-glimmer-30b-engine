@@ -3,7 +3,7 @@
 import Foundation
 import MLXLMCommon
 
-/// Sendable wrapper around the non-Sendable ``ToolCallProcessor`` for
+/// Sendable wrapper around the non-Sendable `MLXLMCommon.ToolCallProcessor` for
 /// capture in a streaming-completion Task closure. Only touched from
 /// that single Task.
 ///
@@ -13,20 +13,39 @@ import MLXLMCommon
 /// tool-call stream parser the Darkbloom provider drives over its
 /// ContinuousBatchingV2 generation events.
 public final class BatchedToolStreamHandler: @unchecked Sendable {
+    public let format: ToolCallFormat
     private let processor: ToolCallProcessor
     private var residualText: String?
 
-    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
-        self.processor = ToolCallProcessor(format: format, tools: tools)
+    public init(
+        format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false,
+        streaming: ToolCallStreamingOptions? = nil
+    ) {
+        self.format = format
+        self.processor = ToolCallProcessor(
+            format: format, tools: tools, strictGemma: strictGemma, streaming: streaming)
     }
+
+    /// True when calls are exposed while generated; use the segment API.
+    public var streamsCalls: Bool { processor.streamsCalls }
 
     public func processChunk(_ chunk: String) -> String? {
         processor.processChunk(chunk)
     }
 
+    public func processChunkSegments(_ chunk: String) -> [ToolCallStreamSegment] {
+        processor.processChunkSegments(chunk)
+    }
+
     public func finish() -> [ToolCall] {
         residualText = processor.processEOS(returnBufferedText: true)
         return processor.toolCalls
+    }
+
+    /// End of generation for the segment API; replaces `finish` and
+    /// `takeResidualText`.
+    public func finishSegments() -> [ToolCallStreamSegment] {
+        processor.processEOSSegments()
     }
 
     public func takeResidualText() -> String? {

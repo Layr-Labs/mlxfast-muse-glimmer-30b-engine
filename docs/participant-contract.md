@@ -947,7 +947,7 @@ target is pending, `./setup.sh` refuses by name.
 | MTP head | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), `fixtures/reference_bonsai2_9b_mtp_head.sha256` (pending, no record) |
 | Geometry source | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` `config.json`, as `fixtures/qwen35_9b_base_config.json` (3,126 bytes) |
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, as `fixtures/bonsai2_27b_config.json` (58,145 bytes) |
-| Engine fork upstream base | `859f4d97e0d1ae9cce0883b044f764283841edfb` (+ fork `main` `0607011` merged; engine-local changes on top) |
+| Engine fork upstream base | tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, the merge of `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `443789360ddbf804d55d063ca9cda4ea2d3013a9` (a local merge branch, not pushed upstream; engine-local changes on top) |
 
 The two reference manifests hold no record until the pack and the head are
 published. When they are, `tools/new-track.sh` writes the target manifest from

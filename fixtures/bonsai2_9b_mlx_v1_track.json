@@ -68,7 +68,7 @@
     "bytes": 36233
   },
   "baseline_reference_commit": "7cfd76a7dd0e265f6c5ec167d5e5ee90836688de",
-  "mlx_swift_lm_revision": "859f4d97e0d1ae9cce0883b044f764283841edfb",
+  "mlx_swift_lm_revision": "0391eacd84cb00ce4001d70763f2303fa2a01210",
   "target": {
     "upstream_model_id": "Qwen/Qwen3.8-27B",
     "upstream_revision": "37561816e66b5b9153b1b64c10968c18c1e6f4a0",

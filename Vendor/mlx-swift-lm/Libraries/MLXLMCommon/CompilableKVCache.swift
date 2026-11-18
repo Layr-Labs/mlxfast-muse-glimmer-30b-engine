@@ -114,6 +114,9 @@ public class CompilableKVCache: BaseKVCache {
         }
     }
 
+    /// The RoPE offset as a graph array, so compiled decode reads no scalar.
+    public override var ropeOffset: RoPEOffset { .batch(offsetArray + 0) }
+
     public override func innerState() -> [MLXArray] {
         if let keys, let values {
             return [keys, values, offsetArray]
@@ -244,10 +247,13 @@ public class CompilableKVCache: BaseKVCache {
     }
 
     public override func copy() -> any KVCache {
+        // `[.ellipsis]` gives new array objects so _updateInternal replaces
+        // only the copy's contexts. Backing storage can still be shared until
+        // normal MLX updates; this is not raw mutable-buffer detachment.
         let c = CompilableKVCache(maxLength: maxLength, step: step)
-        c.keys = keys
-        c.values = values
-        c.offsetArray = offsetArray
+        c.keys = keys?[.ellipsis]
+        c.values = values?[.ellipsis]
+        c.offsetArray = offsetArray[.ellipsis]
         return c
     }
 

@@ -72,7 +72,7 @@ plain files.
 | `Vendor/mlx-swift` | `Layr-Labs/mlx-swift` (fork of `ml-explore/mlx-swift`) | `70052b2147f828e6b9bcc2dce599017415387377` |
 | `Vendor/mlx-swift/Source/Cmlx/mlx` | `Layr-Labs/mlx` (fork of `ml-explore/mlx`), MLX 0.32.2 | `3fa8f25e6451174d7b06be372c3a24272b77d88e` |
 | `Vendor/mlx-swift/Source/Cmlx/mlx-c` | `Layr-Labs/mlx-c` (fork of `ml-explore/mlx-c`) | `02cf6f4d099023e4e0c0357248b8b3f83110e29d` |
-| `Vendor/mlx-swift-lm` | `Layr-Labs/mlx-swift-lm` (fork of `ml-explore/mlx-swift-examples`), `feat/qwen38-flash-next-runner` + `main` `0607011`; engine-local changes on top | `859f4d97e0d1ae9cce0883b044f764283841edfb` |
+| `Vendor/mlx-swift-lm` | `Layr-Labs/mlx-swift-lm` (fork of `ml-explore/mlx-swift-examples`), the local merge of `feat/muse-glimmer-speed` `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `feat/muse-glimmer-rowexact-m5-d5` `443789360ddbf804d55d063ca9cda4ea2d3013a9`; engine-local changes on top | tree `0391eacd84cb00ce4001d70763f2303fa2a01210` (merge of those two commits; not pushed upstream) |
 
 `70052b2` is the MLX core that Darkbloom (`Layr-Labs/d-inference`) builds the
 same engine fork against. It is `6d6796d7` plus the two commits the Bonsai 2

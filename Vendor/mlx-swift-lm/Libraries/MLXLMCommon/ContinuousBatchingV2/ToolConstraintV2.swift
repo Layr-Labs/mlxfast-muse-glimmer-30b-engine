@@ -10,6 +10,7 @@ import Foundation
 /// Privacy-safe, low-cardinality tool-choice modes.
 public enum CBv2TokenConstraintMode: String, Sendable {
     case none
+    case auto
     case required
     case named
 }
@@ -39,6 +40,43 @@ public protocol CBv2TokenConstraint: AnyObject, Sendable {
     /// Advance after the engine materializes and confirms one sampled token.
     /// Returning nil means the sampled token was not a valid transition.
     func nextState(state: Int, tokenID: Int) -> Int?
+
+    /// Optional device-mask cache key for `allowedTokenIDs(state:remainingTokens:)`.
+    /// Two calls on the SAME constraint instance whose keys are equal and
+    /// non-nil MUST return identical token sets; the sampler then reuses the
+    /// uploaded mask and skips `allowedTokenIDs` entirely. nil (the default)
+    /// disables caching for that call. A constraint whose allowed set ignores
+    /// `remainingTokens` while it is positive can return `state` then.
+    func maskCacheKey(state: Int, remainingTokens: Int) -> Int?
+
+    /// Opt-in to chained (pipelined) decode. The engine then samples step
+    /// N+1 before step N's token reaches the host, masking it with the
+    /// constraint state confirmed through N-1 and the budget N+1 will have.
+    /// When step N's confirmed token leaves that state, the engine redraws
+    /// N+1 from the same logits with the correct mask, so the output is
+    /// exactly the unchained stream. Requires only the protocol's existing
+    /// determinism: `allowedTokenIDs` may be called for a state/budget pair
+    /// whose sample is later discarded, and must have no observable effect
+    /// beyond its return value. `nextState` is still called only for
+    /// host-confirmed tokens, in order. Default false.
+    var allowsChainedDecode: Bool { get }
+}
+
+extension CBv2TokenConstraint {
+    public func maskCacheKey(state: Int, remainingTokens: Int) -> Int? { nil }
+    public var allowsChainedDecode: Bool { false }
+}
+
+/// A grammar with opaque spans that can use MTP without previewing mutable state.
+/// Masks in these spans must be independent of the positive remaining budget.
+public protocol CBv2FreeSpanTokenConstraint: CBv2TokenConstraint {
+    /// Whether this committed state is an opaque span. False keeps ordinary decoding.
+    func isFreeSpan(state: Int) -> Bool
+
+    /// Pure, conservative check: true promises that the token is valid, touches no
+    /// protected boundary, and `nextState` would return this same state. It must
+    /// not intern states or change exhaustion, caches, or subsequent results.
+    func isFreeSpanContinuation(state: Int, tokenID: Int) -> Bool
 }
 
 enum CBv2TokenConstraintFailure {

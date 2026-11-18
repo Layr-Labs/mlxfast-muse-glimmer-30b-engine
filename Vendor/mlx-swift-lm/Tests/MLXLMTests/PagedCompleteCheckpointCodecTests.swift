@@ -47,8 +47,7 @@ struct PagedCompleteCheckpointCodecTests {
     }
 
     private func plan(_ fixture: Fixture) throws -> CBv2CompleteCheckpointImportPlan {
-        try fixture.codec.plan(manifest: fixture.manifest, request: fixture.request,
-            minimumChunkSize: fixture.manifest.chunkSize, maximumChunkSize: fixture.manifest.chunkSize)
+        try fixture.codec.plan(manifest: fixture.manifest, request: fixture.request)
     }
 
     private func fill(_ sink: CBv2CompleteCheckpointImport, fixture: Fixture) throws {
@@ -149,8 +148,11 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(throws: CBv2KVError.self) { try plan.allocate { released.increment() } }
         #expect(evaluations == 0 && released.value == 1)
         #expect(fixture.admission.bytesReserved == before && fixture.backend.bytesWired == 0)
-        #expect(plan.scratchBytes == (try Memory.allocationFootprintUpperBound(byteCount: 2))
-            + (try Memory.allocationFootprintUpperBound(byteCount: 4)))
+        // One full segment, not the whole group, is the largest host-zero source.
+        let group = try #require(plan.pagedStoragePlan).groups[0]
+        #expect(plan.scratchBytes
+            == group.layout.allocationBytes(addingUsablePages: group.layout.maximumUsablePages))
+        #expect(plan.scratchBytes < group.nativeBytes)
     }
 
     @Test("Backend identity and dtype mismatches reject before allocations")
@@ -160,8 +162,7 @@ struct PagedCompleteCheckpointCodecTests {
             layerKinds: fixture.codec.layerKinds, recurrentSpec: fixture.codec.recurrentSpec,
             kvDTypes: fixture.codec.kvDTypes, assistant: nil, admission: fixture.admission)
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
-            try contiguous.plan(manifest: fixture.manifest, request: fixture.request,
-                minimumChunkSize: fixture.manifest.chunkSize, maximumChunkSize: fixture.manifest.chunkSize)
+            try contiguous.plan(manifest: fixture.manifest, request: fixture.request)
         }
         let other = try self.fixture(dtype: .float32)
         let wrongType = CBv2CompleteCheckpointManifest(identity: fixture.manifest.identity,
@@ -170,16 +171,14 @@ struct PagedCompleteCheckpointCodecTests {
             assistantCodecID: nil, tensors: other.manifest.tensors,
             backendLayout: CBv2CompleteCheckpointManifest.pagedLayout)
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
-            try fixture.codec.plan(manifest: wrongType, request: fixture.request,
-                minimumChunkSize: fixture.manifest.chunkSize, maximumChunkSize: fixture.manifest.chunkSize)
+            try fixture.codec.plan(manifest: wrongType, request: fixture.request)
         }
         let legacy = CBv2CompleteCheckpointManifest(identity: fixture.manifest.identity,
             position: fixture.manifest.position, chunkSize: fixture.manifest.chunkSize,
             prefixTokens: fixture.manifest.prefixTokens, cacheSalt: fixture.manifest.cacheSalt,
             assistantCodecID: nil, tensors: fixture.manifest.tensors)
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
-            try fixture.codec.plan(manifest: legacy, request: fixture.request,
-                minimumChunkSize: fixture.manifest.chunkSize, maximumChunkSize: fixture.manifest.chunkSize)
+            try fixture.codec.plan(manifest: legacy, request: fixture.request)
         }
         #expect(fixture.admission.bytesReserved == 0 && fixture.backend.bytesWired == 0)
     }

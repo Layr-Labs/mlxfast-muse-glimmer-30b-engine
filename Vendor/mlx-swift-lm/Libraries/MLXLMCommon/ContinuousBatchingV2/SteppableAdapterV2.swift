@@ -16,12 +16,23 @@ import MLX
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
-public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
+public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
+    CBv2DecodeCommandBufferLimitsProviding
+{
 
     private let model: any LanguageModel
 
     public init(_ model: any LanguageModel) {
         self.model = model
+    }
+
+    /// The wrapped model's decode command-buffer limits, if it declares any.
+    public var decodeCommandBufferLimits: GPU.CommandBufferLimits? {
+        (model as? CBv2DecodeCommandBufferLimitsProviding)?.decodeCommandBufferLimits
+    }
+
+    public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+        (model as? CBv2DecodeCommandBufferLimitsProviding)?.speculativeCommandBufferLimits
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -43,12 +54,6 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
-extension CBv2SteppableLanguageModelAdapter: CBv2KeepMaskRequiringModel {
-    public var cbv2RequiresKeepMask: Bool {
-        (model as? any CBv2KeepMaskRequiringModel)?.cbv2RequiresKeepMask ?? false
-    }
-}
-
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
     public var cbv2PositionAxisCount: Int? {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
@@ -61,6 +66,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2CompleteCheckpointKVTypeProvidi
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2Qwen4CheckpointGeometryProviding {
+    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? {
+        guard let owner = model as? any CBv2Qwen4CheckpointGeometryProviding else { return [] }
+        return owner.cbv2Qwen4CheckpointGeometries
+    }
+}
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
     public var supportsPositionedForwarding: Bool {
         if model is any CBv2RecurrentLanguageModelForwardable {
@@ -249,6 +260,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 /// (`CBv2MultimodalError.unsupportedModel`), so the trapping guards below
 /// are unreachable in a correctly gated engine.
 extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
+    public var causalPositionRequirement: CBv2CausalPositionRequirement {
+        (model as? any CBv2CausalPositionRequirementProviding)?.cbv2CausalPositionRequirement
+            ?? .requestOwned
+    }
 
     public var supportsMultimodalPrefill: Bool {
         guard let model = model as? CBv2EmbeddingForwardable else { return false }
@@ -419,8 +434,9 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
                 tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
                 positionIds: positionIds, requirement: requirement)
         }
-        return forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
-                                 positionIds: positionIds)
+        return forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 
     public func forwardWithHidden(
@@ -454,10 +470,22 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPRequestScopedMediaFallbackProviding {
+    var supportsRecurrentRequestScopedMediaFallback: Bool {
+        model is any CBv2RecurrentMTPRequestScopedMediaFallback
+    }
+}
 
+extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
+    public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }
+        return owner.cbv2TargetAuxiliaryAllocationSpecs
+    }
+}
 
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
-        (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
+        (model as? any CBv2HistoricalAttentionCheckpointProviding)?
+            .cbv2SupportsHistoricalAttentionCheckpoint == true
     }
 }

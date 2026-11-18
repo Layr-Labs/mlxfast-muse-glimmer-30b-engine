@@ -6,7 +6,7 @@ import MLXHuggingFace
 import MLXLMCommon
 import Tokenizers
 
-/// Single-request server engine backed by ``ModelContainer``'s serial actor.
+/// Single-request server engine backed by `MLXLMCommon.ModelContainer`'s serial actor.
 /// Concurrent ``streamChatCompletion(request:)`` calls serialise; batched
 /// concurrent serving lives downstream in the Darkbloom provider's
 /// ContinuousBatchingV2 bridge, not in this CLI engine.
@@ -15,17 +15,23 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     private let model: ModelContainer
     private let modelType: String?
     private let defaultToolCallParser: String?
+    private let onyxParsing: OnyxParsingMode
 
+    /// `onyxParsing` is how an Onyx model's tool frames are read. The default
+    /// is the library's strict reading; `.referenceParity` is the reading of
+    /// the reference servers and is used only when asked for.
     public init(
         modelID: String,
         model: ModelContainer,
         modelType: String? = nil,
-        defaultToolCallParser: String? = nil
+        defaultToolCallParser: String? = nil,
+        onyxParsing: OnyxParsingMode = .strict
     ) {
         self.modelID = modelID
         self.model = model
         self.modelType = modelType
         self.defaultToolCallParser = defaultToolCallParser
+        self.onyxParsing = onyxParsing
     }
 
     public func availableModels() async throws -> [MLXServerModel] {
@@ -43,6 +49,16 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         // no-op.
         if request.messages.contains(where: { $0.content.hasMedia }) {
             throw MLXModelContainerEngineError.mediaUnsupported
+        }
+
+        try Self.validateSamplingControls(request)
+        try Self.validateReasoningControls(request)
+        do {
+            try await model.perform { context in
+                try (context.model as? any GenericGenerationValidating)?.validateGenericGeneration()
+            }
+        } catch let error as GenericGenerationError {
+            throw MLXModelContainerEngineError.nativeGenerationRequired(error.localizedDescription)
         }
 
         try await validateToolParserOverride(for: request)
@@ -70,6 +86,10 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             )
         }
         let input = try await model.prepare(input: userInput)
+        if await usesOnyxChannels() {
+            return try await channelStream(
+                input: input, parameters: request.generationParameters, tools: toolSpecs)
+        }
         // Declared-tool schemas flow into the streaming ToolCallProcessor
         // (the deleted v1 adapter did this via BatchedToolStreamHandler):
         // with schemas present, parsers reject undeclared function names and
@@ -88,6 +108,12 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                         continuation.yield(.toolCall(toolCall))
                     case .info(let info):
                         continuation.yield(.info(.init(info)))
+                    case .rejectedToolCall:
+                        // The default frame state machine returns failed calls as
+                        // `.chunk` text. A rejection comes only from a request that
+                        // selects upstream's recovery state machine; the OpenAI wire
+                        // has no field for it.
+                        continue
                     }
                 }
                 continuation.finish()
@@ -95,6 +121,57 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             continuation.onTermination = { _ in
                 task.cancel()
             }
+        }
+    }
+
+    /// Whether the model speaks Muse Glimmer's Onyx protocol and its tokenizer
+    /// holds the control tokens. Without them the markers are plain text, and
+    /// the service's `onyx` reasoning parser splits the text path's output.
+    private func usesOnyxChannels() async -> Bool {
+        guard await model.configuration.toolCallFormat == .atem else { return false }
+        return await model.perform { context in
+            OnyxTokenStreamDecoder(tokenizer: context.tokenizer, tools: nil) != nil
+        }
+    }
+
+    /// Generation for a model whose response protocol separates reasoning
+    /// from content by frames. The stream reports each channel as `.parsed`,
+    /// so reasoning reaches `reasoning_content` and framing never reaches
+    /// content. Tool calls are read as `onyxParsing` says.
+    private func channelStream(
+        input: consuming sending LMInput, parameters: GenerateParameters,
+        tools: [[String: any Sendable]]?
+    ) async throws -> AsyncThrowingStream<MLXServerGenerationEvent, Error> {
+        var parameters = parameters
+        parameters.toolCallPolicy.onyxParsing = onyxParsing
+        let policy = parameters
+        let events = try await model.perform(nonSendable: input) {
+            context, input -> AsyncStream<MLXServerGenerationEvent>? in
+            guard
+                let handler = ChannelTokenLoopHandler(
+                    format: .atem, tokenizer: context.tokenizer,
+                    stopStrings: context.configuration.effectiveStopStrings, tools: tools,
+                    toolCallPolicy: policy.toolCallPolicy)
+            else { return nil }
+            let promptTokenCount = input.text.tokens.size
+            let iterator = try TokenIterator(
+                input: input, model: context.model, parameters: policy)
+            return generateLoopTask(
+                promptTokenCount: promptTokenCount,
+                modelConfiguration: context.configuration, tokenizer: context.tokenizer,
+                iterator: iterator, handler: handler
+            ).0
+        }
+        guard let events else {
+            throw MLXModelContainerEngineError.nativeGenerationRequired(
+                "The tokenizer does not define the Onyx control tokens.")
+        }
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                for await event in events { continuation.yield(event) }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -111,6 +188,31 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         messages.contains {
             ($0.toolCalls?.isEmpty == false) || $0.toolCallID != nil
                 || $0.reasoningContent != nil || $0.name != nil
+        }
+    }
+
+    /// This iterator does not own a request-scoped RNG or logit-bias processor.
+    /// Reject unsupported controls here, not in the shared wire validator:
+    /// native CBv2 engines implement them and must continue to accept them.
+    static func validateSamplingControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.seed != nil {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("seed")
+        }
+        if request.logitBias?.isEmpty == false {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("logit_bias")
+        }
+    }
+
+    /// This generic engine has no model-specific thinking-template contract.
+    /// Output parsing is supported, but it cannot implement inference controls
+    /// such as `effort: "none"` by merely changing the response parser. Keep
+    /// this refusal engine-local so native engines can honor these controls.
+    static func validateReasoningControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.reasoning?.effort != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.effort")
+        }
+        if request.reasoning?.enabled != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.enabled")
         }
     }
 
@@ -202,9 +304,8 @@ public enum MLXServerModelLoader {
         try await #huggingFaceLoadModelContainer(configuration: configuration)
     }
 
-    /// Load a model and return the raw ``ModelContext`` (bypasses the
-    /// serial-access container so ``MLXBatchedEngineServerEngine`` can drive
-    /// ``BatchedEngine`` directly).
+    /// Load a model and return the raw `MLXLMCommon.ModelContext` for
+    /// caller-managed inference without the serial-access `ModelContainer`.
     public static func loadContext(
         configuration: ModelConfiguration
     ) async throws -> sending ModelContext {
