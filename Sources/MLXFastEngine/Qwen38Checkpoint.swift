@@ -1,7 +1,4 @@
 import Foundation
-import MLXLLM
-import MLXLMCommon
-import MLXRunners
 
 public enum Qwen38CheckpointError: Error, CustomStringConvertible, Equatable {
     case notDirectory(String)
@@ -152,58 +149,10 @@ public final class Qwen38CheckpointView: @unchecked Sendable {
         """#.utf8)
 }
 
-/// Loads the fixed intake model through the shared Qwen 3.5 runner.
-public enum Qwen38RunnerLoader {
-    public static func load(
-        weights: URL,
-        options: RunnerLoadOptions
-    ) throws -> (runner: any Runner, view: Qwen38CheckpointView) {
-        let view = try Qwen38CheckpointView(source: weights)
-        let configuration = try JSONDecoder().decode(
-            Qwen35Configuration.self, from: Qwen38CheckpointView.configuration)
-        let model = Qwen38TextOnlyModel(configuration)
-        try loadWeights(modelDirectory: view.directory, model: model)
-
-        var serialOptions = options
-        serialOptions.drafterDirectory = nil
-        serialOptions.preloadedDrafter = nil
-        let runner = try Qwen35Runner.adopt(
-            model: model,
-            tokenizer: Qwen38TokenIDTokenizer(),
-            configuration: ModelConfiguration(
-                directory: view.directory, eosTokenIds: [248044]),
-            directory: view.directory,
-            options: serialOptions)
-        return (runner, view)
-    }
-}
-
-private struct Qwen38TokenIDTokenizer: Tokenizer {
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        text.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
-    }
-
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        tokenIds.map(String.init).joined(separator: " ")
-    }
-
-    func convertTokenToId(_ token: String) -> Int? {
-        token == "<eos>" ? 248044 : Int(token)
-    }
-
-    func convertIdToToken(_ id: Int) -> String? {
-        id == 248044 ? "<eos>" : String(id)
-    }
-
-    var bosToken: String? { "<eos>" }
-    var eosToken: String? { "<eos>" }
-    var unknownToken: String? { nil }
-
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] {
-        throw TokenizerError.missingChatTemplate
-    }
-}
+/// The intake layout check above is all this file carries now.
+///
+/// REMOVED with the move to the runner registry: a loader that built a
+/// family-local text model and adopted it through a family runner. Both are
+/// gone (this tree carries the runner boundary and no family), and the
+/// bench-worker's entry point resolves its runner from the registry and loads
+/// through the one construction path in `MLXRunners`.

@@ -52,6 +52,9 @@ let package = Package(
         .library(
             name: "MLXScriptedLM",
             targets: ["MLXScriptedLM"]),
+        .library(
+            name: "MLXRunners",
+            targets: ["MLXRunners"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -380,8 +383,42 @@ let package = Package(
             dependencies: ["BenchCBv2Core"],
             path: "Sources/BenchCBv2"
         ),
-        // Harness-integrity tests: option parsing, engine resolution, and
-        // report/optimization provenance. Model-free, so they run in CI.
+        // The runner boundary (Darkbloom runner contract): one model family
+        // per runner, a static manifest, and the CBv2 engine + one-row
+        // stepper built over the same model instance. Consumers are the
+        // provider and the track's bench-worker; neither carries family code.
+        .target(
+            name: "MLXRunners",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Libraries/MLXRunners"
+        ),
+        .testTarget(
+            name: "MLXRunnersTests",
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MLXRunnersTests",
+            resources: [
+                // The SHARED Engine Protocol v1 conformance fixture, pinned
+                // identically on the benchd side.
+                .process("Resources/engine-wire-v1-adapter.ndjson"),
+                // The mock adapter's own manifest, checked in beside the
+                // fixture: BOTH repos digest these same bytes.
+                .process("Resources/engine-wire-v1-adapter.manifest.json"),
+            ]
+        ),
         .testTarget(
             name: "BenchCBv2Tests",
             dependencies: ["BenchCBv2Core"],

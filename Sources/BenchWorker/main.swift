@@ -1,12 +1,15 @@
-// Qwen3.8-27B Engine Protocol v1 entry point.
+// Engine Protocol v1 entry point.
 //
 // The shared server sends hello on accept. It returns one `ok:false` line for
 // an unknown or malformed request and keeps the connection open. Its nonce is
 // scoped to the connection and is present on every response, as in the shared
 // conformance fixture.
+//
+// NO FAMILY HERE. The runner comes from the registry, which answers by the
+// checkpoint's own `model_type` or by an explicit `--runner` id, and it is
+// built through the one construction path in `MLXRunners`.
 
 import Foundation
-import MLXFastEngine
 import MLXLMCommon
 import MLXRunners
 
@@ -14,7 +17,20 @@ import MLXRunners
     import Darwin
 #endif
 
-private let buildIdentity = "qwen38-27b@\(Qwen38CheckpointView.modelRevision)"
+/// The hello's build string: the runner that owns the checkpoint plus the
+/// checkpoint's own directory name. Read off what loaded, so an artifact names
+/// its build without a family constant in this file.
+private func helloBuildIdentity(for runner: any Runner, weights: URL) -> String {
+    "\(runner.manifest.runnerID)@\(weights.lastPathComponent)"
+}
+
+/// The registry's answer is a metatype; this is the one construction path
+/// behind it.
+private func loadRunner<T: Runner>(
+    _ type: T.Type, directory: URL, options: RunnerLoadOptions
+) async throws -> any Runner {
+    try await T.load(directory, options: options)
+}
 
 private func probeDevice() -> String {
     #if canImport(Darwin)
@@ -71,7 +87,7 @@ case .help(let topic):
 case .manifest(let options):
     do {
         if options.weights != nil {
-            let manifest = Qwen35Runner.manifest
+            let manifest = try options.resolveRunner().manifest
             let output = options.digestOnly
                 ? manifest.sha256Digest()
                 : String(decoding: manifest.canonicalJSON(), as: UTF8.self)
@@ -110,28 +126,26 @@ if launch.subcommand == .runtimeWorker,
     exit(0)
 }
 
-guard launch.drafter == nil else {
-    fail(WorkerLaunchError.badValue("--drafter (Qwen3.8 port is serial-only)"))
-}
-if let runnerID = launch.runnerID,
-    runnerID != Qwen35Runner.manifest.runnerID
-{
-    fail(WorkerLaunchError.unknownRunner(runnerID))
+let runnerType: any Runner.Type
+do {
+    runnerType = try launch.resolveRunner()
+} catch {
+    fail(error)
 }
 
-let loaded: (runner: any Runner, view: Qwen38CheckpointView)
+let runner: any Runner
 do {
-    loaded = try Qwen38RunnerLoader.load(
-        weights: launch.weights,
+    runner = try await loadRunner(
+        runnerType,
+        directory: launch.weights,
         options: RunnerLoadOptions(
-            drafterDirectory: nil,
+            drafterDirectory: launch.drafter,
             kvBytesCapacity: launch.kvBytesCapacity,
             resources: launch.resources))
 } catch {
     fail(error)
 }
-let runner = loaded.runner
-_ = loaded.view
+let buildIdentity = helloBuildIdentity(for: runner, weights: launch.weights)
 
 switch launch.subcommand {
 case .diagParity:
