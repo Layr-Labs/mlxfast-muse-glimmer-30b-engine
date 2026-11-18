@@ -213,9 +213,16 @@ func transformBuildsPackedRuntimeConfigByPassingTheSourceThrough() throws {
     #expect(config["gdn_activation_layout"] as? String == "grouped")
     #expect(config["tie_word_embeddings"] as? Bool == false)
     let text = try #require(config["text_config"] as? [String: Any])
-    #expect(text["vocab_size"] as? Int == MLXFastConstants.vocabSize)
-    #expect(text["hidden_size"] as? Int == MLXFastConstants.hiddenSize)
-    #expect(text["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+    // These three carry the SOURCE's own geometry, because the runtime config
+    // is the source passed through. Each source value is required, so the
+    // assertion cannot pass on two nils.
+    let sourceText = try #require(source["text_config"] as? [String: Any])
+    let sourceVocabSize = try #require(sourceText["vocab_size"] as? Int)
+    let sourceHiddenSize = try #require(sourceText["hidden_size"] as? Int)
+    let sourceLayerCount = try #require(sourceText["num_hidden_layers"] as? Int)
+    #expect(text["vocab_size"] as? Int == sourceVocabSize)
+    #expect(text["hidden_size"] as? Int == sourceHiddenSize)
+    #expect(text["num_hidden_layers"] as? Int == sourceLayerCount)
     #expect(text["mtp_num_hidden_layers"] as? Int == 0)
     // Every source key survives except the duplicate quantization block, which
     // this pack does not publish.
