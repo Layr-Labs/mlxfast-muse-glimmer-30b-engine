@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <variant>
 
 #include "mlx/api.h"
@@ -28,7 +29,9 @@ MLX_API Stream to_stream(StreamOrDevice s, Device default_);
 
 struct StreamContext {
  public:
-  StreamContext(StreamOrDevice s) : _stream(default_stream(default_device())) {
+  StreamContext(StreamOrDevice s)
+      : _stream(default_stream(default_device())),
+        _owner(std::this_thread::get_id()) {
     if (std::holds_alternative<std::monostate>(s)) {
       throw std::runtime_error(
           "[StreamContext] Invalid argument, please specify a stream or device.");
@@ -38,13 +41,21 @@ struct StreamContext {
     set_default_stream(_s);
   }
 
-  ~StreamContext() {
+  // noexcept(false) so the thread check below can throw. A destructor that
+  // throws while another exception unwinds this thread calls std::terminate.
+  ~StreamContext() noexcept(false) {
+    if (std::this_thread::get_id() != _owner) {
+      throw std::runtime_error(
+          "[StreamContext] Destroyed in a different thread than it was "
+          "constructed in.");
+    }
     set_default_device(_stream.device);
     set_default_stream(_stream);
   }
 
  private:
   Stream _stream;
+  std::thread::id _owner;
 };
 
 struct MLX_API PrintOptions {
@@ -206,9 +217,46 @@ inline bool residency_debug() {
   return residency_debug_;
 }
 
+// Output tile of the steel affine quantized matmul on GPUs without neural
+// accelerators (see `qmm` in backend/metal/quantized.cpp): 32, 64, 6432,
+// 3264 or 6464, or 0 (default) for the input width's own tile. Builds whose
+// kernels come only from the precompiled library keep 32 x 32.
+inline int qmm_steel_tile() {
+  static int tile_ = get_var("MLX_QMM_STEEL_TILE", 0);
+  return tile_;
+}
+
+// Fewest 64 x 64 threadgroups a product must fill to take a tile other than
+// 32 x 32 (fewer keep 32 x 32 and their GPU occupancy).
+inline int qmm_steel_tile_min_groups() {
+  static int groups_ = get_var("MLX_QMM_STEEL_TILE_MIN_GROUPS", 0);
+  return groups_;
+}
+
+// Quantized matmuls (x @ w.T) with fewer rows than the vector limit use only
+// the vector kernels (see `QuantizedMatmul::eval_gpu` in
+// backend/metal/quantized.cpp). Then a row has the same bits at each row count
+// from 2 to the limit - 1.
+inline bool qmv_batch_invariant() {
+  static bool invariant_ = get_var("MLX_QMV_BATCH_INVARIANT", 0);
+  return invariant_;
+}
+
 inline bool metal_fast_synch() {
   static bool metal_fast_synch = get_var("MLX_METAL_FAST_SYNCH", 0);
   return metal_fast_synch;
+}
+
+// A cross-device fast fence update in one dispatch (fence_update_coherent).
+inline bool metal_fused_fence_update() {
+  static bool fused = get_var("MLX_METAL_FUSED_FENCE_UPDATE", 0);
+  return fused;
+}
+
+// Custom kernels wait for their fenced inputs from a CPU stream themselves.
+inline bool metal_fenced_inputs() {
+  static bool fenced = get_var("MLX_METAL_FENCED_INPUTS", 0);
+  return fenced;
 }
 
 inline bool enable_tf32() {

@@ -292,6 +292,29 @@ The following JSON defines the valid 4-node mesh from the image above.
         }
     ]
 
+Two Macs can also be connected with more than one thunderbolt cable. In that
+case, write a list of rdma devices for the peer instead of one device. The
+device at position ``k`` in the list must be connected to the device at
+position ``k`` in the list of the peer. JACCL sends large messages over all
+the cables at the same time. If some pairs have fewer cables than others, JACCL
+uses the smallest number of cables for all pairs. The following JSON defines
+two Macs connected with two cables.
+
+.. code-block:: json
+
+    [
+        {
+            "ssh": "m3-ultra-1",
+            "ips": ["123.123.123.1"],
+            "rdma": [null, ["rdma_en2", "rdma_en3"]]
+        },
+        {
+            "ssh": "m3-ultra-2",
+            "ips": [],
+            "rdma": [["rdma_en2", "rdma_en3"], null]
+        }
+    ]
+
 Even though TCP/IP is not used when communicating with Thunderbolt RDMA,
 disabling the thunderbolt bridge is still required as well as setting up
 isolated local networks for each thunderbolt connection.
@@ -377,6 +400,32 @@ concatenated in rank order.
         backend="jaccl",
         all_gather_factory=make_side_channel,
     )
+
+A peer that does not answer
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+JACCL waits for RDMA completions in a polling loop. When the peer stops or the
+link fails, no completion arrives. A JACCL call that gets no completion for
+longer than :envvar:`MLX_JACCL_PROGRESS_TIMEOUT_MS` (30 seconds by default)
+fails. A call that gets a failed completion fails immediately.
+
+A failed call closes the communication group: JACCL destroys the queue pairs
+and the completion queues of the group and deregisters its buffers. Then, by
+default, it releases the wired GPU memory of the process (it sets the wired
+limit to zero and clears the buffer cache) and exits the process with status
+75, so that a supervisor can restart it. This teardown exit is the default
+because a rank that dies with RDMA work outstanding can leave its memory wired
+until the machine restarts, and because the call often runs on a thread where
+an exception cannot reach the program.
+
+With :envvar:`MLX_JACCL_TIMEOUT_ACTION` set to ``throw`` the call raises an
+error instead and the process continues. Each later call on the closed group
+raises an error immediately, and the group cannot be opened again. Start a new
+process to communicate again.
+
+The time that a rank waits includes the time that its peer computes, for
+example in :func:`mlx.core.distributed.recv`. Set the limit above the longest
+such wait, or set it to ``0`` to remove the limit.
 
 .. _nccl_section:
 
@@ -549,6 +598,13 @@ the following:
       ["rdma_en4", "rdma_en3", null, "rdma_en5"],
       ["rdma_en3", "rdma_en4", "rdma_en5", null]
    ]
+
+:envvar:`MLX_JACCL_PROGRESS_TIMEOUT_MS` is optional. It contains the longest time
+in milliseconds that a call waits for an RDMA completion before it fails and
+closes the group. The default is 30000 and 0 removes the limit.
+:envvar:`MLX_JACCL_TIMEOUT_ACTION` is optional. It selects what a failed call
+does after it closed the group: ``teardown-exit`` (the default) releases the
+GPU memory and exits the process with status 75, ``throw`` raises an error.
 
 
 NCCL

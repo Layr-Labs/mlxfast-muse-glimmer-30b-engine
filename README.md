@@ -259,10 +259,12 @@ uses this package's local `Vendor/mlx-swift` instead, because a local path
 dependency of the root package wins. SwiftPM prints a "conflicting identity"
 warning when it does this. The warning is expected.
 
-The copy is cut from `Layr-Labs/mlx-swift` `70052b2`. It holds the two nested
-submodules of that repository as plain files: `Source/Cmlx/mlx` at `3fa8f25e`
-and `Source/Cmlx/mlx-c` at `02cf6f4d`. To move the pin, copy the whole tree
-again from a fresh checkout of the new commit, with its submodules, then
+The copy is cut from `Layr-Labs/mlx-swift`
+`b1c94d29c5ddff16838fdc25b83fbe8fde48b3e8` (MLX 0.32.5). It holds the two
+nested submodules of that repository as plain files: `Source/Cmlx/mlx` at
+`72dffa2dbbdce95601fd84f5e8b6d7b4ec97a11b` and `Source/Cmlx/mlx-c` at
+`2ac897e34495c924f9cecfa93fffaf4316bbcb91`. To move the pin, copy the whole
+tree again from a fresh checkout of the new commit, with its submodules, then
 rebuild the metallib.
 
 ### The MTP head is a separate export

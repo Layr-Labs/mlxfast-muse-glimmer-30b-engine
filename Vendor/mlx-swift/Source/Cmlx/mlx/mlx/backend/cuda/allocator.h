@@ -3,9 +3,9 @@
 #pragma once
 
 #include "mlx/allocator.h"
-#include "mlx/memory.h"
 #include "mlx/backend/common/buffer_cache.h"
 #include "mlx/backend/cuda/cuda_utils.h"
+#include "mlx/memory.h"
 
 #include <cuda_runtime.h>
 #include <mutex>
@@ -91,6 +91,6 @@ class CudaAllocator : public allocator::Allocator {
 
 CudaAllocator& allocator();
 
-Buffer malloc_async(size_t size, CommandEncoder& encoder);
+allocator::Data malloc_async(size_t size, CommandEncoder& encoder);
 
 } // namespace mlx::core::cu

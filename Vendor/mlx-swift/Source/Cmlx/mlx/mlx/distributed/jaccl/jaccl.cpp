@@ -4,9 +4,11 @@
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/dtype_utils.h"
+#include "mlx/memory.h"
 
 #include <jaccl/group.h>
 #include <jaccl/jaccl.h>
+#include <jaccl/progress_guard.h>
 
 #include <optional>
 #include <sstream>
@@ -76,6 +78,27 @@ class JACCLGroup : public GroupImpl {
 
   int size() override {
     return group_->size();
+  }
+
+  void begin_startup_wait_budget(int64_t timeout_ms) override {
+    group_->begin_startup_wait_budget(timeout_ms);
+  }
+
+  void end_startup_wait_budget() override {
+    group_->end_startup_wait_budget();
+  }
+
+  bool supports_exchange() override {
+    return group_->supports_exchange();
+  }
+
+  void exchange(
+      const char* send,
+      char* recv,
+      size_t n,
+      const std::function<bool(size_t)>& ready,
+      const std::function<void(size_t)>& arrived) override {
+    group_->exchange(send, recv, n, ready, arrived);
   }
 
   void all_sum(const array& input, array& output, Stream stream) override {
@@ -168,6 +191,31 @@ class JACCLGroup : public GroupImpl {
   std::shared_ptr<::jaccl::Group> group_;
 };
 
+/**
+ * Run by a JACCL teardown exit (see progress_guard.h) after the group released
+ * its queue pairs. The exit skips static destructors, so release the wired GPU
+ * memory here: unwire first (the residency set shrinks to nothing), then drop
+ * the buffer cache. Best effort; it never throws into the exit path.
+ */
+void release_memory_before_exit() {
+  try {
+    set_wired_limit(0);
+  } catch (...) {
+  }
+  try {
+    clear_cache();
+  } catch (...) {
+  }
+}
+
+std::shared_ptr<GroupImpl> make_group(std::shared_ptr<::jaccl::Group> group) {
+  if (group == nullptr) {
+    return nullptr;
+  }
+  ::jaccl::set_memory_release(&release_memory_before_exit);
+  return std::make_shared<JACCLGroup>(std::move(group));
+}
+
 } // namespace
 
 bool is_available() {
@@ -175,19 +223,11 @@ bool is_available() {
 }
 
 std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
-  auto group = ::jaccl::init(strict);
-  if (group == nullptr) {
-    return nullptr;
-  }
-  return std::make_shared<JACCLGroup>(std::move(group));
+  return make_group(::jaccl::init(strict));
 }
 
 std::shared_ptr<GroupImpl> init(bool strict, AllGatherFactory factory) {
-  auto group = ::jaccl::init(strict, factory);
-  if (group == nullptr) {
-    return nullptr;
-  }
-  return std::make_shared<JACCLGroup>(std::move(group));
+  return make_group(::jaccl::init(strict, factory));
 }
 
 } // namespace mlx::core::distributed::jaccl

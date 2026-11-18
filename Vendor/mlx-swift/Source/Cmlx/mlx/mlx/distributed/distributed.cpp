@@ -138,6 +138,22 @@ Group Group::split(int color, int key /* = -1 */) const {
   return Group(group_->split(color, key));
 }
 
+void Group::begin_startup_wait_budget(int64_t timeout_ms) const {
+  if (!group_) {
+    throw std::runtime_error(
+        "[distributed] Cannot set a budget on a null group.");
+  }
+  group_->begin_startup_wait_budget(timeout_ms);
+}
+
+void Group::end_startup_wait_budget() const {
+  if (!group_) {
+    throw std::runtime_error(
+        "[distributed] Cannot end a budget on a null group.");
+  }
+  group_->end_startup_wait_budget();
+}
+
 namespace {
 
 std::unordered_map<std::string, std::shared_ptr<detail::GroupImpl>>&
@@ -148,12 +164,11 @@ get_backends() {
 }
 
 Group register_group(std::shared_ptr<detail::GroupImpl> group, std::string bk) {
-  auto& backends = get_backends();
   if (group == nullptr) {
-    group = std::make_shared<detail::EmptyGroup>();
-  } else {
-    backends.insert({"any", group});
+    return Group(std::make_shared<detail::EmptyGroup>());
   }
+  auto& backends = get_backends();
+  backends.insert({"any", group});
   backends.insert({std::move(bk), group});
   return Group(group);
 }

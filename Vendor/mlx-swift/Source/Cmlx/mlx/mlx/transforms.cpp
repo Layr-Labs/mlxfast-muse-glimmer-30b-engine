@@ -24,7 +24,114 @@ namespace mlx::core {
 
 static constexpr int MAX_ACTIVE_TASKS = 10;
 
+// At most MLX_MAX_ACTIVE_TASKS (default MAX_ACTIVE_TASKS) tasks in flight.
+// MLX_MAX_ACTIVE_CPU_TASKS=n (n > 0) gives CPU-stream tasks their own limit
+// n, and the first limit then counts GPU command buffers only.
+static bool too_many_active_tasks() {
+  static const int max_tasks =
+      env::get_var("MLX_MAX_ACTIVE_TASKS", MAX_ACTIVE_TASKS);
+  static const int max_cpu_tasks = env::get_var("MLX_MAX_ACTIVE_CPU_TASKS", 0);
+  int n_tasks = scheduler::n_active_tasks();
+  if (max_cpu_tasks <= 0) {
+    return n_tasks > max_tasks;
+  }
+  int n_cpu_tasks = scheduler::n_active_cpu_tasks();
+  return n_tasks - n_cpu_tasks > max_tasks || n_cpu_tasks > max_cpu_tasks;
+}
+
 namespace {
+
+// Degree of each array id in eval_impl's graph walk: an open-addressing map
+// (linear probing, deletion by backward shift) with the operations of the
+// std::unordered_map it replaces. A decode step's graph has thousands of
+// nodes; this avoids a heap node per entry and the rehash chain.
+class DegreeMap {
+ public:
+  int* find(std::uintptr_t key) {
+    if (keys_.empty()) {
+      return nullptr;
+    }
+    for (size_t i = home(key);; i = (i + 1) & mask_) {
+      if (keys_[i] == key) {
+        return &values_[i];
+      }
+      if (keys_[i] == 0) {
+        return nullptr;
+      }
+    }
+  }
+  // Inserts `value` when `key` is absent; the entry either way.
+  int& emplace(std::uintptr_t key, int value) {
+    if (2 * (size_ + 1) > keys_.size()) {
+      grow();
+    }
+    size_t i = home(key);
+    for (; keys_[i] != 0; i = (i + 1) & mask_) {
+      if (keys_[i] == key) {
+        return values_[i];
+      }
+    }
+    keys_[i] = key;
+    values_[i] = value;
+    ++size_;
+    return values_[i];
+  }
+  int& operator[](std::uintptr_t key) {
+    return emplace(key, 0);
+  }
+  void erase(std::uintptr_t key) {
+    if (keys_.empty()) {
+      return;
+    }
+    size_t i = home(key);
+    for (; keys_[i] != key; i = (i + 1) & mask_) {
+      if (keys_[i] == 0) {
+        return;
+      }
+    }
+    for (size_t j = (i + 1) & mask_; keys_[j] != 0; j = (j + 1) & mask_) {
+      size_t h = home(keys_[j]);
+      bool stays = i <= j ? (i < h && h <= j) : (i < h || h <= j);
+      if (!stays) {
+        keys_[i] = keys_[j];
+        values_[i] = values_[j];
+        i = j;
+      }
+    }
+    keys_[i] = 0;
+    values_[i] = 0;
+    --size_;
+  }
+  bool empty() const {
+    return size_ == 0;
+  }
+
+ private:
+  size_t home(std::uintptr_t key) const {
+    uint64_t k = key;
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    return static_cast<size_t>(k) & mask_;
+  }
+  void grow() {
+    std::vector<std::uintptr_t> keys(std::max<size_t>(64, 2 * keys_.size()), 0);
+    std::vector<int> values(keys.size(), 0);
+    std::swap(keys, keys_);
+    std::swap(values, values_);
+    mask_ = keys_.size() - 1;
+    size_ = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (keys[i] != 0) {
+        emplace(keys[i], values[i]);
+      }
+    }
+  }
+  std::vector<std::uintptr_t> keys_;
+  std::vector<int> values_;
+  size_t mask_ = 0;
+  size_t size_ = 0;
+};
 
 // Create a tracer copy of a primal for use in vjp/jvp. If the primal is a
 // stale Copy from a previous transform call (not an active tracer), peel it
@@ -80,23 +187,51 @@ thread_local int detail::RetainGraph::tracing_counter{0};
 array eval_impl(std::vector<array> outputs, bool async) {
   std::deque<array> tape;
 
-  // Make an effort to choose a good output stream
-  Stream stream = default_stream(default_device());
-  for (auto& o : outputs) {
-    if (o.status() == array::Status::unscheduled && o.has_primitive()) {
-      stream = o.primitive().stream();
-      break;
+  // Make an effort to choose a good output stream, and only create the default
+  // stream when there is no other choice.
+  Stream stream = [&outputs]() {
+    for (auto& o : outputs) {
+      if (o.status() == array::Status::unscheduled && o.has_primitive()) {
+        return o.primitive().stream();
+      }
     }
-  }
+    return default_stream(default_device());
+  }();
 
-  // Map of array id that needs fence and stream it's computed on
-  std::unordered_map<uintptr_t, std::pair<uint32_t, bool>> needs_fence;
+  // Arrays read on another stream: the stream they are computed on, whether
+  // a reader waits on the fence (`fast`, a spinning wait under fast synch) or
+  // on an event fence (`event`), and whether a reader is on another device.
+  struct FenceNeed {
+    uint32_t stream;
+    bool producer_gpu;
+    bool cross_device{false};
+    bool fast{false};
+    bool event{false};
+    // The values that the fence updates returned (see Fence::update).
+    uint32_t fast_value{0};
+    uint32_t event_value{0};
+  };
+  std::unordered_map<uintptr_t, FenceNeed> needs_fence;
+  // GPU streams that read a CPU array, per CPU array (decided after the walk).
+  std::unordered_map<uintptr_t, std::vector<uint32_t>> cpu_to_gpu_readers;
+
+  // GPU streams with an array that a CPU primitive reads
+  std::unordered_set<uint32_t> gpu_to_cpu;
 
   auto synchronizer = array(
       {}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
 
   // Stream fences for inter-stream synchronization
   std::unordered_map<uint32_t, Fence> fences;
+  // Event fences for readers that must not spin. Under fast synch a GPU
+  // fence wait is a kernel that spins until its producer's timestamp
+  // arrives, and Metal does not guarantee that another command queue runs
+  // while a pass of this queue spins. So a GPU stream never spins on another
+  // GPU stream, nor on CPU work that can itself wait for another GPU stream
+  // (the starved queue would hold back the timestamp the spin waits for).
+  // Both wait on a shared event instead. CPU waits keep the fast path: a CPU
+  // stream is a thread and always progresses.
+  std::unordered_map<uint32_t, Fence> event_fences;
 
   // Stream events for synchronization after eval
   std::unordered_map<uint32_t, Event> events;
@@ -109,7 +244,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
 
   {
     // Record the degree of each input
-    std::unordered_map<std::uintptr_t, int> cache;
+    DegreeMap cache;
 
     std::stack<std::pair<std::reference_wrapper<array>, int>> dfs;
     dfs.emplace(synchronizer, 0);
@@ -144,25 +279,41 @@ array eval_impl(std::vector<array> outputs, bool async) {
           if (a.primitive().stream() != in.primitive().stream()) {
             bool device_switch =
                 a.primitive().stream().device != in.primitive().stream().device;
-            auto [it, inserted] = needs_fence.emplace(
-                in.id(),
-                std::make_pair(in.primitive().stream().index, device_switch));
-            if (!inserted) {
-              it->second.second |= device_switch;
+            auto& need = needs_fence
+                             .emplace(
+                                 in.id(),
+                                 FenceNeed{
+                                     static_cast<uint32_t>(
+                                         in.primitive().stream().index),
+                                     in.primitive().device() == Device::gpu})
+                             .first->second;
+            need.cross_device |= device_switch;
+            bool gpu_reader = a.primitive().device() == Device::gpu;
+            if (in.primitive().device() == Device::gpu) {
+              // Another GPU stream waits on an event; the CPU spins.
+              (gpu_reader ? need.event : need.fast) = true;
+            } else if (gpu_reader) {
+              cpu_to_gpu_readers[in.id()].push_back(
+                  static_cast<uint32_t>(a.primitive().stream().index));
+            } else {
+              need.fast = true;
+            }
+            if (device_switch && in.primitive().device() == Device::gpu) {
+              gpu_to_cpu.insert(in.primitive().stream().index);
             }
           }
         }
 
         // All siblings have the same degree
         auto cache_it = cache.find(in.id());
-        if (cache_it == cache.end()) {
+        if (cache_it == nullptr) {
           dfs.emplace(in, 0);
-          cache.insert({in.id(), 1});
+          cache.emplace(in.id(), 1);
           for (auto& s : in.siblings()) {
-            cache.insert({s.id(), 1});
+            cache.emplace(s.id(), 1);
           }
         } else {
-          cache_it->second++;
+          (*cache_it)++;
           for (auto& s : in.siblings()) {
             cache[s.id()]++;
           }
@@ -175,6 +326,17 @@ array eval_impl(std::vector<array> outputs, bool async) {
         a.detach();
       }
       dfs.pop();
+    }
+
+    // A GPU stream may spin on CPU work only when that CPU work can wait for
+    // no GPU stream but this one.
+    for (auto& [id, readers] : cpu_to_gpu_readers) {
+      auto& need = needs_fence.at(id);
+      for (auto reader : readers) {
+        bool alone = gpu_to_cpu.empty() ||
+            (gpu_to_cpu.size() == 1 && gpu_to_cpu.count(reader) == 1);
+        (alone ? need.fast : need.event) = true;
+      }
     }
 
     // Build the tape in BFS order with a width limit
@@ -204,9 +366,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
         }
 
         auto it = cache.find(in.id());
-        it->second -= 1;
+        *it -= 1;
 
-        if (it->second != 0) {
+        if (*it != 0) {
           for (auto& s : in.siblings()) {
             cache[s.id()] -= 1;
           }
@@ -214,7 +376,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         }
 
         // Remove input and siblings from cache
-        cache.erase(it);
+        cache.erase(in.id());
         for (auto& s : in.siblings()) {
           cache.erase(s.id());
         }
@@ -246,12 +408,33 @@ array eval_impl(std::vector<array> outputs, bool async) {
         }
       }
 
-      for (auto& in : arr.inputs()) {
+      // A kernel can wait for its CPU-stream input itself when that CPU work
+      // can depend on no GPU stream other than this one.
+      bool one_gpu_stream = gpu_to_cpu.empty() ||
+          (gpu_to_cpu.size() == 1 && gpu_to_cpu.count(stream.index) == 1);
+      for (int i = 0; i < arr.inputs().size(); ++i) {
+        auto& in = arr.inputs()[i];
         if (auto it = needs_fence.find(in.id()); it != needs_fence.end()) {
           // Use fence to wait within a single eval
           // Get the input array's stream fence and wait on the
           // output arrays stream
-          fences[it->second.first].wait(stream, in);
+          auto& need = it->second;
+          // On the producer's own stream, wait on the fence its update used
+          // (as before: the update precedes in this stream). Across streams,
+          // a GPU stream waits on the event for another GPU stream's array,
+          // or for CPU work that can wait for another GPU stream: never spin.
+          bool same_stream = need.stream == static_cast<uint32_t>(stream.index);
+          if (same_stream ? !need.fast
+                          : (stream.device == Device::gpu &&
+                             (need.producer_gpu || !one_gpu_stream))) {
+            event_fences.at(need.stream).wait(stream, in, need.event_value);
+            continue;
+          }
+          auto& fence = fences.at(need.stream);
+          if (!one_gpu_stream ||
+              !fence.wait_in_consumer(stream, arr, i, need.fast_value)) {
+            fence.wait(stream, in, need.fast_value);
+          }
         } else if (in.event().valid()) {
           if (in.event().is_signaled()) {
             in.detach_event();
@@ -268,7 +451,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         cpu::eval(arr);
       }
 
-      if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+      if (too_many_active_tasks() ||
           (get_active_memory() > get_memory_limit() &&
            scheduler::n_active_tasks() > 0)) {
         // Commit any open streams
@@ -284,16 +467,40 @@ array eval_impl(std::vector<array> outputs, bool async) {
         }
       }
 
-      auto maybe_update_fence =
-          [&fences, &needs_fence, stream](const array& a) {
-            if (auto nf = needs_fence.find(a.id()); nf != needs_fence.end()) {
-              auto it = fences.find(stream.index);
-              if (it == fences.end()) {
-                it = fences.emplace(stream.index, Fence{stream}).first;
-              }
-              it->second.update(stream, a, nf->second.second);
+      auto maybe_update_fence = [&fences, &event_fences, &needs_fence, stream](
+                                    const array& a) {
+        if (auto nf = needs_fence.find(a.id()); nf != needs_fence.end()) {
+          // The fast update comes first: with cross_device it can move `a`
+          // (CUDA moves it to unified memory), and the event update must
+          // come after that move so that event waiters see the moved data.
+          if (nf->second.fast) {
+            auto it = fences.find(stream.index);
+            if (it == fences.end()) {
+              it = fences.emplace(stream.index, Fence{stream}).first;
             }
-          };
+            nf->second.fast_value =
+                it->second.update(stream, a, nf->second.cross_device);
+          }
+          if (nf->second.event) {
+            auto it = event_fences.find(stream.index);
+            if (it == event_fences.end()) {
+              it = event_fences
+                       .emplace(stream.index, Fence{stream, /* fast */ false})
+                       .first;
+            }
+            nf->second.event_value = it->second.update(stream, a, false);
+          }
+          // MLX_EAGER_FENCE_COMMIT=1: commit the GPU work now, after both
+          // updates, so the CPU stream starts when `a` is ready, not when
+          // the buffer is full.
+          static const bool eager_commit =
+              env::get_var("MLX_EAGER_FENCE_COMMIT", 0);
+          if (eager_commit && nf->second.fast && nf->second.cross_device &&
+              stream.device == Device::gpu) {
+            gpu::finalize(stream);
+          }
+        }
+      };
 
       arr.set_status(array::Status::evaluated);
       // TODO Maybe always want the fence coherent kernel in the same cbuf
@@ -322,6 +529,15 @@ array eval_impl(std::vector<array> outputs, bool async) {
         e.signal(es);
         open_streams.insert(es);
       } catch (...) {
+      }
+    }
+    // Commit GPU streams before the wait.
+    for (auto& s : open_streams) {
+      if (s.device == Device::gpu) {
+        try {
+          gpu::finalize(s);
+        } catch (...) {
+        }
       }
     }
     for (auto& s : open_streams) {
@@ -358,6 +574,9 @@ void async_eval(std::vector<array> outputs) {
     return;
   }
 
+  // A stream task can fail while async_eval still enqueues later tasks.
+  // synchronize raises that error, not async_eval.
+  scheduler::DeferStreamErrors defer;
   eval_impl(std::move(outputs), true);
 }
 
