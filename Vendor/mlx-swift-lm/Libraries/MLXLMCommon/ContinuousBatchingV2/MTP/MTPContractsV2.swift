@@ -842,6 +842,11 @@ public struct CBv2MTPMetrics: Sendable {
     /// Sum of measured wall time for cost-eligible speculative rounds.
     public var totalRoundWallTimeNanos: UInt64 = 0
 
+    // engine-local: per-round audit record (benchmark free-run audit)
+    /// Per-verify-round records in finalize order, bounded at
+    /// `CBv2MTPRoundAuditRecord.retainedRecordCap` (oldest dropped first).
+    public var roundAudits: [CBv2MTPRoundAuditRecord] = []
+
     public init() {}
 
     /// Preferred proposal-count spelling. `draftedTokens` remains stored for
@@ -851,5 +856,22 @@ public struct CBv2MTPMetrics: Sendable {
     /// Mean accepted drafts per round (nil before any round).
     public var meanAcceptedPerRound: Double? {
         rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+}
+
+// engine-local: per-round audit record (benchmark free-run audit)
+/// One finalized verify round, read off values the finalize boundary already
+/// holds: drafted, accepted, committed. No readback, no MLX evaluation.
+public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
+    public static let retainedRecordCap = 8192
+    public var requestID: UInt64
+    public var drafted: Int
+    public var accepted: Int
+    public var committed: Int
+    public init(requestID: UInt64, drafted: Int, accepted: Int, committed: Int) {
+        self.requestID = requestID
+        self.drafted = drafted
+        self.accepted = accepted
+        self.committed = committed
     }
 }

@@ -99,6 +99,23 @@ discarded by the cut and are re-applied by later commits in this repository.
 Its Bonsai 2 and Qwen 3.5 model files are the editable surface; the rest of the
 fork is trusted.
 
+### Engine-local changes to the vendored SDK
+
+One change sits on top of the cut, in the MTP path. It is **record-only**: it
+stores numbers the round driver already computes at its finalize boundary and
+changes neither the tokens a window emits, their order, the work inside a round,
+nor any default. Retention is bounded at 8192 records, oldest dropped first.
+
+| File | Added | Removed | What |
+|---|---|---|---|
+| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/MTPContractsV2.swift` | 22 | 0 | one per-round record type, and the metrics array that holds it |
+| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/CBv2MTPRoundDriver.swift` | 10 | 1 | `recordRound` accepts the record and appends it under the lock it already takes |
+| `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/EngineLoopV2+MTPFinalize.swift` | 5 | 1 | the finalize boundary passes `(requestID, drafted, accepted, committed)` |
+
+Each changed block carries the comment line
+`// engine-local: per-round audit record (benchmark free-run audit)`. The runner
+layer reads the records through `Vendor/mlx-swift-lm/Libraries/MLXRunners/RunnerRoundJournal.swift`.
+
 The signed block-Hadamard layers in `Vendor/mlx-swift/Source/MLXNN/Hadamard.swift`
 are adapted from Prism's Swift work at
 `PrismML-Eng/mlx-swift` `6d3a84de28225d1f5bc0a56f5c781596997242f9`, MIT.

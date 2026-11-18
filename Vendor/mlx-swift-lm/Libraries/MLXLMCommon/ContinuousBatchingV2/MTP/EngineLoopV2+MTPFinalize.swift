@@ -601,8 +601,12 @@ extension EngineLoopV2 {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
+            // engine-local: per-round audit record (benchmark free-run audit)
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed)
+                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                audit: CBv2MTPRoundAuditRecord(
+                    requestID: id.raw, drafted: k,
+                    accepted: accepted, committed: confirmed))
             let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
