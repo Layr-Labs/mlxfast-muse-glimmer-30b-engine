@@ -22,6 +22,12 @@ import Foundation
 import MLX
 import MLXLMCommon
 
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
 // MARK: - Transport
 
 /// One NDJSON line in, one NDJSON line out. Abstracted so the conformance
@@ -30,6 +36,13 @@ public protocol BenchWorkerTransport: AnyObject {
     /// Next request line, or nil at EOF.
     func readLine() -> String?
     func write(line: String)
+    /// Make every line already written reach the parent. Called only on the end
+    /// path that skips the runtime's teardown: nothing else is left to flush it.
+    func flush()
+}
+
+extension BenchWorkerTransport {
+    public func flush() {}
 }
 
 /// stdin/stdout.
@@ -38,6 +51,13 @@ public final class StdioTransport: BenchWorkerTransport {
     public func readLine() -> String? { Swift.readLine(strippingNewline: true) }
     public func write(line: String) {
         FileHandle.standardOutput.write(Data((line + "\n").utf8))
+    }
+    public func flush() {
+        // A plain write: nothing is buffered in this process. The sync is for a
+        // FILE stdout; on a pipe it answers EINVAL, which is not an error here
+        // (a pipe write is already in the kernel). The handle's own
+        // `synchronizeFile` raises on a pipe, so it is not used.
+        _ = fsync(FileHandle.standardOutput.fileDescriptor)
     }
 }
 
@@ -519,6 +539,35 @@ public final class BenchWorkerServer: @unchecked Sendable {
     private var stepper: (any TeacherForcedStepper)?
     private var freeRun: FreeRunSession?
 
+    /// The drain timeout the engines this worker builds are given
+    /// (`CBv2EngineLoopConfig.shutdownTimeout`, the loop's own default). A
+    /// shutdown that takes at least this long came back from the loop's
+    /// watchdog, not from the loop.
+    let engineShutdownTimeout: TimeInterval
+
+    /// Set when a shutdown reached `engineShutdownTimeout`: from then on the
+    /// engine's queue is NOT proven quiet, whatever is on it. A process that
+    /// runs the runtime's teardown under such a queue dies in that teardown
+    /// after its replies, so it must not run it.
+    private(set) var shutdownUnproven = false
+
+    /// How the process ends when its teardown is not safe: `_exit`, which skips
+    /// the runtime's static destructors. A seam, so a test can read the decision
+    /// instead of ending the test host.
+    var endProcessWithoutTeardown: (Int32) -> Void = { _exit($0) }
+
+    /// The end this worker has EARNED from what its shutdowns proved.
+    enum ProcessEnd: Equatable {
+        /// Every engine's queue ran out before the process ends: a normal exit
+        /// is safe, and it keeps the process's own cleanup.
+        case normal
+        /// A drain timed out, so some queue may still be inside the runtime.
+        /// The replies are delivered; only the teardown is refused.
+        case skipRuntimeTeardown
+    }
+
+    var processEnd: ProcessEnd { shutdownUnproven ? .skipRuntimeTeardown : .normal }
+
     public init(
         runner: any Runner,
         transport: any BenchWorkerTransport,
@@ -531,7 +580,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
         memory: any WorkerMemoryReporter = MLXMemoryReporter(),
         residentIdentity: ResidentIdentity? = nil,
         residentWeights: String? = nil,
-        nonce: String = UUID().uuidString
+        nonce: String = UUID().uuidString,
+        engineShutdownTimeout: TimeInterval = CBv2EngineLoopConfig().shutdownTimeout
     ) {
         self.runner = runner
         self.manifest = type(of: runner).manifest
@@ -547,6 +597,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
         self.residentWeights = residentWeights
         self.nonce = nonce
         self.decoder = JSONDecoder()
+        self.engineShutdownTimeout = engineShutdownTimeout
     }
 
     // MARK: Hello (§6.1)
@@ -615,6 +666,21 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 continue
             }
             send(await handle(request))
+        }
+        // End of input ends the engine too: a parent that closes the pipe
+        // without `phase_diagnostics` would otherwise leave the loop running
+        // under a process that is already exiting.
+        if let session = freeRun {
+            await shutDownAndQuiesce(session.engine)
+            releaseSessions()
+        }
+        // Every reply is written. If a drain timed out, a queue may still be
+        // inside the runtime: end through `_exit` so the runtime's destructors
+        // cannot run under it. The code is 0 because the replies are complete;
+        // what is refused is the teardown, not the answer.
+        if processEnd == .skipRuntimeTeardown {
+            transport.flush()
+            endProcessWithoutTeardown(0)
         }
     }
 
@@ -693,7 +759,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             response = try await freeDecodeRun(request)
 
         case .cohortReferenceReplay:
-            response = try cohortReferenceReplay(request)
+            response = try await cohortReferenceReplay(request)
 
         case .phaseDiagnostics:
             // PRE-drain watermarks first: the drain is what makes
@@ -835,19 +901,26 @@ public final class BenchWorkerServer: @unchecked Sendable {
             try engineBuild(
                 batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue),
                 seedLength: prompt.count))
-        var request = CBv2Request(
-            id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps)
-        request.sampling = Self.greedySampling
-        request.stopTokens = []
-        var tokens: [Int] = []
-        for await event in try engine.submit(request) {
-            if case .delta(_, let emitted, _) = event {
-                tokens.append(contentsOf: emitted)
-                if tokens.count >= steps { break }
+        do {
+            var request = CBv2Request(
+                id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps)
+            request.sampling = Self.greedySampling
+            request.stopTokens = []
+            var tokens: [Int] = []
+            for await event in try engine.submit(request) {
+                if case .delta(_, let emitted, _) = event {
+                    tokens.append(contentsOf: emitted)
+                    if tokens.count >= steps { break }
+                }
             }
+            await shutDownAndQuiesce(engine)
+            return Array(tokens.prefix(steps))
+        } catch {
+            // A submit that throws leaves an engine this worker built and never
+            // stopped. The process exits under it, so stop it on this path too.
+            await shutDownAndQuiesce(engine)
+            throw error
         }
-        await engine.shutdown()
-        return Array(tokens.prefix(steps))
     }
 
     /// One free-run window: the engine, its streams, and the counter baseline
@@ -949,46 +1022,55 @@ public final class BenchWorkerServer: @unchecked Sendable {
 
         let engine = try runner.makeEngine(
             try engineBuild(batch: batch, spec: spec, seedLength: seeds.map(\.count).max() ?? 0))
-        // Submit ALL streams before consuming ANY: a cohort drained stream by
-        // stream is a sequence of solo runs wearing a cohort's name.
-        var iterators: [AsyncStream<CBv2Event>.Iterator] = []
-        for (slot, seed) in seeds.enumerated() {
-            var cbv2 = CBv2Request(
-                id: CBv2RequestID(UInt64(slot + 1)), promptTokens: seed,
-                maxTokens: maxDecodeTokens)
-            cbv2.sampling = Self.greedySampling
-            cbv2.stopTokens = []
-            iterators.append(try engine.submit(cbv2).makeAsyncIterator())
-        }
+        // Until `freeRun` holds the session, nothing else can stop this engine,
+        // so a throw from here on stops it here.
+        let seedTokens: [Int]
+        do {
+            // Submit ALL streams before consuming ANY: a cohort drained stream by
+            // stream is a sequence of solo runs wearing a cohort's name.
+            var iterators: [AsyncStream<CBv2Event>.Iterator] = []
+            for (slot, seed) in seeds.enumerated() {
+                var cbv2 = CBv2Request(
+                    id: CBv2RequestID(UInt64(slot + 1)), promptTokens: seed,
+                    maxTokens: maxDecodeTokens)
+                cbv2.sampling = Self.greedySampling
+                cbv2.stopTokens = []
+                iterators.append(try engine.submit(cbv2).makeAsyncIterator())
+            }
 
-        var slotForRequestID: [UInt64: Int] = [:]
-        for slot in 0 ..< batch { slotForRequestID[UInt64(slot + 1)] = slot }
-        let session = FreeRunSession(
-            engine: engine, batch: batch, spec: spec, cohort: cohort,
-            slotForRequestID: slotForRequestID, streams: iterators)
-        // The audit's starting position is taken BEFORE the seed is submitted:
-        // the journal is empty at engine build, and every record it writes from
-        // here on belongs to a token this session will return. Taking it after
-        // the seed drain used to drop the rounds that finalized in between —
-        // their tokens arrived in the first run while their records were
-        // skipped by the cursor.
-        if let journal = engine as? any RunnerRoundJournaling {
-            session.journalCursor = journal.roundJournal().dropped
+            var slotForRequestID: [UInt64: Int] = [:]
+            for slot in 0 ..< batch { slotForRequestID[UInt64(slot + 1)] = slot }
+            let session = FreeRunSession(
+                engine: engine, batch: batch, spec: spec, cohort: cohort,
+                slotForRequestID: slotForRequestID, streams: iterators)
+            // The audit's starting position is taken BEFORE the seed is submitted:
+            // the journal is empty at engine build, and every record it writes from
+            // here on belongs to a token this session will return. Taking it after
+            // the seed drain used to drop the rounds that finalized in between —
+            // their tokens arrived in the first run while their records were
+            // skipped by the cursor.
+            if let journal = engine as? any RunnerRoundJournaling {
+                session.journalCursor = journal.roundJournal().dropped
+            }
+            if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
+                session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
+                session.clampBaseline = Self.clampReasons(metrics)
+            }
+            var tokens: [Int] = []
+            for slot in 0 ..< batch {
+                tokens.append(
+                    contentsOf: try await drain(session: session, slot: slot, count: 1))
+            }
+            // The seed token `free_decode_begin` returns is not part of any run
+            // window, so the first window's cut starts after it.
+            session.statedPerStream = 1
+            self.freeRun = session
+            seedTokens = tokens
+        } catch {
+            await shutDownAndQuiesce(engine)
+            throw error
         }
-        if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
-            session.seedCursor = metrics.seedSteps
-            session.seedRoundCursor = metrics.seedRounds
-            session.clampBaseline = Self.clampReasons(metrics)
-        }
-        var seedTokens: [Int] = []
-        for slot in 0 ..< batch {
-            seedTokens.append(
-                contentsOf: try await drain(session: session, slot: slot, count: 1))
-        }
-        // The seed token `free_decode_begin` returns is not part of any run
-        // window, so the first window's cut starts after it.
-        session.statedPerStream = 1
-        self.freeRun = session
 
         var response = WorkerResponse(id: request.id, ok: true, nonce: nonce)
         if cohort {
@@ -1198,7 +1280,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
 
     /// Trusted-build oracle: teacher-forced replay of the candidate's own
     /// committed journal, through the engine's own path.
-    private func cohortReferenceReplay(_ request: WorkerRequest) throws -> WorkerResponse {
+    private func cohortReferenceReplay(_ request: WorkerRequest) async throws -> WorkerResponse {
         guard trusted else {
             throw WorkerError.capabilityNotAdvertised(
                 WorkerCapability.cohortReferenceReplay)
@@ -1219,18 +1301,25 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 seedLength: seeds.map(\.count).max() ?? 0))
 
         var streams: [CohortReferenceReplayReport.Stream] = []
-        for (slot, seed) in seeds.enumerated() {
-            let journal = committed[slot]
-            let reference = try engine.teacherForcedTop1(
-                promptTokens: seed, continuation: journal)
-            streams.append(
-                CohortReferenceReplayReport.Stream(
-                    slot: slot,
-                    positions: zip(journal, reference).map {
-                        CohortReferenceReplayReport.Position(
-                            committedToken: $0, sequentialArgmax: $1)
-                    }))
+        do {
+            for (slot, seed) in seeds.enumerated() {
+                let journal = committed[slot]
+                let reference = try engine.teacherForcedTop1(
+                    promptTokens: seed, continuation: journal)
+                streams.append(
+                    CohortReferenceReplayReport.Stream(
+                        slot: slot,
+                        positions: zip(journal, reference).map {
+                            CohortReferenceReplayReport.Position(
+                                committedToken: $0, sequentialArgmax: $1)
+                        }))
+            }
+        } catch {
+            await shutDownAndQuiesce(engine)
+            throw error
         }
+        // This verb builds an engine of its own; stop it however the replay ended.
+        await shutDownAndQuiesce(engine)
 
         var response = WorkerResponse(id: request.id, ok: true, nonce: nonce)
         response.effectiveBatchSize = seeds.count
@@ -1281,6 +1370,28 @@ public final class BenchWorkerServer: @unchecked Sendable {
         freeRun = nil
     }
 
+    /// Stop an engine and WAIT for its own queue to run out.
+    ///
+    /// `shutdown()` returns when the loop accepts the drain; the work the loop
+    /// had already launched (a chained decode, a retired row's KV release that
+    /// synchronizes the stream) can still be running on its queue behind it.
+    /// A second shutdown is idempotent and queues behind that work, so this
+    /// returns only once the loop is quiet. Without it the process ends with a
+    /// thread still inside the runtime and dies in its teardown.
+    ///
+    /// Each call is timed. A drain that runs into the loop's own watchdog
+    /// returned with its queue possibly still inside the runtime, so the
+    /// worker records that it never proved the engine quiet.
+    private func shutDownAndQuiesce(_ engine: any CBv2Engine) async {
+        for _ in 0 ..< 2 {
+            let started = ContinuousClock.now
+            await engine.shutdown()
+            if ContinuousClock.now - started >= .seconds(engineShutdownTimeout) {
+                shutdownUnproven = true
+            }
+        }
+    }
+
     /// How many drains the phase-close settle tries, and the pause between
     /// two of them. A free that lands after `Memory.clearCache()` (a step's
     /// last `asyncEval` temporaries, the engine loop's teardown on its own
@@ -1311,7 +1422,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
     /// ``drainSettleAttempts`` drains, and stops at the first zero read.
     private func releaseSessionsAndSettle() async -> Int? {
         if let session = freeRun {
-            await session.engine.shutdown()
+            await shutDownAndQuiesce(session.engine)
         }
         releaseSessions()
         var cache: Int?

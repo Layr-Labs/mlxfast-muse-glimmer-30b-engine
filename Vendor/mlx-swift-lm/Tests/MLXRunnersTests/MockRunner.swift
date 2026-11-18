@@ -144,11 +144,29 @@ final class MockEngine:
     private var reads = 0
     private var journalReads = 0
 
+    /// The engine's own serial queue, as the pair of the loop's queue: work put
+    /// here runs in order, so a shutdown that queues behind a successor step
+    /// cannot return before that step finished.
+    let engineQueue = DispatchQueue(label: "mock.cbv2.engine")
+
+    /// The step the loop had already launched when the first drain was
+    /// accepted. It runs on `engineQueue`, outliving that drain, the way a
+    /// chained decode outlives the loop's shutdown.
+    var queuedSuccessor: (@Sendable () -> Void)?
+
+    /// A shutdown that takes at least this long models one that ran into the
+    /// loop's drain watchdog.
+    var shutdownDelay: Duration?
+
+    /// Thrown from `submit` when set, so a test can drive a worker error path.
+    var submitFailure: Error?
+
     init(script: MockRoundScript?) {
         self.script = script
     }
 
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        if let submitFailure { throw submitFailure }
         let start = MockTokens.freeRunStart(request.promptTokens)
         let maxTokens = request.maxTokens
         let deltaWidth = max(1, script?.deltaWidth ?? 1)
@@ -179,7 +197,38 @@ final class MockEngine:
             activeTokens: 0)
     }
 
-    func shutdown() async {}
+    /// How many times this engine has been asked to shut down. The worker
+    /// drains, then waits for the queue with a second (idempotent) shutdown, so
+    /// a count of 2 is "the loop is quiet", and 1 is "the drain was requested".
+    private(set) var shutdowns = 0
+
+    func shutdown() async {
+        let call = recordShutdown()
+        if let delay = shutdownDelay { try? await Task.sleep(for: delay) }
+        if call == 1 {
+            // The first drain is accepted while the loop's own work runs on:
+            // the successor is queued, not awaited.
+            if let successor = queuedSuccessor {
+                queuedSuccessor = nil
+                engineQueue.async(execute: successor)
+            }
+            return
+        }
+        // The second drain queues behind whatever the queue already holds.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            engineQueue.async { continuation.resume() }
+        }
+    }
+
+    /// Locking is not async-safe, so the async entry point hands the counter to
+    /// a synchronous helper.
+    @discardableResult
+    private func recordShutdown() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        shutdowns += 1
+        return shutdowns
+    }
 
     /// Cumulative and monotonic, like the real engine's: the FIRST read is
     /// the baseline `free_decode_begin` takes after its seed forward, when no
@@ -286,6 +335,15 @@ final class MockRunner: Runner, @unchecked Sendable {
     let headProvenance: HeadProvenance? = nil
     let loadedModelType = "qwen4_exp_text"
 
+    /// Every engine this runner builds, so a test can read what the worker did
+    /// to it: the wire has no verb that reports an engine's lifetime.
+    var onEngine: ((MockEngine) -> Void)?
+
+    /// Passed to every engine this runner builds: see `MockEngine`.
+    var successor: (@Sendable () -> Void)?
+    var shutdownDelay: Duration?
+    var submitFailure: Error?
+
     init(script: MockRoundScript? = .fixtureWindow) {
         self.script = script
     }
@@ -311,7 +369,12 @@ final class MockRunner: Runner, @unchecked Sendable {
                 requested: build.decoder.rawValue,
                 loaded: loadedDecoders.map(\.rawValue))
         }
-        return MockEngine(script: build.decoder == .serial ? nil : script)
+        let engine = MockEngine(script: build.decoder == .serial ? nil : script)
+        engine.queuedSuccessor = successor
+        engine.shutdownDelay = shutdownDelay
+        engine.submitFailure = submitFailure
+        onEngine?(engine)
+        return engine
     }
 
     func makeStepper() throws -> any TeacherForcedStepper { MockStepper() }
@@ -418,19 +481,47 @@ final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
 
 /// Scripted transport: the request lines go in, the response lines come out.
 final class ScriptedTransport: BenchWorkerTransport {
+    private let lock = NSLock()
     private var pending: [String]
-    private(set) var written: [String] = []
+    private var lines: [String] = []
+    private var flushes = 0
+
+    /// Lines written so far. Locked, because a test that watches the worker's
+    /// ordering reads this while the worker is still serving.
+    var written: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines
+    }
 
     init(lines: [String]) {
         self.pending = lines
     }
 
     func readLine() -> String? {
-        pending.isEmpty ? nil : pending.removeFirst()
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.isEmpty ? nil : pending.removeFirst()
     }
 
     func write(line: String) {
-        written.append(line)
+        lock.lock()
+        defer { lock.unlock() }
+        lines.append(line)
+    }
+
+    /// How many times the worker asked for a flush. The end path that skips the
+    /// runtime's teardown must flush before it leaves.
+    var flushCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return flushes
+    }
+
+    func flush() {
+        lock.lock()
+        defer { lock.unlock() }
+        flushes += 1
     }
 }
 
