@@ -72,8 +72,9 @@ class Exaone4Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if useRope, let rope {
-            queries = applyRotaryPosition(rope, to: queries, cache: cache)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+            let offset = cache?.ropeOffset
+            queries = applyRotaryPosition(rope, to: queries, offset: offset)
+            keys = applyRotaryPosition(rope, to: keys, offset: offset)
         }
 
         let output = attentionWithCacheUpdate(
@@ -139,6 +140,9 @@ public class Exaone4ModelInner: Module {
 
     fileprivate let layers: [Exaone4TransformerBlock]
     let norm: RMSNorm
+    let swaIdx: Int?
+    let fullIdx: Int
+    let windowSize: Int?
 
     public init(_ args: Exaone4Configuration) {
         precondition(args.vocabularySize > 0)
@@ -160,14 +164,26 @@ public class Exaone4ModelInner: Module {
                 return Exaone4TransformerBlock(args, isLocal: isLocal)
             }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+
+        let pattern = args.slidingWindowPattern.map(Array.init) ?? []
+        self.swaIdx = pattern.firstIndex(of: "L")
+        self.fullIdx = pattern.firstIndex(of: "G") ?? 0
+        self.windowSize = args.slidingWindow
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let globalMask = createAttentionMask(h: h, cache: cache?[fullIdx])
+        let swaMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            if let swaIdx {
+                createAttentionMask(h: h, cache: cache?[swaIdx], windowSize: windowSize)
+            } else {
+                .none
+            }
 
         for (i, layer) in layers.enumerated() {
+            let mask = layer.attention.isLocal ? swaMask : globalMask
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
@@ -208,20 +224,18 @@ public class Exaone4Model: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
     }
 
-    public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
-        return model.layers.map { layer in
-            if layer.attention.isLocal, let slidingWindow = configuration.slidingWindow {
-                return RotatingKVCache(maxSize: slidingWindow, keep: 0)
-            } else {
-                return StandardKVCache()
-            }
+    public func newCache(parameters: GenerateParameters? = nil) throws -> [KVCache] {
+        try model.layers.map { layer in
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: configuration.slidingWindow,
+                usesSlidingWindow: layer.attention.isLocal)
         }
     }
 }

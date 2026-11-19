@@ -41,6 +41,13 @@ import MLXNN
 ///   entirely in MLXArray space.
 /// - `makeMask` always returns `.array(mask)` — the full-buffer return
 ///   means attention must be told which positions are valid.
+///
+/// Qualified for single-token decode after promotion: sliding windows with
+/// `keep == 0`, and full-context attention with preserved sink slots. A window
+/// smaller than the ring with `keep > 0` is not qualified; the inherited mask
+/// does not define a separate sink-window policy. Multi-token updates across
+/// ring wrap are also unsupported. Prefill in `RotatingKVCache` before promotion;
+/// this class does not provide general chunked or speculative-update semantics.
 public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendable {
 
     /// Current write index within the ring buffer, as `MLXArray[1] int32`.
@@ -61,11 +68,14 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     // MARK: - Init
 
     /// Direct constructor matching the parent. Primarily for testing.
-    public override init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
         self.idxArray = MLXArray([Int32(0)])
         self.offsetArray = MLXArray([Int32(0)])
-        super.init(maxSize: maxSize, keep: keep, step: step)
+        super.init(maxSize: maxSize, keep: keep, step: step, rewindCapacity: 0)
     }
+
+    /// The RoPE offset as a graph array, so compiled decode reads no scalar.
+    public override var ropeOffset: RoPEOffset { .batch(offsetArray + 0) }
 
     /// Promote an existing populated ``RotatingKVCache`` to a compile-
     /// traceable variant. Copies the state references AND allocates the
@@ -96,7 +106,19 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
             let vD = srcV.dim(3)
             let curLen = srcK.dim(2)
 
-            if curLen < maxCacheSize {
+            if curLen > maxCacheSize {
+                // A prompt longer than the ring leaves the source buffer
+                // in temporal order with more than maxCacheSize slots.
+                // Keep the first `keep` slots and the newest slots, as
+                // the next update of the source would do.
+                let trimSize = curLen - maxCacheSize
+                self.keys = concatenated(
+                    [srcK[.ellipsis, ..<keep, 0...], srcK[.ellipsis, (trimSize + keep)..., 0...]],
+                    axis: 2)
+                self.values = concatenated(
+                    [srcV[.ellipsis, ..<keep, 0...], srcV[.ellipsis, (trimSize + keep)..., 0...]],
+                    axis: 2)
+            } else if curLen < maxCacheSize {
                 // Need to grow — but this is a ONE-TIME growth during
                 // promotion, not inside a compile trace. Use concat to
                 // extend to full size.
@@ -113,12 +135,20 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // else: keys/values remain nil; first `update` call allocates
         // them at full size.
 
+        // The ring is full: the next write goes to the oldest slot after
+        // `keep`, as in the rotation of the source.
+        if self.idx >= maxCacheSize {
+            self.idx = keep
+        }
+
         self.idxArray = MLXArray([Int32(self.idx)])
         self.offsetArray = MLXArray([Int32(self.offset)])
     }
 
     /// Static promote helper for symmetry with `CompilableKVCache.promote`.
-    public static func promote(from cache: RotatingKVCache, maxLength: Int) -> CompilableRotatingKVCache {
+    public static func promote(from cache: RotatingKVCache, maxLength: Int)
+        -> CompilableRotatingKVCache
+    {
         // maxLength is unused here because RotatingKVCache already has maxCacheSize,
         // but the parameter keeps the API symmetric with CompilableKVCache.promote.
         return CompilableRotatingKVCache(from: cache)
@@ -222,11 +252,19 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
             // After ring wrap, the recent window may be split across buffer
             // end and beginning. Compare in modular token-index space rather
             // than physical ring-column space so both halves are included.
-            // tokenInds maps each physical position to its distance from the
-            // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
-            // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
-            let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
-            let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
+            // The mask is made before the update, so query i is written at
+            // slot idxArray + i. `distance` is the number of tokens from each
+            // physical slot to the query slot. Keep the current token and
+            // the `windowSize - 1` tokens before it.
+            let querySlots: MLXArray
+            if n == 1 {
+                querySlots = idxArray.reshaped(1, 1)
+            } else {
+                querySlots = (MLXArray(Int32(0) ..< Int32(n)) + idxArray).reshaped(n, 1)
+            }
+            let distance =
+                (querySlots - rinds + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
+            let windowFilter = distance .< Int32(windowSize)
             mask = mask & windowFilter
         }
 

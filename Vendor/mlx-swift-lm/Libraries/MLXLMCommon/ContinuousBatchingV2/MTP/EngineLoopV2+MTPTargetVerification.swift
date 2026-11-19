@@ -27,33 +27,49 @@ extension EngineLoopV2 {
     /// with genuine target samples drawn with the request's real sampler
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
+    ///
+    /// `accept` is non-nil only under `CBv2MTPAcceptance.typical` with a
+    /// target-prefix batch: a lazy `[B, k]` bool mask, true where the draft
+    /// is kept (`CBv2StepSampler.mtpVerifyTypical`). Finalize walks the mask
+    /// instead of comparing drafts to `scores`; the committed correction and
+    /// bonus token remain `scores`.
+    ///
+    /// A window position whose target logits hold NaN or infinity scores
+    /// `CBv2NonFiniteLogits.invalidTarget`, so finalize can refuse to commit it.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
-        scores: MLXArray, hidden: MLXArray,
+        scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
         diagnostics: [CBv2LogitDiagnosticPacket],
-        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
-        blockContext: MLXArray?
+        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-        let scores: MLXArray
+        // Raw logits are retained only for grammar-verified rows; rows in an
+        // opted-in free span are scored on the masked window below.
+        let hasConstraints = rows.contains {
+            $0.rec.request.tokenConstraint != nil && mtpFreeSpan($0.rec) == nil
+        }
+        var constraintColumns: [MLXArray] = []
+        var constraintLogits: MLXArray?
+        var scores: MLXArray
+        var accept: MLXArray?
+        let nonFinite: MLXArray
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
-        // The fused tapped context a BLOCK drafter reads. The tap holds ONE
-        // forward's rows, so it is read immediately after each target
-        // forward, before the next one overwrites it.
-        var blockContextColumns: [MLXArray] = []
         var capturedInnerState: [MLXArray] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
-        let diagnosticOffsets = logitDiagnostic == nil ? nil : rows.map {
-            Self.positionOffset(kvStates[$0.rec.id]!)
-        }
+        let diagnosticOffsets =
+            logitDiagnostic == nil
+            ? nil
+            : rows.map {
+                Self.positionOffset(kvStates[$0.rec.id]!)
+            }
 
         let recurrentModel =
             (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap { model in
@@ -70,24 +86,55 @@ extension EngineLoopV2 {
             }
         let verifyParams = rows.map(\.rec.request.sampling)
         let verifyIDs = rows.map(\.rec.id)
+        let spanSampler =
+            rows.contains { mtpFreeSpan($0.rec) != nil }
+            ? sampler as? any CBv2FreeSpanSampler : nil
         // Per-request output-step index of window position 0: the seed token
         // (already confirmed output) was drawn at index base-1, so position j
         // of the window is output index base + j.
         let verifyStepBases = rows.map(\.rec.generatedTokenCount)
+        // Typical acceptance rides the target-prefix path only: an all-greedy
+        // batch keeps the argmax packet, and rounds without drafts have no
+        // position to decide.
+        let typicalDelta: Float? = {
+            guard useTargetPrefix, columns.count > 1,
+                case .typical(let delta) = mtp.config.acceptance
+            else { return nil }
+            return delta
+        }()
+        var typicalUnsupported = false
 
-        func scoreColumns(_ logits: MLXArray, columnOffset: Int) -> MLXArray {
+        /// `drafts` is `[B, D]` (the draft proposed at each of the first `D`
+        /// columns of `logits`) when typical acceptance needs a decision for
+        /// this call; nil otherwise.
+        func scoreColumns(
+            _ rawLogits: MLXArray, columnOffset: Int, drafts: MLXArray?
+        ) -> (scores: MLXArray, accept: MLXArray?) {
+            let logits =
+                spanSampler?.maskFreeSpanVerification(rawLogits, requestIDs: verifyIDs)
+                ?? rawLogits
             guard useTargetPrefix else {
-                return argMax(logits, axis: -1).asType(.int32)
+                return (argMax(logits, axis: -1).asType(.int32), nil)
+            }
+            let stepBases = verifyStepBases.map { $0 + columnOffset }
+            if let typicalDelta, let drafts {
+                if let scored = sampler.mtpVerifyTypical(
+                    logits: logits, draftIDs: drafts, delta: typicalDelta,
+                    params: verifyParams, requestIDs: verifyIDs, stepBases: stepBases)
+                {
+                    return (scored.tokens, scored.accept)
+                }
+                typicalUnsupported = true
             }
             guard
                 let sampled = sampler.mtpVerifySample(
                     logits: logits, params: verifyParams, requestIDs: verifyIDs,
-                    stepBases: verifyStepBases.map { $0 + columnOffset })
+                    stepBases: stepBases)
             else {
                 preconditionFailure(
                     "CBv2 MTP: sampler advertised target-prefix support but returned nil")
             }
-            return sampled
+            return (sampled, nil)
         }
 
         func captureDiagnostics(
@@ -101,7 +148,10 @@ extension EngineLoopV2 {
                 let localColumn = column - columnOffset
                 guard localColumn >= 0, localColumn < logits.dim(1) else { continue }
                 let retainedTopTwo = topTwo.map {
-                    (ids: $0.ids[batchIndex, localColumn], values: $0.values[batchIndex, localColumn])
+                    (
+                        ids: $0.ids[batchIndex, localColumn],
+                        values: $0.values[batchIndex, localColumn]
+                    )
                 }
                 if let packet = makeLogitDiagnostic(
                     logits: logits[batchIndex, localColumn], requestID: row.rec.id,
@@ -110,16 +160,19 @@ extension EngineLoopV2 {
                     verificationWidth: columns.count, draftDepth: columns.count - 1,
                     seedToken: row.carry?.token, cacheOffset: diagnosticOffsets[batchIndex],
                     policyTopTwo: retainedTopTwo)
-                { diagnostics.append(packet) }
+                {
+                    diagnostics.append(packet)
+                }
             }
         }
 
-        var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
-        case .rectangular, .rectangularExact: true
-        case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
-        }
+        var useRectangular =
+            switch mtp.config.verificationMode {
+            case .serialTarget: false
+            case .rectangular, .rectangularExact: true
+            case .automatic:
+                columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            }
 
         // A recurrent target may only verify rectangularly through the
         // captured-window seam. Stateful production never falls back to
@@ -129,7 +182,8 @@ extension EngineLoopV2 {
         {
             if mtp.usesRequestStatefulDrafter {
                 preconditionFailure(
-                    "CBv2 production request-stateful MTP requires captured rectangular verification")
+                    "CBv2 production request-stateful MTP requires captured rectangular verification"
+                )
             }
             mtp.recordControllerFallback("captured_verify_unsupported")
             useRectangular = false
@@ -158,7 +212,8 @@ extension EngineLoopV2 {
             if serializingCaches.count != caches.count {
                 if mtp.usesRequestStatefulDrafter, recurrentModel != nil {
                     preconditionFailure(
-                        "CBv2 production request-stateful MTP cache lacks rectangular serialization")
+                        "CBv2 production request-stateful MTP cache lacks rectangular serialization"
+                    )
                 }
                 mtp.recordControllerFallback("rectangular_cache_unsupported")
                 useRectangular = false
@@ -168,10 +223,14 @@ extension EngineLoopV2 {
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
+            var acceptColumnsAccum: [MLXArray] = []
+            var nonFiniteColumns: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             scoreColumnsAccum.reserveCapacity(columns.count)
             hiddenColumns.reserveCapacity(columns.count)
             for (columnIndex, column) in columns.enumerated() {
+                let nativePagedWork = CBv2NativePagedMTPWork.current
+                let columnWork = try nativePagedWork?.prepareColumn(columnIndex)
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output: (logits: MLXArray, lastHidden: MLXArray)
                 var recurrentArrays: [MLXArray] = []
@@ -189,9 +248,15 @@ extension EngineLoopV2 {
                     let positionIds = CBv2PositionState.decodePositionIds(
                         states: rows.map(\.rec.request.positionState),
                         cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                    output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHidden(
-                        tokens: column, caches: caches, recurrentState: evaluations,
-                        positionIds: positionIds) }
+                    output = try withQwen4PositionScope(
+                        ids: rows.map(\.rec.id), positionIds: positionIds
+                    ) {
+                        try checkedModelForward(phase: .mtpVerification) {
+                            recurrentModel.forwardWithHidden(
+                                tokens: column, caches: caches, recurrentState: evaluations,
+                                positionIds: positionIds)
+                        }
+                    }
                     for (row, evaluation) in zip(rows, evaluations) {
                         do { recurrentArrays.append(contentsOf: try evaluation.evaluate()) } catch {
                             preconditionFailure(
@@ -200,47 +265,77 @@ extension EngineLoopV2 {
                         recurrent[row.rec.id, default: []].append(evaluation)
                     }
                 } else {
-                    output = try checkedModelForward(phase: .mtpVerification) { mtp.model.forwardWithHidden(tokens: column, caches: caches) }
-                }
-                if let block = mtp.blockDrafter {
-                    guard let column = block.blockContextHidden() else {
-                        preconditionFailure(
-                            "CBv2 block MTP: the target's context tap is not armed")
+                    output = try checkedModelForward(phase: .mtpVerification) {
+                        mtp.model.forwardWithHidden(tokens: column, caches: caches)
                     }
-                    blockContextColumns.append(column)
                 }
+                if hasConstraints { constraintColumns.append(output.logits) }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
-                let columnScores = scoreColumns(output.logits, columnOffset: columnIndex)
+                // Flag the model's logits before a host sampler sees them.
+                let columnNonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
+                // Column c scores the draft at column c + 1; the bonus column
+                // has no draft to decide.
+                let columnDrafts: MLXArray? =
+                    typicalDelta != nil && columnIndex + 1 < columns.count
+                    ? columns[columnIndex + 1] : nil
+                let scored = scoreColumns(
+                    output.logits, columnOffset: columnIndex, drafts: columnDrafts)
+                let columnScores = scored.scores
+                if let columnAccept = scored.accept {
+                    acceptColumnsAccum.append(columnAccept)
+                }
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
                 var evaluationTargets =
-                    [columnScores, output.lastHidden] + eagerCacheInnerState(caches) + recurrentArrays
+                    [columnScores, columnNonFinite, output.lastHidden]
+                    + (scored.accept.map { [$0] } ?? [])
+                    + eagerCacheInnerState(caches) + recurrentArrays
                 for packet in diagnostics where packet.column == columnIndex {
                     evaluationTargets.append(contentsOf: packet.evaluationTargets)
                 }
+                retainNativeWork(evaluationTargets)
+                try requireNativeWork()
                 eval(evaluationTargets)
+                try nativeWorkSubmitted()
+                if let nativePagedWork, let columnWork {
+                    try nativePagedWork.completeColumn(columnWork)
+                }
                 // One blocking evaluation per serial verify column, counted.
                 CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)
+                nonFiniteColumns.append(columnNonFinite)
                 hiddenColumns.append(output.lastHidden)
             }
             scores = concatenated(scoreColumnsAccum, axis: 1)
+            nonFinite = concatenated(nonFiniteColumns, axis: 1)
+            if !acceptColumnsAccum.isEmpty {
+                accept = concatenated(acceptColumnsAccum, axis: 1)
+            }
             hidden = concatenated(hiddenColumns, axis: 1)
+            if hasConstraints { constraintLogits = concatenated(constraintColumns, axis: 1) }
 
         } else {
             for cache in serializingCaches {
                 cache.mtpSerializesRectangularAttention = true
-                cache.mtpBatchesRectangularAttention = mtp.drafter.prefersBatchedRectangularAttention
+                cache.mtpBatchesRectangularAttention =
+                    mtp.drafter.prefersBatchedRectangularAttention
+                cache.mtpBatchesRectangularColumnsAsRows =
+                    mtp.drafter.batchesVerifyColumnsAsDecodeRows
             }
             defer {
                 for cache in serializingCaches {
                     cache.mtpSerializesRectangularAttention = false
                     cache.mtpBatchesRectangularAttention = false
+                    cache.mtpBatchesRectangularColumnsAsRows = false
                 }
             }
             let tokens = concatenated(columns, axis: 1)
+            // A native paged rectangular step plans the whole window as one
+            // attention owner; its reads must finish construction before sealing.
+            let nativePagedWork = CBv2NativePagedMTPWork.current
+            let windowWork = try nativePagedWork?.prepareWindow()
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
@@ -262,9 +357,15 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                output = try withQwen4PositionScope(
+                    ids: rows.map(\.rec.id), positionIds: positionIds
+                ) {
+                    try checkedModelForward(phase: .mtpVerification) {
+                        recurrentModel.forwardWithHiddenCaptured(
+                            tokens: tokens, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds)
+                    }
+                }
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,
@@ -278,15 +379,16 @@ extension EngineLoopV2 {
                     recurrent[row.rec.id] = [evaluation]
                 }
             } else {
-                output = try checkedModelForward(phase: .mtpVerification) { mtp.model.forwardWithHidden(tokens: tokens, caches: caches) }
-            }
-            if let block = mtp.blockDrafter {
-                guard let context = block.blockContextHidden() else {
-                    preconditionFailure(
-                        "CBv2 block MTP: the target's context tap is not armed")
+                output = try checkedModelForward(phase: .mtpVerification) {
+                    mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
                 }
-                blockContextColumns.append(context)
             }
+            if let nativePagedWork, let windowWork {
+                try nativePagedWork.closeWindow(windowWork)
+            }
+            if hasConstraints { constraintLogits = output.logits }
+            // Flag the model's logits before a host sampler sees them.
+            nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             if mtp.usesRequestStatefulDrafter {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                     preconditionFailure(
@@ -299,10 +401,16 @@ extension EngineLoopV2 {
                 let topTwo = provider.cbv2MTPTopTwo(flat)
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                    topTwo.values.reshaped([batch, width, 2]).asType(.float32)
+                )
             }
-            if useTargetPrefix {
-                scores = scoreColumns(output.logits, columnOffset: 0)
+            if useTargetPrefix || spanSampler != nil {
+                let drafts: MLXArray? =
+                    typicalDelta != nil
+                    ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
+                let scored = scoreColumns(output.logits, columnOffset: 0, drafts: drafts)
+                scores = scored.scores
+                accept = scored.accept
             } else if let policyTopTwo {
                 scores = policyTopTwo.ids[0..., 0..., 0]
             } else {
@@ -323,16 +431,15 @@ extension EngineLoopV2 {
             }
         }
 
-        let blockContext: MLXArray? =
-            blockContextColumns.isEmpty
-            ? nil
-            : (blockContextColumns.count == 1
-                ? blockContextColumns[0]
-                : concatenated(blockContextColumns, axis: 1))
+        if typicalUnsupported {
+            mtp.recordControllerFallback("typical_acceptance_unsupported")
+        }
+
+        scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
         return (
-            scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent,
-            blockContext)
+            scores, accept, hidden, constraintLogits, shortlist, policyTopTwo,
+            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
+        )
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

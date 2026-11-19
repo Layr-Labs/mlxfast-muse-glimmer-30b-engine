@@ -78,8 +78,9 @@ class MultiHeadCausalAttention: Module {
             keys = kNorm(keys)
         }
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -192,7 +193,7 @@ public class OpenELMModel: Module, LLMModel, KVCacheDimensionProvider {
         self.transformer = OpenELMModelInner(args)
         if !args.shareInputOutputLayers {
             self._lmHead.wrappedValue = Linear(
-                args.numTransformerLayers, args.vocabularySize, bias: false)
+                args.modelDim, args.vocabularySize, bias: false)
         }
     }
 

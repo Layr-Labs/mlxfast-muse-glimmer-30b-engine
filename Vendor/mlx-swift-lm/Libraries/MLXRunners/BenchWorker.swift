@@ -22,6 +22,12 @@ import Foundation
 import MLX
 import MLXLMCommon
 
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
 // MARK: - Transport
 
 /// One NDJSON line in, one NDJSON line out. Abstracted so the conformance
@@ -30,6 +36,13 @@ public protocol BenchWorkerTransport: AnyObject {
     /// Next request line, or nil at EOF.
     func readLine() -> String?
     func write(line: String)
+    /// Make every line already written reach the parent. Called only on the end
+    /// path that skips the runtime's teardown: nothing else is left to flush it.
+    func flush()
+}
+
+extension BenchWorkerTransport {
+    public func flush() {}
 }
 
 /// stdin/stdout.
@@ -38,6 +51,13 @@ public final class StdioTransport: BenchWorkerTransport {
     public func readLine() -> String? { Swift.readLine(strippingNewline: true) }
     public func write(line: String) {
         FileHandle.standardOutput.write(Data((line + "\n").utf8))
+    }
+    public func flush() {
+        // A plain write: nothing is buffered in this process. The sync is for a
+        // FILE stdout; on a pipe it answers EINVAL, which is not an error here
+        // (a pipe write is already in the kernel). The handle's own
+        // `synchronizeFile` raises on a pipe, so it is not used.
+        _ = fsync(FileHandle.standardOutput.fileDescriptor)
     }
 }
 
@@ -89,16 +109,18 @@ public protocol CBv2MTPCountersReporting: AnyObject {
 
 extension EngineV2: CBv2MTPCountersReporting {}
 
-/// Per-round free-run audit, ASSEMBLED from the engine's own journal
-/// (`CBv2MTPMetrics.roundAudits`). Every field here is a reading of records
+/// Per-round free-run audit, ASSEMBLED from the engine build's own round
+/// journal (`RunnerRoundJournaling`). Every field here is a reading of records
 /// the engine wrote at its finalize boundary; nothing is computed from the
 /// tokens the worker happened to drain.
 /// One verify round as the journal states it, across the cohort's streams.
 public struct FreeRunRound: Sendable, Equatable {
-    /// The committed width, common to every active stream.
-    public var width: Int
-    /// Per stream, whether it was still generating in this round.
-    public var active: [Bool]
+    /// Per stream, the tokens this round committed. `0` means the stream was
+    /// not generating in this round. A cohort's rows can commit DIFFERENT
+    /// widths in one round (a drafter that finalizes each row on its own
+    /// accepted prefix), so the width is stated per row rather than as one
+    /// number the rows are forced to share.
+    public var widths: [Int]
     /// Per stream, the PRE-min natural accept-walk length (0 when inactive).
     public var naturalAccepted: [Int]
     /// Draft tokens proposed across the streams.
@@ -106,12 +128,26 @@ public struct FreeRunRound: Sendable, Equatable {
     /// Drafts that passed verification AND were committed, across the streams.
     public var accepted: Int
 
-    public init(width: Int, active: [Bool], naturalAccepted: [Int], drafted: Int, accepted: Int) {
-        self.width = width
-        self.active = active
+    /// Tokens this round committed across every stream: the round's entry in
+    /// `acceptance_lengths`.
+    public var width: Int { widths.reduce(0, +) }
+    /// Per stream, whether it was still generating in this round.
+    public var active: [Bool] { widths.map { $0 > 0 } }
+    /// Streams still generating in this round.
+    public var activeStreams: Int { widths.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } }
+
+    public init(widths: [Int], naturalAccepted: [Int], drafted: Int, accepted: Int) {
+        self.widths = widths
         self.naturalAccepted = naturalAccepted
         self.drafted = drafted
         self.accepted = accepted
+    }
+
+    /// A round whose active rows share one committed width.
+    public init(width: Int, active: [Bool], naturalAccepted: [Int], drafted: Int, accepted: Int) {
+        self.init(
+            widths: active.map { $0 ? width : 0 }, naturalAccepted: naturalAccepted,
+            drafted: drafted, accepted: accepted)
     }
 }
 
@@ -142,30 +178,30 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// Refusals from journal assembly. Each is a refusal to publish an
     /// audit, never a partial one.
     public enum AuditError: Error, CustomStringConvertible, Equatable {
-        /// The journal reached its retention cap, so its head was evicted. A
-        /// TRUNCATED head cannot prove coverage of the window, and an audit
-        /// assembled from what survives would look complete while missing
-        /// rounds. Same rule the 125B worker applies.
-        case journalTruncated(records: Int, cap: Int)
+        /// The journal evicted records this window still needed, so its head
+        /// no longer covers the window. An audit assembled from what survives
+        /// would look complete while missing rounds. Same rule the 125B worker
+        /// applies. A journal that is merely FULL has dropped nothing and is
+        /// not refused: only a position that fell off the head is.
+        case journalTruncated(dropped: UInt64, cursor: UInt64, cap: Int)
         /// A record names a row this window never submitted.
         case unknownRow(requestID: UInt64)
-        /// Two rows report different committed widths for the same round.
-        /// The cohort commits ONE common width per round, so this means the
-        /// window boundary or the row grouping is wrong.
-        case widthDisagreement(round: Int, widths: [Int])
+        /// The journal's own account of the window disagrees with the tokens
+        /// the worker drained. One of the two is wrong, so neither is
+        /// published.
+        case committedTotalDisagreement(audit: Int, drained: Int)
 
         public var description: String {
             switch self {
-            case .journalTruncated(let records, let cap):
-                return "mtp round journal truncated at its \(cap)-record cap "
-                    + "(\(records) retained): coverage cannot be proven"
+            case .journalTruncated(let dropped, let cursor, let cap):
+                return "mtp round journal evicted \(dropped) records past the "
+                    + "window's cursor \(cursor) (cap \(cap)): coverage cannot be proven"
             case .unknownRow(let requestID):
                 return "mtp round journal names row \(requestID), which this "
                     + "window did not submit"
-            case .widthDisagreement(let round, let widths):
-                return "mtp round \(round) reports committed widths "
-                    + "\(widths.map(String.init).joined(separator: ", ")); a cohort "
-                    + "commits one common width"
+            case .committedTotalDisagreement(let audit, let drained):
+                return "mtp round journal accounts for \(audit) tokens, "
+                    + "but this window returned \(drained)"
             }
         }
     }
@@ -179,7 +215,7 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// `activeStreamsByRound` non-increasing without computing it from
     /// anything else.
     public static func assemble(
-        records: [CBv2MTPRoundAuditRecord],
+        records: [RunnerRoundRecord],
         slotForRequestID: [UInt64: Int],
         streamCount: Int
     ) throws -> FreeRunRoundAudit? {
@@ -190,14 +226,19 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     }
 
     /// The window's rounds, in order, from the journal. See `assemble`.
+    ///
+    /// Each row states ITS own committed width for the round. Two rows of a
+    /// cohort may commit different widths — that is what a per-row finalize
+    /// produces — so a disagreement is data, not a refusal; refusing it would
+    /// drop the truth rather than state it.
     public static func assembleRounds(
-        records: [CBv2MTPRoundAuditRecord],
+        records: [RunnerRoundRecord],
         slotForRequestID: [UInt64: Int],
         streamCount: Int
     ) throws -> [FreeRunRound] {
         guard !records.isEmpty else { return [] }
 
-        var byRow = [[CBv2MTPRoundAuditRecord]](repeating: [], count: streamCount)
+        var byRow = [[RunnerRoundRecord]](repeating: [], count: streamCount)
         for record in records {
             guard let slot = slotForRequestID[record.requestID] else {
                 throw AuditError.unknownRow(requestID: record.requestID)
@@ -208,35 +249,44 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
         let roundCount = byRow.map(\.count).max() ?? 0
         var rounds: [FreeRunRound] = []
         for round in 0 ..< roundCount {
-            let present = byRow.map { row in round < row.count ? row[round] : nil }
-            let widths = present.compactMap { $0?.confirmed }
-            guard let width = widths.first else { continue }
-            guard widths.allSatisfy({ $0 == width }) else {
-                throw AuditError.widthDisagreement(round: round, widths: widths)
+            var widths = [Int](repeating: 0, count: streamCount)
+            var naturalAccepted = [Int](repeating: 0, count: streamCount)
+            var drafted = 0
+            var accepted = 0
+            var any = false
+            for slot in 0 ..< streamCount where round < byRow[slot].count {
+                let record = byRow[slot][round]
+                widths[slot] = record.committed
+                naturalAccepted[slot] = record.accepted
+                drafted += record.drafted
+                accepted += min(record.accepted, record.committed)
+                any = true
             }
+            guard any else { continue }
             rounds.append(
                 FreeRunRound(
-                    width: width,
-                    active: present.map { $0 != nil },
-                    naturalAccepted: present.map { $0?.accepted ?? 0 },
-                    drafted: present.reduce(0) { $0 + ($1?.k ?? 0) },
-                    accepted: present.reduce(0) { $0 + min($1?.accepted ?? 0, $1?.confirmed ?? 0) }
-                ))
+                    widths: widths, naturalAccepted: naturalAccepted,
+                    drafted: drafted, accepted: accepted))
         }
         return rounds
     }
 
     /// Build the wire audit from rounds. Totals are sums over rounds; the
     /// per-stream natural walk is transposed to the wire's `[stream][round]`.
+    ///
+    /// `acceptanceLengths` states, per round, the tokens that round committed
+    /// across every stream — so its sum is `committedTotal` on a cohort as
+    /// well as on a single stream, which is the arithmetic benchd checks
+    /// against the tokens the window returned.
     public init(rounds: [FreeRunRound], streamCount: Int) {
         self.acceptanceLengths = rounds.map(\.width)
         self.naturalAcceptedByStream = (0 ..< streamCount).map { stream in
             rounds.map { $0.naturalAccepted[stream] }
         }
-        self.activeStreamsByRound = rounds.map { $0.active.filter { $0 }.count }
+        self.activeStreamsByRound = rounds.map(\.activeStreams)
         self.draftedTotal = rounds.reduce(0) { $0 + $1.drafted }
         self.acceptedTotal = rounds.reduce(0) { $0 + $1.accepted }
-        self.committedTotal = rounds.reduce(0) { $0 + $1.width * $1.active.filter { $0 }.count }
+        self.committedTotal = rounds.reduce(0) { $0 + $1.width }
     }
 
     /// Split the rounds at the drain boundary.
@@ -245,79 +295,139 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// depth + 1 tokens at once, and the journal may already hold rounds whose
     /// tokens are still in the stream. A window must state EXACTLY the
     /// tokens it returned (benchd: `sum(acceptance_lengths) == N`,
-    /// `committed_total == N`), so the rounds are cut at `drainedPerStream`:
-    /// whole rounds inside the boundary stay; the round that straddles it is
-    /// CLIPPED — this window states the width it returned, the drafts that
-    /// round proposed, and the accepts that fit (`min(accepted, width - 1)`;
-    /// the bonus token is the one past the accepts) — and the remainder
-    /// carries into the next window as a round with no drafts and no
-    /// accepts, because those were already stated. Rounds wholly past the
-    /// boundary carry intact. Nothing is dropped and nothing is counted
-    /// twice; a box saw the alternative, a refusal whenever a round did not
-    /// land on the count.
-    /// The rounds that state `count` plain SEED steps: width one, every stream
-    /// active, nothing drafted, nothing accepted. See `FreeRunSession.seedCursor`.
-    public static func seedRounds(count: Int, streamCount: Int) -> [FreeRunRound] {
-        guard count > 0 else { return [] }
-        return Array(
-            repeating: FreeRunRound(
-                width: 1,
-                active: Array(repeating: true, count: streamCount),
-                naturalAccepted: Array(repeating: 0, count: streamCount),
-                drafted: 0,
-                accepted: 0),
-            count: count)
-    }
-
+    /// `committed_total == N`), so the rounds are cut at the stream's token
+    /// positions: each round covers `widths[stream]` tokens of one stream,
+    /// and this window states the tokens whose positions fall in
+    /// `[statedPerStream, statedPerStream + drainedPerStream)`.
+    ///
+    /// - A round wholly inside that span is stated intact, drafts and accepts
+    ///   included.
+    /// - A round that straddles the END is CLIPPED: this window states the
+    ///   width it returned, the drafts that round proposed, and the accepts
+    ///   that fit (`min(accepted, width - 1)`; the bonus token is the one past
+    ///   the accepts). Its remainder carries into the next window with no
+    ///   drafts and no accepts, because those were already stated.
+    /// - A round wholly past the end carries intact.
+    /// - A round whose head falls BEFORE `statedPerStream` has already had
+    ///   that head stated (the `free_decode_begin` seed token), so only its
+    ///   in-span part is stated here and its drafts stay with the window that
+    ///   saw them.
+    ///
+    /// Nothing is dropped and nothing is counted twice; a box saw the
+    /// alternative, a refusal whenever a round did not land on the count.
+    /// The positions are per STREAM, so rows that commit different widths are
+    /// cut at each row's own boundary rather than at one shared number.
     public static func split(
-        rounds: [FreeRunRound], drainedPerStream: Int
+        rounds: [FreeRunRound], statedPerStream stated: Int, drainedPerStream drained: Int
     ) -> (window: [FreeRunRound], carry: [FreeRunRound]) {
         var window: [FreeRunRound] = []
         var carry: [FreeRunRound] = []
-        var seen = 0
+        let streams = rounds.map { $0.widths.count }.max() ?? 0
+        let low = stated
+        let high = stated + drained
+        // The list starts where this window starts: a carried round is the
+        // continuation of the last stated position, and the rounds after it
+        // follow in order. Positions are ABSOLUTE within the session, so a round
+        // carried out of one window lands at the same place in the next.
+        var cursor = [Int](repeating: low, count: streams)
         for round in rounds {
-            if !carry.isEmpty || seen >= drainedPerStream {
-                carry.append(round)
-                continue
+            var headWidths = [Int](repeating: 0, count: streams)
+            var tailWidths = [Int](repeating: 0, count: streams)
+            var headNatural = [Int](repeating: 0, count: streams)
+            var headLostTokens = false
+            for stream in 0 ..< streams {
+                let width = stream < round.widths.count ? round.widths[stream] : 0
+                let start = cursor[stream]
+                let end = start + width
+                cursor[stream] = end
+                let headStart = max(start, low)
+                let headEnd = min(end, high)
+                if headEnd > headStart { headWidths[stream] = headEnd - headStart }
+                let tailStart = max(start, high)
+                if end > tailStart { tailWidths[stream] = end - tailStart }
+                if start < min(end, low) { headLostTokens = true }
+                let natural = stream < round.naturalAccepted.count ? round.naturalAccepted[stream] : 0
+                headNatural[stream] = max(0, min(natural, headWidths[stream] - 1))
             }
-            let room = drainedPerStream - seen
-            if round.width <= room {
-                window.append(round)
-                seen += round.width
-                continue
+            let headStated = headWidths.contains { $0 > 0 }
+            let tailStated = tailWidths.contains { $0 > 0 }
+            // Clipped only when this window returned LESS of the round than it
+            // committed on some stream. An unclipped round keeps its own
+            // drafts and accepts untouched.
+            let headClipped = (0 ..< streams).contains { stream in
+                let width = stream < round.widths.count ? round.widths[stream] : 0
+                return headWidths[stream] < width
             }
-            var head = round
-            head.width = room
-            head.accepted = min(round.accepted, room - 1)
-            head.naturalAccepted = round.naturalAccepted.map { min($0, room - 1) }
-            window.append(head)
-            seen = drainedPerStream
-            var tail = round
-            tail.width = round.width - room
-            tail.drafted = 0
-            tail.accepted = 0
-            tail.naturalAccepted = round.naturalAccepted.map { _ in 0 }
-            carry.append(tail)
+            if headStated {
+                var head = round
+                head.widths = headWidths
+                if headLostTokens {
+                    // The front of this round was stated by an earlier window.
+                    head.drafted = 0
+                    head.accepted = 0
+                    head.naturalAccepted = headNatural
+                } else if headClipped {
+                    head.accepted = min(
+                        round.accepted,
+                        max(0, headWidths.reduce(0, +) - headWidths.filter { $0 > 0 }.count))
+                    head.naturalAccepted = headNatural
+                }
+                window.append(head)
+            }
+            if tailStated {
+                var tail = round
+                tail.widths = tailWidths
+                tail.naturalAccepted = [Int](repeating: 0, count: streams)
+                // Intact only when the whole round is past the boundary;
+                // otherwise this is a straddling remainder and its drafts
+                // were stated with the head.
+                if headStated || headLostTokens {
+                    tail.drafted = 0
+                    tail.accepted = 0
+                }
+                carry.append(tail)
+            }
         }
         return (window, carry)
     }
 
+    /// The rounds that state plain SEED steps: each is one engine step that
+    /// committed one token in `tokens` different rows, so the round count and
+    /// the token count are stated separately. A batched reseed of `b` rows is
+    /// ONE round of `b` tokens, not `b` rounds of `b` — which is what counting
+    /// rows as rounds overstated. See `FreeRunSession.seedCursor`.
+    public static func seedRounds(
+        tokens: Int, rounds: Int, streamCount: Int
+    ) -> [FreeRunRound] {
+        guard tokens > 0, streamCount > 0 else { return [] }
+        let roundCount = max(1, min(rounds, tokens))
+        let base = tokens / roundCount
+        let extra = tokens % roundCount
+        return (0 ..< roundCount).map { round in
+            let count = min(streamCount, base + (round < extra ? 1 : 0))
+            var widths = [Int](repeating: 0, count: streamCount)
+            for stream in 0 ..< count { widths[stream] = 1 }
+            return FreeRunRound(
+                widths: widths,
+                naturalAccepted: [Int](repeating: 0, count: streamCount),
+                drafted: 0, accepted: 0)
+        }
+    }
+
     /// The audit of a serial window: one round of width one per committed
     /// token, nothing drafted, nothing accepted. `rounds` is the longest
-    /// stream; a stream that stopped early leaves the later rounds.
+    /// stream; a stream that stopped early leaves the later rounds — and only
+    /// that row's own width drops, so the per-round entry is the tokens the
+    /// round committed across the rows still generating.
     public static func serial(committedByStream: [[Int]]) -> FreeRunRoundAudit {
         let rounds = committedByStream.map(\.count).max() ?? 0
-        return FreeRunRoundAudit(
-            acceptanceLengths: Array(repeating: 1, count: rounds),
-            naturalAcceptedByStream: committedByStream.map {
-                Array(repeating: 0, count: $0.count)
-            },
-            activeStreamsByRound: (0 ..< rounds).map { round in
-                committedByStream.filter { round < $0.count }.count
-            },
-            draftedTotal: 0,
-            acceptedTotal: 0,
-            committedTotal: committedByStream.reduce(0) { $0 + $1.count })
+        let roundList = (0 ..< rounds).map { round in
+            FreeRunRound(
+                widths: committedByStream.map { round < $0.count ? 1 : 0 },
+                naturalAccepted: [Int](repeating: 0, count: committedByStream.count),
+                drafted: 0, accepted: 0)
+        }
+        return FreeRunRoundAudit(rounds: roundList, streamCount: committedByStream.count)
     }
 
     public init(
@@ -429,6 +539,35 @@ public final class BenchWorkerServer: @unchecked Sendable {
     private var stepper: (any TeacherForcedStepper)?
     private var freeRun: FreeRunSession?
 
+    /// The drain timeout the engines this worker builds are given
+    /// (`CBv2EngineLoopConfig.shutdownTimeout`, the loop's own default). A
+    /// shutdown that takes at least this long came back from the loop's
+    /// watchdog, not from the loop.
+    let engineShutdownTimeout: TimeInterval
+
+    /// Set when a shutdown reached `engineShutdownTimeout`: from then on the
+    /// engine's queue is NOT proven quiet, whatever is on it. A process that
+    /// runs the runtime's teardown under such a queue dies in that teardown
+    /// after its replies, so it must not run it.
+    private(set) var shutdownUnproven = false
+
+    /// How the process ends when its teardown is not safe: `_exit`, which skips
+    /// the runtime's static destructors. A seam, so a test can read the decision
+    /// instead of ending the test host.
+    var endProcessWithoutTeardown: (Int32) -> Void = { _exit($0) }
+
+    /// The end this worker has EARNED from what its shutdowns proved.
+    enum ProcessEnd: Equatable {
+        /// Every engine's queue ran out before the process ends: a normal exit
+        /// is safe, and it keeps the process's own cleanup.
+        case normal
+        /// A drain timed out, so some queue may still be inside the runtime.
+        /// The replies are delivered; only the teardown is refused.
+        case skipRuntimeTeardown
+    }
+
+    var processEnd: ProcessEnd { shutdownUnproven ? .skipRuntimeTeardown : .normal }
+
     public init(
         runner: any Runner,
         transport: any BenchWorkerTransport,
@@ -441,7 +580,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
         memory: any WorkerMemoryReporter = MLXMemoryReporter(),
         residentIdentity: ResidentIdentity? = nil,
         residentWeights: String? = nil,
-        nonce: String = UUID().uuidString
+        nonce: String = UUID().uuidString,
+        engineShutdownTimeout: TimeInterval = CBv2EngineLoopConfig().shutdownTimeout
     ) {
         self.runner = runner
         self.manifest = type(of: runner).manifest
@@ -457,6 +597,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
         self.residentWeights = residentWeights
         self.nonce = nonce
         self.decoder = JSONDecoder()
+        self.engineShutdownTimeout = engineShutdownTimeout
     }
 
     // MARK: Hello (§6.1)
@@ -525,6 +666,21 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 continue
             }
             send(await handle(request))
+        }
+        // End of input ends the engine too: a parent that closes the pipe
+        // without `phase_diagnostics` would otherwise leave the loop running
+        // under a process that is already exiting.
+        if let session = freeRun {
+            await shutDownAndQuiesce(session.engine)
+            releaseSessions()
+        }
+        // Every reply is written. If a drain timed out, a queue may still be
+        // inside the runtime: end through `_exit` so the runtime's destructors
+        // cannot run under it. The code is 0 because the replies are complete;
+        // what is refused is the teardown, not the answer.
+        if processEnd == .skipRuntimeTeardown {
+            transport.flush()
+            endProcessWithoutTeardown(0)
         }
     }
 
@@ -603,7 +759,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             response = try await freeDecodeRun(request)
 
         case .cohortReferenceReplay:
-            response = try cohortReferenceReplay(request)
+            response = try await cohortReferenceReplay(request)
 
         case .phaseDiagnostics:
             // PRE-drain watermarks first: the drain is what makes
@@ -684,17 +840,18 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 // target evaluation is argmax-exact at every shape inside it.
                 // For a benchmark leg the shape set is exactly this one — B
                 // rows by 1+depth verify columns — so the claim is the leg.
-                maxAutomaticRectangularTokens: batch * (1 + depth),
-                // A BLOCK decoder's depth ceiling is its own. Without this the
-                // configuration would clamp a declared depth of 8...16 to the
-                // chain ceiling of 7 and the leg would measure a depth nobody
-                // asked for. The chain ceiling itself never moves.
-                draftTokenCeiling: decoderID == .dflash
-                    ? CBv2MTPConfig.testedMaxBlockDraftTokens
-                    : CBv2MTPConfig.testedMaxDraftTokens)
+                // The engine clamps the requested depth to its tested window
+                // (`CBv2MTPConfig.testedMaxDraftTokens`). A drafter that can
+                // take a narrower depth says so on itself, through its own
+                // `maximumDraftTokens`; there is no per-decoder ceiling here.
+                maxAutomaticRectangularTokens: batch * (1 + depth))
         }
         return EngineBuild(
-            kvBackend: .contiguous,
+            // The RUNNER's declaration picks the backend. A family that
+            // serves only paged storage refuses a contiguous build by name,
+            // and a worker that overrode that would be inventing policy for
+            // the family it was handed.
+            kvBackend: Self.kvBackend(for: runner.manifest),
             kvBytesCapacity: kvBytesCapacity,
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: batch,
@@ -710,15 +867,32 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 // and reproduce through nine tokens with one). So a free run
                 // prefills its whole seed in one chunk. The diagnostic knob
                 // still overrides, by name, for shape experiments.
+                //
+                // A model that cuts prompts on a grid also needs a chunk that
+                // can hold one cell, or the paged pool refuses the model at
+                // engine start.
                 prefillChunkSize: Self.diagnosticPrefillChunk
-                    ?? max(CBv2SchedulerConfig().prefillChunkSize, seedLength),
+                    ?? max(
+                        CBv2SchedulerConfig().prefillChunkSize, seedLength,
+                        runner.manifest.engine.prefillChunkAlignment ?? 0),
                 maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
             prefixCache: nil,
             decoder: decoderID,
             mtpConfig: mtpConfig,
+            // Ignored by a contiguous build; the pool a paged build plans is
+            // sized for the longest row the worker will be handed.
+            pagedPool: PagedPoolPlan(
+                nominalMaxSequenceLength: max(
+                    RunnerEngineAssembly.nominalMaxSequenceLength, seedLength)),
             environment: [:])
+    }
+
+    /// The backend the fixed build asks for: the runner's own declaration,
+    /// contiguous only when the runner serves it.
+    static func kvBackend(for manifest: RunnerManifest) -> KVBackendKind {
+        manifest.kvBackends.contains(.contiguous) ? .contiguous : (manifest.kvBackends.first ?? .contiguous)
     }
 
     /// `correctness`: free-run greedy through the engine, tokens only.
@@ -727,19 +901,26 @@ public final class BenchWorkerServer: @unchecked Sendable {
             try engineBuild(
                 batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue),
                 seedLength: prompt.count))
-        var request = CBv2Request(
-            id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps)
-        request.sampling = Self.greedySampling
-        request.stopTokens = []
-        var tokens: [Int] = []
-        for await event in try engine.submit(request) {
-            if case .delta(_, let emitted, _) = event {
-                tokens.append(contentsOf: emitted)
-                if tokens.count >= steps { break }
+        do {
+            var request = CBv2Request(
+                id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps)
+            request.sampling = Self.greedySampling
+            request.stopTokens = []
+            var tokens: [Int] = []
+            for await event in try engine.submit(request) {
+                if case .delta(_, let emitted, _) = event {
+                    tokens.append(contentsOf: emitted)
+                    if tokens.count >= steps { break }
+                }
             }
+            await shutDownAndQuiesce(engine)
+            return Array(tokens.prefix(steps))
+        } catch {
+            // A submit that throws leaves an engine this worker built and never
+            // stopped. The process exits under it, so stop it on this path too.
+            await shutDownAndQuiesce(engine)
+            throw error
         }
-        await engine.shutdown()
-        return Array(tokens.prefix(steps))
     }
 
     /// One free-run window: the engine, its streams, and the counter baseline
@@ -753,19 +934,32 @@ public final class BenchWorkerServer: @unchecked Sendable {
         /// Request id -> cohort slot, in SLOT ORDER. The journal names rows
         /// by request id; the wire names them by slot.
         let slotForRequestID: [UInt64: Int]
-        /// Records already reported. The seed forward is not a verify round,
-        /// but a row CAN finalize one before `free_decode_run` is called, so
-        /// the window starts where the journal stood after the seed drain.
-        var journalCursor = 0
+        /// Position in the journal's own numbering (see `RunnerRoundJournal`):
+        /// the sequence number of the next record this session has not yet
+        /// stated. Taken BEFORE the seed forward is submitted, so a round that
+        /// finalizes while the seed drains cannot fall between the seed and the
+        /// cursor and vanish from every window.
+        var journalCursor: UInt64 = 0
         /// `CBv2MTPMetrics.seedSteps` at the same boundary. A SEED step is the
         /// plain forward the planner runs when a row has no carry (the first
         /// step of every window, and after a stale carry): it commits ONE token
-        /// and writes no round record, so the drain states it as a round itself.
+        /// in ONE row and writes no round record, so the drain states it as a
+        /// round itself. `seedCursor` counts ROWS; `seedRoundCursor` counts the
+        /// engine STEPS those rows were seeded in.
         var seedCursor = 0
+        var seedRoundCursor = 0
+        /// Tokens already returned to the harness, per stream: the seed token
+        /// `free_decode_begin` returned, plus every token a run has drained.
+        /// The audit's cut is taken at this position, per stream.
+        var statedPerStream = 0
         /// Rounds the journal already stated whose tokens this session has
         /// not yet returned: the clipped remainder and any run-ahead rounds.
         /// See `FreeRunRoundAudit.split`.
         var carriedRounds: [FreeRunRound] = []
+        /// Tokens read off a stream but not yet returned: a delta can carry
+        /// more than the count a run asked for, and dropping the rest would
+        /// lose them.
+        var pending: [[Int]]
         /// Controller clamp counts as they stood at that same boundary.
         var clampBaseline: [String: Int] = [:]
         var streams: [AsyncStream<CBv2Event>.Iterator]
@@ -780,6 +974,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             self.spec = spec
             self.cohort = cohort
             self.slotForRequestID = slotForRequestID
+            self.pending = Array(repeating: [], count: batch)
             self.streams = streams
         }
     }
@@ -827,36 +1022,55 @@ public final class BenchWorkerServer: @unchecked Sendable {
 
         let engine = try runner.makeEngine(
             try engineBuild(batch: batch, spec: spec, seedLength: seeds.map(\.count).max() ?? 0))
-        // Submit ALL streams before consuming ANY: a cohort drained stream by
-        // stream is a sequence of solo runs wearing a cohort's name.
-        var iterators: [AsyncStream<CBv2Event>.Iterator] = []
-        for (slot, seed) in seeds.enumerated() {
-            var cbv2 = CBv2Request(
-                id: CBv2RequestID(UInt64(slot + 1)), promptTokens: seed,
-                maxTokens: maxDecodeTokens)
-            cbv2.sampling = Self.greedySampling
-            cbv2.stopTokens = []
-            iterators.append(try engine.submit(cbv2).makeAsyncIterator())
-        }
+        // Until `freeRun` holds the session, nothing else can stop this engine,
+        // so a throw from here on stops it here.
+        let seedTokens: [Int]
+        do {
+            // Submit ALL streams before consuming ANY: a cohort drained stream by
+            // stream is a sequence of solo runs wearing a cohort's name.
+            var iterators: [AsyncStream<CBv2Event>.Iterator] = []
+            for (slot, seed) in seeds.enumerated() {
+                var cbv2 = CBv2Request(
+                    id: CBv2RequestID(UInt64(slot + 1)), promptTokens: seed,
+                    maxTokens: maxDecodeTokens)
+                cbv2.sampling = Self.greedySampling
+                cbv2.stopTokens = []
+                iterators.append(try engine.submit(cbv2).makeAsyncIterator())
+            }
 
-        var slotForRequestID: [UInt64: Int] = [:]
-        for slot in 0 ..< batch { slotForRequestID[UInt64(slot + 1)] = slot }
-        let session = FreeRunSession(
-            engine: engine, batch: batch, spec: spec, cohort: cohort,
-            slotForRequestID: slotForRequestID, streams: iterators)
-        var seedTokens: [Int] = []
-        for slot in 0 ..< batch {
-            seedTokens.append(
-                contentsOf: try await drain(session: session, slot: slot, count: 1))
+            var slotForRequestID: [UInt64: Int] = [:]
+            for slot in 0 ..< batch { slotForRequestID[UInt64(slot + 1)] = slot }
+            let session = FreeRunSession(
+                engine: engine, batch: batch, spec: spec, cohort: cohort,
+                slotForRequestID: slotForRequestID, streams: iterators)
+            // The audit's starting position is taken BEFORE the seed is submitted:
+            // the journal is empty at engine build, and every record it writes from
+            // here on belongs to a token this session will return. Taking it after
+            // the seed drain used to drop the rounds that finalized in between —
+            // their tokens arrived in the first run while their records were
+            // skipped by the cursor.
+            if let journal = engine as? any RunnerRoundJournaling {
+                session.journalCursor = journal.roundJournal().dropped
+            }
+            if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
+                session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
+                session.clampBaseline = Self.clampReasons(metrics)
+            }
+            var tokens: [Int] = []
+            for slot in 0 ..< batch {
+                tokens.append(
+                    contentsOf: try await drain(session: session, slot: slot, count: 1))
+            }
+            // The seed token `free_decode_begin` returns is not part of any run
+            // window, so the first window's cut starts after it.
+            session.statedPerStream = 1
+            self.freeRun = session
+            seedTokens = tokens
+        } catch {
+            await shutDownAndQuiesce(engine)
+            throw error
         }
-        // The audit window opens HERE, after the seed forward: whatever the
-        // journal already holds belongs to the seed, not to the timed run.
-        if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
-            session.journalCursor = metrics.roundAudits.count
-            session.seedCursor = metrics.seedSteps
-            session.clampBaseline = Self.clampReasons(metrics)
-        }
-        self.freeRun = session
 
         var response = WorkerResponse(id: request.id, ok: true, nonce: nonce)
         if cohort {
@@ -892,38 +1106,72 @@ public final class BenchWorkerServer: @unchecked Sendable {
         let drained = byStream.reduce(0) { $0 + $1.count }
         response.committedTotal = drained
 
-        // AUDIT, assembled from the engine's OWN per-round journal. Nothing
+        // AUDIT, assembled from the engine build's OWN round journal. Nothing
         // here is recomputed from the tokens the worker drained: the journal
         // states what each round drafted, accepted and committed, and the
-        // worker only groups the records it was given.
+        // worker only groups the records it was given. A build that keeps no
+        // journal states no audit — an inferred width distribution would look
+        // like evidence while being a guess.
         var audit: FreeRunRoundAudit?
+        let journal = session.engine as? any RunnerRoundJournaling
         if let metrics = (session.engine as? any CBv2MTPCountersReporting)?
             .mtpMetricsSnapshot()
         {
-            guard metrics.roundAudits.count < CBv2MTPRoundAuditRecord.retainedRecordCap
-            else {
-                throw FreeRunRoundAudit.AuditError.journalTruncated(
-                    records: metrics.roundAudits.count,
-                    cap: CBv2MTPRoundAuditRecord.retainedRecordCap)
-            }
-            let window = Array(metrics.roundAudits.dropFirst(session.journalCursor))
-            let fresh = try FreeRunRoundAudit.assembleRounds(
-                records: window,
-                slotForRequestID: session.slotForRequestID,
-                streamCount: session.batch)
-            session.journalCursor = metrics.roundAudits.count
-            // Seed steps taken inside this window (see `seedCursor`): each is
-            // one committed token with nothing drafted, stated as a width-one
-            // round ahead of the rounds it seeded, so the window states every
-            // token it returned (benchd: sum(acceptance_lengths) == N).
-            let seedDelta = max(0, metrics.seedSteps - session.seedCursor)
-            session.seedCursor = metrics.seedSteps
-            let seeded = FreeRunRoundAudit.seedRounds(count: seedDelta, streamCount: session.batch)
-            let cut = FreeRunRoundAudit.split(
-                rounds: session.carriedRounds + seeded + fresh, drainedPerStream: count)
-            session.carriedRounds = cut.carry
-            if !cut.window.isEmpty {
-                audit = FreeRunRoundAudit(rounds: cut.window, streamCount: session.batch)
+            if let journal {
+                let view = journal.roundJournal()
+                // A cursor still inside the retained range is covered even when
+                // the ring is exactly FULL: only a cursor the ring has dropped
+                // PAST cannot be proven.
+                guard session.journalCursor >= view.dropped else {
+                    throw FreeRunRoundAudit.AuditError.journalTruncated(
+                        dropped: view.dropped, cursor: session.journalCursor,
+                        cap: journal.roundRecordCap)
+                }
+                let firstNew = Int(session.journalCursor - view.dropped)
+                let records = Array(
+                    view.records.dropFirst(min(firstNew, view.records.count)))
+                let fresh = try FreeRunRoundAudit.assembleRounds(
+                    records: records,
+                    slotForRequestID: session.slotForRequestID,
+                    streamCount: session.batch)
+                // Everything retained has now been stated, including the rounds
+                // that ran ahead of the drain; those carry below.
+                session.journalCursor = view.nextSequence
+                // Seed steps taken inside this window (see `seedCursor`): each
+                // is one engine step that committed one token in one row with
+                // nothing drafted, stated as a round ahead of the rounds it
+                // seeded, so the window states every token it returned (benchd:
+                // sum of the widths == N). The engine counts ROWS seeded and
+                // STEPS taken separately, because a batched reseed seeds
+                // several rows in one step.
+                let seedDelta = max(0, metrics.seedSteps - session.seedCursor)
+                let seedRoundDelta = max(0, metrics.seedRounds - session.seedRoundCursor)
+                session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
+                let seeded = FreeRunRoundAudit.seedRounds(
+                    tokens: seedDelta, rounds: seedRoundDelta, streamCount: session.batch)
+                let cut = FreeRunRoundAudit.split(
+                    rounds: session.carriedRounds + seeded + fresh,
+                    statedPerStream: session.statedPerStream, drainedPerStream: count)
+                session.carriedRounds = cut.carry
+                if !cut.window.isEmpty {
+                    let assembled = FreeRunRoundAudit(
+                        rounds: cut.window, streamCount: session.batch)
+                    // The journal's own account is the authority for
+                    // `committed_total`. A disagreement with the tokens this
+                    // window returned means one of the two is wrong, so
+                    // neither is published.
+                    guard assembled.committedTotal == drained else {
+                        throw FreeRunRoundAudit.AuditError.committedTotalDisagreement(
+                            audit: assembled.committedTotal, drained: drained)
+                    }
+                    audit = assembled
+                }
+            } else {
+                // No journal: the seed cursor still advances, so a build that
+                // gains a journal mid-run cannot restate these steps as rounds.
+                session.seedCursor = metrics.seedSteps
+                session.seedRoundCursor = metrics.seedRounds
             }
 
             var clamps = Self.clampReasons(metrics)
@@ -946,6 +1194,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
             }
         }
 
+        // The tokens are now the harness's: the next window's cut starts here.
+        // Advanced for every window, journaled or not, so a build that gains a
+        // journal mid-run still cuts at the right position.
+        session.statedPerStream += count
+
         // A SERIAL window journals no verify rounds, but the protocol carries
         // the audit triple on EVERY free_decode_run (PROTOCOL.md: benchd
         // refuses a reply without `acceptance_lengths`, and the box saw the
@@ -963,6 +1216,10 @@ public final class BenchWorkerServer: @unchecked Sendable {
             response.acceptanceLengths = audit.acceptanceLengths
             response.draftedTotal = audit.draftedTotal
             response.acceptedTotal = audit.acceptedTotal
+            // The journal's own token account, not a second count of the
+            // drained stream: the two were proven equal above, and the audit
+            // is the one that carries the per-round evidence.
+            response.committedTotal = audit.committedTotal
             // `rounds`, `natural_accepted_by_stream` and
             // `active_streams_by_round` are the v1.2 COHORT trio; the
             // single-stream form carries `acceptance_lengths` alone, whose
@@ -985,10 +1242,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
     }
 
     /// Drain exactly `count` committed tokens from one stream.
+    ///
+    /// A delta carries as many tokens as the engine committed at once (up to a
+    /// whole verify round), which can be MORE than the count this window asked
+    /// for. The surplus is kept in the session's per-stream buffer and returned
+    /// ahead of anything read next, so no token is lost and none is returned
+    /// twice.
     private func drain(
         session: FreeRunSession, slot: Int, count: Int
     ) async throws -> [Int] {
-        var out: [Int] = []
+        var out = session.pending[slot]
+        session.pending[slot] = []
         // The iterator is moved out and back rather than mutated in place:
         // a mutating call across an `await` on `session.streams[slot]` would
         // hold an exclusive access over a suspension point.
@@ -1009,12 +1273,14 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 }
             }
         }
-        return Array(out.prefix(count))
+        let delivered = Array(out.prefix(count))
+        session.pending[slot] = Array(out.dropFirst(count))
+        return delivered
     }
 
     /// Trusted-build oracle: teacher-forced replay of the candidate's own
     /// committed journal, through the engine's own path.
-    private func cohortReferenceReplay(_ request: WorkerRequest) throws -> WorkerResponse {
+    private func cohortReferenceReplay(_ request: WorkerRequest) async throws -> WorkerResponse {
         guard trusted else {
             throw WorkerError.capabilityNotAdvertised(
                 WorkerCapability.cohortReferenceReplay)
@@ -1035,18 +1301,25 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 seedLength: seeds.map(\.count).max() ?? 0))
 
         var streams: [CohortReferenceReplayReport.Stream] = []
-        for (slot, seed) in seeds.enumerated() {
-            let journal = committed[slot]
-            let reference = try engine.teacherForcedTop1(
-                promptTokens: seed, continuation: journal)
-            streams.append(
-                CohortReferenceReplayReport.Stream(
-                    slot: slot,
-                    positions: zip(journal, reference).map {
-                        CohortReferenceReplayReport.Position(
-                            committedToken: $0, sequentialArgmax: $1)
-                    }))
+        do {
+            for (slot, seed) in seeds.enumerated() {
+                let journal = committed[slot]
+                let reference = try engine.teacherForcedTop1(
+                    promptTokens: seed, continuation: journal)
+                streams.append(
+                    CohortReferenceReplayReport.Stream(
+                        slot: slot,
+                        positions: zip(journal, reference).map {
+                            CohortReferenceReplayReport.Position(
+                                committedToken: $0, sequentialArgmax: $1)
+                        }))
+            }
+        } catch {
+            await shutDownAndQuiesce(engine)
+            throw error
         }
+        // This verb builds an engine of its own; stop it however the replay ended.
+        await shutDownAndQuiesce(engine)
 
         var response = WorkerResponse(id: request.id, ok: true, nonce: nonce)
         response.effectiveBatchSize = seeds.count
@@ -1097,6 +1370,28 @@ public final class BenchWorkerServer: @unchecked Sendable {
         freeRun = nil
     }
 
+    /// Stop an engine and WAIT for its own queue to run out.
+    ///
+    /// `shutdown()` returns when the loop accepts the drain; the work the loop
+    /// had already launched (a chained decode, a retired row's KV release that
+    /// synchronizes the stream) can still be running on its queue behind it.
+    /// A second shutdown is idempotent and queues behind that work, so this
+    /// returns only once the loop is quiet. Without it the process ends with a
+    /// thread still inside the runtime and dies in its teardown.
+    ///
+    /// Each call is timed. A drain that runs into the loop's own watchdog
+    /// returned with its queue possibly still inside the runtime, so the
+    /// worker records that it never proved the engine quiet.
+    private func shutDownAndQuiesce(_ engine: any CBv2Engine) async {
+        for _ in 0 ..< 2 {
+            let started = ContinuousClock.now
+            await engine.shutdown()
+            if ContinuousClock.now - started >= .seconds(engineShutdownTimeout) {
+                shutdownUnproven = true
+            }
+        }
+    }
+
     /// How many drains the phase-close settle tries, and the pause between
     /// two of them. A free that lands after `Memory.clearCache()` (a step's
     /// last `asyncEval` temporaries, the engine loop's teardown on its own
@@ -1127,7 +1422,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
     /// ``drainSettleAttempts`` drains, and stops at the first zero read.
     private func releaseSessionsAndSettle() async -> Int? {
         if let session = freeRun {
-            await session.engine.shutdown()
+            await shutDownAndQuiesce(session.engine)
         }
         releaseSessions()
         var cache: Int?

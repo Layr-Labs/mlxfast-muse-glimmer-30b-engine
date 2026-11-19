@@ -408,17 +408,20 @@ internal enum PixtralVision {
             let patchWidth = patchEmbeds.dim(2)
             let batch = patchEmbeds.dim(0)
 
-            // Flatten spatial dimensions: (batch, h*w, hidden)
-            patchEmbeds = patchEmbeds.reshaped(batch, -1, patchEmbeds.dim(-1))
+            // Flatten all images into one sequence: (1, batch*h*w, hidden),
+            // as mlx-vlm pixtral/vision.py does. The block mask below keeps
+            // the images apart.
+            patchEmbeds = patchEmbeds.reshaped(1, -1, patchEmbeds.dim(-1))
             patchEmbeds = lnPre(patchEmbeds)
 
-            // Compute position IDs and embeddings
+            // Compute position IDs and embeddings, one meshgrid per image
             let maxWidth = config.imageSize / config.patchSize
-            let positionIds = PixtralVision.positionIdsInMeshgrid(
-                patchHeight: patchHeight,
-                patchWidth: patchWidth,
-                maxWidth: maxWidth
-            )
+            let positionIds = tiled(
+                PixtralVision.positionIdsInMeshgrid(
+                    patchHeight: patchHeight,
+                    patchWidth: patchWidth,
+                    maxWidth: maxWidth
+                ), repetitions: [batch])
             let positionEmbedding = patchPositionalEmbedding(patchEmbeds, positionIds: positionIds)
 
             // Generate block attention mask (supports multiple images in batch)
@@ -426,7 +429,7 @@ internal enum PixtralVision {
 
             let mask = PixtralVision.generateBlockAttentionMask(
                 patchCounts: Array(repeating: patchesPerImage, count: batch),
-                batchSize: batch,
+                batchSize: 1,
                 dtype: patchEmbeds.dtype
             )
 
@@ -712,13 +715,9 @@ private enum PixtralLanguage {
             return out
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            (0 ..< config.numHiddenLayers).map { _ in
-                if let maxKVSize = parameters?.maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
-                } else {
-                    return KVCacheSimple()
-                }
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try (0 ..< config.numHiddenLayers).map { _ in
+                try makeAttentionKVCache(parameters: parameters)
             }
         }
     }
@@ -828,11 +827,11 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
     ) -> MLXArray {
-        let (_, numImagePatches, _) = (
-            imageFeatures.dim(0),
-            imageFeatures.dim(1),
-            imageFeatures.dim(2)
-        )
+        // The features of all images, in order, as one sequence. The image
+        // tokens of the prompt take them one by one, as in mlx-vlm, where
+        // the vision tower puts all images in one sequence.
+        let imageFeatures = imageFeatures.reshaped(1, -1, imageFeatures.dim(-1))
+        let numImagePatches = imageFeatures.dim(1)
 
         // Find image token positions (assuming batch size is 1)
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
@@ -869,7 +868,9 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         return MLX.concatenated(finalEmbeddings, axis: 1)
     }
 
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         var inputIds = input.text.tokens
@@ -881,22 +882,18 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues
         )
 
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = embeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(
                 inputIds[0..., range], cache: cache,
                 inputsEmbeds: embeddings[0..., range, 0...])
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let logits = languageModel(
             inputIds[0..., processed...], cache: cache,
             inputsEmbeds: embeddings[0..., processed..., 0...])
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(.init(logits: logits))
     }
 
@@ -905,6 +902,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
         var newWeights: [String: MLXArray] = [:]
 
         for (key, value) in weights {
@@ -949,8 +948,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         return newWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 }
 
@@ -1137,10 +1136,7 @@ public struct PixtralProcessor: UserInputProcessor {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)
 
-            // Convert to BCHW format for vision model
-            if pixels.dim(-1) == 3 {
-                pixels = pixels.transposed(0, 3, 1, 2)
-            }
+            // `asMLXArray` already gives the BCHW layout of the vision model.
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),

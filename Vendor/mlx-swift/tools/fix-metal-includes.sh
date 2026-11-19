@@ -19,15 +19,21 @@ KERNELS_DIR="${CMLX_MLX_DIR}/${KERNELS_INCLUDE_PATH}"
 
 # list of kernels files to process
 # see Source/Cmlx/mlx/mlx/backend/metal/kernels/CMakeLists.txt
+# fence.metal is not listed: upstream builds it only at Metal 3.2+, and the package targets macOS 14 (Metal 3.1)
 KERNEL_LIST=" \
 arg_reduce.metal \
 conv.metal \
-gemv.metal \
+dot.metal \
+gather_mm_offsets.metal \
+gated_delta_update.metal \
+gated_delta_update_vjp.metal \
 layer_norm.metal \
 random.metal \
 rms_norm.metal \
 rope.metal \
+searchsorted.metal \
 scaled_dot_product_attention.metal \
+scaled_dot_product_attention_vjp.metal \
 steel/attn/kernels/steel_attention.metal"
 
 # We fixup all the header files AND the listed kernel files

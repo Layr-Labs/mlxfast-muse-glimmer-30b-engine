@@ -102,6 +102,27 @@ variables:
   (rank 0 listener)
 - **JACCL_RING** / **MLX_JACCL_RING**: (Optional) Prefer ring topology over
   mesh
+- **JACCL_PROGRESS_TIMEOUT_MS** / **MLX_JACCL_PROGRESS_TIMEOUT_MS**: (Optional)
+  The longest time in milliseconds that a call waits for an RDMA completion.
+  The default is 30000. Zero or a negative value removes the limit.
+- **JACCL_TIMEOUT_ACTION** / **MLX_JACCL_TIMEOUT_ACTION**: (Optional) What a
+  failed call does: `teardown-exit` (the default) or `throw`. Any other value
+  keeps the default.
+
+A call fails when it gets no completion for this time, a failed work
+completion or a failed poll. It first destroys the queue pairs and completion
+queues of the group and deregisters its buffers (the ring waits until all of
+its wires have returned). With `teardown-exit` it then prints the reason, runs
+the memory release hook registered with `jaccl::set_memory_release` (MLX
+registers one that sets the wired limit to zero and clears the buffer cache;
+it gets at most 10 seconds) and exits the process with status 75 (EX_TEMPFAIL,
+restartable) through `std::_Exit`. With `throw` the caller gets the exception;
+every later call on that group throws immediately, and the group cannot be
+opened again in the same process. Set the limit above the longest time that a
+rank can wait for a peer, for example in `recv` while the peer computes.
+
+Each completion queue has `4 * (MAX_SEND_WR + MAX_RECV_WR)` entries, four times
+what its queue pair can have outstanding.
 
 ### Device File Format
 
@@ -321,6 +342,26 @@ class Config {
 }
 ```
 
+## Tests
+
+`tests/jaccl` in the MLX repository has tests that do not use RDMA hardware.
+They compile the mesh, ring and RDMA headers with a small stand-in for
+`<infiniband/verbs.h>` and simulate the verbs. They check that each send frame
+holds its payload and then only zero bytes, and that a call fails and the group
+is closed when a completion does not arrive or reports a failure. The directory
+is a separate CMake project, so the MLX build does not build it:
+
+```bash
+cmake -S tests/jaccl -B build/jaccl-tests
+cmake --build build/jaccl-tests
+ctest --test-dir build/jaccl-tests --output-on-failure
+```
+
+The tests use AddressSanitizer and UndefinedBehaviorSanitizer. Configure with
+`-DJACCL_TESTS_TSAN=ON` to use ThreadSanitizer. The guard tests measure time: a
+stalled call must fail between its limit of 250 ms and one second after it, so
+a machine under heavy load can make them fail.
+
 ## License
 
 JACCL is part of MLX and is released under the same license.
@@ -331,3 +372,41 @@ The name JACCL (pronounced Jackal) stands for Jack and Angelos’ Collective
 Communication Library and it is an obvious pun to Nvidia’s NCCL but also
 tribute to Jack Beasley who led the development of RDMA over Thunderbolt at
 Apple.
+
+### One-shot startup readiness budget
+
+MLX callers can use `Group::begin_startup_wait_budget(int64_t timeout_ms) const`
+and `Group::end_startup_wait_budget() const` on an initialized JACCL group.
+The standalone JACCL group exposes the same operations. Other MLX backends
+and unsupported JACCL group implementations throw; there is no fallback.
+
+Begin accepts 1..900000 ms and checks the monotonic deadline before publishing
+state. Each actual mesh or ring group owns one policy shared by its wires.
+The deadline starts at begin, includes time spent loading, and stays fixed
+across calls and completions. During startup it replaces the idle limit.
+Successful completions check expiry too; empty polls sample it every 1024
+polls. This bounds polling waits, not arbitrary computation or blocked system
+calls. Keep the embedding runtime's hard startup deadline and cancellation.
+
+Drain queued work and serialize scheduling around begin and end. A running
+call makes either transition fail. The caller must retain the group and must
+not move/destroy its implementation while calls run. This API does not make
+concurrent initialization or backend-cache clearing safe.
+
+Only an unused group can begin. Invalid arguments or deadline overflow leave
+it unused. Only an active, unexpired, open and idle group can end; duplicate
+end is refused. Expiry cannot be cleared by end, and begin can never renew or
+reopen a used budget. Expiry observed by polling follows the existing failure
+path: stop wires, close resources, then the configured throw or teardown-exit
+with status 75 and the memory release hook. Ending does not create a transport
+success, clear a failure, or reopen a group.
+
+After a successful end, later calls use the original environment/default idle
+policy (normally 30000 ms). Existing zero/negative environment handling stays
+unchanged, but the startup API always requires a positive finite budget.
+The API accepts a relative duration; an external absolute deadline must still
+be checked by the caller because dispatch/bridge time precedes core begin.
+
+`tests/jaccl/startup_wait_budget_tests.cpp` uses a controllable clock with the
+real policy/guard. The group tests exercise real mesh/ring dispatch and cleanup
+against simulated verbs. These CPU tests do not qualify native RDMA or loading.

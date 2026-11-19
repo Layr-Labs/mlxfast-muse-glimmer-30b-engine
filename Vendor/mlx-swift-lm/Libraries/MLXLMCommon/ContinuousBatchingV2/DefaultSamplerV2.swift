@@ -25,11 +25,12 @@
 import Foundation
 import MLX
 
-public final class CBv2DefaultSampler: CBv2StepSampler {
+public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
 
     private var pipeline: LogitsPipelineV2?
     private let sampler: SamplerV2
     private let constraintSampler = CBv2TokenConstraintSampler()
+    private let budgetSampler = CBv2ReasoningBudgetSampler()
     private var configuredIDs: [CBv2RequestID] = []
     /// The lazy logprob gather built by the most recent `sample` call, until
     /// the loop consumes it via `takeStepLogprobs` (take semantics).
@@ -39,7 +40,28 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     public private(set) var logprobGatherCount = 0
     /// Test hook: the composed pipeline's logprob-capture counter.
     var pipelineLogprobBuildCount: Int { pipeline?.logprobBuildCount ?? 0 }
+    /// Metadata-only test observation of the REAL accepted sampler. Install
+    /// before engine use; never replace during execution. Invoked once per
+    /// sample on the engine queue. No callback result changes sampling.
+    var sampleObserverForTesting: (([CBv2RequestID], Int) -> Void)?
     public var supportsTokenConstraints: Bool { true }
+    public var supportsReasoningBudgets: Bool { true }
+    public var supportsConstrainedChainedDecode: Bool { true }
+
+    /// Sampler state from just before the most recent speculative sample (a
+    /// chained successor over constrained rows): the penalty arrays and RNG
+    /// step indices that sample started from. A redraw restores them, so it
+    /// is the draw the unchained path makes at that output index.
+    private struct SpeculativeSample {
+        let requestIDs: [CBv2RequestID]
+        let params: [CBv2SamplingParams]
+        let penalties: LogitsPipelineV2.PenaltyState
+        let steps: [UInt64]
+    }
+    private var speculation: SpeculativeSample?
+    /// Test hooks for the constrained-chaining device-mask cache.
+    var constraintMaskBuildCount: Int { constraintSampler.maskBuildCount }
+    var constraintMaskCacheHitCount: Int { constraintSampler.maskCacheHitCount }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
     ///   per-request seed (fixed at init so nil-seed rows stay
@@ -53,6 +75,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         stepIndex: Int, pendingSampledTokens: MLXArray?,
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray {
+        sampleObserverForTesting?(requestIDs, stepIndex)
         let vocab = logits.dim(-1)
         if pipeline?.vocabSize != vocab {
             pipeline = LogitsPipelineV2(vocabSize: vocab)
@@ -65,6 +88,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             pipeline.setRows(rows)
             sampler.setRows(rows)
             constraintSampler.configure(rows)
+            budgetSampler.configure(rows)
             configuredIDs = requestIDs
             if let pendingSampledTokens {
                 // Fold the chained in-flight tokens into the fresh state so
@@ -76,6 +100,30 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         // Same IDs ⇒ the incremental commits below already covered every
         // token sampled since configuration (including any pending ones).
 
+        // A chained successor over constrained rows samples before its
+        // predecessor's token is confirmed: snapshot the pre-sample state so
+        // `redrawChainedSuccessor` can replay this draw exactly.
+        let speculative =
+            pendingSampledTokens != nil && constraintSampler.hasRows(in: requestIDs)
+        if speculative {
+            constraintSampler.beginSpeculation()
+            speculation = SpeculativeSample(
+                requestIDs: requestIDs, params: params,
+                penalties: pipeline.penaltyState, steps: sampler.stepIndices)
+        } else {
+            speculation = nil
+        }
+        return draw(
+            logits: logits, params: params, requestIDs: requestIDs,
+            pipeline: pipeline, speculative: speculative)
+    }
+
+    /// One configured draw: transforms, grammar mask, selection, state
+    /// commit, and the lazy logprob gather.
+    private func draw(
+        logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
+        pipeline: LogitsPipelineV2, speculative: Bool
+    ) -> MLXArray {
         // Apply the grammar exactly once, after arithmetic transforms and
         // before top-k/top-p/min-p. This preserves the valid language even
         // for malformed-but-decodable penalties that can resurrect
@@ -84,10 +132,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let output = pipeline.process(
             logits,
             rawLogprobsFrom: logits,
-            hardMask: constraintSampler.hasRows ? { [constraintSampler] transformed in
-                constraintSampler.mask(
-                    transformed, requestIDs: requestIDs)
-            } : nil)
+            hardMask: constraintSampler.hasRows || budgetSampler.hasRows
+                ? { [constraintSampler, budgetSampler] transformed in
+                    budgetSampler.mask(
+                        constraintSampler.mask(
+                            transformed, requestIDs: requestIDs, speculative: speculative),
+                        requestIDs: requestIDs)
+                } : nil)
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()
@@ -110,6 +161,31 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         return tokens
     }
 
+    public func takeInvalidatedChainedRows() -> [CBv2RequestID] {
+        constraintSampler.takeInvalidated()
+    }
+
+    /// Exact redraw of the most recent speculative `sample`: restore the
+    /// penalty state and per-row RNG step indices it started from, then run
+    /// the same transforms with masks built from the now-confirmed
+    /// constraint state. RNG keys are a pure function of (seed, request,
+    /// per-request step), so the redraw uses exactly the keys of the
+    /// discarded draw: the stream never shifts. Rows whose speculative mask
+    /// was valid get the same mask, logits and key, hence the same token.
+    public func redrawChainedSuccessor(
+        logits: MLXArray, requestIDs: [CBv2RequestID]
+    ) -> MLXArray? {
+        guard let speculation, speculation.requestIDs == requestIDs, let pipeline,
+            pipeline.vocabSize == logits.dim(-1)
+        else { return nil }
+        self.speculation = nil
+        pipeline.restore(speculation.penalties)
+        sampler.restoreStepIndices(speculation.steps)
+        return draw(
+            logits: logits, params: speculation.params, requestIDs: requestIDs,
+            pipeline: pipeline, speculative: false)
+    }
+
     public func takeStepLogprobs() -> CBv2StepLogprobs? {
         defer { pendingStepLogprobs = nil }
         return pendingStepLogprobs
@@ -123,6 +199,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// exact — reconfiguration is a pure function of `rowContext()`.
     public func requestDidFinish(_ id: CBv2RequestID) {
         constraintSampler.requestDidFinish(id)
+        budgetSampler.requestDidFinish(id)
         if configuredIDs.contains(id) {
             configuredIDs = []
         }
@@ -144,6 +221,125 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray? {
+        verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: nil
+        ).tokens
+    }
+
+    /// Typical acceptance on the same filtered rows `mtpVerifySample` draws
+    /// from: `H = -sum p ln p` over the filtered, normalized row, `floor =
+    /// min(1, delta * exp(-H))`, keep iff `p(draft) > floor`. The keyed draw
+    /// is unchanged, so the token committed at the first rejection or bonus
+    /// position is the same target sample exact mode would commit.
+    public func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> (tokens: MLXArray, accept: MLXArray)? {
+        let window = verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: (draftIDs: draftIDs, delta: delta))
+        return (window.tokens, window.accept!)
+    }
+
+    /// A coupled proposal per row of draft logits `[B, 1, vocab]`, row r for
+    /// output index `stepBases[r]`: the keyed exponential race
+    /// `mtpVerifySample` runs at that index (same temperature, same noise),
+    /// over the draft's whole row. When the draft's distribution is the
+    /// target's, the target's draw at that index is the same token unless the
+    /// race's winner falls outside the row's top-k / top-p / min-p set; such
+    /// a winner (at most the mass those filters remove) is replaced by the
+    /// row's mode, which every filter keeps. Sort-free, so a few passes over
+    /// the row instead of `mtpVerifySample`'s sort and scatter. Greedy rows
+    /// take the argmax. A verifier that commits only its own draws stays
+    /// exact whatever it is proposed; this only raises how often it agrees.
+    /// Same eligibility as `mtpVerifySample` (stateless transforms). `[B, 1]`.
+    public func mtpCoupledProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray {
+        precondition(
+            logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
+        let b = logits.dim(0)
+        let vocab = logits.dim(2)
+        precondition(
+            params.count == b && requestIDs.count == b && stepBases.count == b,
+            "MTP proposal row metadata mismatch")
+        let x = logits.reshaped([b, vocab]).asType(.float32)
+        let mode = argMax(x, axis: -1).asType(.int32)
+        guard params.contains(where: { $0.temperature >= LogitsPipelineV2.greedyEpsilon }) else {
+            return mode.reshaped([b, 1])
+        }
+        var temps = [Float](repeating: 1, count: b)
+        var topKs = [Int32](repeating: Int32(vocab), count: b)
+        var topPs = [Float](repeating: 2, count: b)
+        var minPs = [Float](repeating: 0, count: b)
+        var greedyFlags = [Bool](repeating: true, count: b)
+        var noiseRows: [(seed: UInt64?, id: UInt64, step: UInt64, greedy: Bool)] = []
+        var anyFilter = false
+        for r in 0 ..< b {
+            let p = params[r]
+            let greedy = p.temperature < LogitsPipelineV2.greedyEpsilon
+            greedyFlags[r] = greedy
+            noiseRows.append(
+                (seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
+            guard !greedy else { continue }
+            temps[r] = p.temperature
+            if p.topK > 0, p.topK < vocab {
+                topKs[r] = Int32(p.topK)
+                anyFilter = true
+            }
+            if p.topP > 0, p.topP < 1 {
+                topPs[r] = p.topP
+                anyFilter = true
+            } else if p.topP <= 0 {
+                topPs[r] = 0
+                anyFilter = true
+            }
+            if p.minP > 0 {
+                minPs[r] = min(p.minP, 1)
+                anyFilter = true
+            }
+        }
+        let scaled = temps.allSatisfy { $0 == 1 } ? x : x / MLXArray(temps).reshaped([b, 1])
+        let probs = softmax(scaled, axis: -1)
+        let noise = sampler.verifyExponentialNoise(rows: noiseRows, vocab: vocab)
+        var proposals = argMax(probs / noise, axis: -1).asType(.int32)
+        if anyFilter {
+            // The winner's place in the descending order: the tokens strictly
+            // more probable than it, and their mass.
+            let winning = takeAlong(probs, proposals.reshaped([b, 1]), axis: -1)
+            let above = probs .> winning
+            let rank = sum(above.asType(.int32), axis: -1)
+            let mass = sum(which(above, probs, MLXArray(Float(0))), axis: -1)
+            let kept =
+                (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
+                .&& (winning.reshaped([b]) .>= MLXArray(minPs) * probs.max(axis: -1))
+            proposals = which(kept, proposals, mode)
+        }
+        return which(MLXArray(greedyFlags), mode, proposals).reshaped([b, 1])
+    }
+
+    /// `mtpCoupledProposal` through the step-sampler seam.
+    public func mtpCoupledDraftProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? {
+        mtpCoupledProposal(
+            logits: logits, params: params, requestIDs: requestIDs, stepBases: stepBases)
+    }
+
+    /// Exact acceptance per draft position: keep iff the target token equals
+    /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
+    private static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {
+        tokens[0..., ..<draftIDs.dim(1)] .== draftIDs
+    }
+
+    private func verifyWindow(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int],
+        typical: (draftIDs: MLXArray, delta: Float)?
+    ) -> (tokens: MLXArray, accept: MLXArray?) {
         precondition(logits.ndim == 3, "MTP verify logits must be [B, W, vocab]")
         let b = logits.dim(0)
         let w = logits.dim(1)
@@ -151,6 +347,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         precondition(
             params.count == b && requestIDs.count == b && stepBases.count == b,
             "MTP verify sampling row metadata mismatch")
+        if let typical {
+            precondition(
+                typical.draftIDs.ndim == 2 && typical.draftIDs.dim(0) == b
+                    && typical.draftIDs.dim(1) >= 1 && typical.draftIDs.dim(1) <= w,
+                "MTP typical draft ids must be [B, D] with 1 <= D <= W")
+            precondition(typical.delta > 0, "MTP typical delta must be positive")
+        }
         let flat = logits.reshaped([b * w, vocab]).asType(.float32)
         let greedyTokens = argMax(flat, axis: -1).asType(.int32)
         let anyStochastic = params.contains {
@@ -158,7 +361,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         }
         if !anyStochastic {
             // Bit-identical to the historical argmax acceptance walk.
-            return greedyTokens.reshaped([b, w])
+            let tokens = greedyTokens.reshaped([b, w])
+            let accept = typical.map { Self.exactAccept(tokens: tokens, draftIDs: $0.draftIDs) }
+            return (tokens, accept)
         }
 
         // Mirror LogitsPipelineV2.setRows parameter resolution, expanded to
@@ -219,8 +424,23 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let probs = softmax(x, axis: -1)
         let noise = sampler.verifyExponentialNoise(rows: noiseRows, vocab: vocab)
         let sampledTokens = argMax(probs / noise, axis: -1).asType(.int32)
-        let merged = which(MLXArray(greedyFlags), greedyTokens, sampledTokens)
-        return merged.reshaped([b, w])
+        let greedyRows = MLXArray(greedyFlags)
+        let tokens = which(greedyRows, greedyTokens, sampledTokens).reshaped([b, w])
+        guard let typical else { return (tokens, nil) }
+
+        // Typical floor per draft position, on the same filtered rows the
+        // draw above used. Zero-mass entries add nothing to the entropy: the
+        // clamp guards only the log operand.
+        let d = typical.draftIDs.dim(1)
+        let rows = probs.reshaped([b, w, vocab])[0..., ..<d, 0...]
+        let pDraft = takeAlong(rows, typical.draftIDs.reshaped([b, d, 1]), axis: -1)
+            .squeezed(axis: -1)
+        let entropy = -sum(rows * log(maximum(rows, MLXArray(Float(1e-30)))), axis: -1)
+        let floor = minimum(exp(-entropy) * typical.delta, MLXArray(Float(1)))
+        let typicalAccept = pDraft .> floor
+        let exact = Self.exactAccept(tokens: tokens, draftIDs: typical.draftIDs)
+        let greedyPerPosition = greedyRows.reshaped([b, w])[0..., ..<d]
+        return (tokens, which(greedyPerPosition, exact, typicalAccept))
     }
 
     /// Verify rows never pass through `sample`, so their pipeline/RNG row
@@ -238,9 +458,22 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         _ tokens: [Int], requestIDs: [CBv2RequestID]
     ) {
         constraintSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+        budgetSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+    }
+
+    public func reasoningBudgetFailure(for id: CBv2RequestID) -> String? {
+        budgetSampler.failure(for: id)
     }
 
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
         constraintSampler.failure(for: id)
+    }
+
+    func confirmedConstraintState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        constraintSampler.confirmedState(for: id, outputTokenCount: outputTokenCount)
+    }
+
+    func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
+        constraintSampler.mask(logits, requestIDs: requestIDs)
     }
 }

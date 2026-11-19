@@ -67,10 +67,11 @@ final class CBv2CompleteCheckpointTests: XCTestCase {
         func exercise() throws -> AdmissionV2 {
             let (codec, source, request, expected) = try fixture()
             let plan = try codec.plan(
-                manifest: source.manifest, request: request, minimumChunkSize: chunk, maximumChunkSize: chunk)
+                manifest: source.manifest, request: request)
             let kvBound = try Memory.allocationFootprintUpperBound(byteCount: (chunk + 7) * 2 * 3 * 4)
             let recurrentBound = try Memory.allocationFootprintUpperBound(byteCount: 16)
             XCTAssertEqual(plan.nativeDestinationBytes, 2 * kvBound + 2 * recurrentBound)
+            XCTAssertGreaterThanOrEqual(plan.scratchBytes, kvBound, "largest host-zero source")
             let counter = CheckpointCounter()
             let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
             let sink = try plan.allocate { counter.increment() }
@@ -111,7 +112,7 @@ final class CBv2CompleteCheckpointTests: XCTestCase {
         func exercise() throws -> AdmissionV2 {
             let (codec, source, request, _) = try fixture()
             let plan = try codec.plan(
-                manifest: source.manifest, request: request, minimumChunkSize: chunk, maximumChunkSize: chunk)
+                manifest: source.manifest, request: request)
             let counter = CheckpointCounter()
             let sink = try plan.allocate { counter.increment() }
             let bytes = try source.readSegment(tensorIndex: 0, byteOffset: 0, maximumBytes: 4)
@@ -136,7 +137,7 @@ final class CBv2CompleteCheckpointTests: XCTestCase {
         func exercise() throws -> AdmissionV2 {
             let (codec, source, request, _) = try fixture()
             let plan = try codec.plan(
-                manifest: source.manifest, request: request, minimumChunkSize: chunk, maximumChunkSize: chunk)
+                manifest: source.manifest, request: request)
             plan.evaluateDestinations = { _ in throw MLXError.caught("injected destination allocation failure") }
             let counter = CheckpointCounter()
             XCTAssertThrowsError(try plan.allocate { counter.increment() })
@@ -181,7 +182,7 @@ final class CBv2CompleteCheckpointTests: XCTestCase {
             ]
             for manifest in cases {
                 XCTAssertThrowsError(try codec.plan(
-                    manifest: manifest, request: request, minimumChunkSize: chunk, maximumChunkSize: chunk))
+                    manifest: manifest, request: request))
             }
             XCTAssertEqual(codec.admission.bytesReserved, try XCTUnwrap(source.manifest.metadata.permit).bytes)
             source.close()

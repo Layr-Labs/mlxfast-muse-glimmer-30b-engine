@@ -33,7 +33,7 @@
 # THIS SCRIPT RUNS ON THE RANKED BOX ONLY. It loads the checkpoint, so it takes
 # the fleet GPU lock (/tmp/mtplx-gpu-exclusive.lock) FIRST and holds it for the
 # whole calibration -- the same lock, taken the same way, as the ranked
-# measurement in tools/bonsai2-9b-measure-and-score.sh. A calibration
+# measurement in tools/muse-glimmer-30b-measure-and-score.sh. A calibration
 # measured beside another GPU owner is a calibration of the wrong machine.
 #
 # IT BOOTS NO RESIDENT AND EXPORTS NO SOCKET. Each pass is a full serial-control
@@ -109,7 +109,7 @@ if [[ -n "${BENCH_WORKER_RESIDENT_SOCKET:-}" ]]; then
 fi
 command -v python3 >/dev/null 2>&1 || die "python3 is required to hold the GPU lock for the calibration window"
 
-CONTRACT="${SCRIPT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json"
 [[ -f "${CONTRACT}" ]] || die "track contract fixture missing: ${CONTRACT}"
 
 # The reference tree. No default: the control leg measured on a guessed tree is

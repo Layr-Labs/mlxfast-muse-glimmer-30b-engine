@@ -12,26 +12,16 @@ import Testing
 @Suite("Runner registry")
 struct RunnerRegistryTests {
 
-    @Test("Every first-party model_type resolves to its own runner")
-    func resolvesFirstParty() throws {
-        let expected: [String: String] = [
-            "gemma4": "layr/gemma4-text",
-            "gemma4_text": "layr/gemma4-text",
-            "gpt_oss": "layr/gptoss",
-            "nemotron_h": "layr/nemotron35-lightning",
-            "prism_hadamard_qwen35": "layr/qwen35",
-            "qwen3_5": "layr/qwen35",
-            "qwen3_5_moe": "layr/qwen35",
-            "qwen3_5_text": "layr/qwen35",
-            "qwen3_vl": "layr/qwen3vl",
-            "qwen3_vl_moe": "layr/qwen3vl",
-            "qwen4_exp": "layr/qwen4exp-125b-a6b",
-            "qwen4_exp_text": "layr/qwen4exp-125b-a6b",
-        ]
-        for (modelType, runnerID) in expected {
+    @Test("Every model_type in one manifest resolves to that runner")
+    func everyModelTypeResolvesToOneRunner() throws {
+        RunnerRegistry.shared.register(MockRunner.self)
+        let manifest = MockRunner.manifest
+        let runner = try RunnerRegistry.shared.resolve(modelType: manifest.modelTypes[0])
+        for modelType in manifest.modelTypes {
             #expect(RunnerRegistry.shared.contains(modelType: modelType))
-            let runner = try RunnerRegistry.shared.resolve(modelType: modelType)
-            #expect(runner.manifest.runnerID == runnerID)
+            #expect(
+                try RunnerRegistry.shared.resolve(modelType: modelType).manifest.runnerID
+                    == runner.manifest.runnerID)
         }
     }
 
@@ -45,14 +35,12 @@ struct RunnerRegistryTests {
 
     @Test("manifests() lists one manifest per runner, stably ordered")
     func manifestListing() {
+        RunnerRegistry.shared.register(MockRunner.self)
+        RunnerRegistry.shared.register(CohortMockRunner.self)
         let ids = RunnerRegistry.shared.manifests().map(\.runnerID)
         #expect(ids == ids.sorted())
-        #expect(
-            Set(ids).isSuperset(
-                of: [
-                    "layr/gemma4-text", "layr/gptoss", "layr/nemotron35-lightning",
-                    "layr/qwen35", "layr/qwen3vl", "layr/qwen4exp-125b-a6b",
-                ]))
+        #expect(ids.contains("layr/mock-adapter"))
+        #expect(ids.contains("layr/mock-cohort"))
         #expect(ids.count == Set(ids).count)
     }
 

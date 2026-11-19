@@ -10,7 +10,7 @@ import MLX
 /// Explicit model/backend feature gates. Attention-only models inherit the
 /// historical all-enabled defaults; first-generation recurrent adapters opt
 /// out of paths whose state semantics have not been proven.
-public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
+public struct CBv2ModelCapabilities: Sendable, Equatable {
     public var supportsPrefixReuse: Bool
     /// Exact committed recurrent state paired with its attention KV.
     public var supportsRecurrentCheckpointReuse: Bool
@@ -25,6 +25,26 @@ public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
     /// and can reconstruct a strict accepted prefix without retaining one
     /// full recurrent state per verify position.
     public var supportsCompactRecurrentMTPReplay: Bool
+    /// Prefill output depends on the chunk partition, so a recurrent
+    /// checkpoint reproduces a cold prefill only where the cold run also has
+    /// a boundary: the engine captures only at multiples of its fixed
+    /// prefill chunk reached by whole chunks (`CBv2RecurrentCheckpointGeometry`).
+    public var alignsRecurrentCheckpointsToPrefillChunks: Bool
+    /// Causal media embeddings substituted at scalar positions are the only
+    /// out-of-band input, so a media request bound to an identity of its
+    /// evaluated embeddings and spans may capture and restore recurrent
+    /// checkpoints in that identity's scope (`permitsHybridCheckpoint`).
+    public var supportsCausalMediaCheckpointReuse: Bool
+    /// The model runs only on paged KV storage: the engine refuses any other
+    /// backend instead of serving it from contiguous rows. Default off.
+    public var requiresPagedKV: Bool
+    /// The model's prompt bytes depend on where a prompt is cut into chunks.
+    /// When set, the scheduler cuts a text prompt only at multiples of this
+    /// many tokens, at the prompt end and at a boundary a prefix restore
+    /// requires, and runs each such cell whole or not at all, so the cuts
+    /// depend on the prompt alone (`SchedulerV2.prefillChunkAlignment`).
+    /// Default off.
+    public var prefillChunkAlignment: Int?
 
     public init(
         supportsPrefixReuse: Bool = true,
@@ -34,7 +54,11 @@ public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
         supportsCompiledDecode: Bool = true,
         supportsPackedPrefill: Bool = true,
         supportsMTP: Bool = true,
-        supportsCompactRecurrentMTPReplay: Bool = false
+        supportsCompactRecurrentMTPReplay: Bool = false,
+        alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
+        supportsCausalMediaCheckpointReuse: Bool = false,
+        requiresPagedKV: Bool = false,
+        prefillChunkAlignment: Int? = nil
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -44,40 +68,10 @@ public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
         self.supportsPackedPrefill = supportsPackedPrefill
         self.supportsMTP = supportsMTP
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case supportsPrefixReuse
-        case supportsRecurrentCheckpointReuse
-        case supportsPagedKV
-        case requiresNativePagedKV
-        case supportsCompiledDecode
-        case supportsPackedPrefill
-        case supportsMTP
-        case supportsCompactRecurrentMTPReplay
-    }
-
-    /// The Engine Protocol v1 manifest wire shape
-    /// (`RunnerManifest.canonicalJSON`) froze the SIX flags it declared, and
-    /// a checked-in v1 manifest carries only those. Flags added after that
-    /// freeze decode to their initializer defaults instead of making the
-    /// pinned file undecodable. The six frozen flags stay mandatory.
-    public init(from decoder: any Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        let defaults = CBv2ModelCapabilities()
-        supportsPrefixReuse = try values.decode(Bool.self, forKey: .supportsPrefixReuse)
-        supportsPagedKV = try values.decode(Bool.self, forKey: .supportsPagedKV)
-        supportsCompiledDecode = try values.decode(Bool.self, forKey: .supportsCompiledDecode)
-        supportsPackedPrefill = try values.decode(Bool.self, forKey: .supportsPackedPrefill)
-        supportsMTP = try values.decode(Bool.self, forKey: .supportsMTP)
-        supportsCompactRecurrentMTPReplay = try values.decode(
-            Bool.self, forKey: .supportsCompactRecurrentMTPReplay)
-        supportsRecurrentCheckpointReuse =
-            try values.decodeIfPresent(Bool.self, forKey: .supportsRecurrentCheckpointReuse)
-            ?? defaults.supportsRecurrentCheckpointReuse
-        requiresNativePagedKV =
-            try values.decodeIfPresent(Bool.self, forKey: .requiresNativePagedKV)
-            ?? defaults.requiresNativePagedKV
+        self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
+        self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
+        self.requiresPagedKV = requiresPagedKV
+        self.prefillChunkAlignment = prefillChunkAlignment
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()
@@ -170,9 +164,14 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
         _ = try fixedBytesPerRequest()
         var total = 0
         for layer in layers {
-            for (shape, dtype) in [(layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType)] {
+            for (shape, dtype) in [
+                (layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType),
+            ] {
                 let logical = try Self.byteCount(shape: shape, dtype: dtype)
-                guard let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(logical, policy: policy) else {
+                guard
+                    let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(
+                        logical, policy: policy)
+                else {
                     throw CBv2RecurrentStateError.byteCountOverflow
                 }
                 let (next, overflow) = total.addingReportingOverflow(bytes)
@@ -187,7 +186,8 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 
     private static func byteCount(shape: [Int], dtype: DType) throws -> Int {
         guard !shape.isEmpty, shape.allSatisfy({ $0 >= 0 }) else {
-            throw CBv2RecurrentStateError.invalidSpec("recurrent shapes must be nonempty and nonnegative")
+            throw CBv2RecurrentStateError.invalidSpec(
+                "recurrent shapes must be nonempty and nonnegative")
         }
         var elements = 1
         for dimension in shape {
@@ -252,8 +252,8 @@ public struct CBv2RecurrentPrefixReplayStage {
                 "prefix replay requires at least two positions")
         }
         guard materializedByteCount >= 0,
-              strictReplayRetainedByteCount >= 0,
-              fullAcceptanceRetainedByteCount >= 0
+            strictReplayRetainedByteCount >= 0,
+            fullAcceptanceRetainedByteCount >= 0
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay materialized bytes must be nonnegative")
@@ -321,6 +321,11 @@ public final class CBv2RecurrentRequestState {
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
+
+    /// What a settled verify window still holds beside the committed state
+    /// (its replay inputs, or the kept window's backing) until the next
+    /// committed generation or release. Inspection only (allocation checks).
+    public var retainedTransitionArrays: [MLXArray] { committedTransitionRetainedRoots }
     private var pending: [Generation] = []
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
@@ -480,7 +485,7 @@ public final class CBv2RecurrentRequestState {
             }
         } else if let replay = first.prefixReplay {
             guard let positions = replay.values.first?.positions,
-                  let keep = keepPositions, (1 ... positions).contains(keep)
+                let keep = keepPositions, (1 ... positions).contains(keep)
             else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
@@ -498,7 +503,8 @@ public final class CBv2RecurrentRequestState {
             var retainedRoots: [MLXArray] = []
             for index in replay.keys.sorted() {
                 guard let stage = replay[index] else { continue }
-                let stageBytes = fullAcceptance
+                let stageBytes =
+                    fullAcceptance
                     ? stage.fullAcceptanceRetainedByteCount
                     : stage.strictReplayRetainedByteCount
                 let (sum, overflow) = retainedBytes.addingReportingOverflow(stageBytes)
@@ -637,7 +643,7 @@ public final class CBv2RecurrentStateEvaluation {
                     + "(\(existing) -> \(positions))")
         }
         if stagedCapturedPositions == nil,
-           (!staged.isEmpty || !stagedPrefixReplay.isEmpty)
+            !staged.isEmpty || !stagedPrefixReplay.isEmpty
         {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "cannot mix captured, compact replay, and plain recurrent stages")
@@ -672,7 +678,7 @@ public final class CBv2RecurrentStateEvaluation {
                 "cannot mix compact replay with captured or plain recurrent stages")
         }
         guard requiredLayers.contains(modelLayerIndex),
-              stagedPrefixReplay[modelLayerIndex] == nil
+            stagedPrefixReplay[modelLayerIndex] == nil
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "compact replay stage for undeclared, duplicate, or evaluated layer "
@@ -724,7 +730,7 @@ public final class CBv2RecurrentStateEvaluation {
 
     public func commit() throws {
         guard evaluated, !finalized, stagedCapturedPositions == nil,
-              stagedPrefixReplay.isEmpty
+            stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation("invalid recurrent commit")
         }
@@ -738,7 +744,7 @@ public final class CBv2RecurrentStateEvaluation {
     /// length including the seed column).
     public func commit(keepPositions: Int) throws {
         guard evaluated, !finalized,
-              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+            stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "captured commit on a non-captured recurrent transaction")

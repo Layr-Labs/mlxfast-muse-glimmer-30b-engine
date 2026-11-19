@@ -113,19 +113,19 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
 
 @Test
 func transformDetectsModelFamilyFromSourceConfig() throws {
-    let bonsai = try #require(
+    let packed = try #require(
         try JSONSerialization.jsonObject(
-            with: Data(bonsai2ReferenceConfigJSON().utf8)
+            with: Data(packingReferenceConfigJSON().utf8)
         ) as? [String: Any]
     )
     #expect(
-        try SwiftTransform.detectModelFamily(sourceConfigRoot: bonsai)
-            == .prismHadamardQwen35
+        try SwiftTransform.detectModelFamily(sourceConfigRoot: packed)
+            == .prismHadamard
     )
     // The pack DOES carry a `text_config`, so the packed test must run before
-    // the text_config-means-legacy-Gemma fallthrough or the pack would be
+    // the text_config-means-legacy-`.gemma4` fallthrough or the pack would be
     // routed to the wrong family.
-    #expect(bonsai["text_config"] is [String: Any])
+    #expect(packed["text_config"] is [String: Any])
 
     let gemma = try #require(
         try JSONSerialization.jsonObject(
@@ -139,7 +139,7 @@ func transformDetectsModelFamilyFromSourceConfig() throws {
     #expect(
         try SwiftTransform.detectModelFamily(
             sourceConfigRoot: ["model_type": "prism_hadamard_qwen35_v2"]
-        ) == .prismHadamardQwen35
+        ) == .prismHadamard
     )
     // And a text_config that is NOT this family keeps the legacy Gemma route.
     #expect(
@@ -163,13 +163,13 @@ func transformKeySelectionKeepsTheLanguageModelNamespaceOnly() {
         "language_model.lm_head.weight",
     ] {
         #expect(
-            SwiftTransform.isSelectedTextTowerKey(kept, family: .prismHadamardQwen35),
+            SwiftTransform.isSelectedTextTowerKey(kept, family: .prismHadamard),
             Comment(rawValue: kept)
         )
     }
-    // The pack PUBLISHES a vision tower. This track serves text only, so the
-    // tower is dropped here the same way the model's own weight filter drops
-    // it at load.
+    // The pack PUBLISHES a vision tower. The transform serves text only, so
+    // the tower is dropped here the same way the model's own weight filter
+    // drops it at load.
     for dropped in [
         "vision_tower.blocks.0.attn.qkv.weight",
         "embed_vision.weight",
@@ -177,7 +177,7 @@ func transformKeySelectionKeepsTheLanguageModelNamespaceOnly() {
         "mtp.layers.0.fc.weight",
     ] {
         #expect(
-            !SwiftTransform.isSelectedTextTowerKey(dropped, family: .prismHadamardQwen35),
+            !SwiftTransform.isSelectedTextTowerKey(dropped, family: .prismHadamard),
             Comment(rawValue: dropped)
         )
     }
@@ -196,8 +196,8 @@ func transformKeySelectionKeepsTheLanguageModelNamespaceOnly() {
 /// dropped field refuses the load; the only edit is the duplicate
 /// quantization block, which this pack does not publish.
 @Test
-func transformBuildsBonsaiRuntimeConfigByPassingTheSourceThrough() throws {
-    let sourceURL = try bonsai2SyntheticPackConfigURL()
+func transformBuildsPackedRuntimeConfigByPassingTheSourceThrough() throws {
+    let sourceURL = try syntheticPackConfigURL()
     defer { try? FileManager.default.removeItem(at: sourceURL.deletingLastPathComponent()) }
     let configData = try SwiftTransform.makeRuntimeConfigData(
         sourceConfigPath: sourceURL
@@ -205,7 +205,7 @@ func transformBuildsBonsaiRuntimeConfigByPassingTheSourceThrough() throws {
     let config = try #require(
         try JSONSerialization.jsonObject(with: configData) as? [String: Any]
     )
-    let source = try bonsai2SyntheticPackConfigObject()
+    let source = try syntheticPackConfigObject()
 
     #expect(config["model_type"] as? String == "prism_hadamard_qwen35")
     #expect(config["base_model_type"] as? String == "qwen3_5")
@@ -213,9 +213,16 @@ func transformBuildsBonsaiRuntimeConfigByPassingTheSourceThrough() throws {
     #expect(config["gdn_activation_layout"] as? String == "grouped")
     #expect(config["tie_word_embeddings"] as? Bool == false)
     let text = try #require(config["text_config"] as? [String: Any])
-    #expect(text["vocab_size"] as? Int == MLXFastConstants.vocabSize)
-    #expect(text["hidden_size"] as? Int == MLXFastConstants.hiddenSize)
-    #expect(text["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+    // These three carry the SOURCE's own geometry, because the runtime config
+    // is the source passed through. Each source value is required, so the
+    // assertion cannot pass on two nils.
+    let sourceText = try #require(source["text_config"] as? [String: Any])
+    let sourceVocabSize = try #require(sourceText["vocab_size"] as? Int)
+    let sourceHiddenSize = try #require(sourceText["hidden_size"] as? Int)
+    let sourceLayerCount = try #require(sourceText["num_hidden_layers"] as? Int)
+    #expect(text["vocab_size"] as? Int == sourceVocabSize)
+    #expect(text["hidden_size"] as? Int == sourceHiddenSize)
+    #expect(text["num_hidden_layers"] as? Int == sourceLayerCount)
     #expect(text["mtp_num_hidden_layers"] as? Int == 0)
     // Every source key survives except the duplicate quantization block, which
     // this pack does not publish.
@@ -237,8 +244,8 @@ func transformBuildsBonsaiRuntimeConfigByPassingTheSourceThrough() throws {
 /// so a pack that ships no `language_model.lm_head.*` is refused before the
 /// copy.
 @Test
-func transformRejectsABonsaiPackWithoutTheUntiedHead() throws {
-    let fixture = try writeBonsaiCheckpointFixture(
+func transformRejectsAPackedConfigWithoutTheUntiedHead() throws {
+    let fixture = try writePackedCheckpointFixture(
         tensors: [
             TensorFixture(
                 name: "language_model.model.norm.weight",
@@ -259,7 +266,7 @@ func transformRejectsABonsaiPackWithoutTheUntiedHead() throws {
 /// a pack that ships an embedded one is a different artifact and is refused
 /// rather than absorbed.
 @Test
-func transformRejectsABonsaiPackThatCarriesAnEmbeddedMTPHead() throws {
+func transformRejectsAPackedConfigThatCarriesAnEmbeddedMTPHead() throws {
     let tensors = packedHadamardTensorQuad(
         stem: "language_model.lm_head", outFeatures: 2, inFeatures: 1024)
         + [
@@ -270,7 +277,7 @@ func transformRejectsABonsaiPackThatCarriesAnEmbeddedMTPHead() throws {
                 data: Data([0, 0, 0, 0])
             )
         ]
-    let fixture = try writeBonsaiCheckpointFixture(tensors: tensors)
+    let fixture = try writePackedCheckpointFixture(tensors: tensors)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let rejection = transformRejection(fixture)
@@ -283,10 +290,10 @@ func transformRejectsABonsaiPackThatCarriesAnEmbeddedMTPHead() throws {
 
 /// Past the structural gates, the set must BE the pinned inventory.
 @Test
-func transformRejectsPartialBonsaiInventoryBeforePublishing() throws {
+func transformRejectsPartialPackedInventoryBeforePublishing() throws {
     let tensors = packedHadamardTensorQuad(
         stem: "language_model.lm_head", outFeatures: 2, inFeatures: 1024)
-    let fixture = try writeBonsaiCheckpointFixture(tensors: tensors)
+    let fixture = try writePackedCheckpointFixture(tensors: tensors)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let rejection = transformRejection(fixture)
@@ -305,7 +312,7 @@ func transformRejectsAPackedModuleMissingItsSignVector() throws {
     tensors.removeAll { $0.name == "\(stem).signs" }
     tensors += packedHadamardTensorQuad(
         stem: "language_model.lm_head", outFeatures: 2, inFeatures: 1024)
-    let fixture = try writeBonsaiCheckpointFixture(tensors: tensors)
+    let fixture = try writePackedCheckpointFixture(tensors: tensors)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let rejection = transformRejection(fixture)
@@ -334,7 +341,7 @@ func transformRejectsASignVectorNarrowerThanTheContractedAxis() throws {
     )
     tensors += packedHadamardTensorQuad(
         stem: "language_model.lm_head", outFeatures: 2, inFeatures: 1024)
-    let fixture = try writeBonsaiCheckpointFixture(tensors: tensors)
+    let fixture = try writePackedCheckpointFixture(tensors: tensors)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     let rejection = transformRejection(fixture)
@@ -348,8 +355,8 @@ func transformRejectsASignVectorNarrowerThanTheContractedAxis() throws {
 /// This pack is UNIFORM, so a per-tensor override in the quantization block is
 /// a width the runtime never reads. Refuse rather than carry it.
 @Test
-func transformRejectsBonsaiQuantizationOverrides() throws {
-    var config = try bonsai2SyntheticPackConfigObject()
+func transformRejectsPackedQuantizationOverrides() throws {
+    var config = try syntheticPackConfigObject()
     var quantization = try #require(config["quantization"] as? [String: Any])
     quantization["language_model.model.layers.1.mlp.gate_proj"] = [
         "group_size": 128,
@@ -360,7 +367,7 @@ func transformRejectsBonsaiQuantizationOverrides() throws {
         withJSONObject: config,
         options: [.sortedKeys]
     )
-    let fixture = try writeBonsaiCheckpointFixture(
+    let fixture = try writePackedCheckpointFixture(
         tensors: [
             TensorFixture(
                 name: "language_model.model.norm.weight",
@@ -390,7 +397,7 @@ func transformRejectsNonMLXCompressedAndGlobalScaleSchemas() throws {
         "language_model.model.layers.3.self_attn.k_scale",
         "language_model.model.layers.3.self_attn.v_scale",
     ] {
-        let fixture = try writeBonsaiCheckpointFixture(
+        let fixture = try writePackedCheckpointFixture(
             tensors: [
                 TensorFixture(
                     name: forbiddenName,
@@ -415,7 +422,7 @@ func transformRejectsNonMLXCompressedAndGlobalScaleSchemas() throws {
 /// agree: emitting one of two conflicting specs would pick a quantization the
 /// shards were not written with.
 @Test
-func transformRequiresTheDuplicateBonsaiQuantizationBlocksToAgree() throws {
+func transformRequiresTheDuplicatePackedQuantizationBlocksToAgree() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let configPath = root.appendingPathComponent("config.json")
@@ -430,31 +437,31 @@ func transformRequiresTheDuplicateBonsaiQuantizationBlocksToAgree() throws {
     }
 
     // One block alone -- what the pack publishes -- is enough.
-    var config = try bonsai2SyntheticPackConfigObject()
+    var config = try syntheticPackConfigObject()
     #expect(config["quantization_config"] == nil)
     #expect(throws: Never.self) { _ = try emit(config) }
 
     // An agreeing duplicate is accepted.
-    config = try bonsai2SyntheticPackConfigObject()
+    config = try syntheticPackConfigObject()
     config["quantization_config"] = try #require(config["quantization"] as? [String: Any])
     #expect(throws: Never.self) { _ = try emit(config) }
 
     // Two blocks that disagree are refused.
-    config = try bonsai2SyntheticPackConfigObject()
+    config = try syntheticPackConfigObject()
     var quantizationConfig = try #require(config["quantization"] as? [String: Any])
     quantizationConfig["bits"] = 4
     config["quantization_config"] = quantizationConfig
     #expect(throws: MLXFastError.self) { _ = try emit(config) }
 
     // A block missing a required scalar is refused rather than defaulted.
-    config = try bonsai2SyntheticPackConfigObject()
+    config = try syntheticPackConfigObject()
     var quantization = try #require(config["quantization"] as? [String: Any])
     quantization.removeValue(forKey: "mode")
     config["quantization"] = quantization
     #expect(throws: MLXFastError.self) { _ = try emit(config) }
 
     // And a width this pack does not use is refused.
-    config = try bonsai2SyntheticPackConfigObject()
+    config = try syntheticPackConfigObject()
     quantization = try #require(config["quantization"] as? [String: Any])
     quantization["group_size"] = 64
     config["quantization"] = quantization
@@ -466,7 +473,7 @@ func transformRuntimeConfigCaptureDoesNotRereadChangedSource() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let configPath = root.appendingPathComponent("config.json")
-    try bonsai2ReferenceConfigJSON().write(
+    try packingReferenceConfigJSON().write(
         to: configPath,
         atomically: true,
         encoding: .utf8
@@ -479,11 +486,13 @@ func transformRuntimeConfigCaptureDoesNotRereadChangedSource() throws {
         encoding: .utf8
     )
 
-    // The Bonsai runtime config is the source passed through, so the layer
-    // count stays inside `text_config`.
+    // The packed runtime config is the source passed through, so the layer
+    // count stays inside `text_config` and equals the SOURCE's own value --
+    // not a constant of this engine's target, which is a different tower.
     let object = try JSONSerialization.jsonObject(with: captured) as? [String: Any]
     let text = try #require(object?["text_config"] as? [String: Any])
-    #expect(text["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+    let sourceText = try #require(try syntheticPackConfigObject()["text_config"] as? [String: Any])
+    #expect(text["num_hidden_layers"] as? Int == sourceText["num_hidden_layers"] as? Int)
 }
 
 @Test
@@ -780,7 +789,7 @@ func transformRejectsCheckpointWithoutTextTowerTensorsBeforeCreatingOutput() thr
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try bonsai2ReferenceConfigJSON().write(
+    try packingReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -909,7 +918,7 @@ func transformRejectsUnsupportedIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try bonsai2ReferenceConfigJSON().write(
+    try packingReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -935,7 +944,7 @@ func transformRejectsUnsafeIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try bonsai2ReferenceConfigJSON().write(
+    try packingReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -961,7 +970,7 @@ func transformRejectsIndexTensorMissingFromShardHeaderBeforeCreatingOutput() thr
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try bonsai2ReferenceConfigJSON().write(
+    try packingReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -1094,12 +1103,12 @@ private func gemmaReferenceConfigJSON() -> String {
     """
 }
 
-/// The Bonsai 2 9B source config. The pack is not published yet, so this is
-/// the synthetic one built from the packing reference and the Qwen 3.5 9B
-/// backbone (`bonsai2SyntheticPackConfigObject`).
-private func bonsai2ReferenceConfigJSON() throws -> String {
+/// The synthetic packed source config. The 9B member of that family is not
+/// published, so this is the one built from the packing reference and the
+/// family's published backbone (`syntheticPackConfigObject`).
+private func packingReferenceConfigJSON() throws -> String {
     let data = try JSONSerialization.data(
-        withJSONObject: try bonsai2SyntheticPackConfigObject(),
+        withJSONObject: try syntheticPackConfigObject(),
         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     )
     return String(decoding: data, as: UTF8.self)
@@ -1146,22 +1155,22 @@ private func packedHadamardTensorQuad(
     ]
 }
 
-private struct BonsaiFixturePaths {
+private struct PackedFixturePaths {
     let root: URL
     let reference: URL
     let output: URL
     let shardName: String
 }
 
-private func writeBonsaiCheckpointFixture(
+private func writePackedCheckpointFixture(
     tensors: [TensorFixture],
     configJSON: String? = nil
-) throws -> BonsaiFixturePaths {
+) throws -> PackedFixturePaths {
     let root = try temporaryDirectory()
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    let effectiveConfigJSON = try configJSON ?? bonsai2ReferenceConfigJSON()
+    let effectiveConfigJSON = try configJSON ?? packingReferenceConfigJSON()
     try effectiveConfigJSON.write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
@@ -1173,7 +1182,7 @@ private func writeBonsaiCheckpointFixture(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: Dictionary(uniqueKeysWithValues: tensors.map { ($0.name, shardName) })
     )
-    return BonsaiFixturePaths(
+    return PackedFixturePaths(
         root: root,
         reference: reference,
         output: output,
@@ -1182,7 +1191,7 @@ private func writeBonsaiCheckpointFixture(
 }
 
 /// Run the transform on a fixture and return the refusal it must produce.
-private func transformRejection(_ fixture: BonsaiFixturePaths) -> MLXFastError? {
+private func transformRejection(_ fixture: PackedFixturePaths) -> MLXFastError? {
     do {
         _ = try SwiftTransform.run(
             TransformOptions(

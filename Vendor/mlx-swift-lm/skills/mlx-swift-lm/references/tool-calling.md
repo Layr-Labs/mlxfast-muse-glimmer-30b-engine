@@ -29,12 +29,18 @@ mlx-swift-lm supports function calling / tool use with multiple model-specific f
 | Format | Models | Example Output |
 |--------|--------|----------------|
 | `.json` | Llama, Qwen, most models | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
-| `.lfm2` | LFM2 | `<\|tool_call_start\|>{"name":"f",...}<\|tool_call_end\|>` |
-| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3.5 | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
-| `.glm4` | GLM4 | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
-| `.gemma` | Gemma | `call:name{key:value}` |
+| `.lfm2` | LFM2 | `<\|tool_call_start\|>[func(arg='value')]<\|tool_call_end\|>` |
+| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3 Next | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
+| `.qwen35` | Qwen 3.5 | Same `<tool_call>` frame as `.xmlFunction`, but also accepts a framed Qwen/Hermes JSON payload (`<tool_call>{"name":"f","arguments":{...}}</tool_call>`) that Qwen 3.5 sporadically emits instead of XML. Bare (unframed) JSON is not recovered. |
+| `.glm4` | GLM4 | `<tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` (GLM-4.5+), or GLM-4-0414's markerless `func` on its own line followed by `{"k":"v"}`. The markerless dialect is detected only when `tools` are supplied and `func` is one of them; an undeclared `word\n{...}` stays response text. |
+| `.gemma` | Gemma | `<start_function_call>call:name{key:value}<end_function_call>` |
+| `.gemma4` | Gemma4 | `<\|tool_call>call:name{key:<\|"\|>value<\|"\|>}<tool_call\|>` |
 | `.kimiK2` | Kimi K2 | `functions.name:0<\|tool_call_argument_begin\|>{...}` |
 | `.minimaxM2` | MiniMax M2 | `<invoke name="f"><parameter name="k">v</parameter></invoke>` |
+| `.atem` | Muse Glimmer (Onyx ATEM) | `<atem:function_calls><atem:invoke name="f">...</atem:invoke></atem:function_calls>` |
+| `.mistral` | Mistral3 | `[TOOL_CALLS]get_weather [ARGS]{"location":"Tokyo"}` |
+| `.llama3` | Llama 3 | `<\|python_tag\|>{"name":"func","parameters":{...}}` |
+| `.gptOSS` | GPT-OSS | Full Harmony protocol, not a JSON dialect: `<\|channel\|>commentary to=functions.get_weather<\|message\|>{...}<\|call\|>` |
 
 ## Defining Tools
 
@@ -184,17 +190,122 @@ let processor = ToolCallProcessor(
 )
 ```
 
-## Format Auto-Detection
+### Schema Validation
 
-Formats are auto-detected from model type:
+When you supply tool schemas, the processor checks calls before dispatch:
+
+1. The function name must be in the declared tools.
+2. With `toolCallPolicy: .init(validation: .strict)`, arguments must not
+   definitively violate the tool's `parameters` schema. The default is
+   `.permissive`, which leaves schema validation to the application.
+
+A call that fails a check is not dispatched. It is reported as a
+`RejectedToolCall` with the reason `undeclaredTool` or `invalidArguments`.
+The `detail` of a schema violation says where the problem is and what the
+schema requires, for example `arguments.limit must be an integer`.
+
+The package validates the JSON Schema keywords that tool declarations commonly use:
+`type`, `properties`, `required`, `additionalProperties`, `items`,
+`minItems`, `maxItems`, `uniqueItems`, `minLength`, `maxLength`, `minimum`,
+`maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `enum`, `const`, `anyOf`,
+`oneOf`, and `allOf`. Validation is conservative: an unsupported assertion such
+as `pattern` or `$ref` makes the result uncertain and cannot reject a call on
+its own. A tool without a `parameters` schema accepts all arguments. Without
+tool declarations, all parsed calls pass.
+
+The package also reads the OpenAPI 3.0 `nullable` marker. A Boolean `true`
+beside an explicit `type` lets that node accept `null`. Every other keyword on
+the node still applies.
+
+A Gemma 4 value written without the `<|"|>` marker, such as `zip:01000`, is
+read by its parameter's schema, at any depth: a parameter that admits a string
+but not the value's JSON type keeps the written text (`"01000"`, `"1.10"`,
+`"true"`). Other parameters, and calls without a schema, keep the JSON reading
+(`1000`). Marker-quoted values remain strings by default. With
+`DARKBLOOM_GEMMA_SCHEMA_COERCION=1`, the Gemma parser converts quoted numeric
+values at frame close when the parameter unambiguously requires an integer or
+number. It uses the existing bounded schema normalization, including nested
+properties and array items; strings, ambiguous or unknown schemas, non-finite
+numbers and non-integral integer values retain their original text. Numeric
+marker values are withheld from argument deltas until the completed parse, so
+streamed JSON agrees with the completed call. Callers still validate the completed
+call against their schema. Unsupported container schemas (including references,
+pattern properties and tuple prefixes) preserve quoted descendants. A numeric
+render type beside a union is insufficient to convert a string: the union
+branches must independently establish a numeric reading. Nested `anyOf`,
+`oneOf` or `allOf` combinations preserve quoted text because render types can
+narrow branches at several levels. Unset or `0` retains the previous parser and streaming
+behavior. Set the variable before starting the server; it is read once per
+process.
+
+Where the bare-value reading differs from
+vLLM's `convert_value`, the SDK keeps the JSON reading: an `enum`- or
+`const`-only schema, a `$ref`, or an `allOf` with an untyped branch (vLLM
+infers the `enum`/`const` types, resolves a local `$ref` and ignores the
+untyped `allOf` branch). Two more differences: an integer too large for
+`Int` reads as a number, so a string-or-integer parameter keeps its text, and
+a `nullable: true` string keeps a bare `null` as null (vLLM returns `"null"`).
+
+## Format Resolution
+
+When a model is loaded, the factories resolve the format in this order:
+
+1. an explicit value on the `ModelConfiguration` (registry entry or caller),
+2. a `ChatConventionsResolving` registered with `ChatConventionsRegistry`
+   (keyed on repo id / model type, for conventions the model cannot know),
+3. an explicit `tool_parser_type` in the checkpoint's tokenizer files,
+4. the selected tool template reconciled with the model's own
+   `ChatConventionsProviding` declaration.
+
+Nothing resolved means the default `.json` parser is used.
+
+At step 4, the model declaration remains selected when it can parse the template's
+dialect. Otherwise, the template refines it because the template is what teaches
+the model what to emit. This lets Qwen 3.5 keep its dual-dialect parser while a
+Hermes checkpoint can refine the Llama 3 architecture heuristic from inline JSON
+to framed JSON. If the template has no recognizable tool syntax, the model
+declaration remains the fallback.
 
 ```swift
-// Auto-detected based on model_type in config.json
-ToolCallFormat.infer(from: "lfm2")     // -> .lfm2
-ToolCallFormat.infer(from: "glm4")     // -> .glm4
-ToolCallFormat.infer(from: "gemma")    // -> .gemma
-ToolCallFormat.infer(from: "llama")    // -> nil (use default .json)
+ToolCallFormat.inferred(fromChatTemplate: template)  // -> .mistral, .glm4, ...
+ToolCallFormat(toolParserType: "qwen3_coder")        // -> .xmlFunction
 ```
+
+Protocols with token-level framing (`.gptOSS`, `.atem`) are deliberately not
+inferred from templates — they are selected by the models that own them.
+
+### Muse Glimmer (Onyx) Parsing Mode
+
+`muse_glimmer` resolves to `.atem`. Its output is read strictly by default:
+one invoke for each tool frame, the invoke name equal to the frame's
+recipient, and no call from a frame that generation leaves open. Set
+`onyxParsing` to read it the way vLLM, SGLang and llama.cpp do: one call for
+each complete invoke, a doubled name `X.X` as the declared tool `X`, values
+typed by the tool schema, and no call from an invoke the token limit cut off.
+An undeclared tool is rejected in both modes.
+
+```swift
+var parameters = GenerateParameters()
+parameters.toolCallPolicy.onyxParsing = .referenceParity
+```
+
+A host that runs its own engine decodes the response with one of two types.
+Both give reasoning, content, tool calls and rejections as `OnyxStreamEvent`.
+
+```swift
+// Token ids: text that spells a marker cannot forge a frame.
+var decoder = OnyxTokenStreamDecoder(tokenizer: tokenizer, tools: toolSpecs)!
+for token in generatedTokens { handle(decoder.push(token)) }  // stop token included
+handle(decoder.finish())
+
+// Text with the control markers visible, cut anywhere.
+var textDecoder = OnyxTextStreamDecoder(tools: toolSpecs)
+for chunk in chunks { handle(textDecoder.process(chunk)) }
+handle(textDecoder.finish())
+```
+
+`<|eot|>` and `<|end_of_text|>` end generation (`stopTokenIDs`); `<|eom|>`
+ends one message and does not.
 
 ### Explicit Format in Configuration
 
@@ -275,9 +386,16 @@ Custom formats can implement `ToolCallParser`:
 public protocol ToolCallParser: Sendable {
     var startTag: String? { get }  // nil for inline formats
     var endTag: String? { get }
+    var supportsBareJSON: Bool { get }             // default false
+    var supportsMarkerlessNamedJSON: Bool { get }  // default false; `name\n{json}`
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
 }
 ```
+
+`supportsMarkerlessNamedJSON` opts a parser into the schema-anchored
+`name\n{json}` detection used by `.glm4`. `ToolCallProcessor` only recognizes
+that shape when `tools` are supplied and the line-leading name is declared in
+them, then hands the whole `name\n{...}` text to `parse(content:tools:)`.
 
 ## Error Handling
 

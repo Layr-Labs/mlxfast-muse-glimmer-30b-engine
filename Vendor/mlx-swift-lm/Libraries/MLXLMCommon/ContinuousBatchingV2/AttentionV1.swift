@@ -32,6 +32,9 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
+    ///
+    /// Full-attention chunks that MLX serves with a fused kernel skip
+    /// blocking regardless of this width (`usesFusedCausalPrefill`).
     static let queryBlockSize: Int = {
         guard
             let raw = ProcessInfo.processInfo.environment[
@@ -47,6 +50,76 @@ enum CBv2AttentionV1 {
     @inline(__always)
     static func shouldBlockQueries(_ L: Int) -> Bool {
         queryBlockSize > 0 && L > queryBlockSize
+    }
+
+    /// Kill switch for `usesFusedCausalPrefill`, read once per process.
+    /// `DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL=0` restores query blocks (and,
+    /// on the paged backend, the absolute BOOL mask) for every prompt chunk.
+    static let fusedCausalPrefillEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL"] != "0"
+
+    /// Whether a multi-token prompt chunk is attended with ONE symbolic
+    /// `.causal` SDPA call instead of query blocks.
+    ///
+    /// Blocking exists to bound the score tensor that MLX's COMPOSED path
+    /// materializes (`queryBlockBounds`). The fused full-attention kernels
+    /// materialize no scores and skip key tiles above the diagonal, so on a
+    /// shape they serve, blocking only splits one launch into
+    /// `L / queryBlockSize` launches that each under-fill the GPU (and on
+    /// paged storage build their own BOOL mask), plus an output concat.
+    /// Peak memory can only drop.
+    ///
+    /// Eligible calls are exactly those whose mask MLX's `.causal` expresses:
+    /// full attention with no window, softcap, span overlay or bidirectional
+    /// chunk. Their keys are the row's whole visible history and the queries
+    /// its trailing `L` columns, which is the bottom-right alignment MLX uses
+    /// for `.causal` (`qL_off = kL - qL`). Sinks pass through unchanged. The
+    /// head geometry must be one MLX actually fuses (`mlxFusesCausalAttention`);
+    /// everything else keeps today's blocked path, so Gemma 4 (head_dim 256
+    /// sliding, 512 full) is unaffected.
+    ///
+    /// Pure in (layer kind, L, head dims, dtype, device), so one chunk always
+    /// takes the same route. It is NOT chunk-partition invariant for head_dim
+    /// 256 on NAX, where a chunk below 1024 queries keeps the composed blocks:
+    /// the two routes differ within rounding.
+    static func usesFusedCausalPrefill(
+        kind: CBv2LayerKind, queries: MLXArray, values: MLXArray,
+        softcap: Float?, hasSpanContext: Bool
+    ) -> Bool {
+        guard fusedCausalPrefillEnabled, kind.attention == .full, !kind.isBidirectional,
+            softcap == nil, !hasSpanContext, queries.ndim == 4, values.ndim == 4,
+            mlxFusesCausalAttention(
+                queryLength: queries.dim(2), queryHeadDim: queries.dim(3),
+                valueHeadDim: values.dim(3), dtype: queries.dtype,
+                naxAvailable: MiMoV26NAXGatherQMM.naxAvailable)
+        else { return false }
+        // The fused kernels exist only on the GPU; a CPU default stream would
+        // take the composed fallback over the whole chunk.
+        return MiMoV26NAXGatherQMM.gpuStream(.default)
+    }
+
+    /// Whether MLX runs a fused full-attention kernel for one `.causal` SDPA
+    /// call with no array mask, mirroring `has_fused_kernel` and
+    /// `ScaledDotProductAttention::use_fallback`
+    /// (`mlx/backend/metal/scaled_dot_product_attention.cpp`).
+    ///
+    /// Must never answer `true` for a shape MLX sends to the composed
+    /// fallback: unblocked, that would materialize the whole
+    /// `[heads, L, kL]` score tensor. So it is deliberately narrower than
+    /// MLX: head_dim 192 is fallback-only for `qL > 8` there; head_dim 256
+    /// takes the NAX head-dim-split kernel only from 1024 queries, and fp32
+    /// is excluded rather than mirroring `MLX_ENABLE_TF32`; `qL <= 8` (the
+    /// vector kernels) is not a prompt chunk worth routing.
+    static func mlxFusesCausalAttention(
+        queryLength: Int, queryHeadDim: Int, valueHeadDim: Int, dtype: DType,
+        naxAvailable: Bool
+    ) -> Bool {
+        guard queryLength > 8, queryHeadDim == valueHeadDim else { return false }
+        switch queryHeadDim {
+        case 64, 72, 80, 96, 128: return true
+        case 256: return naxAvailable && queryLength >= 1024 && dtype != .float32
+        default: return false
+        }
     }
 
     /// The sink logits an `MLXFast.scaledDotProductAttention` call may be
@@ -124,7 +197,8 @@ enum CBv2AttentionV1 {
     /// only the query extent is capped. Both backends therefore have to
     /// compute the SAME span — if the two copies drift, one of them silently
     /// attends a different set of keys, and the memory bound stops holding
-    /// on whichever side widened.
+    /// on whichever side widened. Chunks routed by `usesFusedCausalPrefill`
+    /// never reach this: their kernel materializes no score tensor.
     ///
     /// It is shared rather than copied for exactly that reason. The paged
     /// track originally copied it because `attendQueryBlocks` is `private`
@@ -181,29 +255,19 @@ enum CBv2AttentionV1 {
     /// - spanContexts: when bound, one optional context per row. Non-nil
     ///   entries select that row's vision overlay; nil entries retain q=128
     ///   query-block causal/window semantics in the same rectangular call.
-    /// - Returns `[B, queryHeads, L, headDim]`.
+    /// - Returns `[B, queryHeads, L, valueHeadDim]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false, keepMask: MLXArray? = nil,
-        metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        serializeQueries: Bool = false, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil,
+        mimoV26NAXAttention: Bool = false,
+        mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
-        if keepMask != nil {
-            precondition(
-                B == 1,
-                "CBv2AttentionV1: a keep mask serves one row per call, got batch \(B)")
-            precondition(
-                spanContexts == nil,
-                "CBv2AttentionV1: a keep mask cannot be combined with vision span masks")
-            precondition(
-                window(of: kind) == nil && !kind.isBidirectional,
-                "CBv2AttentionV1: a keep mask serves causal full attention only")
-        }
         precondition(!rows.isEmpty, "CBv2AttentionV1: no rows")
         precondition(
             B == rows.count,
@@ -228,14 +292,15 @@ enum CBv2AttentionV1 {
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
                     scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    keepMask: keepMask)
+                    mimoV26DecodeRows: mimoV26NAXAttention && metadata == nil && packet == nil)
             }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0], keepMask: keepMask,
-                metadata: metadata, packet: packet)
+                spanContext: spanContexts?[0], metadata: metadata, packet: packet,
+                mimoV26NAXAttention: mimoV26NAXAttention,
+                mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         }
 
         if L == 1 {
@@ -274,7 +339,8 @@ enum CBv2AttentionV1 {
                 row: rows[index], kind: kind,
                 queries: slice(queries), keys: slice(keys), values: slice(values),
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[index])
+                spanContext: spanContexts?[index], mimoV26NAXAttention: mimoV26NAXAttention,
+                mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         }
     }
 
@@ -348,7 +414,8 @@ enum CBv2AttentionV1 {
             "CBv2AttentionV1: last-query prefill Q shape does not match the layer kind")
         precondition(
             keys.dim(1) == kind.kvHeads && values.dim(1) == kind.kvHeads
-                && keys.dim(3) == kind.headDim && values.dim(3) == kind.headDim,
+                && keys.dim(3) == kind.headDim && values.dim(3) == kind.valueHeadDim
+                && keys.dtype == values.dtype,
             "CBv2AttentionV1: last-query prefill K/V shape does not match the layer kind")
 
         let effectiveSinks = dispatchSinks(
@@ -376,24 +443,37 @@ enum CBv2AttentionV1 {
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContext: CBv2SpanChunkContext?, keepMask: MLXArray? = nil,
-        metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        spanContext: CBv2SpanChunkContext?, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil,
+        mimoV26NAXAttention: Bool = false,
+        mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let keepMask {
-            precondition(
-                keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
-                "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
-                    + "\(L) queries over \(cachedKeys.dim(2)) keys")
+        let useMiMoNAX =
+            mimoV26NAXAttention && !kind.isBidirectional
+            && spanContext == nil && softcap == nil && metadata == nil && packet == nil
+        if useMiMoNAX, shouldBlockQueries(L),
+            let grouped = MiMoV26BlockBatchAttention.tryAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                sinks: sinks, window: window(of: kind), queryBlockSize: queryBlockSize,
+                budget: mimoV26BlockBatchBudget, layerIndex: kind.modelLayerIndex)
+        {
+            return grouped
         }
-        if shouldBlockQueries(L) && !kind.isBidirectional {
+        // A fused-eligible chunk falls through to the single `attend` below,
+        // whose `maskMode` is `.causal` for a full-attention layer.
+        if shouldBlockQueries(L) && !kind.isBidirectional
+            && (useMiMoNAX
+                || !usesFusedCausalPrefill(
+                    kind: kind, queries: queries, values: cachedValues, softcap: softcap,
+                    hasSpanContext: spanContext != nil))
+        {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
                 sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
-                spanContext: spanContext, keepMask: keepMask)
+                spanContext: spanContext, mimoV26NAXAttention: useMiMoNAX)
         }
         if let spanContext {
             return attendSpanChunk(
@@ -401,31 +481,39 @@ enum CBv2AttentionV1 {
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
+        if useMiMoNAX,
+            let output = MiMoV26NAXAttention.tryAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                mask: maskMode(L: L, kL: cachedKeys.dim(2), window: window(of: kind)),
+                sinks: sinks)
+        {
+            return output
+        }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional,
-            keepMask: keepMask, metadata: metadata, packet: packet)
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional, metadata: metadata,
+            packet: packet)
     }
 
     private static func updateAndAttendRowSerialQueries(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?,
-        keepMask: MLXArray? = nil
+        scale: Float, sinks: MLXArray?, softcap: Float?, mimoV26DecodeRows: Bool = false
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let keepMask {
-            precondition(
-                keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
-                "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
-                    + "\(L) queries over \(cachedKeys.dim(2)) keys")
+        if mimoV26DecodeRows, !kind.isBidirectional, window(of: kind) == nil, softcap == nil,
+            let output = MiMoV26DecodeRows.tryAttention(
+                queries: queries,
+                keys: cachedKeys, values: cachedValues, scale: scale, sinks: sinks)
+        {
+            return output
         }
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: sinks, softcap: softcap, keepMask: keepMask)
+            sinks: sinks, softcap: softcap)
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
@@ -451,6 +539,15 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false
     ) -> MLXArray {
+        precondition(
+            queries.ndim == 4 && queries.dim(1) == kind.queryHeads
+                && queries.dim(3) == kind.headDim,
+            "CBv2AttentionV1: borrowed query geometry mismatch")
+        precondition(
+            sourceKind.kvHeads == kind.kvHeads && sourceKind.headDim == kind.headDim
+                && sourceKind.valueHeadDim == kind.valueHeadDim
+                && sourceKind.attention == kind.attention,
+            "CBv2AttentionV1: borrowed K/V geometry mismatch")
         let B = queries.dim(0)
         let L = queries.dim(2)
         precondition(!sourceRows.isEmpty, "CBv2AttentionV1: no source rows to borrow from")
@@ -543,7 +640,11 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
+        if shouldBlockQueries(L) && !sourceKind.isBidirectional
+            && !usesFusedCausalPrefill(
+                kind: sourceKind, queries: queries, values: cachedValues, softcap: softcap,
+                hasSpanContext: spanContext != nil)
+        {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
@@ -610,11 +711,11 @@ enum CBv2AttentionV1 {
     /// different `kL` changes the reduction tiling and may select a different
     /// kernel specialization, so results can differ in the last ulp.
     ///
-    /// Scope: this applies to every multi-token prompt call that reaches
-    /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
-    /// packed prefill. Vision rows keep the same q=128 blocking; each query
-    /// block expands its K/V slice only as needed to include complete image
-    /// spans touched by that block, then composes causal/window and
+    /// Scope: every multi-token prompt call that reaches `updateAndAttendRow`
+    /// / `borrowAndAttendRow` (packed rows too) unless `usesFusedCausalPrefill`
+    /// sends it to one `.causal` call. Vision rows keep the same q=128 blocking;
+    /// each query block expands its K/V slice only as needed to include complete
+    /// image spans touched by that block, then composes causal/window and
     /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.
     ///
     /// `blockSize == 1` reproduces the MTP serial-query path exactly.
@@ -622,13 +723,9 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
         sinks: MLXArray?, softcap: Float?, blockSize: Int,
-        spanContext: CBv2SpanChunkContext? = nil,
-        keepMask: MLXArray? = nil
+        spanContext: CBv2SpanChunkContext? = nil, mimoV26NAXAttention: Bool = false
     ) -> MLXArray {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
-        precondition(
-            keepMask == nil || spanContext == nil,
-            "CBv2AttentionV1: a keep mask cannot be combined with vision span masks")
         let keyCount = keys.dim(2)
         let historyCount = keyCount - newTokenCount
         precondition(historyCount >= 0)
@@ -676,20 +773,19 @@ enum CBv2AttentionV1 {
                         keyAbsoluteStart: kStart + visibleStart,
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
+            } else if mimoV26NAXAttention,
+                let output = MiMoV26NAXAttention.tryAttention(
+                    queries: querySlice, keys: keySlice, values: valueSlice, scale: scale,
+                    mask: maskMode(L: count, kL: visibleEnd - visibleStart, window: window),
+                    sinks: sinks)
+            {
+                outputs.append(output)
             } else {
-                // The block reads keys `[visibleStart, visibleEnd)` and
-                // queries `[offset, offset + count)`, so the mask is sliced
-                // to the same window. Column coordinates are absolute over
-                // the retained tape on both sides.
-                let blockKeepMask = keepMask.map {
-                    $0[0..., 0..., offset ..< (offset + count), visibleStart ..< visibleEnd]
-                }
                 outputs.append(
                     attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
                         scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap,
-                        keepMask: blockKeepMask))
+                        window: window, sinks: sinks, softcap: softcap))
             }
             offset += count
         }
@@ -700,12 +796,12 @@ enum CBv2AttentionV1 {
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
-        sinks: MLXArray?, softcap: Float?, keepMask: MLXArray? = nil
+        sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
         attendQueryBlocks(
             queries: queries, keys: keys, values: values,
             newTokenCount: newTokenCount, window: window, scale: scale,
-            sinks: sinks, softcap: softcap, blockSize: 1, keepMask: keepMask)
+            sinks: sinks, softcap: softcap, blockSize: 1)
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast
@@ -716,8 +812,7 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false, keepMask: MLXArray? = nil,
-        metadata: CBv2AttentionMetadataObservation? = nil,
+        bidirectional: Bool = false, metadata: CBv2AttentionMetadataObservation? = nil,
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
@@ -725,23 +820,6 @@ enum CBv2AttentionV1 {
         let attentionKeys = keys.dtype == queries.dtype ? keys : keys.asType(queries.dtype)
         let attentionValues =
             values.dtype == queries.dtype ? values : values.asType(queries.dtype)
-        if let keepMask {
-            // EXACT: the keep mask can only remove keys the causal/window
-            // mask already admitted, so the composed mask is the AND of the
-            // two. `boolMask` returns nil at L == 1 (the retained KV IS the
-            // visible set), where the keep mask stands alone.
-            let composed =
-                boolMask(L: L, kL: kL, window: window, bidirectional: bidirectional)
-                .map { $0 .&& keepMask } ?? keepMask
-            guard let softcap else {
-                return MLXFast.scaledDotProductAttention(
-                    queries: queries, keys: attentionKeys, values: attentionValues,
-                    scale: scale, mask: .array(composed), sinks: sinks)
-            }
-            return PagedAttentionReference.composedAttention(
-                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
-                boolMask: composed, sinks: sinks, softcap: softcap)
-        }
         guard let softcap else {
             // Sinks arrive ALREADY normalized to the query dtype: see
             // `sdpaSinks` (MLX aborts the process on a wider sink) and

@@ -1,0 +1,289 @@
+{
+  "schema_version": 1,
+  "track_id": "muse-glimmer-30b-mlx-v1",
+  "track_name": "muse-glimmer-30b-mlx-v1 -- composite cohort speedup",
+  "official_scoring_enabled": true,
+  "official_pairs": 3,
+  "official_pair_combine": "mean",
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "runner_name": "muse_glimmer",
+  "allowed_modes": [
+    "serial",
+    "dflash"
+  ],
+  "benchmark_name": "mlxfast-muse-glimmer-30b",
+  "kv_backend": "paged",
+  "kv_backend_note": "the model refuses a contiguous cache: its engine capabilities set requiresPagedKV and the engine build fails on a non-paged backend. This is the one backend the track can serve.",
+  "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.03,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "vocab_size": 202048,
+  "num_hidden_layers": 52,
+  "seed_tokens": 512,
+  "golden_model_type": "muse_glimmer",
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "live_goldens": [
+    "pool-9",
+    "pool-10",
+    "pool-11"
+  ],
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-9.golden.json",
+      "bytes": 38357,
+      "sha256": "2f8e21a1c33e858a73f2239963c1b9e4b9f78e30efcb9557f49365e4dc510d8d"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-10.golden.json",
+      "bytes": 35800,
+      "sha256": "c002ceca947462cf9fe1eb3e0980760d830b977184127ad8759f5ef0ce630838"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-11.golden.json",
+      "bytes": 38885,
+      "sha256": "9d2f729e1653f43d33eb6103cb268c6f83da04daacec6f67f11623d40e06b42e"
+    }
+  ],
+  "hidden_correctness_golden": {
+    "bytes": 38357,
+    "sha256": "2f8e21a1c33e858a73f2239963c1b9e4b9f78e30efcb9557f49365e4dc510d8d"
+  },
+  "baseline_reference_commit": "e917ccf3c4c4a1b8606f7df4f0aba2a8141ebf2f",
+  "baseline_reference_commit_note": "The control leg's tree: the contract's reference_engine_commit, staged on the box by MLX-L04/L04B. Armed at part 18 as a fixture-only descendant commit after the MLX-L09 pool pin; re-armed at part 21 on the F-92 engine commit.",
+  "mlx_swift_lm_revision": "0391eacd84cb00ce4001d70763f2303fa2a01210",
+  "mlx_swift_lm_revision_note": "a TREE, not a commit: the vendored tree is the local merge of 62cfabd5c67c6042edcfd812698bd34e4b5df7d7 and 443789360ddbf804d55d063ca9cda4ea2d3013a9, and no upstream commit names that merge. Nothing in the tree reads this field as a commit.",
+  "target": {
+    "upstream_model_id": "nvidia/Muse-Glimmer-30B-NVFP4",
+    "upstream_revision": "47818374517751c48c55cde2621594926b1888b6",
+    "format": "safetensors-modelopt",
+    "architecture": "MuseGlimmerForConditionalGeneration",
+    "model_type": "muse_glimmer",
+    "text_model_type": "muse_glimmer_text",
+    "vision_model_type": "muse_glimmer_vision",
+    "schema_version": 2,
+    "config_fixture": {
+      "path": "fixtures/muse_glimmer_30b_nvfp4_config.json",
+      "sha256": "f3add3cfff62038fc7087e72f7df5a560660707aba7c8e65761bfa6bf8f08774",
+      "bytes": 88682,
+      "source": "config.json of the pinned snapshot, downloaded from the Hub at the pinned revision and hashed with shasum -a 256"
+    },
+    "num_hidden_layers": 52,
+    "hidden_size": 6656,
+    "intermediate_size": 19968,
+    "vocab_size": 202048,
+    "max_position_embeddings": 131072,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "attention_bias": false,
+    "attention_output_gate": true,
+    "sliding_window": 2048,
+    "layer_type_counts": {
+      "sliding_attention": 39,
+      "full_attention": 13
+    },
+    "full_attention_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51
+    ],
+    "rope_theta_by_layer": {
+      "sliding_attention": 500000.0,
+      "full_attention": 0.0,
+      "note": "layer_rope_theta in config.json is 500000.0 on every sliding layer and 0 on every full layer, i.e. the full layers are NoPE"
+    },
+    "rope_parameters": {
+      "rope_theta": 500000.0,
+      "rope_type": "default"
+    },
+    "final_logit_softcapping": 20.0,
+    "output_multiplier": 0.19611613513818404,
+    "qk_scale_factor": 3.87,
+    "rms_norm_eps": 1e-05,
+    "post_norm_eps": 1e-08,
+    "hidden_activation": "silu",
+    "tie_word_embeddings": false,
+    "bos_token_id": 200000,
+    "eos_token_ids": [
+      200001
+    ],
+    "pad_token_id": null,
+    "image_token_id": 200092,
+    "video_token_id": 200091,
+    "components": {
+      "text": true,
+      "vision": "present in the checkpoint, not loaded by this text-only track",
+      "mtp": false
+    },
+    "vision_tower": {
+      "model_type": "muse_glimmer_vision",
+      "num_hidden_layers": 50,
+      "hidden_size": 1536,
+      "intermediate_size": 8960,
+      "num_attention_heads": 16,
+      "out_hidden_size": 6144,
+      "projector_hidden_size": 4096,
+      "projector_hidden_act": "gelu",
+      "loaded": false
+    },
+    "tensor_namespace": "muse_glimmer",
+    "mlp_kind": "dense",
+    "experts": "none: model.safetensors.index.json holds no experts tensor",
+    "raw_checkpoint_tensor_count": 2222,
+    "raw_checkpoint_shard_count": 3,
+    "raw_checkpoint_file_count": 15,
+    "raw_checkpoint_total_size_bytes": 24669346036,
+    "language_model_tensor_count": 1410,
+    "vision_tower_tensor_count": 806,
+    "vision_adapter_tensor_count": 2,
+    "vision_projection_tensor_count": 1,
+    "lm_head_tensor_count": 3,
+    "served_tensor_count": 1413,
+    "manifest_path": "fixtures/reference_bonsai2_9b_2bit.sha256",
+    "manifest_path_note": "the target checkpoint's SHA256 file list, written by tools/new-track.sh from the published tree. The FILE NAME is inherited from the source track because setup.sh names that path by default and setup.sh is outside this part's editable set; only the name is inherited, every record in it is nvidia/Muse-Glimmer-30B-NVFP4 @ 4781837.",
+    "config_fixture_path": "fixtures/muse_glimmer_30b_nvfp4_config.json",
+    "quantization": {
+      "mode": "nvfp4-mixed",
+      "bits": 4,
+      "group_size": 16,
+      "weight_dtype": "U32",
+      "weight_packing": "8 four-bit codes per uint32: shape [out, in / 8]",
+      "scale_dtype": "U8",
+      "scale_format": "float8 e4m3, one scale per 16 inputs of a weight row",
+      "mixed_precision": true,
+      "groups": {
+        "group_0": {
+          "bits": 8,
+          "type": "float",
+          "modules": 180
+        },
+        "group_1": {
+          "bits": 4,
+          "group_size": 16,
+          "type": "float",
+          "modules": 213
+        }
+      },
+      "quant_algo": "MIXED_PRECISION",
+      "producer": "modelopt",
+      "authority": "config.json quantization_config: quant_algo MIXED_PRECISION, a float8 group over 180 modules and a 4-bit group-16 NVFP4 group over 213 modules, plus the shard headers on the staged checkpoint"
+    },
+    "hadamard": null,
+    "upstream_base_model": "nvidia/Muse-Glimmer-30B-NVFP4",
+    "upstream_base_model_relation": "same checkpoint (never re-quantized, never re-represented)",
+    "license": {
+      "spdx": "apache-2.0",
+      "source": "the LICENSE file of the pinned snapshot (nvidia/Muse-Glimmer-30B-NVFP4 at 4781837), read from the published tree"
+    }
+  },
+  "mtp_head": {
+    "role": "spec_decode_dflash_drafter",
+    "source": "pinned",
+    "note": "the key keeps its name because mtp-head.manifest.json is the declaration slot the trusted harness reads; the decoder this track declares there is dflash, and the artifact is the quantized DFlash drafter, not an MTP layer",
+    "decoder": "dflash",
+    "upstream_model_id": "meta-models/Muse-Glimmer-30B-assistant",
+    "upstream_revision": "c676cce91658f9568aaf264a416211e2782735b7",
+    "model_type": "muse_glimmer_assistant",
+    "declaration_path": "mtp-head.manifest.json",
+    "manifest_path": "fixtures/reference_bonsai2_9b_mtp_head.sha256",
+    "manifest_path_note": "the head slot's manifest, inherited by name from the source track for the same reason as target.manifest_path. It pins nothing yet: the drafter is PRODUCED from the pinned assistant repository, not downloaded, and its identity is the artifact pin below.",
+    "byte_cap": 2147483648,
+    "artifact": {
+      "writer": "the pinned DFlash artifact writer with the pinned quantized plan: MLP projections 5-bit affine at group 64, attention projections and the encoder output projection 8-bit, norms dense",
+      "files": [
+        "config.json",
+        "model.safetensors"
+      ],
+      "bytes": 1968222936,
+      "weights_sha256": "38f92e9ada069615c24d89768fa6148336c6608880b1ddf825ae5228e1ea6a87",
+      "configuration_sha256": "af24b73c299bffe7537846e42dfd54e43828b0a5f02a06327e168d70db06e2fd",
+      "pinned_at": "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/MuseGlimmer/DFlash/MuseGlimmerDFlashLoading.swift (the quantized artifact pin), byte count from that pin's own comment"
+    },
+    "source_artifact": {
+      "files": [
+        "config.json",
+        "model.safetensors"
+      ],
+      "weights_sha256": "fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84",
+      "configuration_sha256": "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a",
+      "bytes": 5112013325,
+      "note": "the published BF16 drafter the quantized artifact is produced from, pinned at the same library file"
+    },
+    "num_hidden_layers": 5,
+    "hidden_size": 6656,
+    "intermediate_size": 19968,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "block_size": 16,
+    "sliding_window": 2048,
+    "mask_token_id": 201818,
+    "target_layer_ids": [
+      1,
+      13,
+      25,
+      37,
+      49
+    ],
+    "tensor_count": 58,
+    "use_dedicated_embeddings": false,
+    "shares_target_embed_tokens": true,
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "protocol": {
+    "dflash_envelope_constants": {
+      "max_draft_tokens": 7,
+      "max_speculative_batch": 1,
+      "verification_mode": "exact"
+    }
+  },
+  "scoring_semantics": {
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared DFlash draft depth, single-stream (scored_batch_size 1). Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceiling apply to every pair."
+  },
+  "license": {
+    "spdx": "apache-2.0",
+    "license_name": "Apache License 2.0",
+    "url": "https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4",
+    "verified_repositories": []
+  },
+  "live_golden_speculative": {}
+}

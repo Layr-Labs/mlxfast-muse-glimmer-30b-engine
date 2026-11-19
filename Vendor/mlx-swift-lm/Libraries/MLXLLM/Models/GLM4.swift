@@ -55,8 +55,9 @@ class GLM4Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -181,16 +182,6 @@ public class GLM4Model: Module, LLMModel, KVCacheDimensionProvider {
         let out = model(inputs, cache: cache)
         return lmHead(out)
     }
-
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var weights = weights
-
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
-
-        return weights
-    }
 }
 
 public struct GLM4Configuration: Codable, Sendable {
@@ -206,7 +197,6 @@ public struct GLM4Configuration: Codable, Sendable {
     var partialRotaryFactor: Float
     var ropeTheta: Float = 10000.0
     var ropeTraditional: Bool = true
-    var tieWordEmbeddings = false
     var maxPositionEmbeddings: Int = 32768
     var modelType: String
 
@@ -223,7 +213,6 @@ public struct GLM4Configuration: Codable, Sendable {
         case partialRotaryFactor = "partial_rotary_factor"
         case ropeTheta = "rope_theta"
         case ropeTraditional = "rope_traditional"
-        case tieWordEmbeddings = "tie_word_embeddings"
         case maxPositionEmbeddings = "max_position_embeddings"
         case modelType = "model_type"
     }
@@ -262,8 +251,6 @@ public struct GLM4Configuration: Codable, Sendable {
             try container.decodeIfPresent(
                 Bool.self, forKey: GLM4Configuration.CodingKeys.ropeTraditional)
             ?? true
-        self.tieWordEmbeddings =
-            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         self.maxPositionEmbeddings =
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
     }
@@ -275,4 +262,10 @@ extension GLM4Model: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension GLM4Model {
+    public var toolCallFormat: ToolCallFormat? { .glm4 }
 }

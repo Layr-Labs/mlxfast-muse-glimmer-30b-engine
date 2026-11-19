@@ -74,7 +74,7 @@ public final class SamplerV2 {
             )
         }
         allGreedy = self.rows.allSatisfy(\.greedy)
-        greedyMask = self.rows.isEmpty ? nil : MLXArray(self.rows.map(\.greedy))
+        greedyMask = allGreedy ? nil : MLXArray(self.rows.map(\.greedy))
     }
 
     // MARK: Step path
@@ -112,6 +112,16 @@ public final class SamplerV2 {
         for i in rows.indices {
             rows[i].step &+= 1
         }
+    }
+
+    /// Per-row step indices (RNG key inputs), row-aligned with `setRows`.
+    var stepIndices: [UInt64] { rows.map(\.step) }
+
+    /// Restore indices captured under the SAME `setRows` configuration, so
+    /// a redrawn step uses exactly the keys of the draw it replaces.
+    func restoreStepIndices(_ steps: [UInt64]) {
+        precondition(steps.count == rows.count, "step snapshot does not match configured rows")
+        for i in rows.indices { rows[i].step = steps[i] }
     }
 
     // MARK: - Per-row keyed noise

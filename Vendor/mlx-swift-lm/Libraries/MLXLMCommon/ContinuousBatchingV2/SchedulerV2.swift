@@ -88,6 +88,12 @@ public final class CBv2ScheduledRequest {
     internal var prefixReplayBoundarySplits = 0
     internal var plannedPrefillChunkSize = 0
     internal var recurrentChunkWaits = 0
+    /// Monotonic capture veto from an actually packed/disarmed range. This
+    /// prevents scheduling a later short boundary that capture cannot use.
+    internal var shortCheckpointCaptureDisarmed = false
+    /// One actual long range's end, carried only while its qualified solo
+    /// geometry remains compatible. Plans restore changes on rollback.
+    internal var demandedCheckpointContinuation: CBv2DemandedCheckpointContinuation?
 
     public var id: CBv2RequestID { request.id }
     public var numTokens: Int { tokens.count }
@@ -114,9 +120,12 @@ public final class CBv2ScheduledRequest {
         self.submittedAt = submittedAt
         self.enqueuedNanos = enqueuedNanos
         self.tokens = request.promptTokens
-        let (maximum, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
-        self.fullSequenceCapacityTokens = reserveFullSequenceTokens ? (overflow ? Int.max : maximum) : nil
-        self.multimodalBlocks = request.multimodal?.attention == .bidirectionalSpans
+        let (maximum, overflow) = request.promptTokens.count.addingReportingOverflow(
+            max(1, request.maxTokens))
+        self.fullSequenceCapacityTokens =
+            reserveFullSequenceTokens ? (overflow ? Int.max : maximum) : nil
+        self.multimodalBlocks =
+            request.multimodal?.attention == .bidirectionalSpans
             ? CBv2MultimodalPlan.coalescedBlocks(spans: request.multimodal?.spans ?? [])
             : []
     }
@@ -206,6 +215,11 @@ public final class SchedulerV2 {
     /// projection; this bound keeps speculative false rejection capped at the
     /// configured/tested MTP width instead of charging the whole step budget.
     var speculationDraftTokenUpperBound: Int?
+    /// Pure mirror of the live MTP plan's depth gates for a step with the
+    /// given decode-ready rows: zero beyond `maxSpeculativeBatch`, otherwise
+    /// the automatic verification envelope. Reads only immutable config.
+    /// nil leaves the projection charging `1+k` at every width.
+    var speculationDepthCeiling: ((Int) -> Int)?
 
     /// OPT-IN mixed-step prefill quota (nil ⇒ disabled, byte-identical to the
     /// unguarded vLLM-V1 behavior).
@@ -255,22 +269,55 @@ public final class SchedulerV2 {
 
     private var byID: [CBv2RequestID: CBv2ScheduledRequest] = [:]
     private var nextArrivalSeq: UInt64 = 0
+    /// Set by the engine after a step's transient scratch was refused
+    /// (`CBv2StepScratchRefusal`) and it requeued rows to make the rest fit.
+    /// Waiting rows are not admitted until a running request finishes, is
+    /// preempted or is requeued — re-admitting them sooner only repeats the
+    /// refusal.
+    public private(set) var admissionHeld = false
+    /// The hold is inert while nothing runs, so it can never strand the queue.
+    public var admissionHoldActive: Bool { admissionHeld && !running.isEmpty }
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
 
+    /// The model's prefill grid (`CBv2ModelCapabilities.prefillChunkAlignment`),
+    /// installed by the engine; nil keeps ordinary chunking. A text prompt is
+    /// cut only at multiples of it, at the prompt end and at a boundary its
+    /// prefix plan requires (`prefillGridCell`), and each cell runs whole or
+    /// waits, so load and other requests never move a cut. The solo stripe,
+    /// the plain chunk and the demanded checkpoint ranges do not apply to such
+    /// a row. A step may carry one cell even when `maxBatchedTokensPerStep`
+    /// is smaller.
+    ///
+    /// Fairness: decode rows are planned before prompt rows, so a cell takes
+    /// only what they leave. A cell that does not fit waits, then gets first
+    /// claim on the next step's whole budget through the multimodal block's
+    /// guard (`deferredBlockRequestID`), exempt from the mixed-step quota and
+    /// the prompt-row limits. Only a claim step can leave a decode row
+    /// without a token, and a claim step arms no further claim, so a decode
+    /// row waits at most one step for a cell, and the first cell that did
+    /// not fit runs within two steps; others take claims in running order.
+    var prefillChunkAlignment: Int?
+
     /// Starvation guard for block-sized vision chunks (PR#63 review): the id
-    /// of a row whose next multimodal block fits a FULL step budget (submit
-    /// validates that) but not the budget REMAINING after earlier rows were
-    /// assigned this step. The NEXT `plan()` gives that row first claim on
+    /// of a row whose next multimodal block, or prefill grid cell
+    /// (`prefillChunkAlignment`), fits a FULL step budget (submit validates
+    /// blocks; a step always holds one cell) but not the budget REMAINING
+    /// after earlier rows were assigned this step. The NEXT `plan()` gives that row first claim on
     /// the fresh budget — a running row is moved to the front of `running`,
     /// a waiting row is admitted ahead of the running pass — because
     /// otherwise persistent earlier rows (e.g. long decodes at 1 token/step)
     /// can pin the remaining budget below the block size for the row's whole
     /// deadline and it never progresses.
-    private var deferredBlockRequestID: CBv2RequestID?
+    private(set) var deferredBlockRequestID: CBv2RequestID?
+    /// Decode-only plans still owed before the next prompt chunk
+    /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`). The
+    /// first-token projection starts from it.
+    private(set) var decodeOnlyStepsOwed = 0
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
+        self.mixedStepPrefillTokenCap = config.mixedStepPrefillTokenCap
         self.capacity = capacity
     }
 
@@ -286,6 +333,32 @@ public final class SchedulerV2 {
     public var activeTokens: Int { running.reduce(0) { $0 + $1.effectiveTokenCount } }
 
     public func record(for id: CBv2RequestID) -> CBv2ScheduledRequest? { byID[id] }
+
+    /// The grid cell `[start, start + cell)` of a prompt row, or nil when the
+    /// row is not cut on the grid: no alignment, a row with multimodal blocks
+    /// or a recurrent chunk stride of its own, or a decode row. The cell ends
+    /// at the next multiple of the alignment, the prompt end, `end`, or a
+    /// boundary the prefix plan requires (`CBv2PrefixReusePlan.clampedChunk`),
+    /// whichever comes first. Shared by `plan()` and the deadline projection.
+    static func prefillGridCell(
+        alignment: Int?, start: Int, promptTokens: Int, end: Int,
+        plan: CBv2PrefixReusePlan?, hasBlocks: Bool
+    ) -> Int? {
+        guard let alignment, alignment > 0, !hasBlocks, plan?.recurrentChunkSize == nil,
+            start >= 0, end - start > 1
+        else { return nil }
+        var cellEnd = min((start / alignment + 1) * alignment, end)
+        if start < promptTokens { cellEnd = min(cellEnd, promptTokens) }
+        let cell = cellEnd - start
+        return plan?.clampedChunk(start: start, proposed: cell) ?? cell
+    }
+
+    func prefillGridCell(for rec: CBv2ScheduledRequest) -> Int? {
+        Self.prefillGridCell(
+            alignment: prefillChunkAlignment, start: rec.numComputedTokens,
+            promptTokens: rec.request.promptTokens.count, end: rec.effectiveTokenCount,
+            plan: rec.prefixReusePlan, hasBlocks: !rec.multimodalBlocks.isEmpty)
+    }
 
     // MARK: Submission
 
@@ -340,8 +413,8 @@ public final class SchedulerV2 {
         // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
         // Armed ONLY when this plan cannot delay anyone else's work: exactly
         // one live request exists across running+waiting (paused rows count —
-        // they resume), it is text-only (multimodal block snapping keeps its
-        // own budget-bounded contract), it is prefilling (not decode-ready),
+        // they resume), it has no bidirectional blocks (causal media follows
+        // its optional preserved stripe ceiling), it is prefilling (not decode-ready),
         // and it is not itself paused. Solo also means raising the step
         // budget to the stripe cannot starve a decode row — there is none.
         let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
@@ -375,7 +448,11 @@ public final class SchedulerV2 {
                 solo.multimodalBlocks.isEmpty,
                 solo.remainingTokens > 1
             else { return nil }
-            return (tokens: stripe, id: solo.id)
+            guard
+                let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                    isMultimodal: solo.request.multimodal != nil)
+            else { return nil }
+            return (tokens: selectedStripe, id: solo.id)
         }()
         let soloStripeTokens = soloStripe?.tokens
         // The stripe belongs to ONE armed request. A successor admitted in
@@ -384,12 +461,41 @@ public final class SchedulerV2 {
         // chunk delays the striped row's own sample — defeating the very
         // TTFT the stripe exists for.
         func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
-            let cap = rec.prefixReusePlan?.recurrentChunkSize
-                ?? (soloStripe?.id == rec.id ? soloStripe!.tokens : config.prefillChunkSize)
+            if let alignment = prefillChunkAlignment, let cell = prefillGridCell(for: rec) {
+                rec.plannedPrefillChunkSize = alignment
+                return cell
+            }
+            let cap =
+                rec.prefixReusePlan?.recurrentChunkSize
+                ?? (soloStripe?.id == rec.id
+                    ? soloStripe!.tokens
+                    : config.plainPrefillChunkSize(
+                        hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty))
             rec.plannedPrefillChunkSize = cap
             return cap
         }
-        var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
+        var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
+        var demandedCheckpointRanges: [CBv2RequestID: CBv2DemandedCheckpointRange] = [:]
+        func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            let range = config.demandedCheckpointRange(
+                promptTokens: rec.request.promptTokens.count,
+                hintTokens: rec.request.prefixCheckpointTargetTokens,
+                computedTokens: rec.numComputedTokens, proposed: proposed,
+                armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
+                hasPrefixReuse: rec.prefixReusePlan != nil,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                continuation: rec.demandedCheckpointContinuation)
+            if rec.demandedCheckpointContinuation != nil || range.continuation != nil {
+                demandedCheckpointRanges[rec.id] = range
+            }
+            if range.count < proposed {
+                demandedShortCheckpointPositions[rec.id] = rec.numComputedTokens + range.count
+            }
+            return range.count
+        }
+        // A step always holds one grid cell (`prefillChunkAlignment`).
+        let stepTokenLimit = max(config.maxBatchedTokensPerStep, prefillChunkAlignment ?? 0)
+        var budget = max(stepTokenLimit, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
         // consumer stays inside the configured step limit, or a successor
         // admitted beside the striped row's final short remainder could
@@ -442,17 +548,28 @@ public final class SchedulerV2 {
         // slot back to the elder row while younger partials simply receive
         // no prompt work until it finishes.
         var midPrefillAssigned = 0
+        let hasDecodeRows = running.contains { rec in
+            !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
+        }
         let prefillCap: Int? = {
             guard let cap = mixedStepPrefillTokenCap else { return nil }
-            let hasDecodeWork = running.contains { rec in
-                !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
-            }
-            return hasDecodeWork ? max(0, cap) : nil
+            return hasDecodeRows ? max(0, cap) : nil
         }()
         /// Tokens the quota still permits this step (`.max` when disarmed).
         func prefillHeadroom() -> Int {
             guard let prefillCap else { return .max }
             return max(0, prefillCap - prefillTokensAssigned)
+        }
+        // Prompt-row ceiling and decode-only interleave (both opt-in). Like
+        // the quota they only defer prompt work: no advance, reservation or
+        // preemption for a skipped row, and it keeps its queue position.
+        let decodeOnlyStepsOwedBefore = decodeOnlyStepsOwed
+        let promptWorkHeld = hasDecodeRows && decodeOnlyStepsOwed > 0
+        var prefillRowsAssigned = 0
+        func admitsPromptRow() -> Bool {
+            guard !promptWorkHeld else { return false }
+            guard let cap = config.maxPrefillRowsPerStep, cap > 0 else { return true }
+            return prefillRowsAssigned < cap
         }
 
         // 0. Starved block-sized chunk from the previous step: first claim on
@@ -470,7 +587,9 @@ public final class SchedulerV2 {
                 // Remembered for the running pass so the quota can exempt it
                 // — the marker itself is consumed here (one-shot).
                 deferredRunningID = deferredID
-            } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
+            } else if !admissionHoldActive,
+                let wIdx = waiting.firstIndex(where: { $0.id == deferredID })
+            {
                 deferredAdmittedID = admitDeferredBlockRow(
                     at: wIdx, budget: &budget, totalAssignedTokens: &totalAssignedTokens,
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
@@ -483,6 +602,26 @@ public final class SchedulerV2 {
         // can overshoot the cap, and only for multimodal block chunks.
         if let admitted = deferredAdmittedID, let aIdx = assignmentIndex[admitted] {
             prefillTokensAssigned += assignments[aIdx].numTokens
+            prefillRowsAssigned += 1
+        }
+
+        // A claim step arms no further claim, so claim steps never follow
+        // each other (see `prefillChunkAlignment`).
+        let claimStep = deferredRunningID != nil || deferredAdmittedID != nil
+        func armGridClaim(_ rec: CBv2ScheduledRequest) {
+            if !claimStep, deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
+        }
+        // Grid: decode rows are planned first, after only the row holding
+        // the claim; the running order is restored after the plan.
+        let runningOrder: [ObjectIdentifier: Int]? =
+            prefillChunkAlignment == nil
+            ? nil
+            : Dictionary(
+                uniqueKeysWithValues: running.enumerated().map { (ObjectIdentifier($1), $0) })
+        if runningOrder != nil {
+            let claim = running.filter { $0.id == deferredRunningID }
+            let others = running.filter { $0.id != deferredRunningID }
+            running = claim + others.filter(\.isDecodeReady) + others.filter { !$0.isDecodeReady }
         }
 
         // 1. RUNNING first, in order.
@@ -509,14 +648,19 @@ public final class SchedulerV2 {
                 idx += 1
                 continue
             }
+            if isPrefillRow, rec.id != deferredRunningID, !admitsPromptRow() {
+                idx += 1
+                continue
+            }
             var n = rec.remainingTokens
             var speculated = false
+            let gridCell = n > 1 ? prefillGridCell(for: rec) : nil
             if n > 1 {
                 n = min(n, prefillChunkCap(for: rec))  // solo stripe raises ONLY its own row
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
-                let k = max(0, planner(rec))
+                let k = max(0, CBv2StepProfiler.time("v2.plan.speculation") { planner(rec) })
                 if k > 0, 1 + k <= budget {
                     n = 1 + k
                     speculated = true
@@ -525,6 +669,17 @@ public final class SchedulerV2 {
                 }
             }
             n = min(n, budget)
+            // A grid cell runs whole: it must fit the budget and the quota
+            // (the row with the claim is exempt from the quota). Otherwise it
+            // waits, untouched, and may arm the first claim.
+            if let gridCell,
+                gridCell > budget
+                    || (rec.id != deferredRunningID && gridCell > prefillHeadroom())
+            {
+                armGridClaim(rec)
+                idx += 1
+                continue
+            }
             // Mixed-step prefill quota: a second budget that binds ONLY on
             // prefill rows. Applied BEFORE snapping/reservation so a skipped
             // row leaves nothing behind: no optimistic advance, no capacity
@@ -567,6 +722,7 @@ public final class SchedulerV2 {
             // block cannot fit this step's remaining budget — skip the row
             // and arm the starvation guard so the NEXT step schedules it
             // first (earlier rows would otherwise starve it indefinitely).
+            if gridCell == nil { n = demandedCheckpointChunk(for: rec, proposed: n) }
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
             if n <= 0 {
                 if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
@@ -581,22 +737,29 @@ public final class SchedulerV2 {
             // before the preemption machinery may run. Text-only by the solo
             // gate, so re-snapping is a no-op and the shrink cannot split a
             // multimodal block.
-            var striped = soloStripeTokens != nil && n > config.prefillChunkSize
-                && rec.prefixReusePlan?.recurrentChunkSize == nil
+            var striped =
+                soloStripeTokens != nil && n > config.prefillChunkSize
+                && rec.prefixReusePlan?.recurrentChunkSize == nil && gridCell == nil
             var reservationTokens = rec.capacityTokensForChunk(
                 start: rec.numComputedTokens,
                 count: n)
-            var reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: rec.numComputedTokens,
-                count: n) ?? 0
+            var reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: rec.numComputedTokens,
+                    count: n) ?? 0
             var reserved =
                 capacity == nil || (reservationTokens == 0 && reservationBytes == 0)
             while !reserved {
                 do {
+                    let reserveStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                     try capacity?.reserve(
                         id: rec.id,
                         additionalTokens: reservationTokens,
                         additionalBytes: reservationBytes)
+                    if CBv2StepProfiler.enabled {
+                        CBv2StepProfiler.record(
+                            "v2.plan.reserve", seconds: CFAbsoluteTimeGetCurrent() - reserveStart)
+                    }
                     reserved = true
                 } catch {
                     if striped {
@@ -605,9 +768,10 @@ public final class SchedulerV2 {
                         reservationTokens = rec.capacityTokensForChunk(
                             start: rec.numComputedTokens,
                             count: n)
-                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? 0
+                        reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? 0
                         continue
                     }
                     // Speculative slack must never trigger the preemption
@@ -618,9 +782,10 @@ public final class SchedulerV2 {
                         reservationTokens = rec.capacityTokensForChunk(
                             start: rec.numComputedTokens,
                             count: n)
-                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? 0
+                        reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? 0
                         speculationFallbacks[rec.id] = .kvHeadroom
                         continue
                     }
@@ -650,15 +815,19 @@ public final class SchedulerV2 {
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
             totalAssignedTokens += n
-            if isPrefillRow { prefillTokensAssigned += n }
+            if isPrefillRow {
+                prefillTokensAssigned += n
+                prefillRowsAssigned += 1
+            }
             if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
         }
 
-        // 2. WAITING admission — skipped entirely if anything was preempted.
-        if preemptions.isEmpty, !stopScheduling {
+        // 2. WAITING admission — skipped entirely if anything was preempted
+        // or a step-scratch refusal holds admission.
+        if preemptions.isEmpty, !stopScheduling, !admissionHoldActive {
             var wIdx = 0
             while budget > 0, running.count < config.maxConcurrentRequests,
                 wIdx < waiting.count
@@ -701,21 +870,30 @@ public final class SchedulerV2 {
                 // here preserves FCFS. Checked BEFORE chunk/snap so a
                 // quota-blocked row never arms the block starvation guard.
                 let admissionHeadroom = prefillHeadroom()
-                guard admissionHeadroom > 0 else { break }
+                guard admissionHeadroom > 0, admitsPromptRow() else { break }
                 // Non-armed admissions may not touch the stripe-only budget
                 // surplus: they are bounded by what remains of the ORDINARY
                 // step limit. The armed row itself (admission-path solo
                 // striping) keeps the raised budget.
-                let normalHeadroom = soloStripe?.id == rec.id
+                let normalHeadroom =
+                    soloStripe?.id == rec.id
                     ? budget
-                    : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
+                    : max(0, stepTokenLimit - totalAssignedTokens)
                 var chunk = min(
                     rec.remainingTokens, prefillChunkCap(for: rec), budget,
                     normalHeadroom, admissionHeadroom)
+                // A grid cell is admitted whole or the pass ends, arming the
+                // same first claim as a block (FCFS).
+                let gridCell = prefillGridCell(for: rec)
+                if let gridCell, chunk < gridCell {
+                    armGridClaim(rec)
+                    break
+                }
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
                 // block-bearing elder).
+                if gridCell == nil { chunk = demandedCheckpointChunk(for: rec, proposed: chunk) }
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
                 guard chunk > 0 else {
@@ -730,16 +908,18 @@ public final class SchedulerV2 {
                     // KV limiter cannot hold falls back to the plain chunk
                     // size once (text-only by the solo gate — no block to
                     // split) before admission gives up for this step.
-                    var striped = soloStripeTokens != nil && chunk > config.prefillChunkSize
-                        && rec.prefixReusePlan?.recurrentChunkSize == nil
+                    var striped =
+                        soloStripeTokens != nil && chunk > config.prefillChunkSize
+                        && rec.prefixReusePlan?.recurrentChunkSize == nil && gridCell == nil
                     var reservedAdmission = false
                     while !reservedAdmission {
                         let reservationTokens = rec.capacityTokensForChunk(
                             start: rec.numComputedTokens,
                             count: chunk)
-                        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: chunk) ?? 0
+                        let reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: chunk) ?? 0
                         do {
                             if reservationTokens > 0 || reservationBytes > 0 {
                                 try capacity.reserve(
@@ -765,6 +945,7 @@ public final class SchedulerV2 {
                 budget -= chunk
                 totalAssignedTokens += chunk
                 prefillTokensAssigned += chunk
+                prefillRowsAssigned += 1
                 if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
@@ -772,10 +953,49 @@ public final class SchedulerV2 {
             }
         }
 
-        return CBv2StepPlan(
+        if let runningOrder {
+            running = running.enumerated().sorted { a, b in
+                (runningOrder[ObjectIdentifier(a.element)] ?? .max, a.offset)
+                    < (runningOrder[ObjectIdentifier(b.element)] ?? .max, b.offset)
+            }.map(\.element)
+        }
+
+        if !hasDecodeRows {
+            decodeOnlyStepsOwed = 0
+        } else if prefillRowsAssigned > 0 {
+            decodeOnlyStepsOwed = max(0, config.decodeStepsBetweenPrefillChunks)
+        } else if promptWorkHeld {
+            decodeOnlyStepsOwed -= 1
+        }
+        var result = CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions,
             speculationFallbacks: speculationFallbacks)
+        result.decodeOnlyStepsOwedBefore = decodeOnlyStepsOwedBefore
+        // Commit continuation only for the final accepted range. A KV
+        // fallback or incompatible assigned geometry discards it; a paused
+        // or unscheduled plan does not. Rollback restores the prior state.
+        for assignment in result.assignments {
+            guard let range = demandedCheckpointRanges[assignment.id],
+                let rec = record(for: assignment.id)
+            else { continue }
+            let next = assignment.numTokens == range.count ? range.continuation : nil
+            if next != rec.demandedCheckpointContinuation {
+                result.demandedCheckpointContinuationUndo[assignment.id] = .init(
+                    previous: rec.demandedCheckpointContinuation)
+                rec.demandedCheckpointContinuation = next
+            }
+        }
+        // A reservation refusal can replace the requested range with an
+        // ordinary plain chunk. Protect only the boundary actually assigned.
+        result.demandedShortCheckpointRows = Set(
+            result.assignments.compactMap { assignment in
+                guard let target = demandedShortCheckpointPositions[assignment.id],
+                    record(for: assignment.id)?.numComputedTokens == target
+                else { return nil }
+                return assignment.id
+            })
+        return result
     }
 
     /// One-off admission of a starved block-bearing WAITING row ahead of the
@@ -795,9 +1015,14 @@ public final class SchedulerV2 {
         guard !rec.isPaused, !rec.cancelRequested, rec.pendingSamples == 0,
             running.count < config.maxConcurrentRequests
         else { return nil }
-        let cap = rec.prefixReusePlan?.recurrentChunkSize ?? config.prefillChunkSize
-        rec.plannedPrefillChunkSize = cap
+        let gridCell = prefillGridCell(for: rec)
+        let cap =
+            gridCell
+            ?? rec.prefixReusePlan?.recurrentChunkSize
+            ?? config.plainPrefillChunkSize(hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty)
+        rec.plannedPrefillChunkSize = gridCell != nil ? (prefillChunkAlignment ?? cap) : cap
         var chunk = min(rec.remainingTokens, cap, budget)
+        if let gridCell, chunk < gridCell { return nil }
         chunk = rec.snappedChunkTokens(
             start: rec.numComputedTokens, proposed: chunk, budget: budget)
         guard chunk > 0 else { return nil }
@@ -805,9 +1030,10 @@ public final class SchedulerV2 {
             let reservationTokens = rec.capacityTokensForChunk(
                 start: rec.numComputedTokens,
                 count: chunk)
-            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: rec.numComputedTokens,
-                count: chunk) ?? 0
+            let reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: rec.numComputedTokens,
+                    count: chunk) ?? 0
             do {
                 if reservationTokens > 0 || reservationBytes > 0 {
                     try capacity.reserve(
@@ -837,15 +1063,20 @@ public final class SchedulerV2 {
     /// Speculative 1+k assignments roll back unchanged (full n subtracted
     /// and unreserved — nothing was marked pending yet).
     public func rollback(_ plan: CBv2StepPlan) {
+        decodeOnlyStepsOwed = plan.decodeOnlyStepsOwedBefore
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
+            if let undo = plan.demandedCheckpointContinuationUndo[id] {
+                rec.demandedCheckpointContinuation = undo.previous
+            }
             let start = max(0, rec.numComputedTokens - n)
             let reservationTokens = rec.capacityTokensForChunk(
                 start: start,
                 count: n)
-            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: start,
-                count: n) ?? 0
+            let reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: start,
+                    count: n) ?? 0
             rec.numComputedTokens = start
             capacity?.unreserve(
                 id: id, tokens: reservationTokens, bytes: reservationBytes)
@@ -890,9 +1121,10 @@ public final class SchedulerV2 {
         let reservationTokens = rec.capacityTokensForChunk(
             start: start,
             count: n)
-        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-            start: start,
-            count: n) ?? 0
+        let reservationBytes =
+            rec.prefixReusePlan?.capacityBytesForChunk(
+                start: start,
+                count: n) ?? 0
         rec.numComputedTokens = start
         capacity?.unreserve(
             id: id, tokens: reservationTokens, bytes: reservationBytes)
@@ -911,10 +1143,17 @@ public final class SchedulerV2 {
     @discardableResult
     public func finish(id: CBv2RequestID, reason: CBv2FinishReason) -> CBv2ScheduledRequest? {
         guard let rec = byID.removeValue(forKey: id) else { return nil }
+        if rec.status == .running { admissionHeld = false }
         running.removeAll { $0 === rec }
         waiting.removeAll { $0 === rec }
         rec.status = .finished(reason)
         return rec
+    }
+
+    /// Hold waiting admission until a running request leaves `running`
+    /// (see `admissionHeld`). No-op while nothing runs.
+    public func holdAdmissionUntilRunningRequestLeaves() {
+        admissionHeld = !running.isEmpty
     }
 
     // MARK: Cancellation & backpressure
@@ -958,7 +1197,9 @@ public final class SchedulerV2 {
         guard !ids.isEmpty, ids.count <= config.maxBatchedTokensPerStep else { return nil }
         // A join would change membership: if any waiting request could be
         // admitted, the chain must break so the mixed step can run.
-        if !waiting.isEmpty, running.count < config.maxConcurrentRequests { return nil }
+        if !waiting.isEmpty, running.count < config.maxConcurrentRequests, !admissionHoldActive {
+            return nil
+        }
         return ids
     }
 
@@ -966,12 +1207,16 @@ public final class SchedulerV2 {
 
     /// Victim = LOWEST priority; tie → YOUNGEST (largest arrivalSeq).
     private func preemptionVictim() -> CBv2ScheduledRequest? {
-        running.min { a, b in
-            if a.request.priority != b.request.priority {
-                return a.request.priority < b.request.priority
-            }
-            return a.arrivalSeq > b.arrivalSeq
+        running.min(by: Self.isPreemptedBefore)
+    }
+
+    /// Preemption order: `a` is evicted before `b` (lower priority, then
+    /// younger). The engine's step-scratch deferral uses the same order.
+    static func isPreemptedBefore(_ a: CBv2ScheduledRequest, _ b: CBv2ScheduledRequest) -> Bool {
+        if a.request.priority != b.request.priority {
+            return a.request.priority < b.request.priority
         }
+        return a.arrivalSeq > b.arrivalSeq
     }
 
     private func preempt(
@@ -988,6 +1233,7 @@ public final class SchedulerV2 {
         }
         capacity?.releaseAll(id: victim.id)
         running.removeAll { $0 === victim }
+        admissionHeld = false
         // Full restart: keep generated tokens, recompute everything (the
         // prefix cache makes re-prefill cheap once WS-D lands).
         victim.numComputedTokens = 0
@@ -1009,6 +1255,7 @@ public final class SchedulerV2 {
         guard let rec = running.first(where: { $0.id == id }) else { return false }
         capacity?.releaseAll(id: rec.id)
         running.removeAll { $0 === rec }
+        admissionHeld = false
         rec.numComputedTokens = 0
         rec.prefixReusePlan = nil
         rec.prefixReplayBoundarySplits = 0

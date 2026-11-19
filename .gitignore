@@ -82,7 +82,7 @@ private_prompts.json
 private_prompts*.json
 gpqa_reference_cases.json
 gpqa_reference_cases*.json
-# The two public captures ship in git under correctness_prompts/bonsai2-9b-mlx-v1/.
+# The two public captures ship in git under correctness_prompts/muse-glimmer-30b-mlx-v1/.
 # Hidden material never does. These patterns keep a stray recording out of a commit.
 correctness_prompts/*correctness_golden*.json
 correctness_prompts/*golden_prompt*.json

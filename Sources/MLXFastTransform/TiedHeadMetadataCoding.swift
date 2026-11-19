@@ -1,11 +1,11 @@
 import Foundation
 import MLXFastCore
 
-/// Gemma 4 tied-embedding packed13 sidecar generator. Invoked only on the
-/// `.gemma4` transform family path -- this track's Bonsai 2 target has an
-/// untied `lm_head`, so there is no tied vocabulary head to pack. The
-/// production-shape gate below ([262144, 672] packed embedding) is
-/// Gemma-4-specific on purpose.
+/// Tied-embedding packed13 sidecar generator for the legacy `.gemma4` family.
+/// Invoked only on that transform family path -- the engine's ranked target and
+/// the packed family both have an untied `lm_head`, so neither has a tied
+/// vocabulary head to pack. The production-shape gate below ([262144, 672]
+/// packed embedding) is specific to that family on purpose.
 enum TiedHeadMetadataCoding {
     static let shardName = "mlxfast-tied-head-metadata.safetensors"
     static let weightName = "language_model.model.embed_tokens.weight"

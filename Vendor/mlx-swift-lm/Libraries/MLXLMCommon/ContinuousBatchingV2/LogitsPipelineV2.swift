@@ -49,12 +49,14 @@ public struct CBv2SamplerRow {
     /// Request output ceiling, used by the constraint runtime to reserve
     /// enough tokens to close the grammar before the engine length stop.
     public var maxTokens: Int
+    public var reasoningBudget: CBv2ReasoningBudget?
 
     public init(
         id: CBv2RequestID, params: CBv2SamplingParams,
         promptTokens: [Int], outputTokens: [Int] = [],
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
-        maxTokens: Int = .max
+        maxTokens: Int = .max,
+        reasoningBudget: CBv2ReasoningBudget? = nil
     ) {
         self.id = id
         self.params = params
@@ -62,6 +64,7 @@ public struct CBv2SamplerRow {
         self.outputTokens = outputTokens
         self.tokenConstraint = tokenConstraint
         self.maxTokens = maxTokens
+        self.reasoningBudget = reasoningBudget
     }
 }
 
@@ -147,6 +150,19 @@ public final class LogitsPipelineV2 {
     public func setRows(_ rows: [CBv2SamplerRow]) {
         rowCount = rows.count
         guard !rows.isEmpty else {
+            clearState()
+            return
+        }
+
+        // Plain greedy rows use no parameter tensors or penalty state.
+        // Keep hard constraints in process and request/RNG state in the sampler.
+        if rows.allSatisfy({ row in
+            let p = row.params
+            return p.temperature < Self.greedyEpsilon && p.topLogprobs <= 0
+                && p.logitBias.isEmpty
+                && (p.repetitionPenalty == 1 || p.repetitionContextSize <= 0)
+                && p.frequencyPenalty == 0 && p.presencePenalty == 0
+        }) {
             clearState()
             return
         }
@@ -365,6 +381,31 @@ public final class LogitsPipelineV2 {
                 window, slot, values: tokens.expandedDimensions(axis: 1), axis: 1)
             ringPos = remainder(positions + 1, windowSizes)
         }
+    }
+
+    /// The incrementally maintained penalty state (immutable device arrays,
+    /// so a snapshot is a set of references). Constrained chained decode
+    /// restores the state from just before a speculative step's `commit` and
+    /// redraws that step exactly.
+    struct PenaltyState {
+        fileprivate let outputCounts: MLXArray?
+        fileprivate let repWindowCounts: MLXArray?
+        fileprivate let repWindow: MLXArray?
+        fileprivate let ringPos: MLXArray?
+    }
+
+    var penaltyState: PenaltyState {
+        PenaltyState(
+            outputCounts: outputCounts, repWindowCounts: repWindowCounts,
+            repWindow: repWindow, ringPos: ringPos)
+    }
+
+    /// Restore a snapshot taken under the SAME `setRows` configuration.
+    func restore(_ state: PenaltyState) {
+        outputCounts = state.outputCounts
+        repWindowCounts = state.repWindowCounts
+        repWindow = state.repWindow
+        ringPos = state.ringPos
     }
 
     // MARK: - Vectorized top-k/top-p/min-p

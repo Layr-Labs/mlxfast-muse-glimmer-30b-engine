@@ -376,7 +376,7 @@ chmod +x "${TREE}/tools/resident-up.sh"
 mkdir -p "${TREE}/fixtures"
 cp "${ROOT_DIR}/tools/spec-declaration.sh" "${TREE}/tools/spec-declaration.sh"
 chmod +x "${TREE}/tools/spec-declaration.sh"
-cp "${ROOT_DIR}/fixtures/bonsai2_9b_mlx_v1_track.json" "${TREE}/fixtures/"
+cp "${ROOT_DIR}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${TREE}/fixtures/"
 # The stub is staged UNDER THE NAME benchd resolves, so the box-wide
 # "bench-worker resident" scan sees it exactly as it sees a real one.
 cp "${STUB}" "${TREE}/.build/release/bench-worker"

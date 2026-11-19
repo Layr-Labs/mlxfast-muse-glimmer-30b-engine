@@ -1,10 +1,10 @@
 # Bonsai 2 9B — participant contract
 
 This document states the terms that bind a submission to track
-`bonsai2-9b-mlx-v1`.
+`muse-glimmer-30b-mlx-v1`.
 
 `benchmark.json` is the Yukon track manifest.
-`fixtures/bonsai2_9b_mlx_v1_track.json` is the track contract fixture. Both files
+`fixtures/muse_glimmer_30b_mlx_v1_track.json` is the track contract fixture. Both files
 carry pure configuration: values, paths, commands, and pins. They carry no
 prose. This document explains those files. It never overrides them.
 
@@ -13,7 +13,7 @@ prose. This document explains those files. It never overrides them.
 Apply these in order. The higher entry wins.
 
 1. The ranked run on the official runner. It is the authority on any score.
-2. `fixtures/bonsai2_9b_mlx_v1_track.json` and `benchmark.json`.
+2. `fixtures/muse_glimmer_30b_mlx_v1_track.json` and `benchmark.json`.
 3. This document.
 4. `README.md` and `TASK.md`.
 
@@ -238,7 +238,7 @@ This is the 2026-08-26 ruling. It replaces the earlier bring-your-own-head
 design, under which a participant could declare and ship a head of their own
 choosing. That design is retired.
 
-The head is the organizer's pinned weights. `fixtures/bonsai2_9b_mlx_v1_track.json`
+The head is the organizer's pinned weights. `fixtures/muse_glimmer_30b_mlx_v1_track.json`
 names its repository and revision, and `fixtures/reference_bonsai2_9b_mtp_head.sha256`
 carries the per-file digests that `./setup-mtp-head.sh` verifies every
 downloaded byte against. Both pins are pending. Both files live in
@@ -527,7 +527,7 @@ values only:
 ```json
 {
   "version": 3,
-  "track_id": "bonsai2-9b-mlx-v1",
+  "track_id": "muse-glimmer-30b-mlx-v1",
   "box": "<the runner name>",
   "reference_commit": "<the fixture's baseline_reference_commit>",
   "captured_at": "<ISO 8601 UTC>",
@@ -716,7 +716,7 @@ does not certify lossless output.
 
 ### 5.5 Arming
 
-`fixtures/bonsai2_9b_mlx_v1_track.json` sets `official_scoring_enabled` to
+`fixtures/muse_glimmer_30b_mlx_v1_track.json` sets `official_scoring_enabled` to
 `false`. That flag is the SINGLE authority on this track's arm state, and it is
 load-bearing. The pinned benchmarker reads it from the `--contract` fixture. It
 refuses to seal an official scoring artifact while the flag is `false`. It also
@@ -733,7 +733,7 @@ composite is absent only when the record accepted no pair, or when a window is
 degenerate, and the reason names which.
 
 What is missing is the arm state and the goldens, not this repository's score
-path. `tools/bonsai2-9b-measure-and-score.sh` refuses with a non-zero
+path. `tools/muse-glimmer-30b-measure-and-score.sh` refuses with a non-zero
 exit rather than emit a score. It does not substitute a diagnostic for the
 ruled composite formula. Refuse, not degrade, is the standing posture for this
 track. The `kv_backend` check and the byte-budget check use it too.
@@ -752,7 +752,7 @@ prompts are `pool-9`, `pool-10` and `pool-11` at a 512-token seed.
 
 | Object | Where it lives | Can you have it? |
 |---|---|---|
-| The public captures | This repository, under `correctness_prompts/bonsai2-9b-mlx-v1/`. | **Yes.** They are the local goldens. See section 11.3. |
+| The public captures | This repository, under `correctness_prompts/muse-glimmer-30b-mlx-v1/`. | **Yes.** They are the local goldens. See section 11.3. |
 | `timed_prompt_pool[]` tapes | R2, at the `r2_path` keys the fixture pins. The ranked box stages them out of band into `MLXFAST_QWEN38_GOLDEN_DIR`. | **No.** They are organizer material and they are never in git. |
 | `live_golden_speculative{}` per-depth oracles, one per live prompt for each depth | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
 | `hidden_correctness_golden` | A live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
@@ -788,15 +788,15 @@ refuses an extra `*.json` in it.
 
 ## 6. Running the benchmark
 
-`benchmarkCommand` runs `tools/bonsai2-9b-yukon-run.sh`. That script selects
+`benchmarkCommand` runs `tools/muse-glimmer-30b-yukon-run.sh`. That script selects
 one of two paths:
 
 | Condition | Path |
 |---|---|
-| `GITHUB_ACTIONS` is `true`, or one or more of `MLXFAST_QWEN38_GOLDEN_DIR`, `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` is set | Ranked. The script replaces itself with `tools/bonsai2-9b-measure-and-score.sh`. |
+| `GITHUB_ACTIONS` is `true`, or one or more of `MLXFAST_QWEN38_GOLDEN_DIR`, `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` is set | Ranked. The script replaces itself with `tools/muse-glimmer-30b-measure-and-score.sh`. |
 | None of these | Local. The script transforms the weights when `weights/config.json` is absent. Then it runs `./benchmark.sh --local-submit` at the declared depth. The result has `"score": null`. |
 
-The ranked workflow calls `tools/bonsai2-9b-measure-and-score.sh` directly.
+The ranked workflow calls `tools/muse-glimmer-30b-measure-and-score.sh` directly.
 Both scripts are trusted-side tooling. They are not editable paths, so a
 submission cannot rewrite the measurement pipeline from inside its own archive.
 
@@ -809,7 +809,7 @@ benchd iterate --mode official \
   --engine .build/release/bench-worker \
   --weights <transformed weights> \
   --golden $MLXFAST_QWEN38_GOLDEN_DIR/<live golden>.golden.json \
-  --contract fixtures/bonsai2_9b_mlx_v1_track.json \
+  --contract fixtures/muse_glimmer_30b_mlx_v1_track.json \
   --baseline-workspace $MLXFAST_BASELINE_WORKSPACE \
   --baseline-calibration $MLXFAST_BASELINE_CALIBRATION \
   [--box <this box>] [--mtp-depth N] \
@@ -871,7 +871,7 @@ whose `composite_speedup_floor_met` is false, and refuses a run whose sealed
 `scoring.scoredExponents`.
 
 `preSubmitCommand` runs
-`./tools/bonsai2-9b-measure-and-score.sh --preflight-only`.
+`./tools/muse-glimmer-30b-measure-and-score.sh --preflight-only`.
 That runs the arm gate and, for each live golden that is staged, the integrity
 pin.
 It exits without measuring, and it needs no reference tree.
@@ -879,7 +879,7 @@ It exits without measuring, and it needs no reference tree.
 The ranked pipeline is `.github/workflows/benchmark.yml`, which `benchmark.json`
 `runner.workflow` names. It triggers on `workflow_dispatch` only. Its hosted
 surface-check job gates its ranked job, which runs on the self-hosted labels
-`[self-hosted, macOS, bonsai2-9b-mlx-v1]` — the third label is the track id.
+`[self-hosted, macOS, muse-glimmer-30b-mlx-v1]` — the third label is the track id.
 The ranked job holds no credential. The organizer stages the timed-pool tapes
 onto the box out of band, from R2; they are never in the checkout. Before
 `./setup.sh` runs, `tools/ranked-box-preflight.sh` verifies each tape against
@@ -913,7 +913,7 @@ and the depth from the wire per request.
 `mtp-head.manifest.json` through `tools/spec-declaration.sh` and loads that
 tree's own MTP head. Nothing crosses between the two trees.
 
-`tools/bonsai2-9b-measure-and-score.sh` boots no resident and exports no
+`tools/muse-glimmer-30b-measure-and-score.sh` boots no resident and exports no
 socket. What it still owns is the window: it takes the box GPU lock
 `/tmp/mtplx-gpu-exclusive.lock` and holds it for the whole measurement, because
 a resident holds the whole checkpoint in unified memory whoever booted it and
@@ -947,7 +947,7 @@ target is pending, `./setup.sh` refuses by name.
 | MTP head | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), `fixtures/reference_bonsai2_9b_mtp_head.sha256` (pending, no record) |
 | Geometry source | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` `config.json`, as `fixtures/qwen35_9b_base_config.json` (3,126 bytes) |
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, as `fixtures/bonsai2_27b_config.json` (58,145 bytes) |
-| Engine fork upstream base | `859f4d97e0d1ae9cce0883b044f764283841edfb` (+ fork `main` `0607011` merged; engine-local changes on top) |
+| Engine fork upstream base | tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, the merge of `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `443789360ddbf804d55d063ca9cda4ea2d3013a9` (a local merge branch, not pushed upstream; engine-local changes on top) |
 
 The two reference manifests hold no record until the pack and the head are
 published. When they are, `tools/new-track.sh` writes the target manifest from
@@ -1080,7 +1080,7 @@ Read this section before you conclude that something is broken.
 Section 5.5 states the arm state. The target and the head are pending,
 `official_scoring_enabled` is `false`, the timed prompt pool and the live
 goldens are empty, and the hidden correctness oracle is the sentinel. No runner advertises the ranked label set
-`[self-hosted, macOS, bonsai2-9b-mlx-v1]`, and the box is not staged.
+`[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`, and the box is not staged.
 
 THE CHANNEL RESOLVES FROM `main`. benchd is published from the bench
 repository's `main` branch; there is no per-track bench branch (ruled
@@ -1131,7 +1131,7 @@ verified and what is still open.
 
 The public captures are the goldens that `--local-iterate` and
 `--local-submit` check against. They ship in this repository under
-`correctness_prompts/bonsai2-9b-mlx-v1/`:
+`correctness_prompts/muse-glimmer-30b-mlx-v1/`:
 
 | File | Mode |
 |---|---|

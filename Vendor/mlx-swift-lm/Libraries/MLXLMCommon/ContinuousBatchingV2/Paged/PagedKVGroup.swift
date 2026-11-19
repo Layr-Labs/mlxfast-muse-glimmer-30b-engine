@@ -13,10 +13,23 @@ final class PagedKVGroup {
     /// in place by the write kernels, never replaced (see file header).
     private let fixedK: MLXArray?
     private let fixedV: MLXArray?
-    var kSlab: MLXArray { precondition(segmentLayout == nil); return fixedK! }
-    var vSlab: MLXArray { precondition(segmentLayout == nil); return fixedV! }
+    var kSlab: MLXArray {
+        precondition(segmentLayout == nil)
+        return fixedK!
+    }
+    var vSlab: MLXArray {
+        precondition(segmentLayout == nil)
+        return fixedV!
+    }
     private(set) var segmentLayout: PagedKVSegmentLayout?
     private(set) var segments: [Int: PagedKVSegment] = [:]
+    /// Evaluated free backings parked by `trimSegments`, by usable page count.
+    /// Outside the committed set: no grant, floor or ledger coverage.
+    private var retainedSegments: [Int: [PagedKVSegment]] = [:]
+    /// Mirrored into the process-wide `CBv2RetainedKVSegments` gauge.
+    private(set) var retainedSegmentBytes = 0 {
+        didSet { CBv2RetainedKVSegments.recordRetained(retainedSegmentBytes - oldValue) }
+    }
     var committedUsablePages: Int {
         guard segmentLayout != nil else { return usablePageCount }
         return segments.values.reduce(0) { $0 + $1.pages.count - 1 }
@@ -26,10 +39,9 @@ final class PagedKVGroup {
     /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
     /// consume it so page reads order after every prior bulk write.
     var writeFence: MLXArray
-    /// Intrusive free queue. The computed array preserves the historical
-    /// test/diagnostic surface without making arbitrary removal O(n).
-    private var freeQueue: PagedBlockFreeQueue
-    var freeList: [Int32] { freeQueue.elements }
+    /// Free pages and the choice of the next one (`PagedKVFreePages`).
+    private var freePages: PagedKVFreePages
+    var freeList: [Int32] { freePages.elements }
     /// Per-page active-owner count. A cached page may have count zero (in the
     /// free queue) or positive (shared by one or more request tables).
     var refCounts: [Int]
@@ -57,9 +69,13 @@ final class PagedKVGroup {
 
     /// Bytes of ONE slab (K or V alone), poison page included — the unit
     /// `materializeSlabs` allocates and tracks.
-    var slabBytes: Int {
+    var keySlabBytes: Int {
         pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
     }
+    var valueSlabBytes: Int { pageCount * key.kvHeads * pageSize * key.valueHeadDim * dtype.size }
+    /// Legacy equal-width diagnostic surface. Role-aware accounting uses the
+    /// two explicit properties above, never this value for an asymmetric pair.
+    var slabBytes: Int { keySlabBytes }
 
     /// Local page zero is inert and pinned in every backing buffer. Fixed
     /// slabs use global page zero; segmented kernels translate invalid/padded
@@ -72,12 +88,14 @@ final class PagedKVGroup {
 
     /// Bytes of ONE page counting both K and V slabs.
     var pageBytes: Int {
-        2 * key.kvHeads * pageSize * key.headDim * dtype.size
+        (try! key.bytesPerToken()) * pageSize
     }
 
-    init(key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,
-         segmentLayout: PagedKVSegmentLayout? = nil,
-         writeValidation: CBv2PagedKVWriteValidation = CBv2PagedKVWriteValidation()) {
+    init(
+        key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,
+        segmentLayout: PagedKVSegmentLayout? = nil,
+        writeValidation: CBv2PagedKVWriteValidation = CBv2PagedKVWriteValidation()
+    ) {
         self.writeValidation = writeValidation
         precondition(
             segmentLayout != nil || pageCount >= 2,
@@ -87,16 +105,15 @@ final class PagedKVGroup {
         self.dtype = dtype
         self.fixedPageCount = pageCount
         let shape = [pageCount, key.kvHeads, pageSize, key.headDim]
+        let valueShape = [pageCount, key.kvHeads, pageSize, key.valueHeadDim]
         self.segmentLayout = segmentLayout
         self.fixedK = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
-        self.fixedV = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
+        self.fixedV = segmentLayout == nil ? MLXArray.zeros(valueShape, dtype: dtype) : nil
         self.writeFence = MLXArray.zeros([1], dtype: .int32)
-        // Initial FIFO order is ascending ids, so fresh allocations remain
-        // physically consecutive (enables run-coalesced writes). The poison
-        // page is excluded permanently.
-        self.freeQueue = PagedBlockFreeQueue(
-            pageCount: pageCount, excluding: Self.poisonPage,
-            initiallyEmpty: segmentLayout != nil)
+        // The poison page is excluded permanently.
+        self.freePages =
+            segmentLayout.map { PagedKVFreePages(layout: $0) }
+            ?? PagedKVFreePages(fixedPageCount: pageCount)
         // The slabs are zero-initialised and no write can ever address the
         // poison page (every slot comes from an allocated page id), so
         // pinning its refcount at 1 is the whole of "permanently zeroed":
@@ -113,10 +130,18 @@ final class PagedKVGroup {
         self.generations = [UInt64](repeating: 0, count: pageCount)
     }
 
+    deinit {
+        // Parked backings die with the group; property observers do not run here.
+        if retainedSegmentBytes != 0 {
+            CBv2RetainedKVSegments.recordRetained(-retainedSegmentBytes)
+        }
+    }
+
     /// True when `page` is a page a sequence row can own. The poison page
     /// and out-of-range ids are not.
     func isAllocatable(_ page: Int32) -> Bool {
-        segmentLayout?.isUsable(page) ?? (page != Self.poisonPage && page >= 0 && Int(page) < pageCount)
+        segmentLayout?.isUsable(page)
+            ?? (page != Self.poisonPage && page >= 0 && Int(page) < pageCount)
     }
 
     func currentHandle(_ page: Int32) -> PagedKVPageHandle {
@@ -131,11 +156,12 @@ final class PagedKVGroup {
             && generations[Int(handle.page)] == handle.generation
     }
 
-    func allocatePage(willReuse: (PagedKVPageHandle) -> Void) -> Int32 {
-        precondition(
-            freeQueue.count > 0,
-            "[PagedKVPool] free list underflow for group \(key) — reservation accounting bug")
-        let page = freeQueue.first
+    /// `hint`: the page this row layer allocated last, if any.
+    func allocatePage(after hint: Int32? = nil, willReuse: (PagedKVPageHandle) -> Void) -> Int32 {
+        guard let page = freePages.next(after: hint) else {
+            preconditionFailure(
+                "[PagedKVPool] free list underflow for group \(key) — reservation accounting bug")
+        }
         precondition(
             isAllocatable(page),
             "[PagedKVPool] poison page escaped the free list for group \(key)")
@@ -147,7 +173,7 @@ final class PagedKVGroup {
         // This selected page stays queued until the callback returns, then is
         // removed explicitly below, so no half-allocation can escape.
         willReuse(currentHandle(page))
-        freeQueue.remove(page)
+        freePages.remove(page)
         let nextGeneration = generations[Int(page)] &+ 1
         precondition(nextGeneration != 0, "page generation overflow in group \(key)")
         generations[Int(page)] = nextGeneration
@@ -163,11 +189,11 @@ final class PagedKVGroup {
         precondition(isValid(handle))
         let index = Int(handle.page)
         if refCounts[index] == 0 {
-            precondition(freeQueue.contains(handle.page))
-            freeQueue.remove(handle.page)
+            precondition(freePages.contains(handle.page))
+            freePages.remove(handle.page)
             pagesInUse += 1
         } else {
-            precondition(!freeQueue.contains(handle.page))
+            precondition(!freePages.contains(handle.page))
         }
         refCounts[index] += 1
     }
@@ -175,14 +201,14 @@ final class PagedKVGroup {
     func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
         guard isValid(handle) else { return }
         let index = Int(handle.page)
-        guard refCounts[index] == 0, freeQueue.contains(handle.page) else { return }
-        freeQueue.moveToFront(handle.page)
+        guard refCounts[index] == 0, freePages.contains(handle.page) else { return }
+        freePages.markUncached(handle.page)
     }
 
     /// Release in caller-supplied eviction order. vLLM frees a request's
     /// page tables tail-first; cached pages append in that same order so a
     /// branch suffix is reused before its more valuable ancestors. Uncached
-    /// pages prepend for immediate reuse.
+    /// pages are reused before any cached page.
     func release<S: Sequence>(
         _ pages: S, isCached: (PagedKVPageHandle) -> Bool
     ) where S.Element == Int32 {
@@ -197,7 +223,7 @@ final class PagedKVGroup {
             precondition(refCounts[index] > 0, "double free of page \(page) in group \(key)")
             refCounts[index] -= 1
             guard refCounts[index] == 0 else { continue }
-            precondition(!freeQueue.contains(page))
+            precondition(!freePages.contains(page))
             pagesInUse -= 1
             if isCached(currentHandle(page)) {
                 cached.append(page)
@@ -205,8 +231,7 @@ final class PagedKVGroup {
                 uncached.append(page)
             }
         }
-        freeQueue.prepend(contentsOf: uncached)
-        freeQueue.append(contentsOf: cached)
+        freePages.addReleased(uncached: uncached, cached: cached)
     }
 
     /// Queue `page` for release at the end of a speculative transaction.
@@ -225,7 +250,8 @@ final class PagedKVGroup {
 
     func segment(for page: Int32) -> PagedKVSegment {
         precondition(isAllocatable(page))
-        guard let layout = segmentLayout, let segment = segments[layout.segmentIndex(page: page)] else {
+        guard let layout = segmentLayout, let segment = segments[layout.segmentIndex(page: page)]
+        else {
             preconditionFailure("page has no committed segment")
         }
         return segment
@@ -242,7 +268,7 @@ final class PagedKVGroup {
         let segments: [Int: PagedKVSegment]
         let refCounts: [Int]
         let generations: [UInt64]
-        let freeQueue: PagedBlockFreeQueue
+        let freePages: PagedKVFreePages
     }
 
     /// Metadata-only plan. Callers check aggregate bytes before materializing
@@ -259,33 +285,37 @@ final class PagedKVGroup {
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             physical = next
         }
-        return GrowthPlan(layout: planned.layout, segmentIDs: planned.segmentIDs, physicalBytes: physical)
+        return GrowthPlan(
+            layout: planned.layout, segmentIDs: planned.segmentIDs, physicalBytes: physical)
     }
 
-    func prepareGrowth(_ plan: GrowthPlan, evaluate: (MLXArray) throws -> Void,
-                       admission: AdmissionV2? = nil) throws
+    func prepareGrowth(
+        _ plan: GrowthPlan, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil, hostZeroed: Bool = false
+    ) throws
         -> PreparedGrowth
     {
         var replacement = segments
         var counts = refCounts
         var versions = generations
-        var queue = freeQueue
+        var free = freePages
         let appended = plan.layout.pageCount - pageCount
         if appended > 0 {
             counts.append(contentsOf: repeatElement(0, count: appended))
             versions.append(contentsOf: repeatElement(0, count: appended))
-            queue.extend(to: plan.layout.pageCount)
+            free.extend(to: plan.layout)
         }
         for index in plan.segmentIDs {
-            let segment = try PagedKVSegment(
-                index: index, layout: plan.layout, key: key, pageSize: pageSize,
-                dtype: dtype, evaluate: evaluate, admission: admission)
+            let segment = try growthSegment(
+                index: index, layout: plan.layout, evaluate: evaluate,
+                admission: admission, hostZeroed: hostZeroed)
             replacement[index] = segment
             counts[segment.pages.lowerBound] = 1
-            for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
+            free.addFresh(segment.pages.dropFirst().lazy.map { Int32($0) })
         }
-        return PreparedGrowth(layout: plan.layout, segments: replacement,
-                              refCounts: counts, generations: versions, freeQueue: queue)
+        return PreparedGrowth(
+            layout: plan.layout, segments: replacement,
+            refCounts: counts, generations: versions, freePages: free)
     }
 
     /// Only complete ownership swaps occur here. Preparation already performed
@@ -295,7 +325,7 @@ final class PagedKVGroup {
         segments = prepared.segments
         refCounts = prepared.refCounts
         generations = prepared.generations
-        freeQueue = prepared.freeQueue
+        freePages = prepared.freePages
     }
 
     struct ImportPlan {
@@ -316,8 +346,10 @@ final class PagedKVGroup {
 
     /// Rebase only the staged M pages. Existing free backing supplies the
     /// remaining full-N promise before this planner creates any new segments.
-    func planImport(_ source: CBv2PagedCheckpointStorage.Group,
-                    additionalReservedPages: Int) throws -> ImportPlan {
+    func planImport(
+        _ source: CBv2PagedCheckpointStorage.Group,
+        additionalReservedPages: Int
+    ) throws -> ImportPlan {
         guard let current = segmentLayout,
             current.pageBytes == source.layout.pageBytes,
             current.maximumUsablePages == source.layout.maximumUsablePages,
@@ -349,33 +381,39 @@ final class PagedKVGroup {
             usablePages: needed, excluding: Set(segments.keys).union(imported.segmentIDs))
         var physical = committedSegmentBytes + importedBytes
         for id in grown.segmentIDs {
-            let (next, overflow) = physical.addingReportingOverflow(try grown.layout.allocationBytes(forSegment: id))
+            let (next, overflow) = physical.addingReportingOverflow(
+                try grown.layout.allocationBytes(forSegment: id))
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             physical = next
         }
         return ImportPlan(
             layout: grown.layout, importedIDs: imported.segmentIDs, sourceIDs: sourceIDs,
             growthIDs: grown.segmentIDs, physicalBytes: physical,
-            additionalReservedPages: additionalReservedPages, pages: try source.pages.map {
-                guard let page = pageMap[$0] else { throw CBv2CompleteCheckpointError.invalidManifest }
+            additionalReservedPages: additionalReservedPages,
+            pages: try source.pages.map {
+                guard let page = pageMap[$0] else {
+                    throw CBv2CompleteCheckpointError.invalidManifest
+                }
                 return page
             })
     }
 
     /// All replacement dictionaries, tables and free queues are prepared
     /// before grant publication. Only missing suffix buffers allocate/evaluate.
-    func prepareImport(_ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
-                       evaluate: (MLXArray) throws -> Void,
-                       admission: AdmissionV2? = nil) throws -> PreparedImport {
+    func prepareImport(
+        _ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
+        evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil
+    ) throws -> PreparedImport {
         var replacement = segments
         var counts = refCounts
         var versions = generations
-        var queue = freeQueue
+        var free = freePages
         let appended = plan.layout.pageCount - pageCount
         if appended > 0 {
             counts.append(contentsOf: repeatElement(0, count: appended))
             versions.append(contentsOf: repeatElement(0, count: appended))
-            queue.extend(to: plan.layout.pageCount)
+            free.extend(to: plan.layout)
         }
         for (old, new) in zip(plan.sourceIDs, plan.importedIDs) {
             replacement[new] = PagedKVSegment(
@@ -391,16 +429,16 @@ final class PagedKVGroup {
             }
         }
         for id in plan.growthIDs {
-            let segment = try PagedKVSegment(
-                index: id, layout: plan.layout, key: key, pageSize: pageSize,
-                dtype: dtype, evaluate: evaluate, admission: admission)
+            let segment = try growthSegment(
+                index: id, layout: plan.layout, evaluate: evaluate, admission: admission)
             replacement[id] = segment
             counts[segment.pages.lowerBound] = 1
-            for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
+            free.addFresh(segment.pages.dropFirst().lazy.map { Int32($0) })
         }
         return PreparedImport(
-            growth: PreparedGrowth(layout: plan.layout, segments: replacement,
-                                   refCounts: counts, generations: versions, freeQueue: queue),
+            growth: PreparedGrowth(
+                layout: plan.layout, segments: replacement,
+                refCounts: counts, generations: versions, freePages: free),
             pagesInUse: pagesInUse + plan.pages.count,
             pagesReserved: pagesReserved + plan.additionalReservedPages)
     }
@@ -416,8 +454,36 @@ final class PagedKVGroup {
     /// resurrect stale handles. Outstanding reservations retain enough free
     /// physical pages for every nonthrowing future write.
     func trimSegments(willRetire: (PagedKVPageHandle) -> Void) {
-        guard segmentLayout != nil else { return }
+        var none = 0
+        trimSegments(retainingUpTo: &none, willRetire: willRetire)
+    }
+
+    /// The backing `trimSegments` would retire now, without retiring it.
+    var trimmableSegmentBytes: Int {
+        guard segmentLayout != nil else { return 0 }
         var remaining = committedUsablePages
+        var bytes = 0
+        for index in segments.keys.sorted(by: >) {
+            guard let segment = segments[index] else { continue }
+            let usable = segment.pages.count - 1
+            guard remaining - usable >= pagesReserved,
+                segment.pages.dropFirst().allSatisfy({ refCounts[$0] == 0 })
+            else { continue }
+            remaining -= usable
+            bytes += segment.allocatedBytes
+        }
+        return bytes
+    }
+
+    /// Same retirement, but parks backings that fit `budget` instead of
+    /// dropping them. Returns true when any backing was dropped.
+    @discardableResult
+    func trimSegments(
+        retainingUpTo budget: inout Int, willRetire: (PagedKVPageHandle) -> Void
+    ) -> Bool {
+        guard segmentLayout != nil else { return false }
+        var remaining = committedUsablePages
+        var dropped = false
         for index in segments.keys.sorted(by: >) {
             guard let segment = segments[index] else { continue }
             let usable = segment.pages.count - 1
@@ -427,7 +493,7 @@ final class PagedKVGroup {
             for page in pages {
                 let id = Int32(page)
                 willRetire(currentHandle(id))
-                freeQueue.remove(id)
+                freePages.remove(id)
                 let next = generations[page] &+ 1
                 precondition(next != 0, "page generation overflow")
                 generations[page] = next
@@ -435,7 +501,47 @@ final class PagedKVGroup {
             segment.backing.invalidateCoverage()
             segments.removeValue(forKey: index)
             remaining -= usable
+            if segment.allocatedBytes <= budget {
+                budget -= segment.allocatedBytes
+                retainedSegments[usable, default: []].append(segment)
+                retainedSegmentBytes += segment.allocatedBytes
+            } else {
+                dropped = true
+            }
         }
+        return dropped
+    }
+
+    func releaseRetainedSegments() {
+        retainedSegments.removeAll()
+        retainedSegmentBytes = 0
+    }
+
+    /// A parked backing of the same size class is reinstalled under the new
+    /// range (no KV copy, fill or fence); otherwise allocate a new segment.
+    /// Its stale pages are no different from recycled free pages: every read
+    /// is bounded by a row's written length, and the poison page is never
+    /// written.
+    private func growthSegment(
+        index: Int, layout: PagedKVSegmentLayout, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2?, hostZeroed: Bool = false
+    ) throws -> PagedKVSegment {
+        let usable = layout.range(index).count - 1
+        if let parked = retainedSegments[usable]?.popLast() {
+            if retainedSegments[usable]?.isEmpty == true { retainedSegments[usable] = nil }
+            retainedSegmentBytes -= parked.allocatedBytes
+            // A backing covered by another admission is dropped, not reused.
+            if admission.map({ parked.backing.belongs(to: $0) }) ?? true {
+                let segment = PagedKVSegment(rebasing: parked, index: index, layout: layout)
+                if let admission {
+                    try segment.backing.cover(using: admission, bytes: segment.byteCount)
+                }
+                return segment
+            }
+        }
+        return try PagedKVSegment(
+            index: index, layout: layout, key: key, pageSize: pageSize,
+            dtype: dtype, evaluate: evaluate, admission: admission, hostZeroed: hostZeroed)
     }
 
 }

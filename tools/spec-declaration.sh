@@ -2,7 +2,7 @@
 #
 # spec-declaration.sh -- the SINGLE trusted source that reads the participant's
 # speculative-decode DECLARATION and derives the decoder and the draft depth the
-# ranked run requests from it. tools/bonsai2-9b-measure-and-score.sh resolves
+# ranked run requests from it. tools/muse-glimmer-30b-measure-and-score.sh resolves
 # both THROUGH this one script, so the fail-closed validation and the derivation
 # can never drift between the arm gate and the benchd request.
 #
@@ -24,27 +24,31 @@
 #
 #   "spec": { "decoder": "mtp", "enabled": true, "num_speculative_tokens": N }
 #
-#   decoder absent         => "mtp", so an older declaration keeps its meaning
-#   decoder "mtp"          => the pinned MTP head, depth 1..7
+#   decoder absent         => "dflash", this track's decoder
+#   decoder "dflash"       => the pinned DFlash drafter, depth 1..7
+#   decoder "mtp"          => the older MTP slot name, depth 1..7
 #   enabled=false or N=0   => serial (no spec on the wire), whatever the decoder
 #   anything else          => REFUSED here, before any engine spawns
 #
-# THIS TRACK DECLARES ONE DECODER. No DFlash 2 drafter exists for the Qwen 3.5
-# 9B geometry, so `dflash` is refused by name. The permitted depth set is the
+# THIS TRACK DECLARES ONE SPECULATIVE DECODER: `dflash`, the quantized DFlash
+# drafter pinned in the contract fixture's `mtp_head` block. The block keeps the
+# name `mtp_head` because `mtp-head.manifest.json` is the declaration slot the
+# harness reads; the decoder it now names is dflash. `mtp` stays declarable so
+# an older declaration keeps its meaning. The permitted depth set is the
 # contract fixture's `mtp_head.permitted_draft_depths`.
 #
 # VERBS
 #   speculative  prints 1 when a depth is requested, else 0
-#   decoder      prints the declared decoder ("mtp")
+#   decoder      prints the declared decoder ("dflash" or "mtp")
 #   draft-len    prints the requested depth (0 when serial)
-#   describe     prints "serial" or "mtpN"
+#   describe     prints "serial", "dflashN" or "mtpN"
 #   validate     exits 0 when the declaration is well-formed and in-envelope
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MANIFEST="${SPEC_DECLARATION_MANIFEST:-${REPO_ROOT}/mtp-head.manifest.json}"
-CONTRACT="${SPEC_DECLARATION_CONTRACT:-${REPO_ROOT}/fixtures/bonsai2_9b_mlx_v1_track.json}"
+CONTRACT="${SPEC_DECLARATION_CONTRACT:-${REPO_ROOT}/fixtures/muse_glimmer_30b_mlx_v1_track.json}"
 
 fail() {
   echo "spec-declaration.sh: REFUSING -- $*" >&2
@@ -57,7 +61,7 @@ command -v jq >/dev/null 2>&1 || fail "jq is required to read the declaration"
 # An absent manifest OR an absent `spec` block is SERIAL: the pure no-op. It is
 # resolved WITHOUT requiring the file to exist, so the stock-repo derivation
 # never depends on a spec block being present.
-decoder="mtp"
+decoder="dflash"
 enabled="false"
 raw_tokens="0"
 if [[ -f "${MANIFEST}" ]]; then
@@ -94,12 +98,16 @@ fi
 # integer, not a hardcoded value); the contract's permitted set is the tighter,
 # AUTHORITATIVE one enforced below when the value is enabled.
 case "${decoder}" in
+  dflash)
+    SPEC_MAX_TOKENS=8
+    CONTRACT_DEPTHS=".mtp_head.permitted_draft_depths"
+    ;;
   mtp)
     SPEC_MAX_TOKENS=8
     CONTRACT_DEPTHS=".mtp_head.permitted_draft_depths"
     ;;
   *)
-    fail "spec.decoder='${decoder}' is not a declarable decoder; this track declares mtp only"
+    fail "spec.decoder='${decoder}' is not a declarable decoder; this track declares dflash and mtp"
     ;;
 esac
 

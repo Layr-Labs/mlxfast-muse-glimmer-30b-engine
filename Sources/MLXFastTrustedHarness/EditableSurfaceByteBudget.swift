@@ -132,7 +132,7 @@ public enum EditableSurfaceByteBudget {
     /// submission validation. 512,000,000 plus `defaultMaxTotalBytes`
     /// (7,949,663) leaves ~16.9 MB of headroom under the platform cap.
     ///
-    /// NOT a head-declaration cap. `Gemma4MTPHeadDeclaration.defaultMaxBytes`
+    /// NOT a head-declaration cap. `MTPHeadDeclaration.defaultMaxBytes`
     /// bounds what a submission may DECLARE at 2 GiB and is untouched by this
     /// ruling; this constant bounds SUBMITTED exempt-path bytes in the
     /// archive.

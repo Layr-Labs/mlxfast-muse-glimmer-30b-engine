@@ -21,6 +21,13 @@ import Testing
 @Suite("bench-worker manifest command")
 struct BenchWorkerManifestCommandTests {
 
+    /// This repository ships no first-party runner, so the mock adapter is
+    /// registered for the tests that resolve one through the registry. The
+    /// suite runs one instance per test, so every test starts from it.
+    init() {
+        RunnerRegistry.shared.register(MockRunner.self)
+    }
+
     /// A checkpoint with exactly the file the resolution may read, plus the
     /// index a real one carries.
     private func checkpoint(modelType: String) throws -> URL {
@@ -46,30 +53,30 @@ struct BenchWorkerManifestCommandTests {
     // MARK: - The bytes
 
     /// The cross-repo vector, printed by the command: the digest of what it
-    /// prints IS the digest the hello reports.
+    /// prints IS the digest the fixture's hello reports.
     @Test("--runner prints the canonical bytes, and they digest to the vector")
     func runnerPrintsCanonicalBytes() throws {
-        let printed = try render(["manifest", "--runner", "layr/qwen4exp-125b-a6b"])
+        let printed = try render(["manifest", "--runner", "layr/mock-adapter"])
         #expect(printed.hasSuffix("\n"))
 
         let bytes = String(printed.dropLast())
         let canonical = String(
-            decoding: ContractManifests.sectionEleven.canonicalJSON(), as: UTF8.self)
+            decoding: ContractManifests.shared.canonicalJSON(), as: UTF8.self)
         #expect(bytes == canonical)
 
         let digest = SHA256Hex.of(Data(bytes.utf8))
-        #expect(digest == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180")
-        #expect(digest == ContractManifests.sectionEleven.sha256Digest())
+        #expect(digest == "850ef7df262d03f851a355d1572257b04ade4834d2563c18f01b9cf344a6fffd")
+        #expect(digest == ContractManifests.shared.sha256Digest())
     }
 
     @Test("--digest prints only the hex")
     func digestOnly() throws {
         let printed = try render([
-            "manifest", "--runner", "layr/qwen4exp-125b-a6b", "--digest",
+            "manifest", "--runner", "layr/mock-adapter", "--digest",
         ])
         #expect(
             printed
-                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180\n")
+                == "850ef7df262d03f851a355d1572257b04ade4834d2563c18f01b9cf344a6fffd\n")
     }
 
     /// `--weights` reaches the same runner through the registry, reading
@@ -80,7 +87,7 @@ struct BenchWorkerManifestCommandTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fromWeights = try render(["manifest", "--weights", directory.path])
-        let fromID = try render(["manifest", "--runner", "layr/qwen4exp-125b-a6b"])
+        let fromID = try render(["manifest", "--runner", "layr/mock-adapter"])
         #expect(fromWeights == fromID)
     }
 
@@ -91,7 +98,7 @@ struct BenchWorkerManifestCommandTests {
         let printed = try render(["manifest", "--weights", directory.path, "--digest"])
         #expect(
             printed
-                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180\n")
+                == "850ef7df262d03f851a355d1572257b04ade4834d2563c18f01b9cf344a6fffd\n")
     }
 
     @Test("Every first-party runner prints its own manifest")
@@ -138,7 +145,7 @@ struct BenchWorkerManifestCommandTests {
     func targetRefusals() {
         #expect(throws: WorkerLaunchError.manifestTargetAmbiguous) {
             _ = try BenchWorkerCommand.parse([
-                "manifest", "--runner", "layr/gptoss", "--weights", "/nonexistent",
+                "manifest", "--runner", "layr/mock-adapter", "--weights", "/nonexistent",
             ])
         }
         #expect(throws: WorkerLaunchError.manifestTargetMissing) {
@@ -153,7 +160,7 @@ struct BenchWorkerManifestCommandTests {
     func unknownFlagRefused() {
         #expect(throws: WorkerLaunchError.unknownArgument("--socket")) {
             _ = try BenchWorkerCommand.parse([
-                "manifest", "--runner", "layr/gptoss", "--socket", "/tmp/s",
+                "manifest", "--runner", "layr/mock-adapter", "--socket", "/tmp/s",
             ])
         }
         #expect(throws: WorkerLaunchError.missingValue("--runner")) {

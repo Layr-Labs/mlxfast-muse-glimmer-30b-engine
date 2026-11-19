@@ -11,6 +11,7 @@
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
+#include "mlx/backend/common/command_buffer_limits.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/event.h"
@@ -209,7 +210,7 @@ MTL::Library* load_default_library(MTL::Device* device) {
     return lib;
   }
 
-  NS::Error* error[5];
+  NS::Error* error[6];
   MTL::Library* lib;
   // First try the colocated mlx.metallib
   std::tie(lib, error[0]) = load_colocated_library(device, "mlx");
@@ -221,6 +222,22 @@ MTL::Library* load_default_library(MTL::Device* device) {
   if (lib) {
     return lib;
   }
+
+#ifdef SWIFTPM_BUNDLE
+  // `swift test` with the default Swift Build build system nests resource
+  // bundles inside the .xctest and runs tests via the toolchain's
+  // swiftpm-testing-helper, so the running binary is the toolchain helper:
+  // neither Bundle.main nor Bundle.allBundles names the test bundle, and the
+  // SwiftPM bundle search below cannot reach it. In that layout the metallib
+  // sits at a fixed offset from the binary.
+  std::tie(lib, error[5]) = load_colocated_library(
+      device,
+      std::string("../Resources/") + SWIFTPM_BUNDLE +
+          ".bundle/Contents/Resources/default");
+  if (lib) {
+    return lib;
+  }
+#endif
 
   // Then try default.metallib in a SwiftPM bundle if we have one
   std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
@@ -240,7 +257,7 @@ MTL::Library* load_default_library(MTL::Device* device) {
   if (!lib) {
     std::ostringstream msg;
     msg << "Failed to load the default metallib. ";
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
       if (error[i] != nullptr) {
         msg << error[i]->localizedDescription()->utf8String() << " ";
       }
@@ -348,13 +365,12 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
-  if (all_inputs_.insert(a.buffer().ptr()).second) {
+  if (all_inputs_.insert(a.buffer().ptr())) {
     buffer_sizes_ += a.data_size();
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   next_inputs_.insert(r_buf);
-  needs_barrier_ =
-      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
+  needs_barrier_ = needs_barrier_ | prev_outputs_.contains(r_buf);
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -376,8 +392,7 @@ void CommandEncoder::register_output_array(const array& a) {
     concurrent_outputs_.insert(buf);
   } else {
     next_outputs_.insert(buf);
-    needs_barrier_ =
-        needs_barrier_ | (prev_inputs_.find(buf) != prev_inputs_.end());
+    needs_barrier_ = needs_barrier_ | prev_inputs_.contains(buf);
   }
 }
 
@@ -396,7 +411,7 @@ void CommandEncoder::maybeInsertBarrier() {
   if (needs_barrier_) {
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
-    // Preserve the hash tables' buckets for reuse across barrier epochs.
+    // Keep the sets' memory for reuse across barrier epochs.
     prev_inputs_.swap(next_inputs_);
     prev_outputs_.swap(next_outputs_);
   } else {
@@ -427,7 +442,7 @@ void CommandEncoder::barrier() {
   get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
-void CommandEncoder::end_encoding() {
+void CommandEncoder::end_encoding(bool wait_in_flight) {
   // Each command encoder has a unique fence. We also store a map of
   // all previous outputs of command encoders to their corresponding fence.
   // - The command encoder records its inputs and outputs.
@@ -464,6 +479,16 @@ void CommandEncoder::end_encoding() {
         }
       }
     }
+    // A spin wait must start after all earlier encoders, as it might block
+    // earlier operations to be finished.
+    // See https://github.com/ml-explore/mlx/pull/4689
+    if (wait_in_flight || wait_all_pending_) {
+      for (auto& [_, fence] : prev_ce_outputs_) {
+        if (waiting_on.insert(fence).second) {
+          encoder_->waitForFence(fence.get());
+        }
+      }
+    }
     for (auto& out : all_outputs_) {
       prev_ce_outputs_[out] = fence_;
     }
@@ -473,7 +498,8 @@ void CommandEncoder::end_encoding() {
   buffer_->addCompletedHandler([this,
                                 fence = std::move(fence_),
                                 temporaries = std::move(temporaries_),
-                                all_outputs = std::move(all_outputs_),
+                                all_outputs = std::vector<const void*>(
+                                    all_outputs_.begin(), all_outputs_.end()),
                                 waiting_on = std::move(waiting_on)](
                                    MTL::CommandBuffer*) mutable {
     std::lock_guard lk(outputs_mtx_);
@@ -489,6 +515,7 @@ void CommandEncoder::end_encoding() {
   encoder_->endEncoding();
   encoder_.reset();
   needs_barrier_ = false;
+  wait_all_pending_ = false;
   concurrent_ = false;
   prev_inputs_.clear();
   next_inputs_.clear();
@@ -496,6 +523,7 @@ void CommandEncoder::end_encoding() {
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();
+  all_outputs_.clear();
 }
 
 void CommandEncoder::signal_event(Event event, uint64_t value) {
@@ -508,6 +536,42 @@ void CommandEncoder::wait_event(Event event, uint64_t value) {
   end_encoding();
   buffer_->encodeWait(event.cast<EventImpl>().mtl_event(), value);
   wait_events_.push_back(std::move(event));
+}
+
+namespace {
+// Per-thread commit limits; zero selects the device default.
+thread_local int thread_max_ops_per_buffer = 0;
+thread_local int thread_max_mb_per_buffer = 0;
+// Per-thread steel quantized-matmul output tile (32, 64, 6432, 3264 or 6464);
+// zero selects MLX_QMM_STEEL_TILE (see `qmm` in quantized.cpp).
+thread_local int thread_qmm_steel_tile_override = 0;
+
+void set_thread_command_buffer_limits(
+    int max_ops,
+    int max_mb,
+    int* previous_ops,
+    int* previous_mb) {
+  if (previous_ops != nullptr) {
+    *previous_ops = thread_max_ops_per_buffer;
+  }
+  if (previous_mb != nullptr) {
+    *previous_mb = thread_max_mb_per_buffer;
+  }
+  thread_max_ops_per_buffer = std::max(0, max_ops);
+  thread_max_mb_per_buffer = std::max(0, max_mb);
+}
+} // namespace
+
+int thread_qmm_steel_tile() {
+  return thread_qmm_steel_tile_override;
+}
+
+std::tuple<int, int> Device::get_max_ops_mb_per_buffer() const {
+  return std::make_tuple(
+      thread_max_ops_per_buffer > 0 ? thread_max_ops_per_buffer
+                                    : max_ops_per_buffer_,
+      thread_max_mb_per_buffer > 0 ? thread_max_mb_per_buffer
+                                   : max_mb_per_buffer_);
 }
 
 bool CommandEncoder::needs_commit() const {
@@ -523,10 +587,13 @@ void CommandEncoder::commit(std::function<void()> completion) {
       [&error_ = error_,
        wait_events = std::move(wait_events_),
        signal_events = std::move(signal_events_),
+       retained = std::move(retained_),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) mutable {
         if (completion) {
           completion();
         }
+        // The buffer finished: release what its primitives kept alive.
+        retained.clear();
         // If any of the waited event has error in it, poison the encoder.
         for (auto& event : wait_events) {
           if (error_.store_if_valid(event.load_error())) {
@@ -561,6 +628,9 @@ void CommandEncoder::commit(std::function<void()> completion) {
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
+  // The moved-from vector is valid but unspecified: reset it explicitly.
+  retained_ = {};
+  retained_.reserve(256);
 }
 
 void CommandEncoder::synchronize() {
@@ -589,8 +659,7 @@ Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
   auto pool = new_scoped_memory_pool();
   default_library_ = NS::TransferPtr(load_default_library(device_.get()));
 
-  std::string expert_qmm_env =
-      env::get_var("MLX_GATHER_QMM_EXPERT_SLICES", "");
+  std::string expert_qmm_env = env::get_var("MLX_GATHER_QMM_EXPERT_SLICES", "");
   std::transform(
       expert_qmm_env.begin(),
       expert_qmm_env.end(),
@@ -615,16 +684,14 @@ Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
       "alN_true_bm_32_bn_32_bk_32";
   auto has_default_function = [this](const char* name) {
     auto ns_name = NS::String::string(name, NS::ASCIIStringEncoding);
-    auto function =
-        NS::TransferPtr(default_library_->newFunction(ns_name));
+    auto function = NS::TransferPtr(default_library_->newFunction(ns_name));
     return function.get() != nullptr;
   };
   // All expert-tile symbols ship from one source-matched metallib
   // (scripts/fetch-metallib.sh completeness contract), so availability is
   // all-or-nothing: a metallib missing any of them predates this revision
   // and must fail the whole route closed.
-  gemma4_expert_qmm_aot_available_ =
-      has_default_function(descriptor_kernel) &&
+  gemma4_expert_qmm_aot_available_ = has_default_function(descriptor_kernel) &&
       has_default_function(descriptor_kernel_e256) &&
       has_default_function(tile_kernel);
   if (gemma4_expert_qmm_requested_ && gemma4_expert_qmm_aot_available_) {
@@ -983,8 +1050,13 @@ CommandEncoder& get_command_encoder(Stream s) {
 }
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders() {
-  static thread_local std::unordered_map<int, CommandEncoder> encoders;
-  return encoders;
+  if (is_main_thread()) {
+    static auto* encoders = new std::unordered_map<int, CommandEncoder>();
+    return *encoders;
+  } else {
+    static thread_local std::unordered_map<int, CommandEncoder> encoders;
+    return encoders;
+  }
 }
 
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
@@ -1043,8 +1115,7 @@ void gemma4_expert_qmm_diagnostics_snapshot(
     diagnostics->fallback_outer_route = counters.fallback_outer_route;
     diagnostics->fallback_quantization = counters.fallback_quantization;
     diagnostics->fallback_topology = counters.fallback_topology;
-    diagnostics->fallback_assignment_count =
-        counters.fallback_assignment_count;
+    diagnostics->fallback_assignment_count = counters.fallback_assignment_count;
     diagnostics->fallback_geometry = counters.fallback_geometry;
     diagnostics->fallback_metallib_unavailable =
         counters.fallback_metallib_unavailable;
@@ -1056,6 +1127,27 @@ void gemma4_expert_qmm_diagnostics_snapshot(
   }
 }
 } // namespace
+
+extern "C" void mlx_metal_set_thread_command_buffer_limits(
+    int max_ops,
+    int max_mb,
+    int* previous_ops,
+    int* previous_mb) {
+  mlx::core::metal::set_thread_command_buffer_limits(
+      max_ops, max_mb, previous_ops, previous_mb);
+}
+
+extern "C" void mlx_metal_set_thread_qmm_steel_tile(
+    int tile,
+    int* previous_tile) {
+  if (previous_tile != nullptr) {
+    *previous_tile = mlx::core::metal::thread_qmm_steel_tile_override;
+  }
+  mlx::core::metal::thread_qmm_steel_tile_override =
+      (tile == 32 || tile == 64 || tile == 6432 || tile == 3264 || tile == 6464)
+      ? tile
+      : 0;
+}
 
 extern "C" void mlx_metal_gemma4_expert_qmm_diagnostics_snapshot(
     mlx_metal_gemma4_expert_qmm_diagnostics* diagnostics) {
@@ -1080,8 +1172,7 @@ extern "C" void mlx_metal_gemma4_expert_qmm_diagnostics_clear_and_arm(void) {
   }
 }
 
-extern "C" void
-mlx_metal_gemma4_expert_qmm_diagnostics_snapshot_and_disarm(
+extern "C" void mlx_metal_gemma4_expert_qmm_diagnostics_snapshot_and_disarm(
     mlx_metal_gemma4_expert_qmm_diagnostics* diagnostics) {
   gemma4_expert_qmm_diagnostics_snapshot(diagnostics, true);
 }

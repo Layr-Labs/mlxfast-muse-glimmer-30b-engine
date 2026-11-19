@@ -16,11 +16,13 @@ let package = Package(
     ],
     dependencies: [
         // THE ENGINE IS THE FORK. Vendor/mlx-swift-lm is a VENDORED TREE
-        // cut from Layr-Labs/mlx-swift-lm feat/qwen38-flash-next-runner
-        // 859f4d97e0d1ae9cce0883b044f764283841edfb with fork main 0607011
-        // merged in; the merge, the build fixes and the Bonsai 2 support
-        // files taken from fork main fd0eaac (pull requests 154 and 155) are
-        // this repository's commits, and the tree is edited
+        // cut from Layr-Labs/mlx-swift-lm at the merge of
+        // 62cfabd5c67c6042edcfd812698bd34e4b5df7d7 and
+        // 443789360ddbf804d55d063ca9cda4ea2d3013a9, whose tree is
+        // 0391eacd84cb00ce4001d70763f2303fa2a01210. That merge is a local branch and is not pushed
+        // upstream. Everything the engine carries on top of it -- the build
+        // fixes, the Bonsai 2 support files, the model ports -- is this
+        // repository's commits, and the tree is edited
         // here, never upstream. It carries the
         // model ports and the MLXRunners Engine Protocol v1 scaffold. The
         // root BenchWorker target uses that scaffold with the intake model's
@@ -36,15 +38,17 @@ let package = Package(
         // docs/new-track-repo-procedure.md section 6 holds the command.
         // See docs/bonsai2-27b-port-notes.md section 3.4.
         //
-        // mlx-swift is cut from Layr-Labs/mlx-swift 70052b2 (MLX
-        // 0.32.2), with its nested submodules copied in as plain files:
-        // Source/Cmlx/mlx at 3fa8f25e and Source/Cmlx/mlx-c at 02cf6f4d.
-        // 70052b2 adds Source/MLXNN/Hadamard.swift, which holds the packed
-        // signed-Hadamard layers the Bonsai 2 pack loads into.
+        // mlx-swift is cut from Layr-Labs/mlx-swift b1c94d29c5ddff16838fdc25b83fbe8fde48b3e8
+        // (MLX 0.32.5), with its nested submodules copied in as plain files:
+        // Source/Cmlx/mlx at 72dffa2dbbdce95601fd84f5e8b6d7b4ec97a11b and Source/Cmlx/mlx-c at
+        // 2ac897e34495c924f9cecfa93fffaf4316bbcb91. It carries Source/MLXNN/Hadamard.swift, which
+        // holds the packed signed-Hadamard layers the Bonsai 2 pack loads
+        // into.
         // It stays a VENDORED TREE, because its Metal kernel sources are
         // the track's optimization surface, and an editable path cannot be
-        // a submodule. 70052b2 is the MLX core that Darkbloom
-        // (Layr-Labs/d-inference) builds the same fork code against. The
+        // a submodule. That pair is the MLX core the serving provider
+        // (Layr-Labs/d-inference) builds the same fork code against, and it
+        // is the pair the reference speeds were measured on. The
         // fork's Package.swift path-depends on a sibling ../mlx-swift when
         // one exists, so one runner must have ONE core: a different
         // vendored commit here would compile the fork against a core its

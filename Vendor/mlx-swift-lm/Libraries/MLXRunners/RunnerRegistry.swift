@@ -48,13 +48,12 @@ public final class RunnerRegistry: @unchecked Sendable {
     /// while it is being promoted.
     private static var firstPartyRunners: [any Runner.Type] {
         [
-            Gemma4TextRunner.self,
-            GPTOSSRunner.self,
-            NemotronH35Runner.self,
-            Qwen35Runner.self,
-            Qwen3VLRunner.self,
-            Qwen4ExpRunner.self,
-            // INSERTION POINT: register additional runners here
+            // INSERTION POINT: a family runner arrives as its own file beside
+            // this one and is claimed by one line here. Nothing else in this
+            // layer names a family.
+
+            // Muse Glimmer 30B, `muse_glimmer` and `muse_glimmer_text`.
+            MuseGlimmerRunner.self,
         ]
     }
 

@@ -8,4 +8,4 @@
 # step: the label IS the track id.
 self-hosted-runner:
   labels:
-    - bonsai2-9b-mlx-v1
+    - muse-glimmer-30b-mlx-v1

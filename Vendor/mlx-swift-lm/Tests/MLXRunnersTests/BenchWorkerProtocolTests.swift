@@ -203,15 +203,16 @@ struct BenchWorkerProtocolTests {
 
     @Test("A cohort regime yields the batched capability and max_batch_size")
     func helloCohortDerivation() {
-        // Gemma 4 declares an `upTo(8)` free-run regime; the derivation must
-        // read the width off the manifest rather than a constant here.
-        let widths = Gemma4TextRunner.manifest.regimes.map(\.batch.maxWidth)
+        // The cohort mock declares an `upTo(8)` free-run regime; the
+        // derivation must read the width off the manifest rather than a
+        // constant here.
+        let widths = CohortMockRunner.manifest.regimes.map(\.batch.maxWidth)
         #expect(widths.max() == 8)
         #expect(
-            Gemma4TextRunner.manifest.regimes.contains {
+            CohortMockRunner.manifest.regimes.contains {
                 $0.batch.maxWidth > 1 && $0.timing == .freeRun
             })
-        #expect(Qwen3VLRunner.manifest.regimes.allSatisfy { $0.batch.maxWidth == 1 })
+        #expect(MockRunner.manifest.regimes.allSatisfy { $0.batch.maxWidth == 1 })
     }
 
     // MARK: - Wire round trip
@@ -406,13 +407,19 @@ struct FreeRunRoundAuditTests {
         let response = try await freeRun(script: script, batch: 2)
         #expect(response.ok)
         #expect(response.rounds == 3)
-        #expect(response.acceptanceLengths == [3, 1, 2])
+        // Per round, the tokens the round committed ACROSS the rows: two rows
+        // committing 3, 1 and 2 each is 6, 2 and 4, which sums to the 12 tokens
+        // the window returned. A single entry per round cannot carry two rows'
+        // different widths, so the entry is the round's total and the per-row
+        // walk travels in `natural_accepted_by_stream`.
+        #expect(response.acceptanceLengths == [6, 2, 4])
         #expect(response.activeStreamsByRound == [2, 2, 2])
         // PRE-min: round 2 committed 1 while the walk accepted 1, and round 1
         // committed 3 on a walk of 2 — the raw walk, not the clamped count.
         #expect(response.naturalAcceptedByStream == [[2, 1, 1], [2, 1, 1]])
         #expect(response.draftedTotal == 12)
         #expect(response.acceptedTotal == 8)
+        #expect(response.committedTotal == 12)
     }
 
     /// A row that finishes early leaves no record past its last round, so the
@@ -428,7 +435,10 @@ struct FreeRunRoundAuditTests {
         let assembled = try FreeRunRoundAudit.assemble(
             records: records, slotForRequestID: [1: 0, 2: 1], streamCount: 2)
         #expect(assembled?.activeStreamsByRound == [2, 2, 1])
-        #expect(assembled?.acceptanceLengths == [3, 1, 2])
+        // Per round, the tokens both rows committed: three rounds of two rows
+        // committing 3, 1 and 2 each is 6, 2 and 4 — and the last round has one
+        // row left, so it states 2.
+        #expect(assembled?.acceptanceLengths == [6, 2, 2])
         #expect(assembled?.naturalAcceptedByStream == [[2, 1, 1], [2, 1, 0]])
     }
 
@@ -500,42 +510,55 @@ struct FreeRunRoundAuditTests {
         #expect(response.effectiveSpec?.depth == 3)
     }
 
-    /// A truncated head cannot prove coverage of the window, so the response
-    /// is refused rather than assembled from what survived.
-    @Test("A journal at its retention cap refuses the response")
-    func cappedJournalRefuses() async throws {
-        let capped = MockRoundScript(
+    /// A journal that is exactly FULL has dropped nothing, so the window is
+    /// covered and the audit is stated. Refusing here was the false truncation
+    /// refusal: the retained count alone cannot tell "full" from "the head fell
+    /// off".
+    @Test("A journal exactly at its retention cap still states the window")
+    func fullJournalStatesTheWindow() async throws {
+        let full = MockRoundScript(
             rounds: Array(
                 repeating: MockRoundScript.Round(k: 2, accepted: 1, confirmed: 1),
-                count: CBv2MTPRoundAuditRecord.retainedRecordCap))
-        let response = try await freeRun(script: capped, count: 1)
+                count: MockEngine.retainedRecordCap))
+        let response = try await freeRun(script: full, count: 1)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == [1])
+        #expect(response.committedTotal == 1)
+    }
+
+    /// A cursor the ring has evicted PAST cannot be covered, so the response is
+    /// refused rather than assembled from what survived.
+    @Test("A journal that evicted past the window's cursor refuses the response")
+    func evictedJournalRefuses() async throws {
+        var script = MockRoundScript.fixtureWindow
+        script.dropped = 5
+        let response = try await freeRun(script: script, count: 6)
         #expect(response.ok == false)
         #expect(
             response.error
-                == "mtp round journal truncated at its 8192-record cap "
-                + "(8192 retained): coverage cannot be proven")
+                == "mtp round journal evicted 5 records past the window's cursor 0 "
+                + "(cap 8192): coverage cannot be proven")
     }
 
-    /// Rows disagreeing on a round's committed width means the grouping or
-    /// the window boundary is wrong; a cohort commits ONE common width.
-    @Test("Disagreeing committed widths in one round are refused")
-    func widthDisagreementRefused() {
-        let wide = CBv2MTPRoundAuditRecord(
-            requestID: 1, k: 2, draftTokens: [], targetTokens: [], accepted: 1,
-            confirmed: 3, rejected: 0, tokensCountAfter: 1, numComputedAfter: 0,
-            generatedAfter: 1, finishReason: nil)
-        let narrow = CBv2MTPRoundAuditRecord(
-            requestID: 2, k: 2, draftTokens: [], targetTokens: [], accepted: 1,
-            confirmed: 2, rejected: 1, tokensCountAfter: 1, numComputedAfter: 0,
-            generatedAfter: 1, finishReason: nil)
-        let records = [wide, narrow]
-        #expect(
-            throws: FreeRunRoundAudit.AuditError.widthDisagreement(
-                round: 0, widths: [3, 2])
-        ) {
-            _ = try FreeRunRoundAudit.assemble(
-                records: records, slotForRequestID: [1: 0, 2: 1], streamCount: 2)
-        }
+    /// Two rows committing different widths in one round is what a per-row
+    /// finalize produces. The audit states each row's own width instead of
+    /// refusing the window: the scored width is one request, but a cohort must
+    /// neither break nor be described untruthfully.
+    @Test("Rows committing different widths are stated per row")
+    func perRowWidthsStated() throws {
+        let wide = RunnerRoundRecord(requestID: 1, drafted: 2, accepted: 1, committed: 3)
+        let narrow = RunnerRoundRecord(requestID: 2, drafted: 2, accepted: 1, committed: 2)
+        let audit = try #require(
+            try FreeRunRoundAudit.assemble(
+                records: [wide, narrow], slotForRequestID: [1: 0, 2: 1], streamCount: 2))
+        // Five tokens committed across the two rows: the round's entry is the
+        // tokens it committed, and its sum is still the window's token count.
+        #expect(audit.acceptanceLengths == [5])
+        #expect(audit.committedTotal == 5)
+        #expect(audit.activeStreamsByRound == [2])
+        #expect(audit.naturalAcceptedByStream == [[1], [1]])
+        #expect(audit.draftedTotal == 4)
+        #expect(audit.acceptedTotal == 2)
     }
 
     /// An MTP window whose engine journaled nothing reports no audit fields
@@ -577,13 +600,115 @@ struct FreeRunRoundAuditTests {
     func serialCohortStatesItself() async throws {
         let response = try await freeRun(script: nil, batch: 2, count: 4, serial: true)
         #expect(response.ok)
-        #expect(response.acceptanceLengths == [1, 1, 1, 1])
+        // Two rows each committing one token per round: the round's entry is
+        // both rows' token, and the sum is the window's 8.
+        #expect(response.acceptanceLengths == [2, 2, 2, 2])
         #expect(response.rounds == 4)
         #expect(response.activeStreamsByRound == [2, 2, 2, 2])
         #expect(response.naturalAcceptedByStream == [[0, 0, 0, 0], [0, 0, 0, 0]])
         #expect(response.draftedTotal == 0)
         #expect(response.acceptedTotal == 0)
         #expect(response.committedTotal == 8)
+    }
+
+    /// The engine can finalize a round while the seed forward is still
+    /// draining. Taking the journal cursor after that drain skipped those
+    /// records, so their tokens were returned by a window that did not state
+    /// them. The cursor is taken before the seed is submitted, and the round is
+    /// stated here.
+    @Test("A round finalized during the seed drain is stated in the first window")
+    func runAheadDuringSeedIsStated() async throws {
+        var script = MockRoundScript(rounds: [
+            MockRoundScript.Round(k: 2, accepted: 1, confirmed: 4)
+        ])
+        script.journalAtBegin = [MockRoundScript.Round(k: 2, accepted: 2, confirmed: 2)]
+        let begin =
+            "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+            + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+        let run = "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":6}"
+        let transport = ScriptedTransport(lines: [begin, run])
+        let server = makeServer(runner: MockRunner(script: script), transport: transport)
+        await server.run()
+        let response = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[2].utf8))
+        #expect(response.ok)
+        // 2 tokens from the round that ran ahead plus 4 from the window's own:
+        // the six the run returned.
+        #expect(response.acceptanceLengths == [2, 4])
+        #expect(response.committedTotal == 6)
+        #expect(response.draftedTotal == 4)
+        #expect(response.acceptedTotal == 3)
+    }
+
+    /// A delta can carry more tokens than the count a run asked for. The
+    /// surplus belongs to the NEXT window: dropping it jumped the stream forward
+    /// and lost a token that no window ever stated.
+    @Test("Tokens past the requested count are kept for the next window")
+    func surplusDeltaTokensCarry() async throws {
+        var script = MockRoundScript(rounds: [
+            MockRoundScript.Round(k: 2, accepted: 1, confirmed: 3),
+            MockRoundScript.Round(k: 2, accepted: 1, confirmed: 3),
+        ])
+        // Two tokens per delta, three asked for: every window is handed one
+        // more token than it returns.
+        script.deltaWidth = 2
+        let begin =
+            "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+            + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+        let transport = ScriptedTransport(lines: [
+            begin,
+            "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":3}",
+            "{\"id\":3,\"kind\":\"free_decode_run\",\"count\":3}",
+        ])
+        let server = makeServer(runner: MockRunner(script: script), transport: transport)
+        await server.run()
+        let first = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[2].utf8))
+        let second = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[3].utf8))
+        #expect(first.ok && second.ok)
+        #expect(first.tokens?.count == 3)
+        #expect(second.tokens?.count == 3)
+        // The streams run 200004, 200005, … with no gap and no repeat.
+        #expect(first.tokens == [200_004, 200_005, 200_006])
+        #expect(second.tokens == [200_007, 200_008, 200_009])
+        #expect(first.acceptanceLengths == [3])
+        #expect(second.acceptanceLengths == [3])
+    }
+
+    /// `committed_total` is the journal's own account of the window. When it
+    /// disagrees with the tokens the worker drained, one of the two is wrong and
+    /// neither is published.
+    @Test("A journal that accounts for fewer tokens than it returned is refused")
+    func journalDisagreementRefuses() async throws {
+        let short = MockRoundScript(rounds: [
+            MockRoundScript.Round(k: 2, accepted: 1, confirmed: 3)
+        ])
+        let response = try await freeRun(script: short, count: 6)
+        #expect(response.ok == false)
+        #expect(
+            response.error
+                == "mtp round journal accounts for 3 tokens, but this window returned 6")
+    }
+
+    /// A batched reseed seeds several rows in ONE engine step. Counting rows as
+    /// rounds stated `b` rounds of `b` tokens where the engine ran one round of
+    /// `b` tokens.
+    @Test("A batched reseed is one round, not one round per row")
+    func batchedSeedIsOneRound() {
+        let seeded = FreeRunRoundAudit.seedRounds(tokens: 4, rounds: 1, streamCount: 4)
+        #expect(seeded.count == 1)
+        #expect(seeded.first?.width == 4)
+        #expect(seeded.first?.activeStreams == 4)
+        #expect(seeded.reduce(0) { $0 + $1.width } == 4)
+        // Two seed steps, four rows: two rounds, and still four tokens.
+        let twoSteps = FreeRunRoundAudit.seedRounds(tokens: 4, rounds: 2, streamCount: 4)
+        #expect(twoSteps.count == 2)
+        #expect(twoSteps.map(\.width) == [2, 2])
+        #expect(twoSteps.reduce(0) { $0 + $1.width } == 4)
+        // Single stream: one row, one round, one token per step.
+        let single = FreeRunRoundAudit.seedRounds(tokens: 3, rounds: 3, streamCount: 1)
+        #expect(single.map(\.width) == [1, 1, 1])
     }
 }
 

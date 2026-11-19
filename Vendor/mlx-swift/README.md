@@ -2,11 +2,15 @@
 
 [**Installation**](#installation) | [**Documentation**](https://swiftpackageindex.com/ml-explore/mlx-swift/main/documentation/mlx) | [**Examples**](#examples)
 
+> **This is a fork.** `Layr-Labs/mlx-swift` tracks [`ml-explore/mlx-swift`](https://github.com/ml-explore/mlx-swift) and is the Swift layer of Layr-Labs' Apple-silicon inference stack (`mlx` → `mlx-c` → `mlx-swift` → `mlx-swift-lm`). Everything changed relative to upstream is published as a fork diff at **https://layr-labs.github.io/mlx-swift/**, described in [`fork.yaml`](fork.yaml) and kept honest by CI — see [FORKDIFF.md](FORKDIFF.md).
+
 MLX Swift is a Swift API for [MLX](https://ml-explore.github.io/mlx/build/html/index.html).
 
 MLX is an array framework for machine learning on Apple silicon. MLX Swift
 expands MLX to the Swift language, making research and experimentation easier
 on Apple silicon.
+
+[View Current Release Planning](https://github.com/ml-explore/mlx-swift/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-planning) and read about [Contributing](#contributing).
 
 ## Language Models
 
@@ -143,7 +147,7 @@ ninja
 
 **Install Dependencies**
 
-- To build the example binaries, install all dependencies listed in the CI [scripts](.github/scripts/).
+- To build the example binaries, install all dependencies listed in the upstream CI [scripts](https://github.com/ml-explore/mlx-swift/tree/main/.github/scripts).
 - Note: The CUDA GPU backend requires the CUDA toolkit and additional dependencies.
 - For Swift installation on Linux, visit [swift.org](https://www.swift.org/install/linux/).
 
@@ -185,6 +189,8 @@ contributors](ACKNOWLEDGMENTS.md#Individual-Contributors). If you contribute
 to MLX Swift and wish to be acknowledged, please add your name to the list in your
 pull request.
 
+Smaller, focused PRs are easier and quicker to review.  Sometimes larger PRs can't be helped.  If you want to discuss, feel free to open an issue or ask questions in a PR.
+
 MLX Swift was initially developed by David Koski and Ronan Collobert, and is
 now maintained by David Koski. MLX Swift is built on top of
 [MLX](https://github.com/ml-explore/mlx), which was initially developed with
@@ -192,6 +198,21 @@ equal contribution by Awni Hannun, Jagrit Digani, Angelos Katharopoulos, and
 Ronan Collobert.
 
 ## Versions
+
+### Packed signed-Hadamard layers
+
+`MLXNN.SignedBlockHadamard`, `HadamardQuantizedLinear`, and
+`HadamardQuantizedEmbedding` support already-packed affine weights with explicit
+signed block transforms. The transform uses Float32 intermediates and restores
+the input dtype, matching the published Ternary Bonsai 2 MLX pack. This is not a
+GGUF loader, a quantizer, or a claim of full-model qualification. Existing MLX
+Hadamard and 2-bit affine primitives are reused without core kernel changes.
+
+The layer implementation and tests are adapted from
+[PrismML-Eng/mlx-swift](https://github.com/PrismML-Eng/mlx-swift/tree/6d3a84de28225d1f5bc0a56f5c781596997242f9),
+under the repository's MIT license (copyright 2023 ml-explore). No Prism 1-bit,
+CUDA, or optimizer changes are included. Run `swift test --filter HadamardLayerTests`
+with the source-matched Metal library available to validate this layer surface.
 
 See [Releases](https://github.com/ml-explore/mlx-swift/releases).  Generally the MLX Swift version number corresponds to the same version number in [MLX](https://github.com/ml-explore/mlx).  Release notes indicate specifics.
 

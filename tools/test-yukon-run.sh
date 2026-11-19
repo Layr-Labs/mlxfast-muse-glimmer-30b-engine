@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic test for tools/bonsai2-9b-yukon-run.sh. No GPU, no benchd.
+# Hermetic test for tools/muse-glimmer-30b-yukon-run.sh. No GPU, no benchd.
 #
 # The script copies into a temporary tree. Stubs replace the ranked script,
 # ./benchmark.sh and the trusted CLI, and each stub records how it was called.
@@ -28,10 +28,10 @@ pass() { echo "ok   $*"; }
 make_tree() {
   local t="$1"
   mkdir -p "${t}/tools" "${t}/fixtures" "${t}/.build/release"
-  cp "${SRC}/tools/bonsai2-9b-yukon-run.sh" "${SRC}/tools/spec-declaration.sh" "${t}/tools/"
-  cp "${SRC}/fixtures/bonsai2_9b_mlx_v1_track.json" "${t}/fixtures/"
+  cp "${SRC}/tools/muse-glimmer-30b-yukon-run.sh" "${SRC}/tools/spec-declaration.sh" "${t}/tools/"
+  cp "${SRC}/fixtures/muse_glimmer_30b_mlx_v1_track.json" "${t}/fixtures/"
   printf '%s' "$2" > "${t}/mtp-head.manifest.json"
-  cat > "${t}/tools/bonsai2-9b-measure-and-score.sh" <<'EOF'
+  cat > "${t}/tools/muse-glimmer-30b-measure-and-score.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "ranked $*" >> "$(dirname "$0")/../calls"
 EOF
@@ -54,37 +54,37 @@ BAD='{"version":1,"source":"pinned","spec":{"enabled":true,"num_speculative_toke
 
 # 1
 t="${WORK}/c1"; make_tree "${t}" "${MTP3}"
-"${clean_env[@]}" GITHUB_ACTIONS=true "${t}/tools/bonsai2-9b-yukon-run.sh" --preflight-only
+"${clean_env[@]}" GITHUB_ACTIONS=true "${t}/tools/muse-glimmer-30b-yukon-run.sh" --preflight-only
 if [[ "$(cat "${t}/calls")" == "ranked --preflight-only" ]]; then pass "case 1: GITHUB_ACTIONS=true is ranked"; else fail "case 1: $(cat "${t}/calls")"; fi
 
 # 2
 for var in MLXFAST_QWEN38_GOLDEN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_BASELINE_CALIBRATION; do
   t="${WORK}/c2-${var}"; make_tree "${t}" "${MTP3}"
-  "${clean_env[@]}" "${var}=/nonexistent" "${t}/tools/bonsai2-9b-yukon-run.sh"
+  "${clean_env[@]}" "${var}=/nonexistent" "${t}/tools/muse-glimmer-30b-yukon-run.sh"
   if [[ "$(cat "${t}/calls")" == "ranked " ]]; then pass "case 2: ${var} alone is ranked"; else fail "case 2 ${var}: $(cat "${t}/calls")"; fi
 done
 
 # 3
 t="${WORK}/c3"; make_tree "${t}" "${MTP3}"
-"${clean_env[@]}" MLXFAST_SCORE_PATH=score.json "${t}/tools/bonsai2-9b-yukon-run.sh" 2>/dev/null
+"${clean_env[@]}" MLXFAST_SCORE_PATH=score.json "${t}/tools/muse-glimmer-30b-yukon-run.sh" 2>/dev/null
 want="cli transform --reference reference_weights/bonsai2-9b-target --output weights
 local golden= score=score.json engine=.build/release/bench-worker --local-submit --mtp-depth 3"
 if [[ "$(cat "${t}/calls")" == "${want}" ]]; then pass "case 3: local path transforms, then runs --local-submit at depth 3"; else fail "case 3: $(cat "${t}/calls")"; fi
 
 # 4
 t="${WORK}/c4"; make_tree "${t}" "${SERIAL}"; mkdir -p "${t}/weights"; : > "${t}/weights/config.json"
-"${clean_env[@]}" "${t}/tools/bonsai2-9b-yukon-run.sh" 2>/dev/null
+"${clean_env[@]}" "${t}/tools/muse-glimmer-30b-yukon-run.sh" 2>/dev/null
 want="local golden= score= engine=.build/release/bench-worker --local-submit"
 if [[ "$(cat "${t}/calls")" == "${want}" ]]; then pass "case 4: weights present and serial: no transform, no --mtp-depth"; else fail "case 4: $(cat "${t}/calls")"; fi
 
 # 5
 t="${WORK}/c5"; make_tree "${t}" "${SERIAL}"
-"${clean_env[@]}" "${t}/tools/bonsai2-9b-yukon-run.sh" --preflight-only 2>/dev/null; rc=$?
+"${clean_env[@]}" "${t}/tools/muse-glimmer-30b-yukon-run.sh" --preflight-only 2>/dev/null; rc=$?
 if [[ "${rc}" == "2" && ! -e "${t}/calls" ]]; then pass "case 5: the local path refuses an argument"; else fail "case 5: rc=${rc}"; fi
 
 # 6
 t="${WORK}/c6"; make_tree "${t}" "${BAD}"; mkdir -p "${t}/weights"; : > "${t}/weights/config.json"
-"${clean_env[@]}" "${t}/tools/bonsai2-9b-yukon-run.sh" 2>/dev/null; rc=$?
+"${clean_env[@]}" "${t}/tools/muse-glimmer-30b-yukon-run.sh" 2>/dev/null; rc=$?
 if [[ "${rc}" != "0" && ! -e "${t}/calls" ]]; then pass "case 6: an out-of-envelope declaration stops before benchmark.sh"; else fail "case 6: rc=${rc}"; fi
 
 [[ "${fails}" == "0" ]] || exit 1

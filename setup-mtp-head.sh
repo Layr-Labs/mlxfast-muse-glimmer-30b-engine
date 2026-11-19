@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the organizer-pinned MTP HEAD for track bonsai2-9b-mlx-v1.
+# Provision the organizer-pinned MTP HEAD for track muse-glimmer-30b-mlx-v1.
 #
 # This script provisions the HEAD and nothing else. The TARGET is the Bonsai 2
 # 9B pack that ./setup.sh pins, downloads and verifies against
@@ -36,7 +36,7 @@ umask 022
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "${ROOT_DIR}"
 
-TRACK_ID="bonsai2-9b-mlx-v1"
+TRACK_ID="muse-glimmer-30b-mlx-v1"
 HEAD_REPO="${MLXFAST_MTP_HEAD_REPO:-BONSAI-MLX-PENDING-ORGANIZER}"
 HEAD_REVISION="${MLXFAST_MTP_HEAD_REVISION:-BONSAI-MLX-PENDING-ORGANIZER}"
 HEAD_MANIFEST="${MLXFAST_MTP_HEAD_MANIFEST_PATH:-fixtures/reference_bonsai2_9b_mtp_head.sha256}"

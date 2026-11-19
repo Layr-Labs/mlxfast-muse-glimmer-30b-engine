@@ -4,7 +4,8 @@
 // The reference layout uses one fixed K/V slab pair per group. The explicit
 // segmented configuration instead commits bounded combined K/V buffers as
 // admitted demand grows; the total segment count has no dispatch-level cap.
-// Both preserve the selected FP16, BF16 or FP32 dtype without KV quantization.
+// Native groups preserve the selected FP16, BF16 or FP32 dtype. Optional
+// quantized segments store token-local codes plus a separately owned native band.
 //
 // Admission reserves each request's worst-case page demand and materializes
 // enough backing before creating its nonthrowing row. Actual page ownership
@@ -24,6 +25,27 @@ public enum CBv2PagedDefaults {
     public static let pageSize = 16
 }
 
+/// Process-wide request for segmented pools to drop retained free segments
+/// (`PagedKVPoolConfig.retainedFreeSegmentBytes`). That backing is live
+/// allocator memory outside every grant, so a cache flush cannot reclaim it.
+/// Pools are engine-queue confined: a reclaimer only advances this epoch, and
+/// each pool drops its backing at its engine's next step.
+public enum CBv2RetainedKVSegments {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var epoch: UInt64 = 0
+    private nonisolated(unsafe) static var bytes = 0
+
+    public static func requestRelease() { lock.withLock { epoch &+= 1 } }
+
+    /// Retained backing across every pool: allocator-active memory that load
+    /// admission may count as reclaimable once a release request lands.
+    public static var retainedBytes: Int { lock.withLock { bytes } }
+
+    static var releaseEpoch: UInt64 { lock.withLock { epoch } }
+
+    static func recordRetained(_ delta: Int) { lock.withLock { bytes += delta } }
+}
+
 /// Configuration for a `PagedKVPool`.
 public struct PagedKVPoolConfig: Sendable {
     /// Tokens per page. Must divide the decode kernel's expectations; keep
@@ -37,9 +59,29 @@ public struct PagedKVPoolConfig: Sendable {
     /// build-time forward probe must validate this table before serving. nil
     /// preserves the uniform fixed-reference policy.
     public var layerDTypes: [DType]?
+    /// Packed old attention rows; native compute precision remains unchanged.
+    public var quantization: PagedKVQuantizationConfig?
+    /// Owning rows required natively by an enabled assistant/capability.
+    public var nativeLayerIndices: Set<Int>
+    /// Explicit correctness-first asymmetric paging policy. nil preserves
+    /// legacy fused eligibility; no model/provider default opts into this.
+    public var gatheredAttention: CBv2PagedGatheredAttentionLimits?
     /// Explicit foundation opt-in. nil retains the fixed-slab reference.
     /// Segments grow under the same byte grant; this is not a total-pool cap.
     public var segmentSizeBytes: Int?
+    /// Free segment backing kept evaluated across row release, in bytes. A
+    /// retained buffer leaves the committed set exactly as a trim does (grant,
+    /// floor and ledger coverage are released), so admission and headroom see
+    /// it like freed MLX cache; a later growth of the same size class
+    /// reinstalls it without allocating, filling or fencing. 0 drops every
+    /// free segment at release.
+    public var retainedFreeSegmentBytes: Int
+    /// Segments left retained this long while their engine idles are dropped.
+    public var retainedFreeSegmentIdleSeconds: Double
+    /// New segments wrap zero-fill-on-demand host pages without a copy: no
+    /// stream work, completion fence or MLX eval lock at admission. false
+    /// keeps the device zero fill and its stream fence per segment.
+    public var hostZeroedSegments: Bool
     /// Upper bound on tokens written to a WINDOWED layer in one
     /// `update(keys:values:)` call (i.e. the scheduler's max prefill chunk).
     /// Bounds one windowed update; larger updates trap. Since WS-1.2 the
@@ -80,12 +122,24 @@ public struct PagedKVPoolConfig: Sendable {
         maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
-        layerDTypes: [DType]? = nil
+        layerDTypes: [DType]? = nil,
+        gatheredAttention: CBv2PagedGatheredAttentionLimits? = nil,
+        quantization: PagedKVQuantizationConfig? = nil,
+        nativeLayerIndices: Set<Int> = [],
+        retainedFreeSegmentBytes: Int = 0,
+        retainedFreeSegmentIdleSeconds: Double = 30,
+        hostZeroedSegments: Bool = false
     ) {
+        self.retainedFreeSegmentBytes = retainedFreeSegmentBytes
+        self.retainedFreeSegmentIdleSeconds = retainedFreeSegmentIdleSeconds
+        self.hostZeroedSegments = hostZeroedSegments
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
         self.layerDTypes = layerDTypes
+        self.quantization = quantization
+        self.nativeLayerIndices = nativeLayerIndices
+        self.gatheredAttention = gatheredAttention
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.maxBufferLength = maxBufferLength
@@ -112,14 +166,65 @@ public final class PagedKVPool {
     /// request-time resource-failure path.
     let kernelSource: String
     let segmentGrant: PagedKVGrant?
+    /// Decode seqinfo shared across this pool's segmented layers per step.
+    let segmentSeqinfo = PagedSegmentSeqinfoCache()
     /// One engine-ledger owner covers committed and privately preparing native
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
     var memoryAdmission: AdmissionV2?
+    var quantizedRecentRows: [PagedKVRecentWeakRow] = []
+    /// Scoped evaluation of a completed step's compact native destinations.
+    var quantizedRecentEvaluate: ([MLXArray]) throws -> Void = { roots in
+        try withError { fault in
+            eval(roots)
+            try fault.check()
+            StreamOrDevice.default.stream.synchronize()
+            try fault.check()
+        }
+    }
+    var pendingQuantizedScratch: [PagedQuantizedScratchLease] = []
+    var quantizedAttentionCaches: [Int: CBv2PagedAttentionWeakCache] = [:]
+    var nativeModelBinding: CBv2NativePagedModelBinding?
+    public let gatheredAttentionScratchBound: Int
+    var gatheredAttentionReservation: CBv2CheckpointReservation?
+    var attentionWorkEnginePrepared = false
+    private let attentionWorkSnapshotLock = NSLock()
+    private var attentionWorkRefusalSnapshot: String?
+    private var attentionWorkChargeSnapshot = 0
+    var attentionWorkEngineRefusal: String? {
+        get { attentionWorkSnapshotLock.withLock { attentionWorkRefusalSnapshot } }
+        set { attentionWorkSnapshotLock.withLock { attentionWorkRefusalSnapshot = newValue } }
+    }
+    var attentionWorkGeneration: UInt64 = 0
+    var attentionWorkOwners: [UInt64: CBv2PagedAttentionStepOwner] = [:]
+    var attentionWorkCaches: [Int: CBv2PagedAttentionWeakCache] = [:]
+    var activeAttentionWork: CBv2PagedAttentionStepOwner?
+    var activeAttentionLayer: Int?
+    var usesStepOwnedAttention: Bool {
+        if case .stepOwned? = config.gatheredAttention?.admissionMode { return true }
+        return false
+    }
+    var attentionWorkBytesReserved: Int {
+        attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot }
+    }
+    /// Engine-queue test seam, nil in production: sees each step scratch
+    /// reservation's site, requests and exact bytes immediately before it.
+    var stepScratchReservationObserverForTesting:
+        ((CBv2StepScratchSite, Set<CBv2RequestID>, Int) -> Void)?
+    func publishAttentionWorkCharge() {
+        let bytes = attentionWorkOwners.values.reduce(0) { $0 + $1.reservedBytes }
+        attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot = bytes }
+    }
     var storageTelemetry = PagedKVStorageTelemetry()
     let writeValidation = CBv2PagedKVWriteValidation()
     /// Deterministic failure-order observer; production leaves this unset.
     var checkpointImportBeforeRollback: (() -> Void)?
+    /// Empty-pool retirement boundary; replaceable only for ordering tests.
+    var synchronizeEmptyRetirement: (MLX.Stream) -> Void = { $0.synchronize() }
+    /// Last time retained segment backing was parked or reinstalled.
+    var retainedSegmentsTouchedNanos: UInt64 = 0
+    /// Last process-wide retained-segment release request this pool honored.
+    var retainedReleaseEpoch = CBv2RetainedKVSegments.releaseEpoch
     let groupDemandBytes: [PagedKVGroupKey: Int]
     let totalDemandBytes: Int
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
@@ -133,6 +238,13 @@ public final class PagedKVPool {
     /// fingerprinted by serial can never confuse a finished request's rows
     /// with a new request's (see `PagedLayerCache.deviceTables`).
     private var lastRowSerial: UInt64 = 0
+    /// Extra native page promises retained by row-issued immutable snapshots.
+    private(set) var immutableSnapshotReservedPages = 0
+
+    func noteImmutableSnapshotPages(_ delta: Int) {
+        precondition(immutableSnapshotReservedPages + delta >= 0)
+        immutableSnapshotReservedPages += delta
+    }
 
     func nextRowSerial() -> UInt64 {
         lastRowSerial += 1
@@ -242,12 +354,36 @@ public final class PagedKVPool {
                         + "nil for a pool that never shares blocks")
             }
         }
-        let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
-        let groupKeys = layerKinds.enumerated().map { index, kind in
-            PagedKVGroupKey(
-                kind, dtype: resolvedTypes[index],
-                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil)
+        guard
+            config.nativeLayerIndices.allSatisfy({
+                layerKinds.indices.contains($0) && layerKinds[$0].sharesKVWithLayer == nil
+            })
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native KV index is not a loaded storage owner")
         }
+        if let quantization = config.quantization {
+            guard config.segmentSizeBytes != nil else {
+                throw CBv2KVError.backendIneligible(reason: "packed KV requires segmented backing")
+            }
+            try quantization.validateParameters()
+            for (index, kind) in layerKinds.enumerated()
+            where !config.nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
+                && PagedKVGroupKey.quantization(for: kind, config: quantization) != nil
+            {
+                guard kind.headDim == kind.valueHeadDim else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "packed runtime KV requires an equal-width attention reader")
+                }
+                try quantization.validate(headDim: kind.headDim)
+                try quantization.validate(headDim: kind.valueHeadDim)
+            }
+        }
+        let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
+        let groupKeys = PagedKVGroupKey.storageKeys(
+            layerKinds: layerKinds, dtypes: resolvedTypes,
+            separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil,
+            quantization: config.quantization, nativeLayerIndices: config.nativeLayerIndices)
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
         guard !owning.isEmpty else {
@@ -278,8 +414,14 @@ public final class PagedKVPool {
         self.config = config
         self.layerDTypes = resolvedTypes
         self.layerGroupKeys = groupKeys
+        self.gatheredAttentionScratchBound =
+            config.gatheredAttention?.admissionMode == .poolLifetime
+                && layerKinds.contains { $0.headDim != $0.valueHeadDim }
+            ? try config.gatheredAttention?.scratchUpperBound(
+                layerKinds: layerKinds, pageSize: config.pageSize) ?? 0 : 0
         self.kernelSource = source
-        self.segmentGrant = config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
+        self.segmentGrant =
+            config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
 
         var demandTokens: [PagedKVGroupKey: Int] = [:]
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -293,9 +435,10 @@ public final class PagedKVPool {
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            let bytesPerToken = try Self.checkedMultiply(
-                [2, key.kvHeads, key.headDim, key.dtype.size],
-                context: "bytes per token")
+            guard let bytesPerToken = try? key.bytesPerToken()
+            else {
+                throw CBv2KVError.backendIneligible(reason: "paged K/V byte-rate overflow")
+            }
             let bytes = try Self.checkedMultiply(
                 [tokens, bytesPerToken],
                 context: "group byte demand")
@@ -310,9 +453,12 @@ public final class PagedKVPool {
         self.groupDemandBytes = demandBytes
         self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
-            let pageBytes = try Self.checkedMultiply(
-                [2, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
-                context: "page bytes")
+            guard let tokenBytes = try? key.bytesPerToken(),
+                let pageBytes = try? Self.checkedMultiply(
+                    [tokenBytes, config.pageSize], context: "page bytes")
+            else {
+                throw CBv2KVError.backendIneligible(reason: "paged K/V page-byte overflow")
+            }
             if let target = config.segmentSizeBytes {
                 let layout = try PagedKVSegmentLayout(
                     pageBytes: pageBytes, targetBytes: target,
@@ -329,14 +475,19 @@ public final class PagedKVPool {
             let pageCount = groupBytes / pageBytes
             guard pageCount >= 2 else {
                 throw CBv2KVError.capacityExhausted(
-                    needed: try Self.checkedMultiply([2, pageBytes], context: "minimum group bytes"),
+                    needed: try Self.checkedMultiply(
+                        [2, pageBytes], context: "minimum group bytes"),
                     available: groupBytes)
             }
             guard pageCount <= Int(Int32.max) else {
-                throw CBv2KVError.backendIneligible(reason: "paged group exceeds Int32 page-table limit")
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged group exceeds Int32 page-table limit")
             }
             let slabBytes = try Self.checkedMultiply(
-                [pageCount, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
+                [
+                    pageCount, key.kvHeads, config.pageSize, max(key.headDim, key.valueHeadDim),
+                    key.dtype.size,
+                ],
                 context: "slab bytes")
             guard slabBytes <= config.maxBufferLength else {
                 throw CBv2KVError.backendIneligible(
@@ -692,14 +843,63 @@ public final class PagedKVPool {
     /// Retire free native segments after reservation/row release. Fixed pools
     /// retain their reference behavior until segmented execution is promoted.
     func trimFreeSegments() {
+        // Issued native pools keep reusable segments AND their truthful floor
+        // until actual engine quiescence. No native wait/refund under commit.
+        if nativeModelBinding != nil { return }
         guard config.segmentSizeBytes != nil else { return }
+        let previousBytes = bytesMaterialized
+        var retainable = max(0, config.retainedFreeSegmentBytes - retainedSegmentBytes)
+        var dropped = false
         for key in groupKeys {
-            group(key).trimSegments { [unowned self] handle in
+            let droppedBacking = group(key).trimSegments(retainingUpTo: &retainable) {
+                [unowned self] handle in
                 pageReuseObserver?.pagedKVPool(self, willReuse: handle)
             }
+            dropped = dropped || droppedBacking
         }
-        physicalLease?.release(to: bytesMaterialized)
+        let remainingBytes = bytesMaterialized
+        if remainingBytes < previousBytes { retainedSegmentsTouchedNanos = Self.uptimeNanos() }
+        if previousBytes > 0 && remainingBytes == 0 && dropped {
+            // Eval/readback can signal before Metal completion handlers drop
+            // their input-buffer owners. Drain after the pool's owners die,
+            // before refunding its last floor. Native kernels and retirement
+            // share the engine's default stream (including a scoped override).
+            // Retained backings stay alive and counted as allocator memory.
+            synchronizeEmptyRetirement(StreamOrDevice.default.stream)
+        }
+        physicalLease?.release(to: remainingBytes)
     }
+
+    /// Free backing parked by `trimFreeSegments`; not committed or charged.
+    var retainedSegmentBytes: Int {
+        groups.values.reduce(0) { $0 + $1.retainedSegmentBytes }
+    }
+
+    /// Drop every retained backing. Uncommitted, so no floor or ledger edit.
+    func releaseRetainedSegments() {
+        for group in groups.values { group.releaseRetainedSegments() }
+    }
+
+    /// Engine-queue idle hook: retained backing untouched for the configured
+    /// idle interval goes back to the allocator.
+    func releaseRetainedSegmentsIfIdle(nowNanos: UInt64 = PagedKVPool.uptimeNanos()) {
+        guard retainedSegmentBytes > 0 else { return }
+        let idle = UInt64(max(0, config.retainedFreeSegmentIdleSeconds) * 1e9)
+        guard nowNanos &- retainedSegmentsTouchedNanos >= idle else { return }
+        releaseRetainedSegments()
+    }
+
+    /// Engine-queue step hook: a process-wide release request (memory
+    /// pressure, or a refused charge anywhere in the process) drops retained
+    /// backing, which no allocator cache flush can reach.
+    func releaseRetainedSegmentsIfRequested() {
+        let epoch = CBv2RetainedKVSegments.releaseEpoch
+        guard epoch != retainedReleaseEpoch else { return }
+        retainedReleaseEpoch = epoch
+        releaseRetainedSegments()
+    }
+
+    static func uptimeNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
     deinit {
         // Native segment aliases must leave the pool before its charge does.
@@ -708,12 +908,18 @@ public final class PagedKVPool {
         }
         groups.removeAll()
         physicalLease?.close()
+        gatheredAttentionReservation?.release()
+        // Unknown work owners quarantine their roots and C on destruction;
+        // successfully completed owners have already closed their permits.
+        activeAttentionWork = nil
+        attentionWorkOwners.removeAll()
     }
 
     // MARK: - Page lifecycle
 
-    func allocatePage(group key: PagedKVGroupKey) -> Int32 {
-        group(key).allocatePage { [unowned self] handle in
+    /// `hint`: the page the same row layer allocated last, if any.
+    func allocatePage(group key: PagedKVGroupKey, after hint: Int32? = nil) -> Int32 {
+        group(key).allocatePage(after: hint) { [unowned self] handle in
             pageReuseObserver?.pagedKVPool(self, willReuse: handle)
         }
     }
@@ -748,9 +954,9 @@ public final class PagedKVPool {
         return group(handle.group).refCounts[Int(handle.page)]
     }
 
-    /// Move a generation-valid, zero-ref page to the immediate-reuse end after
-    /// its final cache alias disappears. Active pages are classified when
-    /// their last owner releases them instead.
+    /// Make a generation-valid, zero-ref page uncached (reused before any
+    /// cached page) after its final cache alias disappears. Active pages are
+    /// classified when their last owner releases them instead.
     func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
         groups[handle.group]?.reclassifyAsUncached(handle)
     }
@@ -806,9 +1012,30 @@ public final class PagedKVPool {
     ) {
         guard !slots.isEmpty else { return }
         let g = group(key)
-        guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else { return }
+        guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else {
+            return
+        }
+        guard
+            writeValidation.validateShape(
+                keys: keys, values: values, group: key,
+                rank: 3, batch: nil, tokens: slots.count)
+        else { return }
+        if usesStepOwnedAttention {
+            guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
+                writeValidation.refuse("unplanned low-level paged write", expected: g.dtype)
+                return
+            }
+            PagedAsymmetricTransfers.writeSegmented(
+                group: g, slots: slots, keys: keys, values: values,
+                work: activeAttentionWork)
+            return
+        }
         if g.segmentLayout != nil {
             PagedSegmentTransfers.write(group: g, slots: slots, keys: keys, values: values)
+            return
+        }
+        if key.isAsymmetric {
+            PagedAsymmetricTransfers.writeFixed(group: g, slots: slots, keys: keys, values: values)
             return
         }
         precondition(keys.dim(1) == slots.count && values.dim(1) == slots.count)
@@ -876,15 +1103,29 @@ public final class PagedKVPool {
         group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int
     ) -> (keys: MLXArray, values: MLXArray) {
         let g = group(key)
+        if usesStepOwnedAttention {
+            guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
+                writeValidation.refuse("unplanned low-level paged gather", expected: g.dtype)
+                return (
+                    MLXArray.zeros([1, key.kvHeads, 0, key.headDim], dtype: g.dtype),
+                    MLXArray.zeros([1, key.kvHeads, 0, key.valueHeadDim], dtype: g.dtype)
+                )
+            }
+            return PagedAsymmetricTransfers.gatherSegmented(
+                group: g, pages: pages,
+                firstSlot: firstSlot, count: count, work: activeAttentionWork)
+        }
         if g.segmentLayout != nil {
-            return PagedSegmentTransfers.gather(group: g, pages: pages, firstSlot: firstSlot, count: count)
+            return PagedSegmentTransfers.gather(
+                group: g, pages: pages, firstSlot: firstSlot, count: count)
         }
         let h = g.key.kvHeads
         let d = g.key.headDim
+        let vd = g.key.valueHeadDim
         let s = g.pageSize
         guard count > 0 else {
             let empty = MLXArray.zeros([1, h, 0, d], dtype: g.dtype)
-            return (empty, empty)
+            return (empty, d == vd ? empty : MLXArray.zeros([1, h, 0, vd], dtype: g.dtype))
         }
         precondition(firstSlot < s)
         precondition(pages.count * s >= firstSlot + count, "gather range exceeds page list")
@@ -893,15 +1134,17 @@ public final class PagedKVPool {
         // barrier it induces) is what orders this gather after every prior
         // bulk write of the group.
         let idx = MLXArray(pages) + g.writeFence * 0
-        func assemble(_ slab: MLXArray) -> MLXArray {
+        func assemble(_ slab: MLXArray, width: Int) -> MLXArray {
             // [np, H, S, D] -> [H, np, S, D] -> [H, np*S, D] -> slice -> [1, H, count, D]
             take(slab, idx, axis: 0)
                 .transposed(1, 0, 2, 3)
-                .reshaped([h, pages.count * s, d])[0..., firstSlot ..< (firstSlot + count), 0...]
+                .reshaped([h, pages.count * s, width])[
+                    0..., firstSlot ..< (firstSlot + count), 0...
+                ]
                 .expandedDimensions(axis: 0)
         }
-        let keys = assemble(g.kSlab)
-        let values = assemble(g.vSlab)
+        let keys = assemble(g.kSlab, width: d)
+        let values = assemble(g.vSlab, width: vd)
         // The back-edge. ONE element of each is enough: MLX schedules whole
         // primitives, so a dependency on any slice of the gather forces the
         // gather itself. (`CBv2MTPCaptureFence` publishes the identical edge
@@ -918,7 +1161,7 @@ public final class PagedKVPool {
 
     /// Truthful bytes behind pages sequences have actually touched.
     public var bytesInUse: Int {
-        groups.values.reduce(0) { $0 + $1.pagesInUse * $1.pageBytes }
+        groups.values.reduce(nativeRecentBytesInUse) { $0 + $1.pagesInUse * $1.pageBytes }
     }
 
     /// Bytes promised to admitted sequences (the admission-relevant figure).
@@ -949,8 +1192,8 @@ public final class PagedKVPool {
             return max(0, segmentGrant.snapshot().bytes - bytesMaterialized)
         }
         return groups.values.reduce(0) {
-            $0 + ($1.kSlabMaterialized ? 0 : $1.slabBytes)
-                + ($1.vSlabMaterialized ? 0 : $1.slabBytes)
+            $0 + ($1.kSlabMaterialized ? 0 : $1.keySlabBytes)
+                + ($1.vSlabMaterialized ? 0 : $1.valueSlabBytes)
         }
     }
 
@@ -1005,4 +1248,118 @@ public final class PagedKVPool {
         try materializeSegments(all: false)
     }
 
+}
+
+extension PagedKVPool {
+    /// Called only outside the native outcome commit, with no remaining row,
+    /// step, import, media or unrelated operation loan. Its lifetime loan still
+    /// retains the real engine/pool until actual backing and C are detached.
+    func retireIssuedNativePool() throws {
+        guard let binding = nativeModelBinding else { return }
+        if binding.poolRetired { return }
+        guard binding.canStartPoolRetirement, activeAttentionWork == nil,
+            attentionWorkOwners.isEmpty,
+            groups.values.allSatisfy({
+                $0.pagesReserved == 0 && $0.pagesInUse == 0
+                    && $0.deferredFrees.isEmpty
+            }),
+            residentPrefixQuarantineIsAbsent
+        else {
+            throw CBv2NativeShutdownError.operationClosed
+        }
+        let operation = try binding.beginWork(nativeData: false)
+        retainNativePoolBacking(in: operation)
+        do {
+            try operation.requiredDrain()
+            guard
+                try operation.tracking.commitIfHealthyThrowing({
+                    try binding.markPoolRetired(after: operation)
+                })
+            else { throw CBv2NativeShutdownError.operationClosed }
+            // Backing references remain on the genuine operation while these
+            // metadata maps and actual M coverage are detached OUTSIDE commit.
+            for group in groups.values { group.trimSegments { _ in } }
+            guard bytesMaterialized == 0 else { throw CBv2NativeShutdownError.operationClosed }
+            if binding.completePrefixIdentity != nil {
+                // No remaining request/work/import/export loan can retain a
+                // map generation here. Retire actual address/refcount/free-page
+                // maps before releasing their pool-owned host allowance.
+                groups.removeAll(keepingCapacity: false)
+            }
+            operation.finish {
+                physicalLease?.release(to: 0)
+                physicalLease?.close()
+                physicalLease = nil
+                binding.finishPoolLifetime()
+            }
+        } catch {
+            operation.fail()
+            throw error
+        }
+    }
+
+    /// Whole free segments an issued GLM pool could return now: what
+    /// `trimSegments` would retire. Metadata only.
+    var issuedNativeReleasableBytes: Int {
+        guard nativeModelBinding?.isGLM5Next == true else { return 0 }
+        return groups.values.reduce(0) { $0 + $1.trimmableSegmentBytes }
+    }
+
+    /// Returns an issued GLM pool's free segments to the allocator and refunds
+    /// their physical floor, as `trimFreeSegments` does for other pools. A
+    /// native pool skips that trim (no native wait under commit), so without
+    /// this its backing only grows: every complete-checkpoint import attaches
+    /// new segments, and the free ones stay charged until the pool retires.
+    /// Once that floor nears the grant, a lone request cannot reserve its
+    /// state and first step's scratch beside it and fails as capacity.
+    ///
+    /// Same order as `retireIssuedNativePool`, without retiring the pool:
+    /// engine queue only, outside the native outcome commit, between steps,
+    /// with no attention work and no native loan but the pool's own lifetime
+    /// loan. Segments holding an in-use or reserved page stay, exactly as
+    /// `trimSegments` keeps them. Returns the bytes released (0 when nothing
+    /// was free), or nil while other native work keeps the pool busy.
+    func releaseIssuedNativeFreeSegments() throws -> Int? {
+        guard let binding = nativeModelBinding, binding.isGLM5Next, !binding.poolRetired,
+            binding.canStartPoolRetirement, activeAttentionWork == nil,
+            attentionWorkOwners.isEmpty,
+            groups.values.allSatisfy({ $0.deferredFrees.isEmpty }),
+            residentPrefixQuarantineIsAbsent
+        else { return nil }
+        guard issuedNativeReleasableBytes > 0 else { return 0 }
+        let before = bytesMaterialized
+        // The lease covers the backing; `release(to:)` may only lower it.
+        if let lease = physicalLease, lease.bytes < before { return nil }
+        let operation = try binding.beginWork(nativeData: false)
+        retainNativePoolBacking(in: operation)
+        do {
+            try operation.requiredDrain()
+        } catch {
+            // A failed drain has already failed the native runtime.
+            operation.fail()
+            throw error
+        }
+        // Backing references remain on the operation while these metadata maps
+        // and actual M coverage are detached OUTSIDE commit.
+        for group in groups.values { group.trimSegments { _ in } }
+        let remaining = bytesMaterialized
+        // `finish` refuses only after a terminal native fault, which has
+        // already failed every row; the trim stands either way.
+        _ = operation.finish { physicalLease?.release(to: remaining) }
+        return before - remaining
+    }
+
+    private var residentPrefixQuarantineIsAbsent: Bool {
+        // The constructor refuses a resident prefix index for this profile.
+        pageReuseObserver == nil
+    }
+
+    private func retainNativePoolBacking(in operation: CBv2NativePagedOperation) {
+        for group in groups.values {
+            for segment in group.segments.values {
+                operation.retain(segment.storage)
+                operation.retain(owner: segment.backing)
+            }
+        }
+    }
 }

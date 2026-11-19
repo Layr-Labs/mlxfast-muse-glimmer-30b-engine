@@ -1,5 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
+import contextlib
 import os
 import platform
 import sys
@@ -8,6 +9,26 @@ from typing import Any, Callable, List, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
+
+
+@contextlib.contextmanager
+def scoped_env(**environ):
+    """
+    Temporarily set the process environment variables.
+
+    Passing a value of None removes the variable for the duration of the context.
+    """
+    old_environ = dict(os.environ)
+    for key, value in environ.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old_environ)
 
 
 class MLXTestRunner(unittest.TestProgram):
@@ -33,11 +54,18 @@ class MLXTestCase(unittest.TestCase):
         if device is not None:
             device = getattr(mx, device)
             mx.set_default_device(device)
+        # Each test draws the same random input in every run. Many tests
+        # compare with a reference under a fixed tolerance, and some random
+        # inputs fall outside it (for example a near-zero element under a
+        # relative tolerance), so unseeded input made them fail now and then.
+        mx.random.seed(0)
+        np.random.seed(0)
 
     def tearDown(self):
         mx.set_default_device(self.default)
 
-    # Note if a tuple is passed into args, it will be considered a shape request and convert to a mx.random.normal with the shape matching the tuple
+    # Note if a tuple is passed into args, it will be considered a shape request and
+    # convert to a mx.random.normal with the shape matching the tuple
     def assertCmpNumpy(
         self,
         args: List[Union[Tuple[int], Any]],

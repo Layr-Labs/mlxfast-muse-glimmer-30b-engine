@@ -286,6 +286,71 @@ public struct RunnerManifest: Sendable, Codable, Equatable {
         case requiresKeepMask
     }
 
+    /// The engine capabilities a manifest DECLARES, as its own frozen six.
+    ///
+    /// The batching layer's capability struct is not `Codable` and carries
+    /// fields no manifest declares, so the manifest pins the six it does
+    /// declare and takes the struct's defaults for the rest. The six here are
+    /// exactly the six `canonicalEngine` hashes.
+    private struct EngineDeclaration: Codable {
+        let supportsPrefixReuse: Bool
+        let supportsPagedKV: Bool
+        let supportsCompiledDecode: Bool
+        let supportsPackedPrefill: Bool
+        let supportsMTP: Bool
+        let supportsCompactRecurrentMTPReplay: Bool
+
+        init(_ engine: CBv2ModelCapabilities) {
+            self.supportsPrefixReuse = engine.supportsPrefixReuse
+            self.supportsPagedKV = engine.supportsPagedKV
+            self.supportsCompiledDecode = engine.supportsCompiledDecode
+            self.supportsPackedPrefill = engine.supportsPackedPrefill
+            self.supportsMTP = engine.supportsMTP
+            self.supportsCompactRecurrentMTPReplay = engine.supportsCompactRecurrentMTPReplay
+        }
+
+        func capabilities() -> CBv2ModelCapabilities {
+            var engine = CBv2ModelCapabilities()
+            engine.supportsPrefixReuse = supportsPrefixReuse
+            engine.supportsPagedKV = supportsPagedKV
+            engine.supportsCompiledDecode = supportsCompiledDecode
+            engine.supportsPackedPrefill = supportsPackedPrefill
+            engine.supportsMTP = supportsMTP
+            engine.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
+            return engine
+        }
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        runnerID = try container.decode(String.self, forKey: .runnerID)
+        modelTypes = try container.decode([String].self, forKey: .modelTypes)
+        backend = try container.decode(String.self, forKey: .backend)
+        engine = try container.decode(EngineDeclaration.self, forKey: .engine).capabilities()
+        kvBackends = try container.decode([KVBackendKind].self, forKey: .kvBackends)
+        decoders = try container.decode([DecoderDeclaration].self, forKey: .decoders)
+        regimes = try container.decode([RegimeDeclaration].self, forKey: .regimes)
+        multimodal = try container.decode(Bool.self, forKey: .multimodal)
+        recurrentLayers = try container.decode(Bool.self, forKey: .recurrentLayers)
+        requiresKeepMask = try container.decode(Bool.self, forKey: .requiresKeepMask)
+    }
+
+    public func encode(to encoder: Swift.Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(runnerID, forKey: .runnerID)
+        try container.encode(modelTypes, forKey: .modelTypes)
+        try container.encode(backend, forKey: .backend)
+        try container.encode(EngineDeclaration(engine), forKey: .engine)
+        try container.encode(kvBackends, forKey: .kvBackends)
+        try container.encode(decoders, forKey: .decoders)
+        try container.encode(regimes, forKey: .regimes)
+        try container.encode(multimodal, forKey: .multimodal)
+        try container.encode(recurrentLayers, forKey: .recurrentLayers)
+        try container.encode(requiresKeepMask, forKey: .requiresKeepMask)
+    }
+
     // MARK: Canonical bytes
 
     /// Deterministic UTF-8 bytes of this manifest.
@@ -621,6 +686,14 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
     /// refused BY NAME: serving fp16 under an fp32 label would make a
     /// control arm a second copy of the baseline.
     case pagedPoolDTypeUnsupported(requested: String, served: String)
+    /// A drafter artifact is larger than the assistant size bound. Loaded
+    /// anyway it would be a different artifact than the one the runner
+    /// advertises, so it is refused before a byte of it is read.
+    case drafterOverByteCap(bytes: Int, cap: Int)
+    /// The loaded tower does not report the numerics profile its serving
+    /// bytes are pinned to. Decode bytes change with the profile, so a tower
+    /// that reports another one is refused rather than served.
+    case numericsProfileRefused(expected: String, observed: String)
 
     public var description: String {
         switch self {
@@ -645,6 +718,10 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
                 + "digest still checks out"
         case .pagedPoolDTypeUnsupported(let requested, let served):
             return "runner: paged pool requested \(requested) but was built \(served)"
+        case .drafterOverByteCap(let bytes, let cap):
+            return "runner: drafter artifact is \(bytes) bytes, over the \(cap)-byte cap"
+        case .numericsProfileRefused(let expected, let observed):
+            return "runner: tower reports numerics profile \(observed), not \(expected)"
         }
     }
 }
@@ -942,6 +1019,23 @@ public enum RunnerCheckpoint {
 
 // MARK: - Shared engine assembly
 
+/// Native paged storage a runner asks the assembly for.
+///
+/// A model that declares `requiresNativePagedKV` serves only from segmented
+/// paged storage whose per-layer K/V dtypes are the ones it actually writes;
+/// `EngineV2` refuses any other backend before a request is admitted. The
+/// dtypes are the runner's to observe (they come from the model's own weight
+/// layout), which is why they travel here rather than on `EngineBuild` — the
+/// caller owns sizing, the runner owns what the model stores.
+public struct NativePagedPlan: Sendable {
+    /// One dtype per attending layer, in model layer order.
+    public var layerDTypes: [DType]
+
+    public init(layerDTypes: [DType]) {
+        self.layerDTypes = layerDTypes
+    }
+}
+
 /// The one place `EngineV2` is assembled for a fork runner.
 ///
 /// Lifted from d-inference's `EngineV2Factory+Production` (the code this
@@ -959,6 +1053,22 @@ public enum RunnerEngineAssembly {
     /// to; paged SIZING policy is otherwise the caller's.
     public static let nominalMaxSequenceLength = 8192
 
+    /// The backend half of the refusal, on its own.
+    ///
+    /// It reads the manifest and the build and nothing else, so a caller can
+    /// be told why a build cannot be served before any weight file is
+    /// touched — and a test can prove the refusal without staging a model.
+    public static func backendRefusal(
+        manifest: RunnerManifest, build: EngineBuild
+    ) -> RunnerError? {
+        guard manifest.kvBackends.contains(build.kvBackend) else {
+            return .kvBackendRefused(
+                requested: build.kvBackend.rawValue,
+                declared: manifest.kvBackends.map(\.rawValue))
+        }
+        return nil
+    }
+
     public static func makeEngine(
         manifest: RunnerManifest,
         loadedDecoders: [DecoderID],
@@ -968,13 +1078,13 @@ public enum RunnerEngineAssembly {
         newCaches: (
             (_ layerIndex: Int, _ kind: CBv2LayerKind) throws -> any CBv2AttendingLayerCache
         ) throws -> [any CBv2AttendingLayerCache],
+        nativePaged: NativePagedPlan? = nil,
+        steppable: (any CBv2SteppableModel)? = nil,
         mtpDrafter: (any CBv2MTPDrafter)?,
         build: EngineBuild
     ) throws -> any CBv2Engine {
-        guard manifest.kvBackends.contains(build.kvBackend) else {
-            throw RunnerError.kvBackendRefused(
-                requested: build.kvBackend.rawValue,
-                declared: manifest.kvBackends.map(\.rawValue))
+        if let refusal = backendRefusal(manifest: manifest, build: build) {
+            throw refusal
         }
         guard loadedDecoders.contains(build.decoder) else {
             throw RunnerError.decoderNotLoaded(
@@ -993,29 +1103,47 @@ public enum RunnerEngineAssembly {
             }
         case .paged:
             let plan = build.pagedPool
-            let paged = try PagedKVBackend(
-                layerKinds: layerKinds,
-                config: PagedKVPoolConfig(
-                    capacityBytes: plan.capacityBytes ?? build.kvBytesCapacity,
-                    dtype: plan.dtype.dtype,
-                    // LOCKSTEP: a windowed-layer update larger than the
-                    // ring's provision traps the process, so the pool is
-                    // sized from the chunk the engine can actually schedule
-                    // — a solo stripe included.
-                    maxPrefillChunk: max(
-                        build.schedulerConfig.prefillChunkSize,
-                        build.schedulerConfig.soloPrefillStripeTokens ?? 0),
+            // LOCKSTEP: a windowed-layer update larger than the ring's
+            // provision traps the process, so the pool is sized from the
+            // chunk the engine can actually schedule — a solo stripe
+            // included.
+            let maxPrefillChunk = max(
+                build.schedulerConfig.prefillChunkSize,
+                build.schedulerConfig.soloPrefillStripeTokens ?? 0)
+            let maxBufferLength = plan.maxBufferLength ?? MLX.GPU.deviceInfo().maxBufferSize
+            let paged: PagedKVBackend
+            if let nativePaged {
+                // Segmented storage with the model's own K/V dtypes: the one
+                // layout a `requiresNativePagedKV` model may be served from.
+                paged = try PagedKVBackend.segmented(
+                    admittedGrantBytes: plan.capacityBytes ?? build.kvBytesCapacity,
+                    layerKinds: layerKinds,
+                    layerDTypes: nativePaged.layerDTypes,
+                    maxPrefillChunk: maxPrefillChunk,
                     nominalMaxSequenceLength: plan.nominalMaxSequenceLength,
-                    maxBufferLength: plan.maxBufferLength
-                        ?? MLX.GPU.deviceInfo().maxBufferSize),
-                slabCommitment: plan.slabCommitment)
+                    maxBufferLength: maxBufferLength)
+            } else {
+                paged = try PagedKVBackend(
+                    layerKinds: layerKinds,
+                    config: PagedKVPoolConfig(
+                        capacityBytes: plan.capacityBytes ?? build.kvBytesCapacity,
+                        dtype: plan.dtype.dtype,
+                        maxPrefillChunk: maxPrefillChunk,
+                        nominalMaxSequenceLength: plan.nominalMaxSequenceLength,
+                        maxBufferLength: maxBufferLength),
+                    slabCommitment: plan.slabCommitment)
+            }
             // Read off the CONSTRUCTED pool, never off the request: this is
             // the built artifact reporting itself, and it is what separates
-            // "fp32 served" from "fp32 asked for and ignored".
-            guard paged.pool.config.dtype == plan.dtype.dtype else {
-                throw RunnerError.pagedPoolDTypeUnsupported(
-                    requested: plan.dtype.rawValue,
-                    served: "\(paged.pool.config.dtype)")
+            // "fp32 served" from "fp32 asked for and ignored". A segmented
+            // pool stores each layer in its own dtype, so the request's
+            // single dtype is compared only on the unsegmented path.
+            if nativePaged == nil {
+                guard paged.pool.config.dtype == plan.dtype.dtype else {
+                    throw RunnerError.pagedPoolDTypeUnsupported(
+                        requested: plan.dtype.rawValue,
+                        served: "\(paged.pool.config.dtype)")
+                }
             }
             let pagedCaches = paged.makeLayerCaches()
             // `newCacheV2` hands the closure the MODEL layer index
@@ -1042,17 +1170,20 @@ public enum RunnerEngineAssembly {
         var schedulerConfig = build.schedulerConfig
         schedulerConfig.enablePrefixCache = build.prefixCache != nil
 
-        // A BLOCK drafter reads the TARGET's hidden state at named layers, so
-        // the target has to keep those layers on every forward. Arm that tap
-        // HERE, where both directions are visible: a build that will not
-        // speculate disarms it, so a serial leg in a process that also served
-        // a block leg pays nothing for a drafter that is merely resident.
-        if let block = mtpDrafter as? any CBv2MTPBlockDrafter {
-            try block.setBlockContextArmed(build.decoder != .serial)
+        // A drafter that reads the TARGET's intermediate state needs the
+        // target to keep that state on every forward. Arm that tap HERE,
+        // where both directions are visible: a build that will not speculate
+        // disarms it, so a serial leg in a process that also served a
+        // speculative leg pays nothing for a drafter that is merely resident.
+        if let armed = mtpDrafter as? any RunnerTargetContextArming {
+            try armed.setTargetContextArmed(build.decoder != .serial)
         }
 
         return EngineV2(
-            model: CBv2SteppableLanguageModelAdapter(model),
+            // A family whose drafter reads the target's intermediate state
+            // supplies its own steppable view; otherwise the generic adapter
+            // wraps the plain forward.
+            model: steppable ?? CBv2SteppableLanguageModelAdapter(model),
             layerKinds: layerKinds,
             backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: caches),

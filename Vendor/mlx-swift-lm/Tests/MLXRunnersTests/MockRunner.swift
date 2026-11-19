@@ -75,8 +75,8 @@ final class MockStepper: TeacherForcedStepper {
 /// The per-round journal a scripted engine replays for one free-run window.
 ///
 /// Written as records, not as summary numbers: the worker derives every
-/// audit field from `CBv2MTPMetrics.roundAudits`, so the mock has to exercise
-/// that same path or the test proves nothing about it.
+/// audit field from the engine build's `RunnerRoundJournaling` records, so the
+/// mock has to exercise that same path or the test proves nothing about it.
 struct MockRoundScript: Sendable {
     /// One round: draft depth, the pre-min accept-walk length, and the
     /// committed width.
@@ -90,11 +90,21 @@ struct MockRoundScript: Sendable {
     /// Rows the rounds are attributed to, in SLOT ORDER. bench-worker submits
     /// slot s as request id s + 1.
     var requestIDs: [UInt64] = [1]
+    /// Rounds already finalized when `free_decode_begin` reads the journal:
+    /// the engine ran ahead while the seed drained.
+    var journalAtBegin: [Round] = []
+    /// Records the journal has evicted. Reported on the read a RUN makes, and
+    /// never on the one `free_decode_begin` makes, so a test can put a cursor
+    /// behind the retained range.
+    var dropped: UInt64 = 0
+    /// Tokens the scripted engine yields in ONE delta. Above 1, a run can be
+    /// handed more tokens than the count it asked for.
+    var deltaWidth: Int = 1
 
     /// The fixture's window: three rounds at depth 2, committing 3, 1 and 2
     /// tokens, with accept walks of 2, 1 and 1. That gives the fixture's
     /// `acceptance_lengths [3,1,2]`, `drafted_total 6`, `accepted_total 4`
-    /// (the sum of `min(accepted, confirmed)`) and `committed_total 6`.
+    /// (the sum of `min(accepted, committed)`) and `committed_total 6`.
     static let fixtureWindow = MockRoundScript(rounds: [
         Round(k: 2, accepted: 2, confirmed: 3),
         Round(k: 2, accepted: 1, confirmed: 1),
@@ -102,42 +112,71 @@ struct MockRoundScript: Sendable {
     ])
 
     /// The journal in finalize order: one record per (row, round).
-    var journal: [CBv2MTPRoundAuditRecord] {
-        rounds.enumerated().flatMap { roundIndex, round in
+    var journal: [RunnerRoundRecord] {
+        Self.records(for: journalAtBegin + rounds, requestIDs: requestIDs)
+    }
+
+    /// The records the run's read sees.
+    var journalAfterBegin: [RunnerRoundRecord] {
+        Self.records(for: rounds, requestIDs: requestIDs)
+    }
+
+    static func records(
+        for rounds: [Round], requestIDs: [UInt64]
+    ) -> [RunnerRoundRecord] {
+        rounds.flatMap { round in
             requestIDs.map { requestID in
-                CBv2MTPRoundAuditRecord(
+                RunnerRoundRecord(
                     requestID: requestID,
-                    k: round.k,
-                    draftTokens: Array(repeating: 0, count: round.k),
-                    targetTokens: Array(repeating: 0, count: 1 + round.k),
+                    drafted: round.k,
                     accepted: round.accepted,
-                    confirmed: round.confirmed,
-                    rejected: (1 + round.k) - round.confirmed,
-                    tokensCountAfter: roundIndex + 1,
-                    numComputedAfter: roundIndex,
-                    generatedAfter: roundIndex + 1,
-                    finishReason: nil)
+                    committed: round.confirmed)
             }
         }
     }
 }
 
-final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, @unchecked Sendable {
+final class MockEngine:
+    CBv2Engine, CBv2MTPCountersReporting, RunnerRoundJournaling, @unchecked Sendable
+{
     private let script: MockRoundScript?
     private let lock = NSLock()
     private var reads = 0
+    private var journalReads = 0
+
+    /// The engine's own serial queue, as the pair of the loop's queue: work put
+    /// here runs in order, so a shutdown that queues behind a successor step
+    /// cannot return before that step finished.
+    let engineQueue = DispatchQueue(label: "mock.cbv2.engine")
+
+    /// The step the loop had already launched when the first drain was
+    /// accepted. It runs on `engineQueue`, outliving that drain, the way a
+    /// chained decode outlives the loop's shutdown.
+    var queuedSuccessor: (@Sendable () -> Void)?
+
+    /// A shutdown that takes at least this long models one that ran into the
+    /// loop's drain watchdog.
+    var shutdownDelay: Duration?
+
+    /// Thrown from `submit` when set, so a test can drive a worker error path.
+    var submitFailure: Error?
 
     init(script: MockRoundScript?) {
         self.script = script
     }
 
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        if let submitFailure { throw submitFailure }
         let start = MockTokens.freeRunStart(request.promptTokens)
         let maxTokens = request.maxTokens
+        let deltaWidth = max(1, script?.deltaWidth ?? 1)
         return AsyncStream { continuation in
-            for index in 0 ..< maxTokens {
-                continuation.yield(
-                    .delta(text: "", tokens: [start + index], logprobs: nil))
+            var index = 0
+            while index < maxTokens {
+                let width = min(deltaWidth, maxTokens - index)
+                let tokens = (0 ..< width).map { start + index + $0 }
+                continuation.yield(.delta(text: "", tokens: tokens, logprobs: nil))
+                index += width
             }
             continuation.yield(
                 .finished(
@@ -158,7 +197,38 @@ final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, @unchecked Sendabl
             activeTokens: 0)
     }
 
-    func shutdown() async {}
+    /// How many times this engine has been asked to shut down. The worker
+    /// drains, then waits for the queue with a second (idempotent) shutdown, so
+    /// a count of 2 is "the loop is quiet", and 1 is "the drain was requested".
+    private(set) var shutdowns = 0
+
+    func shutdown() async {
+        let call = recordShutdown()
+        if let delay = shutdownDelay { try? await Task.sleep(for: delay) }
+        if call == 1 {
+            // The first drain is accepted while the loop's own work runs on:
+            // the successor is queued, not awaited.
+            if let successor = queuedSuccessor {
+                queuedSuccessor = nil
+                engineQueue.async(execute: successor)
+            }
+            return
+        }
+        // The second drain queues behind whatever the queue already holds.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            engineQueue.async { continuation.resume() }
+        }
+    }
+
+    /// Locking is not async-safe, so the async entry point hands the counter to
+    /// a synchronous helper.
+    @discardableResult
+    private func recordShutdown() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        shutdowns += 1
+        return shutdowns
+    }
 
     /// Cumulative and monotonic, like the real engine's: the FIRST read is
     /// the baseline `free_decode_begin` takes after its seed forward, when no
@@ -171,25 +241,52 @@ final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, @unchecked Sendabl
         defer { reads += 1 }
         var metrics = CBv2MTPMetrics()
         guard reads > 0 else { return metrics }
-        metrics.roundAudits = script.journal
         metrics.rounds = script.rounds.count
         return metrics
     }
+
+    /// The journal, with the same first-read-is-empty rule as the counters:
+    /// the seed forward has finalized no round when the window opens. The
+    /// FIRST read (the one `free_decode_begin` makes, before its seed drain)
+    /// reports whatever the script says had already finalized, and no
+    /// eviction; every read after it reports the window's records plus the
+    /// script's eviction count.
+    func roundJournal() -> RunnerRoundJournal {
+        guard let script else { return RunnerRoundJournal() }
+        lock.lock()
+        defer { lock.unlock() }
+        defer { journalReads += 1 }
+        guard journalReads > 0 else {
+            return RunnerRoundJournal(
+                records: MockRoundScript.records(
+                    for: script.journalAtBegin, requestIDs: script.requestIDs),
+                dropped: 0)
+        }
+        return RunnerRoundJournal(
+            records: MockRoundScript.records(
+                for: script.journalAtBegin + script.rounds,
+                requestIDs: script.requestIDs),
+            dropped: script.dropped)
+    }
+
+    /// The library's retention cap, so a test can build a journal that is
+    /// exactly full (which states the window) or one that has evicted past the
+    /// cursor (which refuses it).
+    static let retainedRecordCap = 8192
+    var roundRecordCap: Int { Self.retainedRecordCap }
 }
 
 // MARK: - Runner
 
 /// Manifests the CONTRACT itself pins, built here from the document.
 ///
-/// The section 11 manifest for Qwen 3.8 Flash-Next is the cross-repo digest
-/// vector, and the shared conformance fixture's hello carries its runner
-/// identity. It is the runner's own manifest: the fixture is driven over the
-/// value the fork serves, not over a copy of it.
+/// The shared conformance fixture's hello carries the mock adapter's runner
+/// identity and manifest digest, and both are readings of ONE declaration:
+/// the file benchd checked in beside the fixture. A test that pins the digest
+/// and a hello driven over this value therefore cannot drift apart.
 enum ContractManifests {
-    /// The runner's own manifest. One declaration: a test that pins the
-    /// digest and a fixture hello driven over this value cannot drift apart
-    /// from what the fork actually serves.
-    static let sectionEleven = Qwen4ExpRunner.manifest
+    /// The mock adapter's manifest — the only runner this repository ships.
+    static let shared = MockRunner.manifest
 }
 
 /// The mock adapter's manifest, DECODED from the file benchd checked in
@@ -238,6 +335,15 @@ final class MockRunner: Runner, @unchecked Sendable {
     let headProvenance: HeadProvenance? = nil
     let loadedModelType = "qwen4_exp_text"
 
+    /// Every engine this runner builds, so a test can read what the worker did
+    /// to it: the wire has no verb that reports an engine's lifetime.
+    var onEngine: ((MockEngine) -> Void)?
+
+    /// Passed to every engine this runner builds: see `MockEngine`.
+    var successor: (@Sendable () -> Void)?
+    var shutdownDelay: Duration?
+    var submitFailure: Error?
+
     init(script: MockRoundScript? = .fixtureWindow) {
         self.script = script
     }
@@ -263,7 +369,12 @@ final class MockRunner: Runner, @unchecked Sendable {
                 requested: build.decoder.rawValue,
                 loaded: loadedDecoders.map(\.rawValue))
         }
-        return MockEngine(script: build.decoder == .serial ? nil : script)
+        let engine = MockEngine(script: build.decoder == .serial ? nil : script)
+        engine.queuedSuccessor = successor
+        engine.shutdownDelay = shutdownDelay
+        engine.submitFailure = submitFailure
+        onEngine?(engine)
+        return engine
     }
 
     func makeStepper() throws -> any TeacherForcedStepper { MockStepper() }
@@ -370,19 +481,47 @@ final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
 
 /// Scripted transport: the request lines go in, the response lines come out.
 final class ScriptedTransport: BenchWorkerTransport {
+    private let lock = NSLock()
     private var pending: [String]
-    private(set) var written: [String] = []
+    private var lines: [String] = []
+    private var flushes = 0
+
+    /// Lines written so far. Locked, because a test that watches the worker's
+    /// ordering reads this while the worker is still serving.
+    var written: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines
+    }
 
     init(lines: [String]) {
         self.pending = lines
     }
 
     func readLine() -> String? {
-        pending.isEmpty ? nil : pending.removeFirst()
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.isEmpty ? nil : pending.removeFirst()
     }
 
     func write(line: String) {
-        written.append(line)
+        lock.lock()
+        defer { lock.unlock() }
+        lines.append(line)
+    }
+
+    /// How many times the worker asked for a flush. The end path that skips the
+    /// runtime's teardown must flush before it leaves.
+    var flushCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return flushes
+    }
+
+    func flush() {
+        lock.lock()
+        defer { lock.unlock() }
+        flushes += 1
     }
 }
 

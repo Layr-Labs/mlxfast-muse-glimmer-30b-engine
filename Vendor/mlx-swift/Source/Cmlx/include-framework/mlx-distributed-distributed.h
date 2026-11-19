@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 
 #include <Cmlx/mlx-api.h>
@@ -14,7 +17,26 @@ namespace mlx::core::distributed {
 // Forward declaration of the base group implementation.
 namespace detail {
 class GroupImpl;
-};
+}
+
+/**
+ * Byte-level all-gather function used by the JACCL side channel.
+ *
+ * Args:
+ *   src: Pointer to this rank's data of size n_bytes.
+ *   dst: Pointer to an output buffer of size size_ * n_bytes. After the call,
+ *        dst[rank * n_bytes, (rank+1) * n_bytes] contains the data from rank.
+ *   n_bytes: The number of bytes contributed by each rank.
+ */
+using AllGatherFn = std::function<void(const char*, char*, size_t)>;
+
+/**
+ * Factory that produces a per-rank side-channel all-gather function.
+ *
+ * The factory receives the rank and size of the group and returns the
+ * AllGatherFn that will be used for the side channel.
+ */
+using AllGatherFactory = std::function<AllGatherFn(int, int)>;
 
 /* Check if a communication backend is available */
 MLX_API bool is_available();
@@ -41,6 +63,20 @@ struct MLX_API Group {
    */
   Group split(int color, int key = -1) const;
 
+  /**
+   * Start one JACCL readiness budget of 1..900000 ms from the current
+   * monotonic time. Progress does not renew it. Other backends refuse.
+   * Drain queued work and serialize scheduling around begin/end; both require
+   * no running calls. The budget cannot restart after end or expiry.
+   */
+  void begin_startup_wait_budget(int64_t timeout_ms) const;
+
+  /**
+   * End an unexpired budget and restore the original idle timeout for later
+   * calls. Refuses unused, ended, expired or failed groups; never reopens one.
+   */
+  void end_startup_wait_budget() const;
+
   const std::shared_ptr<detail::GroupImpl>& raw_group() const {
     return group_;
   }
@@ -58,6 +94,17 @@ struct MLX_API Group {
  * render communication operations as no-op.
  */
 MLX_API Group init(bool strict = false, const std::string& bk = "any");
+
+/**
+ * Initialize the distributed backend using a custom JACCL side channel.
+ *
+ * This behaves like init(strict, bk) but requires bk to be "jaccl".
+ */
+MLX_API Group
+init(bool strict, const std::string& bk, AllGatherFactory factory);
+
+/** Clear the distributed backend cache. */
+MLX_API void clear_backends();
 
 } // namespace mlx::core::distributed
 #endif

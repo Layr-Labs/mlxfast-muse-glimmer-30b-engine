@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mlx/array.h"
 #include "mlx/ops.h"
@@ -60,13 +61,11 @@ std::vector<array> array::make_arrays(
 array array::unsafe_weak_copy(const array& other) {
   auto cpy = array(other.shape(), other.dtype(), nullptr, {});
   cpy.set_data(
-      other.buffer(),
+      Data(other.buffer(), nullptr),
       other.data_size(),
       other.strides(),
       other.flags(),
-      0,
-      [](auto) {});
-  cpy.array_desc_->offset = other.array_desc_->offset;
+      other.offset());
   return cpy;
 }
 
@@ -104,14 +103,13 @@ array::array(
       allocator::release(buffer);
       return deleter(ptr);
     };
-    set_data(buffer, std::move(wrapped_deleter));
+    set_data(Data(buffer, std::move(wrapped_deleter)));
   }
 }
 
-/* Build an array from a shared buffer */
-array::array(allocator::Buffer data, Shape shape, Dtype dtype, Deleter deleter)
+array::array(allocator::Data data, Shape shape, Dtype dtype)
     : array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
-  set_data(data, deleter);
+  set_data(std::move(data));
 }
 
 void array::detach() {
@@ -166,8 +164,8 @@ bool array::is_tracer() const {
       detail::retain_graph();
 }
 
-void array::set_data(allocator::Buffer buffer, Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
+void array::set_data(allocator::Data data) {
+  array_desc_->data = std::make_shared<Data>(std::move(data));
   array_desc_->offset = 0;
   array_desc_->data_size = size();
   array_desc_->flags.contiguous = true;
@@ -177,13 +175,12 @@ void array::set_data(allocator::Buffer buffer, Deleter d) {
 }
 
 void array::set_data(
-    allocator::Buffer buffer,
+    allocator::Data data,
     size_t data_size,
     Strides strides,
     Flags flags,
-    int64_t offset,
-    Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
+    int64_t offset) {
+  array_desc_->data = std::make_shared<Data>(std::move(data));
   array_desc_->offset = offset;
   array_desc_->data_size = data_size;
   array_desc_->strides = std::move(strides);
@@ -208,34 +205,33 @@ void array::copy_shared_buffer(const array& other) {
   copy_shared_buffer(other, other.strides(), other.flags(), other.data_size());
 }
 
-array::~array() {
-  if (array_desc_ == nullptr) {
+void array::release(std::shared_ptr<ArrayDesc> desc) {
+  if (desc == nullptr) {
     return;
   }
 
   // Detached/detaching
-  if (array_desc_->primitive == nullptr) {
+  if (desc->primitive == nullptr) {
     return;
   }
 
   // Break circular reference for non-detached arrays with siblings
-  if (auto n = siblings().size(); n > 0) {
+  if (auto n = desc->siblings.size(); n > 0) {
     bool do_detach = true;
     // If all siblings have siblings.size() references except
-    // the one we are currently destroying (which has siblings.size() + 1)
+    // the one we are currently releasing (which has siblings.size() + 1)
     // then there are no more external references
-    do_detach &= (array_desc_.use_count() == (n + 1));
-    for (auto& s : siblings()) {
+    do_detach &= (desc.use_count() == (n + 1));
+    for (auto& s : desc->siblings) {
       do_detach &= (s.array_desc_.use_count() == n);
       if (!do_detach) {
         break;
       }
     }
     if (do_detach) {
-      for (auto& s : siblings()) {
+      for (auto& s : desc->siblings) {
         for (auto& ss : s.siblings()) {
-          // Set to null here to avoid descending into array destructor
-          // for siblings
+          // Set to null here to avoid descending into reset() for siblings
           ss.array_desc_ = nullptr;
         }
         s.array_desc_->siblings.clear();
@@ -288,18 +284,50 @@ array::ArrayDesc::~ArrayDesc() {
 
   std::vector<std::shared_ptr<ArrayDesc>> for_deletion;
 
+  // The distinct inputs (and their siblings) of `ad`, one reference each.
+  // A graph node has a few inputs, so a vector with a linear search does
+  // the work of a hash map without allocating a node per input; large
+  // input lists also get a hash index.
   auto append_deletable_inputs = [&for_deletion](ArrayDesc& ad) {
-    std::unordered_map<std::uintptr_t, array> input_map;
+    constexpr size_t linear_max = 32;
+    // Ids are kept beside the arrays: a moved-out array has no id.
+    std::vector<std::pair<std::uintptr_t, array>> distinct;
+    std::unordered_set<std::uintptr_t> index;
+    auto contains = [&](std::uintptr_t id) {
+      if (distinct.size() <= linear_max) {
+        for (auto& x : distinct) {
+          if (x.first == id) {
+            return true;
+          }
+        }
+        return false;
+      }
+      return index.count(id) > 0;
+    };
+    auto insert = [&](const array& x) {
+      if (contains(x.id())) {
+        return;
+      }
+      distinct.emplace_back(x.id(), x);
+      if (distinct.size() == linear_max + 1) {
+        for (auto& y : distinct) {
+          index.insert(y.first);
+        }
+      } else if (distinct.size() > linear_max + 1) {
+        index.insert(x.id());
+      }
+    };
+    distinct.reserve(ad.inputs.size());
     for (array& a : ad.inputs) {
       if (a.array_desc_) {
-        input_map.insert({a.id(), a});
+        insert(a);
         for (auto& s : a.siblings()) {
-          input_map.insert({s.id(), s});
+          insert(s);
         }
       }
     }
     ad.inputs.clear();
-    for (auto& [_, a] : input_map) {
+    for (auto& [_, a] : distinct) {
       bool is_deletable =
           (a.array_desc_.use_count() <= a.siblings().size() + 1);
       // An array with siblings is deletable only if all of its siblings
@@ -308,7 +336,7 @@ array::ArrayDesc::~ArrayDesc() {
         if (!is_deletable) {
           break;
         }
-        int is_input = (input_map.find(s.id()) != input_map.end());
+        int is_input = contains(s.id());
         is_deletable &=
             s.array_desc_.use_count() <= a.siblings().size() + is_input;
       }

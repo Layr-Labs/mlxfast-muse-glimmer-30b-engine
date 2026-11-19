@@ -18,19 +18,86 @@
 /// contains work for a phase whose rate is nil fails closed. In particular, a
 /// mixed prefill/decode posture needs both rates: the engine never prices
 /// decode assignments at prefill throughput.
+///
+/// `calibration` is optional reviewed caller evidence. The engine matches its
+/// cells only after actual queue projection and prefix adoption. Unsupported,
+/// expired or invalidated evidence uses these original conservative rates;
+/// calibration never restarts or extends `deadline`.
+///
+/// `decodeRateShape` selects per-batch decode charging. A per-request decode
+/// rate prices one row's cadence; all decode rows of one step advance
+/// together, so summing every row's tokens overcharges a B-row step about B
+/// times. When set, each projected step costs one measured step of the
+/// requests that produced the rate, scaled linearly when the step has more
+/// decode rows or a wider assignment than they did. nil keeps the legacy
+/// per-row charge.
 public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
     public let deadline: ContinuousClock.Instant
     public let conservativePrefillTokensPerSecond: Double?
     public let conservativeDecodeTokensPerSecond: Double?
+    public let calibration: CBv2FirstContentCalibration?
+    public let nativeTargetPrefill: CBv2NativeTargetPrefillPolicy?
+    public let decodeRateShape: CBv2DecodeRateShape?
 
     public init(
         deadline: ContinuousClock.Instant,
         conservativePrefillTokensPerSecond: Double?,
-        conservativeDecodeTokensPerSecond: Double?
+        conservativeDecodeTokensPerSecond: Double?,
+        calibration: CBv2FirstContentCalibration? = nil,
+        nativeTargetPrefill: CBv2NativeTargetPrefillPolicy? = nil,
+        decodeRateShape: CBv2DecodeRateShape? = nil
     ) {
         self.deadline = deadline
         self.conservativePrefillTokensPerSecond = conservativePrefillTokensPerSecond
         self.conservativeDecodeTokensPerSecond = conservativeDecodeTokensPerSecond
+        self.calibration = calibration
+        self.nativeTargetPrefill = nativeTargetPrefill
+        self.decodeRateShape = decodeRateShape
+    }
+
+    /// Per-batch charging is requested with a usable measured shape.
+    var chargesDecodePerBatch: Bool {
+        decodeRateShape?.isValid == true
+    }
+
+    /// Whether the projection may apply the live MTP depth gates. A reviewed
+    /// calibration's error envelope was measured against the configured
+    /// `1+k` work vector, so supplying one keeps that vector unchanged.
+    var mirrorsSpeculationDepth: Bool {
+        chargesDecodePerBatch && calibration == nil
+    }
+}
+
+/// The decode steps behind a per-request decode rate, averaged over the
+/// requests that measured it: token-producing rows per step, confirmed tokens
+/// per decode step, and assigned width per decode step (1 for plain decode,
+/// `1+k` for an MTP verify round). One measured step therefore takes
+/// `tokensPerStep / rate` seconds.
+public struct CBv2DecodeRateShape: Sendable, Equatable {
+    public let batchRows: Double
+    public let tokensPerStep: Double
+    public let stepWidth: Double
+
+    public init(batchRows: Double, tokensPerStep: Double = 1, stepWidth: Double = 1) {
+        self.batchRows = batchRows
+        self.tokensPerStep = tokensPerStep
+        self.stepWidth = stepWidth
+    }
+
+    /// Every component is finite and at least one.
+    public var isValid: Bool {
+        [batchRows, tokensPerStep, stepWidth].allSatisfy { $0.isFinite && $0 >= 1 }
+    }
+}
+
+/// One projected step's decode rows and its widest decode assignment.
+public struct CBv2DecodeStepShape: Sendable, Hashable {
+    public let rows: Int
+    public let width: Int
+
+    public init(rows: Int, width: Int) {
+        self.rows = rows
+        self.width = width
     }
 }
 
@@ -47,22 +114,50 @@ public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
 /// is therefore bounded by the sum of those smaller envelopes. If either
 /// lower-bound phase rate is unavailable, mixed work is unbounded and
 /// enforcement fails closed.
+///
+/// Per-batch charging (`decodeRateShape`) replaces `decodeTokens` in `T` with
+/// `batchDecodeTokens(rate:)`.
 public struct CBv2FirstTokenScheduledWork: Sendable, Equatable {
     public let prefillTokens: Int
     public let decodeTokens: Int
     public let scheduledSteps: Int
     public let mixedSteps: Int
+    /// Projected decode steps by shape, rather than per-row tokens. A plain
+    /// decode step has width 1 whatever its row count. nil when the work did
+    /// not come from a scheduler projection (callers then keep the per-row
+    /// `decodeTokens` charge).
+    public let decodeSteps: [CBv2DecodeStepShape: Int]?
 
     public init(
         prefillTokens: Int,
         decodeTokens: Int,
         scheduledSteps: Int,
-        mixedSteps: Int
+        mixedSteps: Int,
+        decodeSteps: [CBv2DecodeStepShape: Int]? = nil
     ) {
         self.prefillTokens = prefillTokens
         self.decodeTokens = decodeTokens
         self.scheduledSteps = scheduledSteps
         self.mixedSteps = mixedSteps
+        self.decodeSteps = decodeSteps
+    }
+
+    /// Per-batch decode charge in decode-rate tokens: each step costs the
+    /// measured `tokensPerStep`, scaled by `max(1, width / stepWidth)` and
+    /// `max(1, rows / batchRows)`. That is a bound when step time never falls
+    /// and grows at most linearly as rows or width grow. nil without a
+    /// per-step projection or with an invalid shape.
+    func batchDecodeTokens(rate shape: CBv2DecodeRateShape) -> Double? {
+        guard let decodeSteps, shape.isValid else { return nil }
+        var total = 0.0
+        for (step, count) in decodeSteps {
+            guard step.rows > 0, step.width > 0, count >= 0 else { return nil }
+            total +=
+                Double(count) * shape.tokensPerStep
+                * max(1, Double(step.width) / shape.stepWidth)
+                * max(1, Double(step.rows) / shape.batchRows)
+        }
+        return total.isFinite ? total : nil
     }
 
     public var scheduledTokens: Int {
@@ -81,11 +176,15 @@ public enum CBv2FirstTokenProjectedWork: Sendable, Equatable {
         work: CBv2FirstTokenScheduledWork,
         serviceDuration: Duration
     )
+    /// One idle native-media observation under the original absolute deadline.
+    /// Work is bounded but time is unknown: do not record zero predicted time.
+    case unmeasuredNativeMedia(work: CBv2FirstTokenScheduledWork)
     /// The current scheduler state cannot produce a finite safe projection
     /// (for example, serialized prefill is not configured, all running slots
     /// are paused, the request is multimodal, or the projection complexity
-    /// guard is reached). Deadline admission fails closed.
-    case unbounded
+    /// guard is reached). Deadline admission fails closed. The engine supplies
+    /// the first failed guard; nil represents unavailable legacy/test evidence.
+    case unbounded(reason: CBv2FirstTokenUnboundedReason? = nil)
 }
 
 /// Generation-bound acknowledgement that an admitted request no longer owns
@@ -150,7 +249,7 @@ enum CBv2FirstTokenWorkProjection: Equatable {
         work: CBv2FirstTokenScheduledWork,
         capacityOperations: [CBv2ProjectedCapacityOperation]
     )
-    case unbounded
+    case unbounded(reason: CBv2FirstTokenUnboundedReason)
 }
 
 struct CBv2ProjectedCapacityReservation: Sendable, Equatable {
@@ -173,6 +272,9 @@ private struct CBv2ProjectionRow {
     let id: CBv2RequestID
     let promptTokens: Int
     let maxTokens: Int
+    let isMultimodal: Bool
+    let requestAllowsCheckpoint: Bool
+    let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
@@ -180,6 +282,7 @@ private struct CBv2ProjectionRow {
     var knownTokens: Int
     var computedTokens: Int
     var generatedTokens: Int
+    var demandedCheckpointContinuation: CBv2DemandedCheckpointContinuation?
 
     var remainingKnownTokens: Int {
         knownTokens - computedTokens
@@ -211,19 +314,44 @@ extension SchedulerV2 {
     /// queue/pause/cancel state. Future arrivals, pause transitions, and
     /// capacity failures are external state changes, not facts available to
     /// an atomic snapshot.
+    /// Already-launched packing is reflected in the record's capture veto.
+    /// Future ordinary packing is not predicted without model/cache claims;
+    /// a later disarm can conservatively remove one priced short boundary.
+    ///
+    /// `mirrorsSpeculationDepth` applies the live MTP plan's pure depth gates
+    /// (`speculationDepthCeiling`): no decode row is charged more than
+    /// `1 + ceiling`, so beyond the batch gate, or where the automatic
+    /// verification envelope leaves no depth, every decode row is charged its
+    /// one target token instead of the configured `1+k`.
+    ///
+    /// The decode-only interleave (`decodeStepsBetweenPrefillChunks`) is
+    /// replayed from the live owed count: every held step is charged as a
+    /// decode-only step of the rows decoding then, so prompt work behind the
+    /// held steps is priced at their measured decode-step cost.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         inFlightAllowsChainedSuccessor: Bool = true,
-        unmaterializedPrefixAdoption: Bool = false
+        unmaterializedPrefixAdoption: Bool = false,
+        mirrorsSpeculationDepth: Bool = false
     ) -> CBv2FirstTokenWorkProjection {
+        // The projection does not model the opt-in prompt-row ceiling, so it
+        // refuses to forecast under it.
         guard config.maxConcurrentPartialPrefills == 1,
             config.maxConcurrentRequests > 0,
             config.maxBatchedTokensPerStep > 0,
             config.prefillChunkSize > 0,
-            record(for: id) != nil
+            (config.maxPrefillRowsPerStep ?? 0) <= 0
         else {
-            return .unbounded
+            return .unbounded(reason: .unsupportedScheduler)
+        }
+        guard record(for: id) != nil else {
+            return .unbounded(reason: .targetMissing)
+        }
+        // A grid cell that did not fit holds a first claim on the next step
+        // (`prefillChunkAlignment`); the projection does not model the claim.
+        guard prefillChunkAlignment == nil || deferredBlockRequestID == nil else {
+            return .unbounded(reason: .prefixGeometryBlocked)
         }
 
         var inFlightByID: [CBv2RequestID: Int] = [:]
@@ -232,7 +360,7 @@ extension SchedulerV2 {
                 let nextForID = Self.projectionAdd(
                     inFlightByID[assignment.id, default: 0], assignment.numTokens)
             else {
-                return .unbounded
+                return .unbounded(reason: .invalidInFlightAssignment)
             }
             inFlightByID[assignment.id] = nextForID
         }
@@ -240,11 +368,41 @@ extension SchedulerV2 {
         var projectedDecodeTokens = 0
         var projectedSteps = 0
         var projectedMixedSteps = 0
+        var projectedDecodeSteps: [CBv2DecodeStepShape: Int] = [:]
         var projectedCapacityOperations: [CBv2ProjectedCapacityOperation] = []
+        // The live count already settles the launched step's plan.
+        var projectedDecodeOnlyStepsOwed = decodeOnlyStepsOwed
+        let decodeStepsBetweenChunks = max(0, config.decodeStepsBetweenPrefillChunks)
+
+        /// The interleave bookkeeping at the end of `plan()`, for `steps`
+        /// identical steps; more than one only for decode-only stretches.
+        func settleInterleave(hasDecodeRows: Bool, promptRows: Int, steps: Int = 1) {
+            if !hasDecodeRows {
+                projectedDecodeOnlyStepsOwed = 0
+            } else if promptRows > 0 {
+                projectedDecodeOnlyStepsOwed = decodeStepsBetweenChunks
+            } else {
+                projectedDecodeOnlyStepsOwed = max(0, projectedDecodeOnlyStepsOwed - steps)
+            }
+        }
+
+        /// One step's decode rows advance together; record its shape once.
+        func chargeDecodeSteps(rows: Int, width: Int, steps: Int) -> Bool {
+            let shape = CBv2DecodeStepShape(rows: rows, width: width)
+            guard rows > 0, width > 0, steps > 0,
+                let next = Self.projectionAdd(projectedDecodeSteps[shape, default: 0], steps)
+            else {
+                return false
+            }
+            projectedDecodeSteps[shape] = next
+            return true
+        }
 
         func chargeStep(_ assignments: [CBv2ProjectionAssignment]) -> Bool {
             var prefillTokens = 0
             var decodeTokens = 0
+            var decodeRows = 0
+            var widestDecode = 0
             for assignment in assignments {
                 guard assignment.count > 0,
                     assignment.prefillCount >= 0,
@@ -258,6 +416,10 @@ extension SchedulerV2 {
                 }
                 prefillTokens = nextPrefill
                 decodeTokens = nextDecode
+                if assignment.decodeCount > 0 {
+                    decodeRows += 1
+                    widestDecode = max(widestDecode, assignment.decodeCount)
+                }
             }
             guard !assignments.isEmpty,
                 let nextPrefill = Self.projectionAdd(
@@ -267,6 +429,10 @@ extension SchedulerV2 {
                 let nextSteps = Self.projectionAdd(projectedSteps, 1)
             else {
                 return false
+            }
+            if decodeRows > 0 {
+                guard chargeDecodeSteps(rows: decodeRows, width: widestDecode, steps: 1)
+                else { return false }
             }
             projectedPrefillTokens = nextPrefill
             projectedDecodeTokens = nextDecode
@@ -280,10 +446,13 @@ extension SchedulerV2 {
             return true
         }
 
-        func chargeDecodeStretch(tokens: Int, steps: Int) -> Bool {
-            guard tokens > 0, steps > 0,
+        /// `steps` plain-decode steps, each advancing every one of `rows`.
+        func chargeDecodeStretch(rows: Int, steps: Int) -> Bool {
+            guard rows > 0, steps > 0,
+                let tokens = Self.projectionMultiply(rows, steps),
                 let nextDecode = Self.projectionAdd(projectedDecodeTokens, tokens),
-                let nextSteps = Self.projectionAdd(projectedSteps, steps)
+                let nextSteps = Self.projectionAdd(projectedSteps, steps),
+                chargeDecodeSteps(rows: rows, width: 1, steps: steps)
             else {
                 return false
             }
@@ -298,7 +467,8 @@ extension SchedulerV2 {
                     prefillTokens: projectedPrefillTokens,
                     decodeTokens: projectedDecodeTokens,
                     scheduledSteps: projectedSteps,
-                    mixedSteps: projectedMixedSteps),
+                    mixedSteps: projectedMixedSteps,
+                    decodeSteps: projectedDecodeSteps),
                 capacityOperations: projectedCapacityOperations)
         }
 
@@ -306,33 +476,56 @@ extension SchedulerV2 {
         for rec in running + waiting {
             let assigned = inFlightByID[rec.id, default: 0]
             guard rec.numComputedTokens >= assigned else {
-                return .unbounded
+                return .unbounded(reason: .inconsistentTokenCursor)
             }
             let confirmedComputed = rec.numComputedTokens - assigned
             guard confirmedComputed >= 0, confirmedComputed <= rec.tokens.count else {
-                return .unbounded
+                return .unbounded(reason: .inconsistentTokenCursor)
             }
             // A pending sample without the launched assignment that owns it
             // cannot be placed on this projection's timeline.
             guard rec.pendingSamples == 0 || assigned > 0 else {
-                return .unbounded
+                return .unbounded(reason: .unownedPendingSample)
             }
             // Multimodal token counts are not a safe service-work proxy: image
-            // spans can carry model-specific superlinear work.
-            guard rec.cancelRequested || rec.multimodalBlocks.isEmpty else {
-                return .unbounded
+            // spans can carry model-specific superlinear work, and block rows
+            // chunk differently. Once such a row has sampled from its whole
+            // prompt and is decode-ready, its work is ordinary decode.
+            guard
+                rec.cancelRequested || rec.multimodalBlocks.isEmpty
+                    || confirmedComputed
+                        >= max(rec.request.promptTokens.count, rec.tokens.count - 1)
+            else {
+                return .unbounded(reason: .multimodalWork)
             }
             rows[rec.id] = CBv2ProjectionRow(
                 id: rec.id,
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
+                isMultimodal: rec.request.multimodal != nil,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
                 fullSequenceCapacityTokens: rec.fullSequenceCapacityTokens,
                 knownTokens: rec.tokens.count,
                 computedTokens: confirmedComputed,
-                generatedTokens: rec.generatedTokenCount)
+                generatedTokens: rec.generatedTokenCount,
+                demandedCheckpointContinuation: rec.demandedCheckpointContinuation)
+        }
+
+        /// The live MTP plan's depth ceiling for a step with `decodeRows`
+        /// decode-ready rows. Media rows can leave the planner's batch count,
+        /// so any media row keeps the conservative configured `1+k` charge.
+        func speculationDepthLimit(decodeRows: Int) -> Int? {
+            guard mirrorsSpeculationDepth, speculationPlanner != nil,
+                let ceiling = speculationDepthCeiling,
+                !rows.values.contains(where: \.isMultimodal)
+            else {
+                return nil
+            }
+            return max(0, ceiling(decodeRows))
         }
 
         if unmaterializedPrefixAdoption {
@@ -340,13 +533,14 @@ extension SchedulerV2 {
                 plan.capacityReservationTokens >= 0,
                 plan.initialAdditionalCapacityBytes >= 0
             else {
-                return .unbounded
+                return .unbounded(reason: .invalidPrefixReservation)
             }
             projectedCapacityOperations.append(
-                .reserve(CBv2ProjectedCapacityReservation(
-                    id: id,
-                    additionalTokens: plan.capacityReservationTokens,
-                    additionalBytes: plan.initialAdditionalCapacityBytes)))
+                .reserve(
+                    CBv2ProjectedCapacityReservation(
+                        id: id,
+                        additionalTokens: plan.capacityReservationTokens,
+                        additionalBytes: plan.initialAdditionalCapacityBytes)))
         }
 
         var runningIDs = running.map(\.id)
@@ -378,8 +572,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -394,8 +589,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -410,8 +606,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -446,9 +643,10 @@ extension SchedulerV2 {
         }
 
         func removeTerminatedRows() {
-            let terminated = Set(rows.values.compactMap { row -> CBv2RequestID? in
-                row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
-            })
+            let terminated = Set(
+                rows.values.compactMap { row -> CBv2RequestID? in
+                    row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
+                })
             guard !terminated.isEmpty else { return }
             runningIDs.removeAll { terminated.contains($0) }
             waitingIDs.removeAll { terminated.contains($0) }
@@ -508,7 +706,11 @@ extension SchedulerV2 {
                     return false
                 }
             }
-            return chargeDecodeStretch(tokens: activeDecodeIDs.count, steps: 1)
+            guard chargeDecodeStretch(rows: activeDecodeIDs.count, steps: 1) else {
+                return false
+            }
+            settleInterleave(hasDecodeRows: true, promptRows: 0)
+            return true
         }
 
         /// Apply one executed assignment. Speculative decode may assign more
@@ -545,10 +747,11 @@ extension SchedulerV2 {
             // its reserve operation precedes this temporal unreserve.
             let rejectedSpeculativeSuffix = count - remaining
             if rejectedSpeculativeSuffix > 0 {
-                guard appendCapacityUnreservation(
-                    id: assignedID,
-                    start: startComputedTokens + remaining,
-                    count: rejectedSpeculativeSuffix)
+                guard
+                    appendCapacityUnreservation(
+                        id: assignedID,
+                        start: startComputedTokens + remaining,
+                        count: rejectedSpeculativeSuffix)
                 else {
                     return nil
                 }
@@ -577,14 +780,15 @@ extension SchedulerV2 {
             projectedAssignments.reserveCapacity(inFlightAssignments.count)
             for assignment in inFlightAssignments {
                 guard let row = rows[assignment.id], row.remainingKnownTokens > 0 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidInFlightAssignment)
                 }
-                guard let projectedAssignment = projectionAssignment(
-                    id: assignment.id,
-                    count: assignment.numTokens,
-                    row: row)
+                guard
+                    let projectedAssignment = projectionAssignment(
+                        id: assignment.id,
+                        count: assignment.numTokens,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 projectedAssignments.append(projectedAssignment)
                 if assignment.numTokens >= row.remainingKnownTokens {
@@ -597,21 +801,22 @@ extension SchedulerV2 {
                         startComputedTokens: row.computedTokens,
                         knownTokensBeforeStep: row.knownTokens)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionTransition)
                 }
                 targetSampled = targetSampled || sampled
             }
             guard chargeStep(projectedAssignments) else {
-                return .unbounded
+                return .unbounded(reason: .projectionArithmetic)
             }
             if targetSampled {
                 return boundedProjection()
             }
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
             else {
-                return .unbounded
+                return .unbounded(reason: .chainedStepUnprojectable)
             }
             removeTerminatedRows()
         } else {
@@ -628,15 +833,16 @@ extension SchedulerV2 {
         while rows[id] != nil {
             iterations += 1
             guard iterations <= maxProjectionIterations else {
-                return .unbounded
+                return .unbounded(reason: .iterationLimit)
             }
 
             // Exact acceleration for the common "all slots are decode/paused,
             // target waits" stretch. Every active plain-decode row gets one
-            // token per step when the step budget can seat all of them.
+            // token per step when the step budget can seat all of them. An MTP
+            // stretch whose mirrored depth is zero is plain decode too: its row
+            // count only falls when the first row finishes, where the jump ends.
             if waitingIDs.contains(id),
-                runningIDs.count >= config.maxConcurrentRequests,
-                speculationPlanner == nil
+                runningIDs.count >= config.maxConcurrentRequests
             {
                 let activeDecodeIDs = runningIDs.filter { runningID in
                     guard let row = rows[runningID], !row.isPaused else { return false }
@@ -646,18 +852,19 @@ extension SchedulerV2 {
                     guard let row = rows[runningID] else { return false }
                     return row.isPaused || row.remainingKnownTokens == 1
                 }
-                if allRunningDecodeOrPaused,
+                if speculationPlanner == nil
+                    || speculationDepthLimit(decodeRows: activeDecodeIDs.count) == 0,
+                    allRunningDecodeOrPaused,
                     !activeDecodeIDs.isEmpty,
                     activeDecodeIDs.count <= config.maxBatchedTokensPerStep
                 {
-                    let jump = activeDecodeIDs.compactMap { runningID -> Int? in
-                        guard let row = rows[runningID] else { return nil }
-                        return row.maxTokens - row.generatedTokens
-                    }.min() ?? 0
-                    guard jump > 0,
-                        let jumpWork = Self.projectionMultiply(activeDecodeIDs.count, jump)
-                    else {
-                        return .unbounded
+                    let jump =
+                        activeDecodeIDs.compactMap { runningID -> Int? in
+                            guard let row = rows[runningID] else { return nil }
+                            return row.maxTokens - row.generatedTokens
+                        }.min() ?? 0
+                    guard jump > 0 else {
+                        return .unbounded(reason: .projectionArithmetic)
                     }
                     for runningID in activeDecodeIDs {
                         guard var row = rows[runningID],
@@ -669,29 +876,30 @@ extension SchedulerV2 {
                             let known = Self.projectionAdd(row.knownTokens, jump),
                             let computed = Self.projectionAdd(row.computedTokens, jump)
                         else {
-                            return .unbounded
+                            return .unbounded(reason: .invalidProjectionTransition)
                         }
                         row.generatedTokens = generated
                         row.knownTokens = known
                         row.computedTokens = computed
                         rows[runningID] = row
                     }
-                    guard chargeDecodeStretch(tokens: jumpWork, steps: jump) else {
-                        return .unbounded
+                    guard chargeDecodeStretch(rows: activeDecodeIDs.count, steps: jump) else {
+                        return .unbounded(reason: .projectionArithmetic)
                     }
+                    settleInterleave(hasDecodeRows: true, promptRows: 0, steps: jump)
                     guard
                         chargeTerminalChainedStepIfNeeded(
                             sampledIDs: activeDecodeIDs,
                             allowsChainedSuccessor: true)
                     else {
-                        return .unbounded
+                        return .unbounded(reason: .chainedStepUnprojectable)
                     }
                     removeTerminatedRows()
                     continue
                 }
             }
 
-            let baseBudget = config.maxBatchedTokensPerStep
+            let baseBudget = max(config.maxBatchedTokensPerStep, prefillChunkAlignment ?? 0)
             let liveRunningIDs = runningIDs.filter { runningID in
                 guard let row = rows[runningID] else { return false }
                 return !row.cancelRequested && row.remainingKnownTokens > 0
@@ -722,7 +930,11 @@ extension SchedulerV2 {
                 else {
                     return nil
                 }
-                return (candidateID, stripe)
+                guard
+                    let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                        isMultimodal: candidate.isMultimodal)
+                else { return nil }
+                return (candidateID, selectedStripe)
             }()
 
             var budget = max(baseBudget, soloStripe?.tokens ?? 0)
@@ -731,11 +943,16 @@ extension SchedulerV2 {
             var midPrefillAssigned = 0
             var assignments: [CBv2ProjectionAssignment] = []
 
-            let hasDecodeWork = runningIDs.contains { runningID in
+            let decodeReadyRows = runningIDs.filter { runningID in
                 guard let row = rows[runningID] else { return false }
                 return !row.isPaused && !row.cancelRequested
                     && row.remainingKnownTokens == 1
-            }
+            }.count
+            let hasDecodeWork = decodeReadyRows > 0
+            // A held plan runs its decode rows and no prompt work.
+            let promptWorkHeld = hasDecodeWork && projectedDecodeOnlyStepsOwed > 0
+            var promptRowsAssigned = 0
+            let speculationLimit = speculationDepthLimit(decodeRows: decodeReadyRows)
             let prefillCap = hasDecodeWork ? mixedStepPrefillTokenCap.map { max(0, $0) } : nil
 
             func prefillHeadroom() -> Int {
@@ -743,22 +960,49 @@ extension SchedulerV2 {
                 return max(0, prefillCap - prefillTokensAssigned)
             }
 
+            /// `plan()`'s grid cell. A row with multimodal blocks reaches
+            /// planning only decode-ready (`multimodalWork` above), where no
+            /// cell exists.
+            func gridCell(for row: CBv2ProjectionRow) -> Int? {
+                Self.prefillGridCell(
+                    alignment: prefillChunkAlignment, start: row.computedTokens,
+                    promptTokens: row.promptTokens, end: row.knownTokens,
+                    plan: row.prefixReusePlan, hasBlocks: false)
+            }
+
             func chunkCap(for rowID: CBv2RequestID) -> Int {
-                rows[rowID]?.prefixReusePlan?.recurrentChunkSize
+                if let row = rows[rowID], let cell = gridCell(for: row) { return cell }
+                return rows[rowID]?.prefixReusePlan?.recurrentChunkSize
                     ?? (soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize)
             }
 
             func prefixClamp(
-                row: CBv2ProjectionRow,
+                row: inout CBv2ProjectionRow,
                 proposed: Int
             ) -> Int {
-                row.prefixReusePlan?.clampedChunk(
-                    start: row.computedTokens,
-                    proposed: proposed) ?? proposed
+                let range = config.demandedCheckpointRange(
+                    promptTokens: row.promptTokens, hintTokens: row.checkpointTargetTokens,
+                    computedTokens: row.computedTokens, proposed: proposed,
+                    armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
+                    hasPrefixReuse: row.prefixReusePlan != nil,
+                    requestAllowsCheckpoint: row.requestAllowsCheckpoint,
+                    continuation: row.demandedCheckpointContinuation)
+                let count =
+                    row.prefixReusePlan?.clampedChunk(
+                        start: row.computedTokens,
+                        proposed: range.count) ?? range.count
+                row.demandedCheckpointContinuation = count == range.count ? range.continuation : nil
+                return count
             }
 
-            // RUNNING first, preserving authoritative scheduler order.
-            for runningID in runningIDs where budget > 0 {
+            // RUNNING first, preserving authoritative scheduler order; a
+            // grid plan takes decode rows before prompt rows.
+            let visitOrder =
+                prefillChunkAlignment == nil
+                ? runningIDs
+                : runningIDs.filter { rows[$0]?.remainingKnownTokens == 1 }
+                    + runningIDs.filter { rows[$0]?.remainingKnownTokens != 1 }
+            for runningID in visitOrder where budget > 0 {
                 guard var row = rows[runningID],
                     !row.isPaused,
                     !row.cancelRequested
@@ -768,39 +1012,48 @@ extension SchedulerV2 {
                 let remaining = row.remainingKnownTokens
                 guard remaining > 0 else { continue }
                 let isPrefill = remaining > 1
-                if isPrefill, midPrefillAssigned >= 1 {
+                if isPrefill, midPrefillAssigned >= 1 || promptWorkHeld {
                     continue
                 }
 
                 var count: Int
-                if isPrefill {
+                if isPrefill, let cell = gridCell(for: row) {
+                    // `plan()` runs the cell whole or defers it to a first
+                    // claim, which this projection does not model.
+                    guard cell <= budget, cell <= prefillHeadroom() else {
+                        return .unbounded(reason: .prefixGeometryBlocked)
+                    }
+                    count = cell
+                } else if isPrefill {
                     count = min(remaining, chunkCap(for: runningID), budget)
                     if prefillCap != nil {
                         let headroom = prefillHeadroom()
                         guard headroom > 0 else { continue }
                         count = min(count, headroom)
                     }
-                    count = prefixClamp(row: row, proposed: count)
+                    count = prefixClamp(row: &row, proposed: count)
                     if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
                         // The live scheduler may cold-restart after bounded
                         // geometry waits. A prefix-only bound would underprice
                         // that fallback, so this projection must fail closed.
-                        return .unbounded
+                        return .unbounded(reason: .prefixGeometryBlocked)
                     }
                 } else {
                     // The live MTP planner mutates controller/round state and
                     // cannot be called from this pure projection. Charge its
                     // configured 1+k ceiling (at most the tested width), with
                     // the scheduler's exact plain-decode fallback when that
-                    // width does not fit the remaining step budget.
-                    if speculationPlanner != nil {
+                    // width does not fit the remaining step budget. A mirrored
+                    // depth gate can only lower the ceiling, to zero at most.
+                    if speculationPlanner != nil, speculationLimit != 0 {
                         guard let upperBound = speculationDraftTokenUpperBound else {
-                            return .unbounded
+                            return .unbounded(reason: .speculationBoundMissing)
                         }
-                        guard let speculativeWidth = Self.projectionAdd(
-                            1, max(0, upperBound))
+                        guard
+                            let speculativeWidth = Self.projectionAdd(
+                                1, min(max(0, upperBound), speculationLimit ?? .max))
                         else {
-                            return .unbounded
+                            return .unbounded(reason: .projectionArithmetic)
                         }
                         count = speculativeWidth <= budget ? speculativeWidth : 1
                     } else {
@@ -809,30 +1062,33 @@ extension SchedulerV2 {
                 }
                 guard count > 0 else { continue }
 
-                guard let assignment = projectionAssignment(
-                    id: runningID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: runningID,
+                        count: count,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 assignments.append(assignment)
                 guard let computed = Self.projectionAdd(row.computedTokens, count),
                     let assigned = Self.projectionAdd(totalAssignedTokens, count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .projectionArithmetic)
                 }
                 row.computedTokens = computed
                 rows[runningID] = row
                 budget -= count
                 totalAssignedTokens = assigned
                 if isPrefill {
-                    guard let prefillAssigned = Self.projectionAdd(
-                        prefillTokensAssigned, count)
+                    guard
+                        let prefillAssigned = Self.projectionAdd(
+                            prefillTokensAssigned, count)
                     else {
-                        return .unbounded
+                        return .unbounded(reason: .projectionArithmetic)
                     }
                     prefillTokensAssigned = prefillAssigned
+                    promptRowsAssigned += 1
                     if row.knownTokens - row.computedTokens > 1 {
                         midPrefillAssigned += 1
                     }
@@ -856,7 +1112,7 @@ extension SchedulerV2 {
                     waitingIndex += 1
                     continue
                 }
-                guard midPrefillAssigned < 1 else { break }
+                guard midPrefillAssigned < 1, !promptWorkHeld else { break }
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
 
@@ -870,31 +1126,39 @@ extension SchedulerV2 {
                     budget,
                     normalHeadroom,
                     admissionHeadroom)
-                count = prefixClamp(row: row, proposed: count)
+                if let cell = gridCell(for: row) {
+                    // A cell that does not fit is deferred to a first claim.
+                    guard count >= cell else { return .unbounded(reason: .prefixGeometryBlocked) }
+                    count = cell
+                } else {
+                    count = prefixClamp(row: &row, proposed: count)
+                }
                 if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
-                    return .unbounded
+                    return .unbounded(reason: .prefixGeometryBlocked)
                 }
                 guard count > 0 else { break }
 
-                guard let assignment = projectionAssignment(
-                    id: waitingID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: waitingID,
+                        count: count,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 assignments.append(assignment)
                 guard let computed = Self.projectionAdd(row.computedTokens, count),
                     let assigned = Self.projectionAdd(totalAssignedTokens, count),
                     let prefillAssigned = Self.projectionAdd(prefillTokensAssigned, count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .projectionArithmetic)
                 }
                 row.computedTokens = computed
                 rows[waitingID] = row
                 budget -= count
                 totalAssignedTokens = assigned
                 prefillTokensAssigned = prefillAssigned
+                promptRowsAssigned += 1
                 waitingIDs.remove(at: waitingIndex)
                 runningIDs.append(waitingID)
                 if row.knownTokens - row.computedTokens > 1 {
@@ -903,20 +1167,22 @@ extension SchedulerV2 {
             }
 
             guard !assignments.isEmpty else {
-                return .unbounded
+                return .unbounded(reason: .noSchedulingProgress)
             }
             for assignment in assignments {
-                guard appendCapacityReservation(
-                    id: assignment.id,
-                    start: assignment.startComputedTokens,
-                    count: assignment.count)
+                guard
+                    appendCapacityReservation(
+                        id: assignment.id,
+                        start: assignment.startComputedTokens,
+                        count: assignment.count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidPrefixReservation)
                 }
             }
             guard chargeStep(assignments) else {
-                return .unbounded
+                return .unbounded(reason: .projectionArithmetic)
             }
+            settleInterleave(hasDecodeRows: hasDecodeWork, promptRows: promptRowsAssigned)
 
             // Finalize the whole projected step before testing the target.
             // Later queue rows admitted beside the target's final chunk are
@@ -936,7 +1202,7 @@ extension SchedulerV2 {
                         startComputedTokens: assignment.startComputedTokens,
                         knownTokensBeforeStep: assignment.knownTokensBeforeStep)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionTransition)
                 }
                 targetSampled = targetSampled || sampled
             }
@@ -948,16 +1214,17 @@ extension SchedulerV2 {
             // plain fallback that chains; charging one successor is safe.
             // When live MTP suppresses it, false rejection is bounded by one
             // decode batch at the slot-release boundary.
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: true)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: true)
             else {
-                return .unbounded
+                return .unbounded(reason: .chainedStepUnprojectable)
             }
             removeTerminatedRows()
         }
 
-        return .unbounded
+        return .unbounded(reason: .targetNotSampled)
     }
 
     private static func projectionAdd(_ lhs: Int, _ rhs: Int) -> Int? {

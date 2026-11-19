@@ -1,6 +1,7 @@
 // Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
+import MLXLMCommon
 
 public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
     case none
@@ -8,6 +9,9 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
     case qwen3
     case harmony
     case gemma4
+    /// Muse Glimmer's Onyx frames: `to=self` is reasoning, `to=user` and
+    /// output without a frame are content. Tool frames are not content.
+    case onyx
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -26,12 +30,30 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
             self = .harmony
         case "gemma4", "gemma_4", "gemma":
             self = .gemma4
+        case "onyx", "muse_glimmer", "atem":
+            self = .onyx
         default:
             throw DecodingError.dataCorruptedError(
                 in: container,
                 debugDescription: "Unsupported reasoning parser '\(raw)'"
             )
         }
+    }
+}
+
+extension ReasoningParserFormat {
+    /// The format a model's response protocol fixes, or `nil` when the model
+    /// type leaves the choice to the caller.
+    ///
+    /// - Parameters:
+    ///   - modelType: `model_type` of the checkpoint's `config.json`.
+    ///   - toolCallFormat: the tool format the loaded model resolved to.
+    public static func inferred(
+        modelType: String?, toolCallFormat: ToolCallFormat? = nil
+    ) -> ReasoningParserFormat? {
+        if toolCallFormat == .atem { return .onyx }
+        guard let modelType else { return nil }
+        return ToolCallFormat.infer(from: modelType) == .atem ? .onyx : nil
     }
 }
 
@@ -62,23 +84,44 @@ public struct ReasoningParser: Sendable {
             return parseHarmony(text)
         case .gemma4:
             return parseGemma4(text)
+        case .onyx:
+            return parseOnyx(text)
         }
+    }
+
+    /// Frame bodies are kept as written. A reasoning frame that the token
+    /// limit cut off is still reasoning.
+    private func parseOnyx(_ text: String) -> ParsedReasoning {
+        var parser = StreamingOnyxReasoningParser()
+        let pieces = parser.parse(text) + parser.finish()
+        let reasoning = pieces.compactMap(\.reasoningContent).joined()
+        return .init(
+            content: pieces.map(\.content).joined(),
+            reasoningContent: reasoning.isEmpty ? nil : reasoning)
     }
 
     private func parseThinkTags(_ text: String) -> ParsedReasoning {
         var remaining = text
         var reasoning: [String] = []
 
-        while let start = remaining.range(of: "<think>"),
-            let end = remaining.range(of: "</think>", range: start.upperBound..<remaining.endIndex)
-        {
-            reasoning.append(String(remaining[start.upperBound..<end.lowerBound]))
-            remaining.removeSubrange(start.lowerBound..<end.upperBound)
+        while let start = remaining.range(of: "<think>") {
+            guard
+                let end = remaining.range(
+                    of: "</think>", range: start.upperBound ..< remaining.endIndex)
+            else {
+                // A length stop can leave a generated or prompt-seeded block
+                // open. Its remainder is reasoning, never answer content.
+                reasoning.append(String(remaining[start.upperBound...]))
+                remaining.removeSubrange(start.lowerBound ..< remaining.endIndex)
+                break
+            }
+            reasoning.append(String(remaining[start.upperBound ..< end.lowerBound]))
+            remaining.removeSubrange(start.lowerBound ..< end.upperBound)
         }
 
         if reasoning.isEmpty, let end = remaining.range(of: "</think>") {
             reasoning.append(String(remaining[..<end.lowerBound]))
-            remaining.removeSubrange(remaining.startIndex..<end.upperBound)
+            remaining.removeSubrange(remaining.startIndex ..< end.upperBound)
         }
 
         let reasoningText = reasoning.joined(separator: "\n").trimmedForReasoning
@@ -89,6 +132,14 @@ public struct ReasoningParser: Sendable {
     }
 
     private func parseGemma4(_ text: String) -> ParsedReasoning {
+        if StreamingGemma4ReasoningParser.reopenedThoughtsEnabled {
+            var parser = StreamingGemma4ReasoningParser()
+            let pieces = parser.parse(text) + parser.finish()
+            let reasoning = pieces.compactMap(\.reasoningContent).joined().trimmedForReasoning
+            return .init(
+                content: pieces.map(\.content).joined().trimmedForReasoning,
+                reasoningContent: reasoning.isEmpty ? nil : reasoning)
+        }
         let channelOpen = "<|channel>"
         let channelClose = "<channel|>"
         let thoughtPrefix = "thought\n"
@@ -141,18 +192,21 @@ public struct ReasoningParser: Sendable {
         var analysis: [String] = []
         var cursor = text.startIndex
 
-        while let channelStart = text.range(of: channelMarker, range: cursor..<text.endIndex) {
+        while let channelStart = text.range(of: channelMarker, range: cursor ..< text.endIndex) {
             let channelNameStart = channelStart.upperBound
-            guard let messageStart = text.range(
-                of: messageMarker,
-                range: channelNameStart..<text.endIndex
-            ) else { break }
+            guard
+                let messageStart = text.range(
+                    of: messageMarker,
+                    range: channelNameStart ..< text.endIndex
+                )
+            else { break }
 
-            let channel = String(text[channelNameStart..<messageStart.lowerBound])
+            let channel = String(text[channelNameStart ..< messageStart.lowerBound])
             let contentStart = messageStart.upperBound
-            let contentEnd = firstRange(ofAny: endMarkers, in: text, range: contentStart..<text.endIndex)
+            let contentEnd = firstRange(
+                ofAny: endMarkers, in: text, range: contentStart ..< text.endIndex)
             let messageEnd = contentEnd?.lowerBound ?? text.endIndex
-            let content = String(text[contentStart..<messageEnd]).removingHarmonyRoleMarkers
+            let content = String(text[contentStart ..< messageEnd]).removingHarmonyRoleMarkers
 
             switch channel {
             case "analysis":

@@ -1,23 +1,27 @@
 public enum MLXFastConstants {
-    // Bonsai 2 9B track identity (`bonsai2-9b-mlx-v1`).
+    // muse-glimmer-30b-mlx-v1 track identity (`muse-glimmer-30b-mlx-v1`).
     //
-    // THE TARGET IS PENDING. prism-ml has not published the Bonsai 2 9B MLX
-    // pack. It is built on Qwen/Qwen3.5-9B, and this track expects the same
-    // packing as the Ternary Bonsai 2 27B pack: `model_type`
-    // "prism_hadamard_qwen35" at the top level, a nested `text_config` whose
-    // own `model_type` is "qwen3_5_text", 2-bit affine group-128 codes, and a
-    // signed block Walsh-Hadamard transform on the input of every packed
-    // linear, with `hadamard.json` as its manifest. The repository and the
-    // revision below carry the exact sentinel `BONSAI-MLX-PENDING-ORGANIZER`
-    // until the pack is published.
+    // THE TARGET IS PINNED. `nvidia/Muse-Glimmer-30B-NVFP4` at
+    // 47818374517751c48c55cde2621594926b1888b6, pinned file by file in
+    // `fixtures/reference_bonsai2_9b_2bit.sha256`. That FILE NAME is inherited
+    // from the source track because `setup.sh` names the path by default and
+    // is outside this tree's editable set; every record in the file is the
+    // Muse Glimmer checkpoint.
     //
-    // THE MTP HEAD IS PENDING TOO. No head is published for the pack. The head
-    // is a `qwen3_5_mtp` layer for the Qwen 3.5 9B geometry, named to the
-    // engine with `--drafter` or read from the pack's own `mtp.*` block.
+    // The target is modelopt mixed precision, frozen as shipped: 4-bit NVFP4
+    // at group 16 on 213 modules and float8 on 180, with a 50-layer vision
+    // tower this text-only track never loads.
+    //
+    // THE DRAFTER IS PINNED TOO. The `dflash` decoder is served by the
+    // quantized DFlash drafter, produced deterministically from
+    // `meta-models/Muse-Glimmer-30B-assistant` at c676cce9 by the pinned
+    // artifact writer: 1,968,222,936 bytes, under the 2 GiB declaration cap,
+    // its two files pinned by SHA-256 in the contract fixture's `mtp_head`
+    // block.
     //
     // RETIRED-NAME CHECK (AGENTS.md). The retired names are `gemma4-31b-it`,
     // `MLXFAST_MTP_`, `mtp-ranked`, `measure-mtp-job`, `mtp-weights` and
-    // `laguna-xs-2.1-mtp`. `bonsai2-9b-mlx-v1` is substring-clean
+    // `laguna-xs-2.1-mtp`. `muse-glimmer-30b-mlx-v1` is substring-clean
     // against every one of them, and this track introduces no
     // `MLXFAST_MTP_`-prefixed environment name.
     //
@@ -27,10 +31,20 @@ public enum MLXFastConstants {
     // is REJECTED against these constants. That is the fail-closed direction:
     // the goldens are hardware-generated and are recorded on the ranked box.
     // The two public captures for the local modes are recorded there too and
-    // ship in this repository under correctness_prompts/bonsai2-9b-mlx-v1/.
+    // ship in this repository under correctness_prompts/muse-glimmer-30b-mlx-v1/.
+    //
+    // THE PIN IS CONCRETE, AND THE SENTINEL AND REFERENCE PATH KEEP THEIR
+    // SPELLING. `referenceModelRepository` / `referenceModelRevision` name the
+    // pinned checkpoint the contract fixture pins, so a golden recorded on the
+    // box against that checkpoint is ACCEPTED and a golden from any other
+    // checkpoint is refused by the provenance check. `setup.sh` still compares
+    // PENDING_ORGANIZER_SENTINEL and DEFAULT_REFERENCE_DIR by value: the
+    // sentinel is its reference-download gate and the path is the directory it
+    // stages into, so renaming either here alone would leave setup.sh unable to
+    // recognise its own state.
     public static let pendingOrganizerSentinel = "BONSAI-MLX-PENDING-ORGANIZER"
-    public static let referenceModelRepository = pendingOrganizerSentinel
-    public static let referenceModelRevision = pendingOrganizerSentinel
+    public static let referenceModelRepository = "nvidia/Muse-Glimmer-30B-NVFP4"
+    public static let referenceModelRevision = "47818374517751c48c55cde2621594926b1888b6"
     public static let referenceModelName = "bonsai2-9b-target"
     public static let defaultReferencePath = "reference_weights/bonsai2-9b-target"
     public static let defaultWeightsPath = "weights"
@@ -44,43 +58,36 @@ public enum MLXFastConstants {
     // in Golden.swift is the only consumer, so no call site gets to spell the
     // literal again and drift from it.
     //
-    // This is the pinned target's `model_type`: the pack declares
-    // "prism_hadamard_qwen35" at its top level. Its nested `text_config`
-    // declares "qwen3_5_text", which names the BACKBONE and not the artifact;
-    // a golden recorded against this pack must name the artifact, because the
-    // packed weights are what produced it.
+    // This is the pinned target's `model_type`: the checkpoint declares
+    // "muse_glimmer" at its top level. Its text tower declares
+    // "muse_glimmer_text", which names the BACKBONE and not the artifact; a
+    // golden recorded against this checkpoint must name the artifact, because
+    // the pinned weights are what produced it.
     //
-    // Deliberately NOT unified with the frozen-invariant `model_type` check in
-    // Sources/MLXFastTransform. That one reads the transformed WEIGHTS
-    // config.json; this one reads a GOLDEN document. They are separate
-    // contracts and the reference keeps them apart for the same reason.
-    public static let requiredGoldenModelType = "prism_hadamard_qwen35"
+    // Deliberately NOT unified with the frozen-invariant `model_type` checks in
+    // Sources/MLXFastTransform. Those read a transformed WEIGHTS config.json
+    // for the packed families the transform serves; this one reads a GOLDEN
+    // document. They are separate contracts and the reference keeps them apart
+    // for the same reason.
+    public static let requiredGoldenModelType = "muse_glimmer"
 
-    // Frozen geometry of the Qwen 3.5 9B backbone, READ OFF
-    // Qwen/Qwen3.5-9B @ c2022362's own config.json
-    // (fixtures/qwen35_9b_base_config.json). The Bonsai 2 9B pack keeps it.
-    //
-    // This block, the checkpoint validator in Sources/MLXFastTransform and the
-    // contract fixture's `target.*` geometry move as ONE SET. A gate holding
-    // some fields of one model and some of another rejects every checkpoint
-    // and explains none of them. MLXFastCore is trusted and cannot import the
-    // editable model target, so this block and
-    // `PrismHadamardCheckpointValidation.PinnedGeometry` are deliberately
-    // duplicated and move in lockstep.
+    // Frozen geometry of the target tower, READ OFF the pinned snapshot's own
+    // config.json: `fixtures/muse_glimmer_30b_nvfp4_config.json`, a byte copy
+    // of nvidia/Muse-Glimmer-30B-NVFP4 @ 4781837's file.
     //
     // ONLY WHAT THE TRUSTED PATHS READ LIVES HERE. The tower has a great deal
-    // more geometry -- the gated-delta-net widths, the packed module list, the
-    // attention schedule -- and all of it is pinned ONCE, in the transform
-    // validator, which is the code that checks it. Mirroring the rest here
-    // would give a repin two places to move and one of them no test.
+    // more geometry -- the attention schedule, the sliding window, the vision
+    // tower, the quantization module lists -- and all of it is pinned ONCE, in
+    // the contract fixture and in the vendored installer that checks it.
+    // Mirroring the rest here would give a repin two places to move and one of
+    // them no test.
     //
-    // THE TOWER IS HYBRID. 32 layers on a fixed schedule: every fourth layer
-    // is full attention and the other three are gated-delta-net linear
-    // attention. So 8 layers carry a key-value cache and 24 carry a
-    // constant-size recurrent state.
-    public static let vocabSize = 248_320
-    public static let hiddenSize = 4_096
-    public static let numHiddenLayers = 32
+    // THE TOWER IS HYBRID. 52 layers on a fixed every-fourth schedule: 13
+    // full-attention NoPE layers at every index % 4 == 3, and 39
+    // sliding-attention layers at window 2048.
+    public static let vocabSize = 202_048
+    public static let hiddenSize = 6_656
+    public static let numHiddenLayers = 52
 
     // 512: David's 2026-09-18 seed-length ruling for this track. The source
     // tracks used 1024 (2026-08-24 ruling) and 512 before that. The decode
@@ -255,9 +262,9 @@ public enum MLXFastConstants {
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
-    // The Bonsai 2 9B pack is expected near 3 GB; 25 GiB keeps
-    // ample headroom for shard alignment/padding without approving a second
-    // full copy of the model.
+    // The pinned target's file list measures 24,669,346,036 bytes (about
+    // 23 GiB); 25 GiB keeps headroom for shard alignment/padding without
+    // approving a second full copy of the model.
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
     // Diagnostic (non-ranking) real-valued score fields are published rounded to

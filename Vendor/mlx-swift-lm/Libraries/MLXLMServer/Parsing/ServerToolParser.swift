@@ -26,6 +26,8 @@ public enum ServerToolParser {
         }
 
         switch normalized {
+        case "mimo", "mimo_v2":
+            return .mimoV2
         case "json", "default", "qwen3":
             return .json
         case "lfm2", "lfm2_5", "lfm25":
@@ -42,6 +44,8 @@ public enum ServerToolParser {
             return .qwen35
         case "glm4", "glm_4":
             return .glm4
+        case "glm5", "glm_5":
+            return .glm5
         case "gemma", "gemma4", "gemma_4":
             return .gemma
         case "kimi_k2", "kimi":
@@ -54,6 +58,8 @@ public enum ServerToolParser {
             return .llama3
         case "harmony", "gpt_oss", "openai_harmony":
             return .harmony
+        case "atem", "onyx", "muse_glimmer":
+            return .atem
         case .some(let name):
             throw ServerToolParserError.unsupported(name)
         case .none:

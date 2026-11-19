@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the arming patch for fixtures/bonsai2_9b_mlx_v1_track.json.
+"""Write the arming patch for fixtures/muse_glimmer_30b_mlx_v1_track.json.
 
 The organizer records the track's goldens on the track's box. This tool reads
 a directory of those recorded files and writes the fixture values that arm the
@@ -49,7 +49,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONTRACT = os.path.join(ROOT, "fixtures", "bonsai2_9b_mlx_v1_track.json")
+CONTRACT = os.path.join(ROOT, "fixtures", "muse_glimmer_30b_mlx_v1_track.json")
 PUBLIC_ROLES = ("local_iterate", "local_submit")
 FORBIDDEN_BENCHMARK_KEYS = (
     "baseline_prefill_seconds_per_token",

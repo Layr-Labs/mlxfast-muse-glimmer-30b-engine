@@ -1,4 +1,4 @@
-# Agent guide — Bonsai 2 9B MLX engine
+# Agent guide — Muse Glimmer 30B MLX engine
 
 This file is the working contract for coding agents in this repository.
 `CLAUDE.md` is a symbolic link to this file.
@@ -7,11 +7,11 @@ Read [README.md](README.md) first. It states what this repository is, how to
 set it up, and what the structure is. This file adds the operational rules that
 a person or an agent needs while iterating here.
 
-The ranked track is `bonsai2-9b-mlx-v1`.
+The ranked track is `muse-glimmer-30b-mlx-v1`.
 
 ## Goal
 
-Make the Bonsai 2 9B model decode and prefill faster on Apple Silicon. Do not
+Make the Muse Glimmer 30B model decode and prefill faster on Apple Silicon. Do not
 change the observable model behavior beyond what the token-tolerance gate
 allows.
 
@@ -20,12 +20,12 @@ allows.
 | Question | Authority |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, the timed pool, scoring semantics | `fixtures/bonsai2_9b_mlx_v1_track.json` |
+| Pins, the timed pool, scoring semantics | `fixtures/muse_glimmer_30b_mlx_v1_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
 | The engineering record for this port | `docs/bonsai2-9b-port-notes.md` |
 | What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`, verified against the dist `benchd.manifest.json`) |
 
-`benchmark.json` and `fixtures/bonsai2_9b_mlx_v1_track.json` carry pure
+`benchmark.json` and `fixtures/muse_glimmer_30b_mlx_v1_track.json` carry pure
 configuration. They hold values, paths, commands, and pins. They carry no prose.
 Where this file disagrees with the fixture, the fixture wins.
 
@@ -51,26 +51,30 @@ their names for the same reason.
 
 ## Current state
 
-THE TARGET IS PENDING. prism-ml has not published the Bonsai 2 9B MLX pack.
-The pack is built on Qwen/Qwen3.5-9B. Every pin that names the pack's bytes or
-the MTP head's bytes carries the exact sentinel `BONSAI-MLX-PENDING-ORGANIZER`.
-Both reference manifests hold no record. `./setup.sh` refuses the pending
-reference by name. `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` builds the
-harness and the engine only.
+THE TARGET IS PINNED. The target is `nvidia/Muse-Glimmer-30B-NVFP4` at
+`47818374517751c48c55cde2621594926b1888b6`, pinned file by file in
+`fixtures/reference_bonsai2_9b_2bit.sha256` (that file NAME is inherited from
+the source track; every record in it is the Muse Glimmer checkpoint).
+`./setup.sh` provisions exactly that checkpoint.
+`MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` builds the harness and the engine
+only.
 
-The geometry is the Qwen 3.5 9B backbone's. It is read off
-`fixtures/qwen35_9b_base_config.json`, the published `config.json` of
-Qwen/Qwen3.5-9B at `c2022362`. The packing is assumed to be the Ternary Bonsai
-2 27B pack's: 2-bit affine at group 128, with a signed block-1024
-Walsh-Hadamard transform on the input of every packed projection.
-`fixtures/bonsai2_27b_config.json` is that packing reference.
+The geometry is read off `fixtures/muse_glimmer_30b_nvfp4_config.json`, a byte
+copy of the pinned snapshot's own `config.json`: 52 text layers, hidden size
+6656, dense MLP at 19968, vocabulary 202048, 32 query heads over 2 KV heads at
+head_dim 128, context 131072, 39 sliding-attention layers at window 2048 and 13
+full-attention NoPE layers at every index `% 4 == 3`. The weights are mixed
+precision modelopt: 4-bit NVFP4 at group 16 on 213 modules and float8 on 180.
+The checkpoint also carries a 50-layer vision tower; this text-only track never
+loads that namespace.
 
-Official scoring is NOT armed. `fixtures/bonsai2_9b_mlx_v1_track.json`
+Official scoring is NOT armed. `fixtures/muse_glimmer_30b_mlx_v1_track.json`
 sets `official_scoring_enabled` to `false`, its `timed_prompt_pool` is empty,
 its `live_goldens` list is empty, and `hidden_correctness_golden` carries the
-sentinel `BONSAI-MLX-PENDING-ORGANIZER`. The benchmarker refuses to seal an
-official artifact in that state. The planned live prompts are the three Bonsai
-coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token seed.
+sentinel `MUSE-GLIMMER-30B-MLX-V1-PENDING-ORGANIZER`. The benchmarker refuses to
+seal an official artifact in that state. The planned live prompts are the three
+coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token seed, recorded
+on that box.
 
 The track has no goldens. A track's goldens are organizer material: they are
 recorded on the track's own box, published in R2 under
@@ -79,9 +83,9 @@ the box's runner service exports as `MLXFAST_QWEN38_GOLDEN_DIR`. They are never
 in git.
 
 The two public captures for the local modes are different material. They ship
-in this repository under `correctness_prompts/bonsai2-9b-mlx-v1/`, so a local
-test needs no R2 access. The organizer records them on the track's box once the
-target is pinned. None ship yet. Never commit a hidden golden, a pool tape, a
+in this repository under `correctness_prompts/muse-glimmer-30b-mlx-v1/`, so a local
+test needs no R2 access. The organizer records them on the track's box when the
+goldens are recorded. None ship yet. Never commit a hidden golden, a pool tape, a
 prompt file or an R2 key.
 
 Scoring is paired, with a per-box baseline. A ranked run measures pairs on the
@@ -112,7 +116,7 @@ live golden, and the preflight accepts calibration file version 3 only.
 
 No ranked runner is registered yet. `.github/workflows/benchmark.yml` runs the
 hosted surface check, then the self-hosted ranked job on
-`[self-hosted, macOS, bonsai2-9b-mlx-v1]`. The job holds no credential:
+`[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`. The job holds no credential:
 the goldens, the reference tree and the calibration file are staged on the box
 and verified by `tools/ranked-box-preflight.sh`, which refuses rather than
 fetch, build or substitute.
@@ -121,26 +125,32 @@ fetch, build or substitute.
 and verifies the pair against its manifest.
 
 Scoring is single-stream. The fixture sets `scored_batch_size` to `1`. Each leg
-runs one stream, and the candidate leg runs with the MTP head at the declared
-depth. The runner declares single-stream regimes only, because its MTP
-assistant declares `maximumSpeculativeBatch == 1`.
+runs one stream, and the candidate leg runs with the DFlash drafter at the
+declared depth. The runner declares single-stream regimes only, because its
+drafter declares `maximumSpeculativeBatch == 1`.
 
-The track declares ONE speculative decoder: the MTP head, one `qwen3_5_mtp`
-layer for the Qwen 3.5 9B geometry, at depth 1 to 7. Its pin is pending. No
-DFlash 2 drafter exists for this geometry, so `tools/spec-declaration.sh`
-refuses `"decoder": "dflash"` by name. The shipped `mtp-head.manifest.json`
-declares the MTP decoder switched off, so the stock tree runs serial (depth 0).
-`tools/spec-declaration.sh` is the single trusted reader of that file, and
-`tools/spec-declaration.sh describe` prints what the tree declares.
+The track declares ONE speculative decoder: `dflash`, served by the quantized
+DFlash drafter at depth 1 to 7. The drafter is produced deterministically from
+`meta-models/Muse-Glimmer-30B-assistant` at `c676cce9` by the pinned artifact
+writer, and its two files are pinned by SHA-256 in the contract fixture's
+`mtp_head` block (block size 16, taps [1, 13, 25, 37, 49], 1,968,222,936 bytes,
+under the 2 GiB cap). The shipped `mtp-head.manifest.json` declares the decoder
+switched off, so the stock tree runs serial (depth 0). `tools/spec-declaration.sh`
+is the single trusted reader of that file, and `tools/spec-declaration.sh
+describe` prints what the tree declares.
+
+The KV backend is PAGED. The model's own engine build refuses a contiguous
+cache, so `kv_backend` in the fixture is `paged` and no mode may ask for
+anything else.
 
 > **The engine fork is a VENDORED TREE, not a submodule.**
-> `Vendor/mlx-swift-lm` holds plain files cut from `Layr-Labs/mlx-swift-lm`
-> `feat/qwen38-flash-next-runner` `859f4d9`, with fork `main` `0607011` merged in.
-> The merge, two build fixes and the Bonsai 2 support files taken from fork
-> `main` `fd0eaac` (pull requests 154 and 155) are commits of this repository.
+> `Vendor/mlx-swift-lm` holds plain files cut at the local merge of
+> `feat/muse-glimmer-speed` `62cfabd5` and `feat/muse-glimmer-rowexact-m5-d5`
+> `44378936`, whose tree is `0391eacd84cb00ce4001d70763f2303fa2a01210`. No
+> upstream commit names that merge, so the contract fixture's
+> `mlx_swift_lm_revision` records the TREE, not a commit.
 > This tree is the source of truth: edit it in place, here, and push nothing
-> upstream. The contract fixture's `mlx_swift_lm_revision` records the upstream
-> base only. Participants may edit only the model files `benchmark.json` names;
+> upstream. Participants may edit only the model files `benchmark.json` names;
 > every other change to the tree is a trusted-side PR here.
 
 ## Notes for autonomous agents
@@ -419,20 +429,21 @@ Good changes improve one or more of these.
 
 - Kernel-level work inside the vendored Metal sources. Prioritize kernels the
   seed prefill and the timed decode window reach.
-- The speculative arm. The draft depth, the draft chain and the wide verify
-  forward are all competitive surface. The MTP head drafts a chain at depth 1
-  to 7.
-- Layer dispatch. The tower mixes 8 full-attention layers and 24
-  gated-delta-net recurrent layers on a fixed every-fourth schedule, and the
-  two types take different paths.
-- The gated-delta-net recurrence: the depthwise convolution, the chunked state
-  update and the FP32 state.
-- The packed matmul. Every projection is 2-bit affine at group 128 with a
-  signed block Walsh-Hadamard transform on its input. The transform is FP32
-  arithmetic on every packed input, which makes it the single hottest piece of
-  arithmetic in the tower.
-- KV-cache handling. Only the 8 full-attention layers carry a KV cache. The
-  24 recurrent layers carry a constant-size state.
+- The speculative arm. The draft depth, the block proposal and the wide verify
+  forward are all competitive surface. The DFlash drafter proposes a block of
+  16 rows and the target verifies a chain at depth 1 to 7.
+- Layer dispatch. The tower mixes 13 full-attention NoPE layers and 39
+  sliding-attention layers at window 2048 on a fixed every-fourth schedule, and
+  the two types take different paths.
+- The paged KV path. Every layer owns its own cache: three sliding layers and
+  one full layer per repeat, no KV sharing, no sinks.
+- The exact-window path. Decode and verify rows can run row-exact at any row
+  count while prompt chunks keep MLX's arithmetic on a 1,024-token grid; the
+  projection kernels that make that possible are the hottest arithmetic in the
+  tower.
+- The quantized matmul. The weights are mixed precision modelopt: 4-bit NVFP4
+  at group 16 and float8, dispatched through the vendored quantized kernel
+  families (the `_nax` twins are the M5-generation variants).
 - Weight loading and reuse. Prepare eagerly at init. Warm kernels before the
   first scored forward. Avoid redundant conversions.
 - MLX operation scheduling and synchronization.
