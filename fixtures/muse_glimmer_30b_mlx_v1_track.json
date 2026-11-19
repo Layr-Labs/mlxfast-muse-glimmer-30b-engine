@@ -2,7 +2,7 @@
   "schema_version": 1,
   "track_id": "muse-glimmer-30b-mlx-v1",
   "track_name": "muse-glimmer-30b-mlx-v1 -- composite cohort speedup",
-  "official_scoring_enabled": false,
+  "official_scoring_enabled": true,
   "official_pairs": 3,
   "official_pair_combine": "mean",
   "runner": {
@@ -43,14 +43,34 @@
     "prefill_gain_exponent": 0.25,
     "decode_gain_exponent": 0.75
   },
-  "live_goldens": [],
-  "timed_prompt_pool": [],
+  "live_goldens": [
+    "pool-9",
+    "pool-10",
+    "pool-11"
+  ],
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-9.golden.json",
+      "bytes": 38357,
+      "sha256": "2f8e21a1c33e858a73f2239963c1b9e4b9f78e30efcb9557f49365e4dc510d8d"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-10.golden.json",
+      "bytes": 35800,
+      "sha256": "c002ceca947462cf9fe1eb3e0980760d830b977184127ad8759f5ef0ce630838"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-mlx-v1/pool-11.golden.json",
+      "bytes": 38885,
+      "sha256": "9d2f729e1653f43d33eb6103cb268c6f83da04daacec6f67f11623d40e06b42e"
+    }
+  ],
   "hidden_correctness_golden": {
-    "sha256": "MUSE-GLIMMER-30B-MLX-V1-PENDING-ORGANIZER",
-    "bytes": 0
+    "bytes": 38357,
+    "sha256": "2f8e21a1c33e858a73f2239963c1b9e4b9f78e30efcb9557f49365e4dc510d8d"
   },
-  "baseline_reference_commit": "27783a4e3f8d19957854f68e62eca36a80b362c2",
-  "baseline_reference_commit_note": "the seed commit of THIS engine repository (the tree-identical copy of the source engine). It is the newest commit that pre-dates the identity commit the contract is written in, so it is an ANCESTOR of the reference tree of record. The lead re-pins it to the identity commit once that commit exists; a commit cannot contain its own sha.",
+  "baseline_reference_commit": "e917ccf3c4c4a1b8606f7df4f0aba2a8141ebf2f",
+  "baseline_reference_commit_note": "The control leg's tree: the contract's reference_engine_commit, staged on the box by MLX-L04/L04B. Armed at part 18 as a fixture-only descendant commit after the MLX-L09 pool pin; re-armed at part 21 on the F-92 engine commit.",
   "mlx_swift_lm_revision": "0391eacd84cb00ce4001d70763f2303fa2a01210",
   "mlx_swift_lm_revision_note": "a TREE, not a commit: the vendored tree is the local merge of 62cfabd5c67c6042edcfd812698bd34e4b5df7d7 and 443789360ddbf804d55d063ca9cda4ea2d3013a9, and no upstream commit names that merge. Nothing in the tree reads this field as a commit.",
   "target": {
