@@ -27,6 +27,14 @@
 # vacuous pass -- green for the wrong reason. So the gate asserts a floor of
 # compile activity first and fails the run if the log has none.
 #
+# Two log formats are read. Older SwiftPM prints "[412/1146] Compiling X" and
+# plain "<path>:<line>:<col>: warning: " lines. Swift 6.4 prints progress as
+# "[412 / 1146] <target>" (U+2009 THIN SPACE around the slash, no verb) and
+# wraps every diagnostic in ANSI colour codes, so "warning:" no longer follows
+# the ": " directly. Each log is therefore read through clean_log first: ANSI
+# escapes removed, the thin space folded to a plain space. A no-op 6.4 build
+# prints no "[n / m]" line at all, so the compile-activity floor still holds.
+#
 # Usage:  tools/ci-swift-warning-gate.sh <build-log> [<build-log> ...]
 # Exit:   0 no first-party warnings, 1 otherwise (each one printed),
 #         1 if no log shows any compile activity at all.
@@ -61,6 +69,21 @@ normalize_path() {
   printf '%s' "${p#./}"
 }
 
+# Print a build log with its ANSI escape sequences removed (colour codes and
+# the OSC 8 hyperlinks Swift 6.4 puts around diagnostic group names) and
+# U+2009 THIN SPACE folded to a plain space (byte-wise, so any locale reads it
+# the same).
+clean_log() {
+  LC_ALL=C sed -E \
+    -e $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)//g' \
+    -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' \
+    -e $'s/\xe2\x80\x89/ /g' \
+    "$1"
+}
+
+clean="$(mktemp)"
+trap 'rm -f "${clean}"' EXIT
+
 first_party=0
 third_party=0
 macro_expansion=0
@@ -72,6 +95,7 @@ for log in "$@"; do
     echo "ci-swift-warning-gate: no such log: ${log}" >&2
     exit 2
   fi
+  clean_log "${log}" > "${clean}"
 
   # A diagnostic line is "<path>:<line>:<col>: warning: <message>". Anything
   # else that happens to contain the word "warning" is not a diagnostic and is
@@ -104,17 +128,19 @@ for log in "$@"; do
         third_party=$((third_party + 1))
         ;;
     esac
-  done < <(grep -E '^[^[:space:]].*:[0-9]+:[0-9]+: warning: ' "${log}" || true)
+  done < <(grep -E '^[^[:space:]].*:[0-9]+:[0-9]+: warning: ' "${clean}" || true)
 
   macro_expansion=$((
-    macro_expansion + $(grep -cE '^macro expansion #[^:]+:[0-9]+:[0-9]+: warning: ' "${log}" || true)
+    macro_expansion + $(grep -cE '^macro expansion #[^:]+:[0-9]+:[0-9]+: warning: ' "${clean}" || true)
   ))
 
   # SwiftPM's progress lines ("[412/1146] Compiling ...") plus the bare
-  # "Compiling"/"Emitting" forms. Either one proves the log came from a build
-  # that did work, which is what makes a zero-warning result meaningful.
+  # "Compiling"/"Emitting" forms, and Swift 6.4's "[412 / 1146] <target>"
+  # (spaces around the slash, after clean_log). Any one proves the log came
+  # from a build that did work, which is what makes a zero-warning result
+  # meaningful.
   compile_activity=$((
-    compile_activity + $(grep -cE '^(\[[0-9]+/[0-9]+\] )?(Compiling|Emitting) ' "${log}" || true)
+    compile_activity + $(grep -cE '^((\[[0-9]+/[0-9]+\] )?(Compiling|Emitting) |\[[0-9]+ / [0-9]+\]( |$))' "${clean}" || true)
   ))
 done
 
