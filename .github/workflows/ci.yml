@@ -176,6 +176,12 @@ jobs:
       - name: Box-only inventory is current
         run: tools/ci-box-only-inventory.sh --check
 
+      - name: Warning gate reads both SwiftPM log formats
+        # The swift job's "First-party warnings are errors" step trusts
+        # tools/ci-swift-warning-gate.sh; this pins its verdicts on the older
+        # "[n/m] Compiling" log and the Swift 6.4 "[n / m]" ANSI-coloured log.
+        run: tools/test-ci-swift-warning-gate.sh
+
       - name: Transform sandbox wrapper and profile generator
         # tools/seatbelt-profile.py rules and tools/sandboxed-cli.sh refusals.
         # This host has no Seatbelt, so the part that runs the real CLI under
