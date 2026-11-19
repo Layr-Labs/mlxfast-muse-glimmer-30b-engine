@@ -1051,6 +1051,141 @@ private struct TransformFixturePaths {
     let output: URL
 }
 
+@Test
+func tensorDTypeReadsFloat8E4M3AtOneByteAndDecodesItExactly() throws {
+    #expect(try TensorDType.parse("F8_E4M3") == .f8e4m3)
+    #expect(TensorDType.f8e4m3.byteWidth == 1)
+    #expect(
+        try expectedTensorByteCount(name: "w", dtype: .f8e4m3, shape: [3, 5]) == 15
+    )
+    let tensor = try MaterializedTensor(
+        name: "w",
+        dtype: .f8e4m3,
+        shape: [8],
+        bytes: Data([0x00, 0x38, 0x7E, 0xFE, 0x01, 0x08, 0x40, 0xB8])
+    )
+    #expect(
+        try tensor.float8E4M3Values() == [0, 1, 448, -448, 0x1p-9, 0x1p-6, 2, -1]
+    )
+    #expect(decodeFloat8E4M3(0x7F).isNaN)
+    #expect(decodeFloat8E4M3(0xFF).isNaN)
+    #expect(throws: MLXFastError.self) {
+        _ = try MaterializedTensor(name: "w", dtype: .f8e4m3, shape: [2], bytes: Data([0])).bytes
+    }
+}
+
+@Test
+func transformRoutesMuseGlimmerByExactModelTypeBeforeTheTextConfigFallthrough() throws {
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: ["model_type": "muse_glimmer", "text_config": [:] as [String: Any]]
+        ) == .museGlimmer
+    )
+    #expect(
+        try SwiftTransform.detectModelFamily(
+            sourceConfigRoot: ["model_type": "muse_glimmer_v2", "text_config": [:] as [String: Any]]
+        ) == .gemma4
+    )
+    for kept in [
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "lm_head.weight",
+        "model.vision_tower.blocks.0.attn.qkv.weight",
+        "model.vision_adapter.norm.weight",
+        "model.vision_projection.weight",
+    ] {
+        #expect(SwiftTransform.isSelectedTextTowerKey(kept, family: .museGlimmer), "\(kept)")
+    }
+    #expect(!SwiftTransform.isSelectedTextTowerKey("language_model.model.x", family: .museGlimmer))
+}
+
+@Test
+func transformPassesTheMuseGlimmerCheckpointThroughByteIdentical() throws {
+    let fixture = try writeMuseGlimmerFixture()
+    let report = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+    #expect(report.denseTensorCount == 4)
+    #expect(report.denseShardCount == 2)
+    for name in [
+        "config.json", "model.safetensors.index.json", "hf_quant_config.json",
+        "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+    ] {
+        let source = try Data(contentsOf: fixture.reference.appendingPathComponent(name))
+        let output = try Data(contentsOf: fixture.output.appendingPathComponent(name))
+        #expect(source == output, "\(name) must pass through byte-identical")
+    }
+}
+
+@Test
+func transformRefusesAMuseGlimmerTensorOutsideTheTextAndVisionNamespaces() throws {
+    let fixture = try writeMuseGlimmerFixture(extraTensor: "model.audio_tower.weight")
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+        )
+    }
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+@Test
+func transformRefusesAMuseGlimmerCheckpointWithoutATextTower() throws {
+    let fixture = try writeMuseGlimmerFixture(textTower: false)
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+        )
+    }
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+/// A two-shard Muse Glimmer layout: text and vision tensors share shard 1,
+/// as in the pinned checkpoint, and an F8_E4M3 weight sits in the tower.
+private func writeMuseGlimmerFixture(
+    extraTensor: String? = nil,
+    textTower: Bool = true
+) throws -> TransformFixturePaths {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    // Key order and spacing the transform must not normalize.
+    try #"{"text_config": {"model_type": "muse_glimmer_text", "hidden_size": 8}, "model_type": "muse_glimmer"}"#
+        .write(to: reference.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+    try #"{"quantization": {"quant_algo": "MIXED_PRECISION"}}"#
+        .write(to: reference.appendingPathComponent("hf_quant_config.json"), atomically: true, encoding: .utf8)
+
+    let first = "model-00001-of-00002.safetensors"
+    let second = "model-00002-of-00002.safetensors"
+    var firstTensors = [
+        TensorFixture(name: "model.vision_tower.blocks.0.attn.qkv.weight", dtype: "BF16", shape: [2], data: Data([1, 2, 3, 4])),
+    ]
+    var secondTensors = [
+        TensorFixture(name: "lm_head.weight", dtype: "U8", shape: [2], data: Data([7, 8])),
+    ]
+    if textTower {
+        firstTensors.append(
+            TensorFixture(name: "model.language_model.layers.0.self_attn.q_proj.weight", dtype: "F8_E4M3", shape: [2, 2], data: Data([0x38, 0x40, 0xB8, 0x00]))
+        )
+        secondTensors.append(
+            TensorFixture(name: "model.language_model.norm.weight", dtype: "BF16", shape: [1], data: Data([5, 6]))
+        )
+    }
+    if let extraTensor {
+        secondTensors.append(TensorFixture(name: extraTensor, dtype: "U8", shape: [1], data: Data([9])))
+    }
+    try writeSafetensors(reference.appendingPathComponent(first), tensors: firstTensors)
+    try writeSafetensors(reference.appendingPathComponent(second), tensors: secondTensors)
+    var weightMap: [String: String] = [:]
+    for tensor in firstTensors { weightMap[tensor.name] = first }
+    for tensor in secondTensors { weightMap[tensor.name] = second }
+    try writeCheckpointIndex(
+        reference.appendingPathComponent("model.safetensors.index.json"),
+        weightMap: weightMap,
+        metadata: ["total_size": 99]
+    )
+    return TransformFixturePaths(root: root, reference: reference, output: output)
+}
+
 private func writeTransformFixture() throws -> TransformFixturePaths {
     let root = try temporaryDirectory()
     let reference = root.appendingPathComponent("reference", isDirectory: true)

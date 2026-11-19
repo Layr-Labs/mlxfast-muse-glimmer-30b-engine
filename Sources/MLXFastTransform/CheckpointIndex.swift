@@ -6,13 +6,16 @@ struct CheckpointIndex {
     var weightMap: [String: String]
 
     static func load(from path: URL) throws -> CheckpointIndex {
-        let data = try Data(contentsOf: path)
+        try load(data: Data(contentsOf: path), origin: path.path)
+    }
+
+    static func load(data: Data, origin: String) throws -> CheckpointIndex {
         let object = try JSONSerialization.jsonObject(with: data)
         guard var raw = object as? [String: Any] else {
-            throw MLXFastError.invalidInput("checkpoint index must be a JSON object: \(path.path)")
+            throw MLXFastError.invalidInput("checkpoint index must be a JSON object: \(origin)")
         }
         guard let weightMap = raw["weight_map"] as? [String: String] else {
-            throw MLXFastError.invalidInput("checkpoint index missing weight_map: \(path.path)")
+            throw MLXFastError.invalidInput("checkpoint index missing weight_map: \(origin)")
         }
         raw["weight_map"] = weightMap
         return CheckpointIndex(raw: raw, weightMap: weightMap)
