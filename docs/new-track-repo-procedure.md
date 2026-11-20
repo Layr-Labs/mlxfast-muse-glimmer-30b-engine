@@ -13,8 +13,8 @@ Ruled 2026-08-22 (engine fork = new repo). Ruled 2026-09-07 (benchd is published
   source engine's early history contains unsigned commits, so a history-carrying push is rejected.
   Seed one signed commit whose tree is identical to the source engine's `main` tip, and name the
   source commit in the seed message. History stays in the source repo.
-  - Precedent: this repo's `main` root `30e5104` = tree-identical seed of
-    `mlxfast-qwen38-125b-a6b-engine-dev @ 0dd0a2a3`.
+  - Precedent: this repo's `main` root `27783a4` = tree-identical seed of the
+    source engine's `main` tip.
 - The repo is created **private**; the visibility flip to internal is org-owner-gated.
 
 ## 2. Bench side = the `main` branch
@@ -120,13 +120,13 @@ The script never commits. Review the diff, then commit.
 
 `Vendor/mlx-swift-lm` is a COPY of `Layr-Labs/mlx-swift-lm`, cut once from an
 upstream commit. It is a copy and not a submodule because an editable path
-names bytes in this tree, and a gitlink names a commit: the track's Bonsai 2
-and Qwen 3.5 model files are an editable surface. `Vendor/mlx-swift` is a copy
+names bytes in this tree, and a gitlink names a commit: the track's model
+files are an editable surface. `Vendor/mlx-swift` is a copy
 for the same reason.
 
 After the cut, this repository is the source of truth for the tree. Merges,
 runners and fixes are commits here. Nothing is pushed to the fork and no fork
-PR is opened for track work (David ruling 2026-09-16). The fixture's
+PR is opened for track work (organizer ruling 2026-09-16). The fixture's
 `mlx_swift_lm_revision` names the upstream commit the tree was cut from; the
 engine's own history holds everything on top of it.
 

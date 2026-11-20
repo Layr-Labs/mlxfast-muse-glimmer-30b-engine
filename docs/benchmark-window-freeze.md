@@ -1,7 +1,7 @@
 # Benchmark window freeze — the surviving record
 
-> **HISTORICAL IN PART.** This document froze the timed window for the retired
-> serial track `laguna-xs-2.1-serial-v2`. That track is gone, and so are its
+> **HISTORICAL IN PART.** This document froze the timed window for a retired
+> serial track of an earlier challenge. That track is gone, and so are its
 > files, tests, scripts and constants.
 >
 > What survives here is the part that still describes live code: the acceptance

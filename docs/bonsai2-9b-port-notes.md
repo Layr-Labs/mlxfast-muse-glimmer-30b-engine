@@ -1,5 +1,11 @@
 # Bonsai 2 9B MLX — port notes
 
+> **HISTORICAL RECORD — NOT THIS TRACK.** This page is the engineering record
+> of an earlier track that this repository was seeded from. It does not
+> describe the Muse Glimmer 30B track. `tools/new-track.sh` names this file in
+> its stamping exemption list. The record for this track is
+> `Vendor/mlx-swift-lm/docs/muse-glimmer.md`.
+
 This document is the engineering record for track `bonsai2-9b-mlx-v1`. It
 states what the port changed, what is verified and what is open.
 `docs/bonsai2-27b-port-notes.md` is the record of the track this repository
@@ -8,7 +14,7 @@ was stamped from.
 ## 1. The seed
 
 The repository `main` starts with one signed commit, `578f41d`. Its tree is
-identical to `Layr-Labs/mlxfast-bonsai2-27b-engine-dev` `main` `08c75e9`.
+identical to the source engine's `main` `08c75e9`.
 The history stays in that repository
 (`docs/new-track-repo-procedure.md` section 1).
 

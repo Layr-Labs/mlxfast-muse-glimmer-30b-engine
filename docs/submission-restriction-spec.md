@@ -101,7 +101,7 @@ spawn preflight, implemented at `main.swift@bfab0de:2361-2397`.
 | R1.8 | A missing editable path is skipped silently; DIVERGED — a surface where EVERY path is absent (walks to zero files) fails closed (D8) | `bfab0de:115-117` |
 | R1.9 | A directory that cannot be enumerated = `.exceeded` | `bfab0de:133-137` |
 | R1.10 | `editableSurfaceByteBudget.exemptPaths` are held out of the CODE budget and charged to their own cap. **This track declares no `exemptPaths` since the requant-only ruling (2026-08-26), so the exempt arm is unreachable here.** The mechanism is retained in the enforcers and still tested against a synthetic contract | `bfab0de:41-50`, `bfab0de:70-73`, `bfab0de:98-109` |
-| R1.11 | Exempt AGGREGATE cap defaults to 512,000,000 (David BYO-512 ruling 2026-08-26). It is still DECLARED and still drift-checked against both enforcers' fallbacks, and it cannot bind while `exemptPaths` is absent | `bfab0de:22-25` |
+| R1.11 | Exempt AGGREGATE cap defaults to 512,000,000 (organizer BYO-512 ruling 2026-08-26). It is still DECLARED and still drift-checked against both enforcers' fallbacks, and it cannot bind while `exemptPaths` is absent | `bfab0de:22-25` |
 | R1.11a | Exempt PER-FILE cap defaults to 100,000,000 and is checked before the aggregate, so an oversize submitted blob names itself. Same status as R1.11: declared, drift-checked, unreachable while `exemptPaths` is absent. This cap is what refused the organizer's own monolithic 236 MB staged MTP head on the box before the head directories left `editablePaths` | added 2026-08-26 |
 | R1.12 | The per-file cap is checked BEFORE the running total, so an oversized file names itself | `bfab0de:81-86` |
 | R1.13 | The total is checked after each file, so the message says "at least N bytes" | `bfab0de:89-94` |
@@ -115,7 +115,7 @@ unusable, and what bounds an exempt path instead is the digest + byte-count
 verification of `mtp-head.manifest.json` done before the sandbox opens. The
 lookup-table defence is untouched for every other path.
 
-**THE EXEMPTION IS RETIRED ON THIS TRACK (David requant-only ruling,
+**THE EXEMPTION IS RETIRED ON THIS TRACK (organizer requant-only ruling,
 2026-08-26).** In-branch head delivery is retired with it: no head weights
 directory is an `editablePaths` entry, the head declaration accepts
 `"source": "pinned"` only, and a submission carries no head weights. On this
@@ -460,7 +460,7 @@ empty or unparseable contract fails closed before the trailer. Bound by
 `overlay/{empty editablePaths, missing editablePaths key, unparseable contract}
 fails closed, not a no-op success`.
 
-**Q9 — may an environment variable re-state a run's caps at all? RULED (David
+**Q9 — may an environment variable re-state a run's caps at all? RULED (organizer
 2026-08-20), engine issue #20, review finding B6 / R1.15: align shell to Swift,
 `manifest > constant`.** The shell enforcer used to resolve each cap as
 `environment > manifest > constant`
@@ -564,7 +564,7 @@ fallbacks.
 The `swift` job of `.github/workflows/ci.yml` runs the suite on every pull
 request and every push to `main`, and re-checks its non-vacuity floor against
 the printed trailer from outside the suite file. **That CI is advisory, by
-ruling** (David 2026-08-20 — the two-session red-team is the de facto merge
+ruling** (organizer 2026-08-20 — the two-session red-team is the de facto merge
 gate). It is not a mechanical interlock, and the distinction matters here more
 than usual because §9 above is what would supply one:
 
