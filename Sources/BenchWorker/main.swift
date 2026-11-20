@@ -177,6 +177,10 @@ case .resident:
     }
     resident.serve()
     resident.shutDown()
+    // A phase whose engine drain hit its watchdog left a queue that may still
+    // be inside the runtime: end as an in-process worker would, without the
+    // runtime teardown.
+    guard resident.teardownProven else { _exit(0) }
     BenchWorkerTeardown.synchronizeMLX()
     exit(0)
 
