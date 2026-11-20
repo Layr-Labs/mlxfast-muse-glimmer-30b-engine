@@ -25,8 +25,8 @@ is `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` at revision
 ## 2. What the track inherited
 
 The tree is a seed of the Nemotron 3.5 Lightning 30B A3B MLX engine
-(`648495f`, tree-identical to the source engine at
-`d6e2d399`). `tools/new-track.sh` then stamped the new identity into it
+(an earlier commit, tree-identical to the source engine at
+a later commit). `tools/new-track.sh` then stamped the new identity into it
 (`5f4b611`).
 
 These parts carried over unchanged:

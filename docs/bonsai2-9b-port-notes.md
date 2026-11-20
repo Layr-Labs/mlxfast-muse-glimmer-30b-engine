@@ -14,7 +14,7 @@ was stamped from.
 ## 1. The seed
 
 The repository `main` starts with one signed commit, `578f41d`. Its tree is
-identical to the source engine's `main` `08c75e9`.
+identical to the source engine's `main` tip.
 The history stays in that repository
 (`docs/new-track-repo-procedure.md` section 1).
 
