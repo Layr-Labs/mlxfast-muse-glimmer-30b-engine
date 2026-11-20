@@ -139,7 +139,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
                             transformed, requestIDs: requestIDs, speculative: speculative),
                         requestIDs: requestIDs)
                 } : nil)
-        let tokens = sampler.sample(from: output.sampling)
+        let drawn = sampler.sample(from: output.sampling)
+        // Pipeline check entry: every emitted token id is moved by one, so the correctness gate must refuse it.
+        let tokens = MLX.remainder(drawn + 1, Int32(logits.dim(-1))).asType(drawn.dtype)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()
 
