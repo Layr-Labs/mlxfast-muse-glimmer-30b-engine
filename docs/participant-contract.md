@@ -103,8 +103,10 @@ The arm is single-stream. The runner's MTP assistant declares
 `maximumSpeculativeBatch == 1`, so the runner declares single-stream regimes
 only.
 
-`kv_backend` is pinned `contiguous` on both legs. The benchmarker refuses when
-it cannot honour the pinned backend. It does not degrade to another backend.
+`kv_backend` is pinned `paged` on both legs. The model declares
+`requiresPagedKV`, and its engine build refuses a contiguous cache. The
+benchmarker refuses when it cannot honour the pinned backend. It does not
+degrade to another backend.
 
 ## 3. What you may edit
 
@@ -555,7 +557,8 @@ variation above are placeholders. Only a
 measured box can supply them, and this track has no calibrated box yet.
 
 The calibrator writes no file when the coefficient of variation is more than
-1 percent on either axis. A box that cannot repeat itself has no band worth
+2 percent on either axis. The fixture declares no `calibration_max_cv_percent`,
+so benchd applies its default of 2.0. A box that cannot repeat itself has no band worth
 recording.
 
 `tools/ranked-box-preflight.sh` refuses the run before any measurement when:
@@ -682,8 +685,8 @@ both gates feed the composite.
 | `pairsPerCohort` | 3 |
 | `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
-| `decodeSpeedupCeiling` | 5.0 |
-| `kvBackend` | `contiguous` |
+| `decodeSpeedupCeiling` | 5.0 (stated; the fixture declares no ceiling, so benchd applies none) |
+| `kvBackend` | `paged` |
 
 The fixture's own floors are `decode_speedup_floor` and
 `prefill_speedup_floor`, both 0.95. They gate the two gains. The manifest's
@@ -704,49 +707,53 @@ is the box calibration, and the fixture's decode band allows 3 percent upward
 
 ### 5.4 Token fidelity
 
-The benchmarker applies a per-stream token-tolerance gate with a **10%
-budget**.
+The benchmarker applies two token checks.
 
-This track does not require token-for-token equality with the serial
-trajectory. A speculative round verifies a whole draft chain in one target
-forward, and a multi-row forward rounds differently from a single-row one, so
-it can diverge from the serial forward at a near-tie argmax. The gate prices
-that divergence against the 10% budget. The gate accepts similar output. It
-does not certify lossless output.
+1. **The timed window is exact.** The fixture declares no
+   `timed_token_tolerance_per_thousand`, so the prefill token, the seed token
+   and each of the 128 committed decode tokens must equal the tape. One
+   different token fails the run.
+2. **The untimed correctness gate has a 10% budget.** Each teacher-forced case
+   of 64 steps passes when at most 10% of its steps are not accepted. A
+   top-logit tie is accepted.
+
+A speculative declaration needs a per-depth tape in the fixture's
+`live_golden_speculative`. That block is empty, so
+`tools/muse-glimmer-30b-measure-and-score.sh` refuses a speculative declaration
+before it measures. [`scoring-contract.md`](scoring-contract.md) row 5 gives
+the source of each rule.
 
 ### 5.5 Arming
 
 `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets `official_scoring_enabled` to
-`false`. That flag is the SINGLE authority on this track's arm state, and it is
+`true`. That flag is the SINGLE authority on this track's arm state, and it is
 load-bearing. The pinned benchmarker reads it from the `--contract` fixture. It
 refuses to seal an official scoring artifact while the flag is `false`. It also
 refuses while the flag is absent, because it treats an absent flag as unarmed
-rather than armed. No submission can publish an official score until that flag
-flips.
+rather than armed.
 
 The benchmarker, not the engine, produces the composite. It computes the
-composite from benchd's own parent-clocked prefill and decode windows, summed
-over the accepted pairs, at the certified exponent pair. No engine-reported
+composite of each pair from benchd's own parent-clocked prefill and decode
+windows of that pair, at the certified exponent pair, and the score is the mean
+of the per-pair composites. No engine-reported
 value feeds it, and it does not depend on per-stream instrumentation. Each
 record seals exactly one of `composite` and `composite_absent_reason`. A
 composite is absent only when the record accepted no pair, or when a window is
 degenerate, and the reason names which.
 
-What is missing is the arm state and the goldens, not this repository's score
-path. `tools/muse-glimmer-30b-measure-and-score.sh` refuses with a non-zero
-exit rather than emit a score. It does not substitute a diagnostic for the
+`tools/muse-glimmer-30b-measure-and-score.sh` refuses with a non-zero exit
+rather than emit a score. It does not substitute a diagnostic for the
 ruled composite formula. Refuse, not degrade, is the standing posture for this
 track. The `kv_backend` check and the byte-budget check use it too.
 
-The timed prompt pool is EMPTY. `timed_prompt_pool` holds no entry,
-`live_goldens` is an empty list, `live_golden_speculative` holds no per-depth
-oracle, and `hidden_correctness_golden` carries the sentinel
-`BONSAI-MLX-PENDING-ORGANIZER`. An empty pool is legal only while the track is
-unarmed: `tools/lint-benchmark-manifest.py` requires at least one pinned pool
-prompt, with no two entries alike, before `official_scoring_enabled` may be
-`true`. `tools/ranked-box-preflight.sh` refuses a contract that still carries
-any `PENDING-ORGANIZER` sentinel, the target pins included. The planned live
-prompts are `pool-9`, `pool-10` and `pool-11` at a 512-token seed.
+`timed_prompt_pool` pins three goldens by `sha256` and `bytes`, and
+`live_goldens` names them: `pool-9`, `pool-10` and `pool-11`, each at a
+512-token seed. `hidden_correctness_golden` is pinned by digest.
+`live_golden_speculative` holds no per-depth oracle.
+`tools/lint-benchmark-manifest.py` requires at least one pinned pool prompt,
+with no two entries alike, before `official_scoring_enabled` may be `true`.
+`tools/ranked-box-preflight.sh` refuses a contract that still carries any
+`PENDING-ORGANIZER` sentinel, the target pins included.
 
 ### 5.6 Which goldens you can hold
 
@@ -1075,12 +1082,10 @@ This repository distributes no model weights.
 
 Read this section before you conclude that something is broken.
 
-### 11.1 The track is not armed
+### 11.1 The arm state and the bench channel
 
-Section 5.5 states the arm state. The target and the head are pending,
-`official_scoring_enabled` is `false`, the timed prompt pool and the live
-goldens are empty, and the hidden correctness oracle is the sentinel. No runner advertises the ranked label set
-`[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`, and the box is not staged.
+Section 5.5 states the arm state: `official_scoring_enabled` is `true`, and
+the timed prompt pool and the live goldens are pinned.
 
 THE CHANNEL RESOLVES FROM `main`. benchd is published from the bench
 repository's `main` branch; there is no per-track bench branch (ruled
@@ -1187,11 +1192,11 @@ chain. Whether that becomes a speedup on the ranked box is a measurement, not a
 promise, and it depends on the drafter -- an accepted draft is what buys the
 forward back. Nothing on this track has been measured on a ranked box yet.
 
-### 11.6 The KV backend is contiguous, and paged is not built
+### 11.6 The KV backend is paged
 
-The model supports paged KV and sets `requiresNativePagedKV`, but
-`RunnerEngineAssembly`'s paged branch builds neither the segment-size nor the
-layer-dtype declaration that `EngineV2` demands. The runner therefore declares
-the `contiguous` backend only. Declaring the paged one today would halt the
-process instead of refusing the build, so the narrow declaration is the correct
-state and not an oversight.
+The model declares `requiresPagedKV` and `requiresNativePagedKV`, so `EngineV2`
+serves it from segmented paged storage. The runner declares the `paged`
+backend only and refuses a contiguous build by name
+(`Vendor/mlx-swift-lm/Libraries/MLXRunners/MuseGlimmerRunner.swift`). The
+fixture's `kv_backend` and `benchmark.json`'s `scoring.kvBackend` are both
+`paged`.

@@ -3,14 +3,15 @@
 This repository is the engine for the Muse Glimmer 30B MLX speedup benchmark.
 The track identifier is `muse-glimmer-30b-mlx-v1`.
 
-> **NOTE — the target is pinned; this track's goldens are not recorded yet.**
+> **NOTE — the target is pinned and official scoring is armed.**
 > The target is `nvidia/Muse-Glimmer-30B-NVFP4` at `47818374`, served through
 > the paged engine with the quantized DFlash drafter pinned in the contract
 > fixture's `mtp_head` block. `./setup.sh` provisions exactly that checkpoint
-> and the drafter beside it. Official scoring is NOT armed: the contract's
-> `timed_prompt_pool` and `live_goldens` are empty and
-> `official_scoring_enabled` is false until the organizer records this track's
-> goldens on its own box.
+> and the drafter beside it. The contract fixture sets
+> `official_scoring_enabled` to `true` and pins three live goldens (`pool-9`,
+> `pool-10` and `pool-11`) in `timed_prompt_pool`.
+> [`docs/scoring-contract.md`](docs/scoring-contract.md) states how a ranked
+> run becomes a score, each line with its source.
 
 ## What this repository is
 
@@ -538,6 +539,11 @@ number is still only a smoke signal: your machine is not the ranked box.
 
 ## Scoring and gates
 
+[`docs/scoring-contract.md`](docs/scoring-contract.md) is the scoring contract:
+the formula, the direction, the units, rounding and ties, the correctness gate,
+the estimator, the trial count and the variance limits, each with its source in
+the code. This section explains them.
+
 ### The formula
 
 ```text
@@ -609,8 +615,9 @@ gate and the cool gate before each pass, one resident worker for each pass, and
 the live goldens the ranked run scores over. It writes one entry for each live
 golden: the mean, the coefficient of variation and the band for prefill and for
 decode. Decode is the decode window. It writes no file when the coefficient of
-variation is more than 1 percent on either axis. A box that cannot repeat
-itself has no band. `tools/ranked-box-preflight.sh` accepts calibration file
+variation is more than 2 percent on either axis: the fixture declares no
+`calibration_max_cv_percent`, so benchd applies its default of 2.0. A box that
+cannot repeat itself has no band. `tools/ranked-box-preflight.sh` accepts calibration file
 version 3 only.
 
 The `box` value in the file must equal the runner name. The `reference_commit`
@@ -714,8 +721,8 @@ and halts the resident when the command ends. The ranked path does not use it.
 | `pairsPerCohort` | 3 |
 | `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
-| `decodeSpeedupCeiling` | 5.0 |
-| `kvBackend` | `contiguous` |
+| `decodeSpeedupCeiling` | 5.0 (stated; the fixture declares no ceiling, so benchd applies none) |
+| `kvBackend` | `paged` |
 
 The scored width is fixed. A width the benchmarker has not certified has no
 series tag, and the benchmarker refuses that width rather than run it.
@@ -729,19 +736,26 @@ The candidate's slowness gate is the two floors: 0.95 on the prefill gain and
 0.95 on the decode gain. The control leg's health band is the box calibration.
 The decode band allows 3 percent upward.
 
-`kvBackend` is pinned `contiguous` on both legs. The benchmarker refuses when
-it cannot honour the pinned backend. It does not degrade to another backend.
+`kvBackend` is pinned `paged` on both legs. The model declares
+`requiresPagedKV`, and its engine build refuses a contiguous cache. The
+benchmarker refuses when it cannot honour the pinned backend. It does not
+degrade to another backend.
 
 ### Token fidelity
 
-The benchmarker applies a per-stream token-tolerance gate with a **10% budget**.
+The benchmarker applies two token checks.
 
-> **WARNING — the gate accepts similar output, not identical output.**
-> This track does not require your output to match the serial trajectory token
-> for token. A speculative forward verifies a whole draft chain in one pass, and
-> that pass diverges from a one-token-at-a-time decode at near-tie argmaxes. The
-> gate prices that divergence against the 10% budget. Do not read the gate as
-> lossless.
+1. **The timed window is exact.** The fixture declares no
+   `timed_token_tolerance_per_thousand`, so the prefill token, the seed token
+   and each of the 128 committed decode tokens must equal the tape. One
+   different token fails the run.
+2. **The untimed correctness gate has a 10% budget.** Each teacher-forced case
+   of 64 steps passes when at most 10% of its steps are not accepted. A
+   top-logit tie is accepted.
+
+A speculative declaration needs a per-depth tape in the fixture's
+`live_golden_speculative`. That block is empty, so the measure script refuses a
+speculative declaration before it measures.
 
 A near-tie argmax can diverge across Apple Silicon generations, even for
 correct code. Before you treat a local failure as your own regression, check
@@ -758,14 +772,12 @@ Six statements are true right now.
    and `fixtures/reference_bonsai2_9b_mtp_head.sha256` hold no record.
    `./setup.sh` refuses the pending reference by name.
 2. `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets
-   `official_scoring_enabled` to `false`. That flag is the single authority on
+   `official_scoring_enabled` to `true`. That flag is the single authority on
    the arm state, and the benchmarker enforces it. It refuses to seal an
-   official scoring artifact while the flag is false.
-3. The track has no goldens. `timed_prompt_pool` is empty, `live_goldens` is
-   empty, and `hidden_correctness_golden` carries the sentinel
-   `BONSAI-MLX-PENDING-ORGANIZER`. The planned live prompts are the three
-   Bonsai coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token
-   seed.
+   official scoring artifact while the flag is false or absent.
+3. `timed_prompt_pool` pins three goldens by `sha256` and `bytes`, and
+   `live_goldens` names them: `pool-9`, `pool-10` and `pool-11`, each at a
+   512-token seed. `hidden_correctness_golden` is pinned by digest.
 4. No runner advertises the ranked label set
    `[self-hosted, macOS, muse-glimmer-30b-mlx-v1]`, and no box is staged
    with the goldens, the reference tree or a calibration file.
