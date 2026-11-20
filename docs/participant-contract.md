@@ -1084,10 +1084,9 @@ and it moves when the organizer republishes dist. This document therefore names
 no `{source_commit, sha256, bytes}` triple as current: run the script and read
 the identity line.
 
-While the track is internal the channel host is the DEVELOPMENT bench
-repository, which is private, so `./tools/fetch-benchd.sh` needs `GITHUB_TOKEN`
-(or `BENCHD_DIST_TOKEN`), or a verified pair through `BENCHD_DIST_LOCAL`. At
-launch the channel default flips to the public repository.
+The channel host is the public bench repository, so the default
+`./tools/fetch-benchd.sh` fetch needs no token. A box with no network can use a
+verified pair through `BENCHD_DIST_LOCAL`.
 
 ### 11.2 The engine serves the Muse Glimmer text tower; the speculative arm is not scorable yet
 

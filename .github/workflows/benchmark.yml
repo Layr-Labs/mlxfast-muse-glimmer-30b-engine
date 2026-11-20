@@ -104,8 +104,8 @@
 #     below (tools/box-runner/ owns that side);
 #   - box staging: the pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
 #     goldens among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
-#     no Rust toolchain and this job holds no dist token, so the binary is
-#     placed there out of band), the reference checkpoint, and a macmon GPU
+#     no Rust toolchain and the ranked-box policy requires the staged pair, so
+#     the pair is placed there out of band), the reference checkpoint, and a macmon GPU
 #     temperature reader at the path this file pins into MLXFAST_MACMON and
 #     MLXFAST_MACMON_BIN (/opt/homebrew/bin/macmon) -- no reader, no ranked run:
 #     tools/ranked-box-preflight.sh hard-fails on it. The reference tree and
@@ -389,9 +389,10 @@ jobs:
         run: ./tools/ranked-box-preflight.sh
 
       - name: Resolve the pinned benchd (sha256 + bytes, no credential)
-        # First half of benchmark.json's setupCommand. mlxfast-bench's dist is
-        # not anonymously readable and this job holds no token, so the resolve
-        # is expected to take fetch-benchd.sh's OFFLINE path: an operator-placed
+        # First half of benchmark.json's setupCommand. The benchd dist is in the
+        # public channel Layr-Labs/benchd, but the ranked-box policy is offline
+        # staging, so the resolve is expected to take fetch-benchd.sh's OFFLINE
+        # path: an operator-placed
         # benchd-bin/benchd + benchd.manifest.json pair, accepted only when the
         # two agree. A binary that fails its manifest, or arrives without one, is a
         # hard refusal, never a replacement.

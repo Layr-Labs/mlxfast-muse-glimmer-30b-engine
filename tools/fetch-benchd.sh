@@ -69,16 +69,8 @@
 #                       bare.
 #   BENCHD_DIST_BASE_URL
 #                       raw host + repo prefix. Default:
-#                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev
-#                       -- the DEVELOPMENT bench repository, which is where this
-#                       track's release branch and dist channel live while the
-#                       track is internal (organizer ruling 2026-08-27: port pull
-#                       requests point at the development repository). It is
-#                       PRIVATE, so a fetch needs BENCHD_DIST_TOKEN/GITHUB_TOKEN.
-#                       AT LAUNCH this default flips to the public repository
-#                       (.../Layr-Labs/mlxfast-bench) together with the branch
-#                       publication; the flip is one line here plus the two
-#                       naming lines in README.md and docs/participant-contract.md.
+#                       https://raw.githubusercontent.com/Layr-Labs/benchd
+#                       -- the public bench repository. A fetch needs no token.
 #   BENCHD_DIST_TOKEN / GITHUB_TOKEN
 #                       bearer token for a private channel repo.
 set -euo pipefail
@@ -88,10 +80,8 @@ BRANCH="${BENCHD_BRANCH:-main}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
 DEST="${DEST_DIR}/benchd"
 DEST_MANIFEST="${DEST_DIR}/benchd.manifest.json"
-# The DEVELOPMENT bench repository is the default channel while the track is
-# internal (organizer ruling 2026-08-27). See the BENCHD_DIST_BASE_URL note above
-# for the launch flip.
-BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev}"
+# The public bench repository is the default channel.
+BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/benchd}"
 
 die() {
   echo "fetch-benchd.sh: $*" >&2

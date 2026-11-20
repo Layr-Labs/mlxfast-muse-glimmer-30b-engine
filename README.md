@@ -94,9 +94,8 @@ run on. Those tests exercise the transform, not a Gemma model.
 
 You do not need Rust. The benchmarker arrives as a prebuilt binary.
 `./tools/fetch-benchd.sh` resolves it from the bench repository's `main` dist
-channel and verifies it against that channel's `benchd.manifest.json`. While
-the track is internal that channel is the DEVELOPMENT bench repository, which
-is private, so the fetch needs `GITHUB_TOKEN` (or `BENCHD_DIST_TOKEN`).
+channel and verifies it against that channel's `benchd.manifest.json`. That
+channel is the public bench repository, so the default fetch needs no token.
 
 ## Quickstart
 
