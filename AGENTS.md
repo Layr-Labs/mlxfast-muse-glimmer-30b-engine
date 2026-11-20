@@ -22,7 +22,7 @@ allows.
 | Editable paths, commands, scoring values | `benchmark.json` |
 | Pins, the timed pool, scoring semantics | `fixtures/muse_glimmer_30b_mlx_v1_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
-| The engineering record for this port | `docs/bonsai2-9b-port-notes.md` |
+| The engineering record for this port | `Vendor/mlx-swift-lm/docs/muse-glimmer.md` |
 | What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`, verified against the dist `benchd.manifest.json`) |
 
 `benchmark.json` and `fixtures/muse_glimmer_30b_mlx_v1_track.json` carry pure
@@ -31,11 +31,9 @@ Where this file disagrees with the fixture, the fixture wins.
 
 ## Lineage
 
-This repository is a seed of the Ternary Bonsai 2 27B MLX engine
-(`Layr-Labs/mlxfast-bonsai2-27b-engine-dev`). That engine descends from the
-Nemotron 3.5 30B A3B and Qwen 3.8 125B A6B MLX engines, and from
-`Layr-Labs/mlxfast-challenge-dev`. Those repositories rank different models
-under different rules. Only this track's rules apply here.
+This repository was seeded from the engines of earlier MLX tracks. Those
+tracks rank different models under different rules. Only this track's rules
+apply here.
 
 The `.gemma4` transform family in `Sources/MLXFastTransform/` is not a
 leftover. It is the synthetic-fixture substrate the transform pipeline tests
@@ -53,9 +51,11 @@ their names for the same reason.
 
 THE TARGET IS PINNED. The target is `nvidia/Muse-Glimmer-30B-NVFP4` at
 `47818374517751c48c55cde2621594926b1888b6`, pinned file by file in
-`fixtures/reference_bonsai2_9b_2bit.sha256` (that file NAME is inherited from
-the source track; every record in it is the Muse Glimmer checkpoint).
-`./setup.sh` provisions exactly that checkpoint.
+the fixture's `target.manifest_path` (that file NAME is a legacy
+compatibility value from the source track; every record in it is the Muse
+Glimmer checkpoint). `setup.sh` reads the pin from
+`MLXFAST_REFERENCE_MODEL_REPO` and `MLXFAST_REFERENCE_REVISION`; with neither
+set, both default to a legacy pending sentinel and the script refuses by name.
 `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` builds the harness and the engine
 only.
 
@@ -68,15 +68,15 @@ precision modelopt: 4-bit NVFP4 at group 16 on 213 modules and float8 on 180.
 The checkpoint also carries a 50-layer vision tower; this text-only track never
 loads that namespace.
 
-Official scoring is NOT armed. `fixtures/muse_glimmer_30b_mlx_v1_track.json`
-sets `official_scoring_enabled` to `false`, its `timed_prompt_pool` is empty,
-its `live_goldens` list is empty, and `hidden_correctness_golden` carries the
-sentinel `MUSE-GLIMMER-30B-MLX-V1-PENDING-ORGANIZER`. The benchmarker refuses to
-seal an official artifact in that state. The planned live prompts are the three
-coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token seed, recorded
-on that box.
+The scoring flag is armed. `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets
+`official_scoring_enabled` to `true`, its `timed_prompt_pool` pins three
+goldens by digest, and `live_goldens` names them: the three coding prompts
+`pool-9`, `pool-10` and `pool-11` at a 512-token seed.
+`hidden_correctness_golden` is pinned by digest. The fixture's
+`live_golden_speculative` block is empty, so a ranked run can score a serial
+declaration only.
 
-The track has no goldens. A track's goldens are organizer material: they are
+The goldens are not in git. A track's goldens are organizer material: they are
 recorded on the track's own box, published in R2 under
 `correctness_prompts/<track id>/`, and staged out of band into the directory
 the box's runner service exports as `MLXFAST_QWEN38_GOLDEN_DIR`. They are never
@@ -266,13 +266,8 @@ identifier is 1 is usually an orphan. Verify it, then kill it.
 
 ### The startup memory profile
 
-The runtime selects a low-memory profile automatically below 64 GiB of physical
-memory. The profile caps the MLX allocator cache at 6 GiB, shortens command
-buffers, and releases free warmup buffers before the worker serves requests.
-
-The profile is pure memory management. It disables no code path and no
-output-affecting feature. It announces itself on stderr. Force it either way
-with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`.
+This tree has no startup memory profile. No code in this repository selects a
+low-memory profile or reads a memory-profile environment variable.
 
 A machine that is too small fails loudly with an out-of-memory error. It does
 not diverge silently from ranked behavior.
@@ -404,14 +399,14 @@ This command resolves and verifies the pinned benchmarker binary.
 ./setup.sh
 ```
 
-This command provisions the target model, then stages the MTP head beside it
-with `./setup-mtp-head.sh`. While the target is pending, it refuses by name.
+This command provisions the target model, then runs `./setup-mtp-head.sh` for
+the drafter slot. With no override of the target pin, it refuses by name.
 
 ```bash
 ./benchmark.sh --local-iterate --mtp-depth 3
 ```
 
-This command runs the local test with the MTP head at depth 3.
+This command runs the local test at draft depth 3.
 
 ## Swift tooling
 
@@ -476,7 +471,7 @@ flip a near-tie greedy argmax.
 > correctness gate. `Sources/MLXFastTransform/` is editable, but that does not
 > license a change of target format: a lossier target substitutes a degraded
 > model instead of optimizing the accepted one. The MTP head is a narrow
-> exception, and the exception is RE-QUANTIZATION ONLY (David ruling
+> exception, and the exception is RE-QUANTIZATION ONLY (organizer ruling
 > 2026-08-26) — re-quantize the head within its 2 GiB declaration cap, but do
 > not replace it and do not upload head weights. The head is a SEPARATE pinned
 > export, and `mtp-head.manifest.json` accepts `"source": "pinned"` only, which
