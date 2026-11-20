@@ -30,9 +30,9 @@ Artifacts referenced by this repository:
 | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` (not loaded by this engine; its `config.json` is checked in as `fixtures/bonsai2_27b_config.json`) | Prism ML | Apache-2.0 |
 
 The two rows marked as not loaded are checked-in configuration fixtures only; the
-`reference_bonsai2_*` and `mtp-head.manifest.json` file names are slots inherited
-from the source track, and the records in them name the two Muse Glimmer
-repositories above.
+two checkpoint manifest file names under `fixtures/` and `mtp-head.manifest.json`
+are slots inherited from the source track. The target manifest's records name
+the pinned Muse Glimmer target; the drafter slot's manifest holds no record yet.
 
 Attribution statement: "Qwen3.5-9B © Qwen, licensed Apache-2.0. Ternary Bonsai
 2 27B configuration by Prism ML, licensed Apache-2.0. Muse-Glimmer-30B-NVFP4
@@ -46,9 +46,11 @@ tree):
 - Review and satisfy the Apache-2.0 terms published on the model card before
   redistribution. The license URL the contract fixture records is the one on
   the pinned revision.
-- Mark modified files as changed. The harness's `transform` output is a
-  repacked derivative of the pinned checkpoint, and its provenance is recorded
-  in the emitted `config.json` and hash manifests.
+- Mark modified files as changed. For this track the harness's `transform`
+  checks the pinned checkpoint and passes its shards,
+  `model.safetensors.index.json` and `config.json` through byte-identical
+  (`Sources/MLXFastTransform/Transform.swift`); the runtime drops the vision
+  tensors at load. Keep the upstream license and notices with any copy.
 - Retain the attribution statement above.
 - The Apache License 2.0 appendix below covers these models and the Swift
   package dependencies listed in the next section.
@@ -91,8 +93,8 @@ and measured on: it is the pair the serving provider (`Layr-Labs/d-inference`)
 builds the same engine fork against. `b1c94d29c5ddff16838fdc25b83fbe8fde48b3e8` descends from `6d6796d7`, the
 base the earlier pin sat on, and it carries `Source/MLXNN/Hadamard.swift`, which
 holds the signed block-Hadamard transform and the packed
-`HadamardQuantizedLinear` and `HadamardQuantizedEmbedding` layers the Bonsai 2
-pack loads into. The nested `mlx` reports MLX 0.32.5. The engine fork's
+`HadamardQuantizedLinear` and `HadamardQuantizedEmbedding` layers that the
+packed model files inherited from the source track load into. The nested `mlx` reports MLX 0.32.5. The engine fork's
 `Package.swift` uses a sibling `../mlx-swift` checkout when one exists, so the
 copy here IS the core the fork compiles against. Keep the two in step: one
 runner builds against one core.
@@ -107,11 +109,11 @@ tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, otherwise unchanged — plus th
 engine-local changes the section below lists: the three record-only files in the
 MTP path and `Package.swift`, four files in all. The changes the
 earlier base carried -- the merge of fork `main` `0607011`, two build fixes, and
-the Bonsai 2 support files taken from fork `main`
+the support files for the source track's model taken from fork `main`
 `fd0eaac7b5ec5c199f1595d29be011f66343f1db` (pull requests 154 and 155) -- were
 discarded by the cut and are re-applied by later commits in this repository.
-Its Bonsai 2 and Qwen 3.5 model files are the editable surface; the rest of the
-fork is trusted.
+The model files that `benchmark.json` `editablePaths` lists are the editable
+surface; the rest of the fork is trusted.
 
 ### Engine-local changes to the vendored SDK
 
