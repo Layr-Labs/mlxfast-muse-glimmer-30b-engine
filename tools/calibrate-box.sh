@@ -3,7 +3,7 @@
 # calibrate-box.sh -- record THIS box's health band for the serial-control leg.
 #
 # WHAT A CALIBRATION IS, AND WHAT IT IS NOT. A ranked run on this track is
-# PAIRED (David ruling 2026-09-08): it measures a serial-control leg on the
+# PAIRED (organizer ruling 2026-09-08): it measures a serial-control leg on the
 # organizer-staged reference tree and a candidate leg on the submission tree, in
 # the same job, on the same box, and the score is the LIVE ratio of the two. The
 # calibration file this script writes is NEVER that denominator. It is a HEALTH

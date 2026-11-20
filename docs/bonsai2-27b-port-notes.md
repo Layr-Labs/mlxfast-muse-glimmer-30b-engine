@@ -1,5 +1,11 @@
 # Ternary Bonsai 2 27B — port notes
 
+> **HISTORICAL RECORD — NOT THIS TRACK.** This page is the engineering record
+> of an earlier track that this repository was seeded from. It does not
+> describe the Muse Glimmer 30B track. `tools/new-track.sh` names this file in
+> its stamping exemption list. The record for this track is
+> `Vendor/mlx-swift-lm/docs/muse-glimmer.md`.
+
 This document is the engineering record of the port. It says what this
 repository inherited, what the port changed, what is verified, and what is
 still open.
@@ -19,8 +25,8 @@ is `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` at revision
 ## 2. What the track inherited
 
 The tree is a seed of the Nemotron 3.5 Lightning 30B A3B MLX engine
-(`648495f`, tree-identical to `mlxfast-nemotron35-30b-a3b-engine-dev @
-d6e2d399`). `tools/new-track.sh` then stamped the new identity into it
+(an earlier commit, tree-identical to the source engine at
+a later commit). `tools/new-track.sh` then stamped the new identity into it
 (`5f4b611`).
 
 These parts carried over unchanged:
@@ -96,7 +102,7 @@ load. The tower is never built.
 The pack declares `mtp_num_hidden_layers: 0` and carries no `mtp.*` tensor.
 The transform refuses a pack that carries one.
 
-David ruled MTP enabled for this track. The head is therefore a SEPARATE
+The organizer ruled MTP enabled for this track. The head is therefore a SEPARATE
 published export, used unmodified: `EigenLabs/Qwen3.8-27B-MTP-4bit` at
 `329261c5e0b3f9c233485e682cb3b67b88c20a55`. It is `qwen3_5_mtp`, affine 4-bit
 at group 64, one layer, 31 tensors, 238,930,944 tensor bytes.
@@ -135,7 +141,7 @@ a raw `.weight`. Section 6.1 is the defect that rule exists to prevent.
 **THE DECLARATION.** `mtp-head.manifest.json` `spec` gained `decoder`, which is
 `"mtp"` or `"dflash"`. An absent key reads as `"mtp"`, so an older declaration
 keeps its meaning. The MTP head's depths stay 1 to 7 and its 2 GiB declaration
-cap is unchanged. The drafter's depths are 1 to 16, which is David's limit, and
+cap is unchanged. The drafter's depths are 1 to 16, which is the organizer's limit, and
 its declaration cap is its own, 4 GiB, because one cap cannot bound a 239 MB
 export and a 3.85 GB one. `max_bytes` may lower the cap of the declared decoder
 and may not raise it.
@@ -216,7 +222,7 @@ The runner declares the two ranges as separate constants for the same reason.
 the reason `Qwen35MTP.swift` is: it PROPOSES tokens, and the rule this track
 draws is that code which proposes is editable while code that verifies,
 measures or ledgers stays trusted. Its CBv2 adapter,
-`Qwen35DFlash2Assistant.swift`, is editable too (David ruling 2026-09-20: the
+`Qwen35DFlash2Assistant.swift`, is editable too (organizer ruling 2026-09-20: the
 source files of both decoders are editable). The MTP head's adapter is already
 editable, because it is in `Qwen35MTP.swift`. The adapter only feeds and trims
 the drafter; the engine's verification and its ledgers are in other files.
@@ -386,7 +392,7 @@ that lane on will fail correctness.
 ### 6.3 The fork doc says not to attach a head
 
 `Vendor/mlx-swift-lm/docs/bonsai2.md` said "do not attach a similarly named
-checkpoint's head or advertise MTP". David's ruling overrides that sentence for
+checkpoint's head or advertise MTP". The organizer's ruling overrides that sentence for
 this track, and the file now records what this repository does and why. The
 underlying caution is real and is restated in section 7.
 

@@ -3,7 +3,7 @@
 # fetch-benchd.sh -- resolve the `benchd` measurement harness from its release
 # channel.
 #
-# THE PIN IS REMOVED (David ruling 2026-08-27). benchd used to be frozen here by
+# THE PIN IS REMOVED (organizer ruling 2026-08-27). benchd used to be frozen here by
 # ./benchd.pin ({branch, commit, sha256, bytes}), which made every benchd bug
 # fix require an engine-repo pin-advance commit before it could reach a box --
 # the depth/echo fix sat merged in the bench repo while the served pin still
@@ -72,7 +72,7 @@
 #                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev
 #                       -- the DEVELOPMENT bench repository, which is where this
 #                       track's release branch and dist channel live while the
-#                       track is internal (David ruling 2026-08-27: port pull
+#                       track is internal (organizer ruling 2026-08-27: port pull
 #                       requests point at the development repository). It is
 #                       PRIVATE, so a fetch needs BENCHD_DIST_TOKEN/GITHUB_TOKEN.
 #                       AT LAUNCH this default flips to the public repository
@@ -89,7 +89,7 @@ DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
 DEST="${DEST_DIR}/benchd"
 DEST_MANIFEST="${DEST_DIR}/benchd.manifest.json"
 # The DEVELOPMENT bench repository is the default channel while the track is
-# internal (David ruling 2026-08-27). See the BENCHD_DIST_BASE_URL note above
+# internal (organizer ruling 2026-08-27). See the BENCHD_DIST_BASE_URL note above
 # for the launch flip.
 BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev}"
 

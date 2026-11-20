@@ -1,6 +1,6 @@
-# The task — Bonsai 2 9B MLX
+# The task — Muse Glimmer 30B MLX
 
-Make the Bonsai 2 9B model run faster on Apple Silicon.
+Make the Muse Glimmer 30B model run faster on Apple Silicon.
 
 The ranked track is `muse-glimmer-30b-mlx-v1`. Read [README.md](README.md) for the
 setup steps and the repository structure. Read
@@ -13,39 +13,39 @@ You optimize the engine. The engine is the MLX runner, the offline transform,
 and the vendored MLX Metal kernels that the forward pass dispatches. You also
 optimize the speculative-decode arm.
 
-> **NOTE — the target is pending.**
-> prism-ml has not published the Bonsai 2 9B MLX pack. Every pin that names
-> the pack's bytes or the MTP head's bytes carries the exact sentinel
-> `BONSAI-MLX-PENDING-ORGANIZER`. `./setup.sh` refuses the pending reference
-> by name.
+> **NOTE — the target is pinned; the default setup run still refuses.**
+> The contract fixture pins `nvidia/Muse-Glimmer-30B-NVFP4` at
+> `47818374517751c48c55cde2621594926b1888b6`. `setup.sh` and
+> `setup-mtp-head.sh` still default their repository and revision to a legacy
+> pending sentinel, so a run with no override refuses by name. README.md,
+> "Current status", states each fact.
 
-The target model is the Bonsai 2 9B pack of `Qwen/Qwen3.5-9B`. It is a hybrid
-model. The tower is 32 layers. Every fourth layer is full attention, so 8
-layers carry a key-value cache and the other 24 are gated-delta-net recurrent
-layers. The MLP is dense: a gate and an up projection into a down projection,
-with no experts. The embeddings are untied.
+The target model is `nvidia/Muse-Glimmer-30B-NVFP4`. The text tower is 52
+layers: three sliding-attention layers at window 2048, then one
+full-attention layer with no position encoding, repeated, so 39 sliding and 13
+full-attention layers. Attention has 32 query heads over 2 KV heads at head
+dimension 128. The MLP is dense, width 19968, with no experts. The vocabulary
+is 202048, and the embeddings are untied.
 
-The pack is expected to use the Ternary Bonsai 2 27B packing: 2 bits, and
-every one of its 202 linear modules folds a signed block Walsh-Hadamard
-transform into its weights. `hadamard.json` declares that transform. The
-runtime applies the forward transform to the input of each packed linear and
-the inverse transform to the output of the embedding. Read
-[`Vendor/mlx-swift-lm/docs/bonsai2.md`](Vendor/mlx-swift-lm/docs/bonsai2.md)
+The weights are mixed precision modelopt: 4-bit NVFP4 at group 16 on 213
+modules and float8 on 180 modules. Read
+[`Vendor/mlx-swift-lm/docs/muse-glimmer.md`](Vendor/mlx-swift-lm/docs/muse-glimmer.md)
 before you change a projection.
 
-The backbone also declares a vision tower. This track serves text only. The
-transform drops that namespace and the model never builds the tower.
+The checkpoint also carries a vision tower. This track serves text only, and
+the model never loads that namespace.
 
-The track has ONE declarable speculative decoder, the MTP head. It proposes
-tokens, and the target model decides every emitted token. The head is a
-separate published export, staged beside the target.
+The track has ONE declarable speculative decoder, `dflash`. It proposes
+tokens, and the target model decides every emitted token. The drafter is
+produced from a pinned assistant repository by the pinned DFlash artifact
+writer.
 
-| Decoder | Export | Staged by | Depths |
+| Decoder | Source | Pinned by | Depths |
 |---|---|---|---|
-| MTP head | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), one `qwen3_5_mtp` layer | `./setup-mtp-head.sh` | 1 to 7 |
+| `dflash` | `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce9`, quantized to 1,968,222,936 bytes | the fixture's `mtp_head.artifact` (two SHA-256 pins) | 1 to 7 |
 
-The MTP head proposes one token at a time. No DFlash 2 drafter exists for the
-Qwen 3.5 9B geometry, so this track declares no DFlash 2 decoder.
+The DFlash drafter proposes a block of 16 rows, and the target verifies a
+chain at the declared depth.
 
 ## What you may change
 
@@ -56,27 +56,26 @@ groups.
 |---|---|
 | The decoder declaration | `mtp-head.manifest.json` (the declaration file only) |
 | The offline transform | `Sources/MLXFastTransform/` |
-| The model files | `PrismHadamardCheckpoint.swift`, `PrismHadamardQwen35.swift`, the 9 `Qwen35*.swift` tower and MTP files, `DFlash2Draft.swift`, `Qwen35DFlash2Assistant.swift`, and `Vendor/mlx-swift/Source/MLXNN/Hadamard.swift` |
+| The model files | `MuseGlimmer/MuseGlimmerTextModel+CBv2.swift` and `MuseGlimmer/DFlash/MuseGlimmerDFlashDrafter.swift`, plus files inherited from the source track: `PrismHadamardCheckpoint.swift`, `PrismHadamardQwen35.swift`, the 8 `Qwen35*.swift` files, and `Vendor/mlx-swift/Source/MLXNN/Hadamard.swift` |
 | The batching engine and cache layer | `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/` and 12 `MLXLMCommon` cache, attention, RoPE and config files, plus `MLXLMServer/Runtime/ToolStreamHandler.swift` (the Gemma 4 shape) |
 | The vendored kernels | The 68 MLX Metal files the forward pass dispatches |
 
 The engine fork `Vendor/mlx-swift-lm` is a vendored tree of plain files. Its
-Bonsai 2 and Qwen 3.5 model files, the batching engine and the cache layer are
+listed model files, the batching engine and the cache layer are
 editable. The runner, `bench-worker` and the server in the same fork stay
 trusted.
 
 The rule behind the list is simple. Code that **proposes** tokens or computes
 the forward pass is editable. Code that **verifies**, **measures**, or
-**ledgers** stays trusted. The two DFlash 2 files are inherited from the 27B
-track. This track declares no DFlash 2 decoder, so no run reaches them.
+**ledgers** stays trusted.
 
 The MTP head is the organizer's pinned weights. You may re-quantize it. You
 may not replace it, and you may not upload head weights of your own.
 
 No submission carries a head weight file. Nothing stages one.
 `mtp-head.manifest.json` stays editable and optional, and it accepts
-`"source": "pinned"` only, which on this track means the pinned MTP head,
-`fixtures/reference_bonsai2_9b_mtp_head.sha256`. That pin is pending.
+`"source": "pinned"` only, which on this track means the drafter the
+fixture's `mtp_head` block pins. Its slot manifest holds no record yet.
 `"source": "remote"` and `"source": "in_branch"` are refused by name.
 
 The MTP head's declaration cap is 2 GiB. `max_bytes` may lower the cap and may
@@ -106,12 +105,13 @@ Change the geometry that call selects. `docs/participant-contract.md` section
 > is editable. The depth is not pinned at 1.
 >
 > ```json
-> "spec": { "decoder": "mtp", "enabled": true, "num_speculative_tokens": 3 }
+> "spec": { "decoder": "dflash", "enabled": true, "num_speculative_tokens": 3 }
 > ```
 >
-> An absent `decoder` key reads as `"mtp"`. `"decoder": "dflash"` is refused
-> by name. The shipped declaration switches the decoder off, so the stock tree
-> runs serial (depth 0).
+> An absent `decoder` key reads as `"dflash"` in `tools/spec-declaration.sh`.
+> Declare `dflash`: the Swift reader refuses the older slot name `"mtp"`. The
+> shipped declaration switches the decoder off, so the stock tree runs serial
+> (depth 0).
 >
 > Select a depth from 1 to 7 (`mtp_head.permitted_draft_depths`). A depth
 > outside the list is refused before the engine starts.
@@ -136,14 +136,16 @@ This command resolves and verifies the pinned benchmarker binary.
 ```
 
 This command builds the Swift binaries and downloads the target model. It then
-stages the MTP head beside it with `./setup-mtp-head.sh`. While the target is
-pending, it refuses by name.
+runs `./setup-mtp-head.sh` for the drafter slot. With no override of
+`MLXFAST_REFERENCE_MODEL_REPO` and `MLXFAST_REFERENCE_REVISION`, it refuses by
+name.
 
 ```bash
 MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 ```
 
-This command builds the Swift binaries and downloads nothing.
+This command builds the Swift binaries and skips the model download. It still
+checks the toolchain and can install missing tools.
 
 ```bash
 .build/release/mlxfast-swift transform \
@@ -151,7 +153,9 @@ This command builds the Swift binaries and downloads nothing.
   --output weights
 ```
 
-This command writes the `weights/` tree that the engine loads.
+This command writes the `weights/` tree that the engine loads. The
+`--reference` path is the `DEFAULT_REFERENCE_DIR` of `setup.sh`, a legacy
+compatibility name from the source track.
 
 ```bash
 ./benchmark.sh --local-iterate
@@ -165,7 +169,7 @@ with no speculation. It needs no environment variable: the engine is the one
 ./benchmark.sh --local-iterate --mtp-depth 3
 ```
 
-This command runs the same local test with the MTP head at depth 3. The flag
+This command runs the same local test at draft depth 3. The flag
 also exports the head directory to the worker in `BENCH_WORKER_DRAFTER`.
 
 > **WARNING — the local test runs serial unless you give it a depth.**
@@ -177,14 +181,14 @@ also exports the head directory to the worker in `BENCH_WORKER_DRAFTER`.
 
 > **WARNING — no public capture ships yet.**
 > The organizer records the two public captures on the track's box against the
-> pinned target. The target is pending, so the local test has no capture to
-> check against yet.
+> pinned target. They are not recorded yet, so the local test has no capture
+> to check against.
 
 ## How it scores
 
 ```text
 composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75
-gain      = baseline_aggregate / candidate_aggregate
+gain      = control_leg_seconds_per_token / candidate_leg_seconds_per_token
 ```
 
 The score is serial-anchored. A faster candidate scores above 1. The decode
@@ -196,33 +200,31 @@ at the draft depth you declare, over one live prompt. Each leg times one
 stream over a 512-token seed and a 128-step decode window. It runs 3 pairs,
 and pair k measures live prompt (k - 1) mod N. The score is the mean of the
 per-pair composites. Every pair must clear the 0.95 floor on prefill and on
-decode. The ceiling is 5.0. The KV backend is pinned `contiguous`.
+decode. `benchmark.json` states a decode ceiling of 5.0, but the fixture
+declares none, so no ceiling is applied. The KV backend is pinned `paged`.
 
-The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
-
-> **WARNING — the gate accepts similar output, not identical output.**
-> This track does not require token-for-token equality with the serial
-> trajectory. The gate prices divergence against the 10% budget.
+The benchmarker applies two token checks. The timed window is exact: the
+prefill token, the seed token and each of the 128 committed decode tokens must
+equal the tape. The untimed correctness gate allows at most 10% of the steps
+of each 64-step teacher-forced case to be not accepted.
+[`docs/scoring-contract.md`](docs/scoring-contract.md) states both, each with
+its source.
 
 ## The current state
 
-> **NOTE — the track is NOT armed.**
-> `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets `official_scoring_enabled` to
-> `false`, and the benchmarker refuses to seal an official scoring artifact
-> while it is. The timed prompt pool and the `live_goldens` list are empty,
-> and the hidden correctness oracle carries the sentinel
-> `BONSAI-MLX-PENDING-ORGANIZER`. No organizer goldens exist for this track,
-> and no runner advertises the ranked label. The planned live prompts are
-> `pool-9`, `pool-10` and `pool-11`.
+> **NOTE — the scoring flag is armed.**
+> `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets `official_scoring_enabled`
+> to `true`. The timed prompt pool pins three goldens by digest, and
+> `live_goldens` names them: `pool-9`, `pool-10` and `pool-11`. The
+> `live_golden_speculative` block is empty, so a ranked run can score a serial
+> declaration only. README.md, "Current status", lists what else a ranked run
+> needs.
 
 > **NOTE — the engine fork is a vendored tree, edited here.**
-> `Vendor/mlx-swift-lm` was cut from `Layr-Labs/mlx-swift-lm`
-> `feat/qwen38-flash-next-runner` `859f4d9` with fork `main` `0607011` merged in;
-> the merge, the Bonsai 2 support files and the build fixes are this
-> repository's commits. Nothing goes upstream.
-> `docs/bonsai2-9b-port-notes.md` holds the detail.
-
-The repositories stay private until launch.
+> `Vendor/mlx-swift-lm` is the local merge of `Layr-Labs/mlx-swift-lm`
+> `feat/muse-glimmer-speed` `62cfabd5` and `feat/muse-glimmer-rowexact-m5-d5`
+> `44378936`; engine-local changes are this repository's commits. Nothing goes
+> upstream. `Vendor/mlx-swift-lm/docs/muse-glimmer.md` holds the port detail.
 
 ## Local runs are directional
 

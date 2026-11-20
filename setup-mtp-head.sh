@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Provision the organizer-pinned MTP HEAD for track muse-glimmer-30b-mlx-v1.
+# Provision the organizer-pinned drafter slot (the file and variable names keep
+# the older MTP HEAD spelling) for track muse-glimmer-30b-mlx-v1.
 #
-# This script provisions the HEAD and nothing else. The TARGET is the Bonsai 2
-# 9B pack that ./setup.sh pins, downloads and verifies against
-# fixtures/reference_bonsai2_9b_2bit.sha256, so there is no second target
-# download here and no way for this script to point the track at a different
-# pack.
+# This script provisions the drafter slot and nothing else. The TARGET is
+# nvidia/Muse-Glimmer-30B-NVFP4, which ./setup.sh downloads and verifies against
+# the target manifest the contract fixture names (target.manifest_path), so
+# there is no second target download here and no way for this script to point
+# the track at a different checkpoint.
 #
-# THE HEAD IS PENDING. No MTP head is published for the Bonsai 2 9B pack. Its
-# repository and revision carry the sentinel BONSAI-MLX-PENDING-ORGANIZER, and
-# ./setup.sh refuses the delegated download by name until the head is pinned.
-# The head is a qwen3_5_mtp layer for the Qwen 3.5 9B geometry, used unmodified.
+# THE SLOT PINS NO RECORD YET. The track's drafter is the quantized DFlash
+# drafter produced from meta-models/Muse-Glimmer-30B-assistant; the fixture's
+# mtp_head.artifact pins its two files. The default repository and revision
+# below still carry the legacy pending sentinel, and ./setup.sh refuses the
+# delegated download by name until the slot is pinned.
 #
 # WHY THIS IS A WRAPPER AND NOT A DOWNLOADER. setup.sh already holds the
 # resumable, hash-verified, stall-detecting download logic, and it is fully

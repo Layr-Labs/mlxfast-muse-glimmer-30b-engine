@@ -4,7 +4,7 @@
 # calibrate-baseline invocation, holds the GPU lock, and refuses by name.
 #
 # WHAT IS UNDER TEST. tools/calibrate-box.sh records THIS box's health band for
-# the serial-control leg of the paired ranked run (David ruling 2026-09-08). It
+# the serial-control leg of the paired ranked run (organizer ruling 2026-09-08). It
 # is a box-only script -- the real one loads an 18.5 GB checkpoint -- so what a
 # hermetic suite can hold is everything AROUND the measurement: the argv it
 # builds, the environment it builds it from, the lock it takes, and every

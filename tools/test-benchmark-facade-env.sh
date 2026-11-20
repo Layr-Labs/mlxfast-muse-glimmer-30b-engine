@@ -37,7 +37,7 @@
 #   8. --preflight-only boots no resident and takes no lock: a pre-GPU dry run
 #      loads nothing, so it must not open a GPU window.
 #
-# Cases 9-13 pin the PAIRED plumbing (David ruling 2026-09-08). A ranked run
+# Cases 9-13 pin the PAIRED plumbing (organizer ruling 2026-09-08). A ranked run
 # measures a serial-control leg on the organizer's reference tree and a
 # candidate leg on this checkout, and the score is the LIVE ratio:
 #   9.  the dispatch carries --baseline-workspace and --baseline-calibration

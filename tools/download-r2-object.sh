@@ -191,8 +191,8 @@ sign_request() {
   # computed for the same request, and R2 answered HTTP 403 SignatureDoesNotMatch
   # with a well-formed signature. Never reached on the serial box because its
   # runner PATH has the aws CLI, which takes download_with_aws_cli() instead;
-  # M5-C's runner PATH is /usr/bin:/bin:/usr/sbin:/sbin, so it is the first box to
-  # execute this signer at all (2026-07-30).
+  # a ranked box whose runner PATH is /usr/bin:/bin:/usr/sbin:/sbin was the first
+  # box to execute this signer at all (2026-07-30).
   #
   # Both newlines are therefore spelled in the canonical_request format string
   # ("...%s\n\n%s..."), where nothing can strip them: one terminates the last

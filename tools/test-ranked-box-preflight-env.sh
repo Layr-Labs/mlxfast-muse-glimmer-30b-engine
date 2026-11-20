@@ -4,7 +4,7 @@
 # paired-leg staging is wrong, and names which part is wrong.
 #
 # WHAT IS UNDER TEST. tools/ranked-box-preflight.sh section 6, the gate the
-# paired design added (David ruling 2026-09-08): the serial-control leg runs on
+# paired design added (organizer ruling 2026-09-08): the serial-control leg runs on
 # an organizer-staged REFERENCE tree, and this box's calibration file is the
 # health band that leg must land inside. Neither is a thing the job can fetch or
 # repair, so the only correct behaviour on a bad stage is a refusal that names

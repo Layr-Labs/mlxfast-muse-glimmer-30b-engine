@@ -192,7 +192,7 @@ fi
 
 # R22 / R2-mirror pin (fail-closed): the supplied correctness golden is the official INPUT.
 # The REAL official goldens come from R2 (read-only, integrity-pinned) — pending: R2/.env
-# location (David). When the caller pins the golden (sha256 and/or byte count), VERIFY the
+# location (organizer). When the caller pins the golden (sha256 and/or byte count), VERIFY the
 # supplied file against the pin BEFORE any run trusts it; a mismatch is fatal (never run
 # against an unpinned/altered golden). When BOTH sha256 and bytes are pinned, the official
 # dispatch also forwards them to benchd as --golden-sha256/--golden-bytes, which re-verifies
@@ -462,7 +462,7 @@ fi
 if [[ "${OFFICIAL}" == "1" ]]; then
   enforce_official_sandbox
   export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
-  # ARM GATE (David 2026-08-26): --mode official seals only when the fixture
+  # ARM GATE (organizer ruling 2026-08-26): --mode official seals only when the fixture
   # declares official_scoring_enabled: true. It is false today, so official
   # runs refuse until the arming change flips it true.
 else

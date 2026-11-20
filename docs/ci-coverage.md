@@ -51,7 +51,7 @@ templating, wire fixtures, and request validation.
 
 ### What "hard gate" does and does not mean
 
-**This pipeline is ADVISORY, and that is the accepted posture** (ruled by David
+**This pipeline is ADVISORY, and that is the accepted posture** (ruled by the organizer
 2026-08-20: the two-session red-team is the de facto merge gate). CI runs
 `tools/test-submission-security.sh` on every pull request and every push to
 `main`, and reds the run on a regression. That is the whole of it. **No status
@@ -124,7 +124,7 @@ The gate variable is one switch for both classes; set it to `1`:
 
     MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --force-resolved-versions
 
-THE INVENTORY IS EMPTY, and that is the correct state after the Darkbloom
+THE INVENTORY IS EMPTY, and that is the correct state after the
 CBv2 re-base. Every GPU-resident and checkpoint-resident test in this tree
 tested the private engine. That engine is deleted, and the tests went with it.
 The model, the runner and their GPU tests are in the vendored

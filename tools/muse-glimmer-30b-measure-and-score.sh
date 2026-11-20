@@ -14,7 +14,7 @@
 # editablePaths, so a submission cannot rewrite the measurement pipeline from
 # inside its own archive.
 #
-# THE RUN IS PAIRED, AND THE PAIR IS PER BOX (David ruling 2026-09-08). A ranked
+# THE RUN IS PAIRED, AND THE PAIR IS PER BOX (organizer ruling 2026-09-08). A ranked
 # run measures TWO legs on the same box in the same job, over each live
 # golden:
 #
@@ -54,7 +54,7 @@
 # tools/benchmark.sh runs its --official path through.
 #
 # ONE RESIDENT bench-worker PER LEG, AND benchd BOOTS IT (weights load once per
-# leg; David 2026-08-30 as the paired design realises it). benchd spawns
+# leg; organizer ruling 2026-08-30 as the paired design realises it). benchd spawns
 # `bench-worker runtime-worker` once per phase -- warmup, timed prefill, timed
 # decode, correctness -- and an in-process spawn loads the whole checkpoint each
 # time, so the weights need an OWNER. Under the paired design that owner is
@@ -197,7 +197,7 @@ fi
 
 # Resolve the PINNED benchd. benchd ships as a channel PREBUILT
 # (./tools/fetch-benchd.sh, verified against the channel's
-# benchd.manifest.json; the sha pin is retired -- David ruling 2026-08-27, so
+# benchd.manifest.json; the sha pin is retired -- organizer ruling 2026-08-27, so
 # measurement fixes ship bench-side with no engine commit). fetch-benchd.sh
 # accepts an already-present benchd-bin/benchd whose sha256 and bytes match the
 # manifest beside it -- the offline path on the ranked box, which has no Rust
@@ -267,7 +267,7 @@ if [[ ${#LIVE_GOLDEN_NAMES[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# PER-DEPTH ORACLE (David ruling 2026-09-07, the CUDA track's shape). A window
+# PER-DEPTH ORACLE (organizer ruling 2026-09-07, the CUDA track's shape). A window
 # verified in one target forward does not reproduce the serial tape token for
 # token (the kernels differ at M > 1), so a speculative declaration scores
 # against the oracle RECORDED AT THAT DEPTH: fixture live_golden_speculative
