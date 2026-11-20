@@ -23,7 +23,8 @@ extension MuseGlimmerTextModel {
         makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
             any CBv2AttendingLayerCache
     ) rethrows -> [any CBv2AttendingLayerCache] {
-        try cbv2LayerKinds.enumerated().map { try makeLayerCache($0.offset, $0.element) }
+        let kinds = cbv2LayerKinds
+        return try kinds.indices.map { try makeLayerCache($0, kinds[$0]) }
     }
 }
 
