@@ -179,8 +179,10 @@ case .resident:
     resident.shutDown()
     // A phase whose engine drain hit its watchdog left a queue that may still
     // be inside the runtime: end as an in-process worker would, without the
-    // runtime teardown.
-    guard resident.teardownProven else { _exit(0) }
+    // runtime teardown. A session still running at the deadline counts as
+    // unproven too.
+    let sessionsEnded = resident.waitForSessionEnd(timeout: 30)
+    guard sessionsEnded, resident.teardownProven else { _exit(0) }
     BenchWorkerTeardown.synchronizeMLX()
     exit(0)
 

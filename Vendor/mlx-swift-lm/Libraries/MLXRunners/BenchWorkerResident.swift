@@ -163,6 +163,19 @@ public final class BenchWorkerResident: @unchecked Sendable {
         return !anySessionTeardownUnproven
     }
 
+    /// Wait, bounded, for a session that is still finishing (its drain can
+    /// take up to two engine watchdogs) so `teardownProven` covers it.
+    /// Returns false when a session is still active at the deadline.
+    public func waitForSessionEnd(timeout: TimeInterval) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while sessionActive, Date() < deadline {
+            _ = condition.wait(until: deadline)
+        }
+        return !sessionActive
+    }
+
     /// How long a new attach waits for a FINISHING session before it is
     /// refused. Teardown is microseconds — the client has already closed and
     /// the session thread only has to notice EOF — so this is three orders
