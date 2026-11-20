@@ -1,4 +1,4 @@
-# Bonsai 2 9B — participant contract
+# Muse Glimmer 30B MLX — participant contract
 
 This document states the terms that bind a submission to track
 `muse-glimmer-30b-mlx-v1`.
@@ -35,18 +35,20 @@ everything a build needs.
 
 ## 2. What the track measures
 
-The track measures Bonsai 2 9B MLX inference speed.
+The track measures Muse Glimmer 30B MLX inference speed.
 
 You optimize the MLX runner, the offline transform, and the vendored MLX Metal
 kernel families that the forward pass dispatches. You also optimize the
 speculative-decode arm.
 
-THE TARGET IS PENDING. The target model is the Bonsai 2 9B MLX pack of
-`Qwen/Qwen3.5-9B`. prism-ml has not published it. The contract's
-`target.upstream_model_id` and `target.upstream_revision` carry the exact
-sentinel `BONSAI-MLX-PENDING-ORGANIZER`, and so does every other pin that only
-the published pack can state. `fixtures/reference_bonsai2_9b_2bit.sha256` holds
-no record. `./setup.sh` refuses the pending reference by name.
+THE TARGET IS PINNED. The target model is `nvidia/Muse-Glimmer-30B-NVFP4` at
+`47818374517751c48c55cde2621594926b1888b6` (the contract's
+`target.upstream_model_id` and `target.upstream_revision`).
+`fixtures/reference_bonsai2_9b_2bit.sha256` pins it file by file; the file name
+is inherited from the source track. `./setup.sh` still defaults its download
+repository and revision to the sentinel `BONSAI-MLX-PENDING-ORGANIZER`, so it
+refuses by name unless `MLXFAST_REFERENCE_MODEL_REPO` and
+`MLXFAST_REFERENCE_REVISION` name the pin.
 
 THE GEOMETRY IS THE BACKBONE'S. `target.geometry_source` names
 `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a`, whose
@@ -91,13 +93,15 @@ THE BACKBONE DECLARES A VISION TOWER. This track serves text only. The
 transform drops that namespace, the runner declares `multimodal: false`, and
 the model filters the same prefix at load.
 
-The speculative-decode arm has ONE declarable decoder, an MTP head: one
-`qwen3_5_mtp` full-attention layer for the Qwen 3.5 9B geometry. Its pin is
-pending. The head has no embedding table or `lm_head` of its own. It rides the
-target's, which is what `use_dedicated_embeddings: false` means here.
-
-No DFlash 2 drafter exists for the Qwen 3.5 9B geometry. The contract
-declares no `dflash_drafter` block, and `allowed_modes` is `serial` and `mtp`.
+The speculative-decode arm has ONE declarable decoder, a DFlash drafter
+(`mtp_head.decoder` is `dflash`). It is produced from
+`meta-models/Muse-Glimmer-30B-assistant` at
+`c676cce91658f9568aaf264a416211e2782735b7`, and the fixture's
+`mtp_head.artifact` pins its identity. The fixture block keeps the name
+`mtp_head` because `mtp-head.manifest.json` is the slot the trusted harness
+reads. The drafter has no embedding table of its own: it shares the target's
+(`use_dedicated_embeddings: false`, `shares_target_embed_tokens: true`). The
+fixture's `allowed_modes` is `serial` and `dflash`.
 
 The arm is single-stream. The runner's MTP assistant declares
 `maximumSpeculativeBatch == 1`, so the runner declares single-stream regimes
@@ -273,19 +277,21 @@ only proposes tokens. The pinned target model decides every emitted token.
 ## 4. The speculative decoder
 
 The track carries ONE declarable speculative decoder and ONE declaration file.
-The decoder is the MTP head, the organizer's weights, a separate pinned export.
+The decoder is the DFlash drafter, the organizer's pinned artifact.
 
 `mtp-head.manifest.json` `spec.decoder` names the decoder a submission arms.
-This track declares `"mtp"` only. The key is optional and reads as `"mtp"`
-when it is absent. `"dflash"` is refused by name, because no DFlash 2 drafter
-exists for the Qwen 3.5 9B geometry.
+The shipped declaration names `"dflash"`, and the key reads as `"dflash"` when
+it is absent (`tools/spec-declaration.sh`). A speculative leg also needs a
+per-depth tape in the fixture's `live_golden_speculative`. That block is
+empty, so the ranked measure script refuses a speculative declaration before
+it measures.
 
-| Item | The MTP head |
+| Item | The DFlash drafter |
 |---|---|
 | Declaration | `mtp-head.manifest.json` |
-| Where the weights are | A separate pinned export, `reference_weights/bonsai2-9b-mtp-head` |
-| Organizer pin | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), `fixtures/reference_bonsai2_9b_mtp_head.sha256` |
-| Shape | 1 full-attention `qwen3_5_mtp` hidden layer; the tensor count and the quantization are pending |
+| Where the weights are | The decoder slot `reference_weights/bonsai2-9b-mtp-head` (the directory name is inherited from the source track) |
+| Organizer pin | The fixture's `mtp_head.artifact` (produced from `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7`, 1,968,222,936 bytes); `fixtures/reference_bonsai2_9b_mtp_head.sha256` holds no record |
+| Shape | 5 hidden layers at hidden size 6656, block size 16, 58 tensors (`mtp_head` in the fixture) |
 | Declaration cap | 2 GiB |
 | Permitted draft depths | 1 to 7 |
 | Staged by | `./setup-mtp-head.sh` |
@@ -557,8 +563,9 @@ variation above are placeholders. Only a
 measured box can supply them, and this track has no calibrated box yet.
 
 The calibrator writes no file when the coefficient of variation is more than
-2 percent on either axis. The fixture declares no `calibration_max_cv_percent`,
-so benchd applies its default of 2.0. A box that cannot repeat itself has no band worth
+1 percent on either axis: the fixture's `calibration_max_cv_percent` is 1.0.
+A ranked run checks the file against the same limit when it loads it. A box
+that cannot repeat itself has no band worth
 recording.
 
 `tools/ranked-box-preflight.sh` refuses the run before any measurement when:
@@ -685,7 +692,7 @@ both gates feed the composite.
 | `pairsPerCohort` | 3 |
 | `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
-| `decodeSpeedupCeiling` | 5.0 (stated; the fixture declares no ceiling, so benchd applies none) |
+| `decodeSpeedupCeiling` | 5.0 (the fixture's `decode_speedup_ceiling`) |
 | `kvBackend` | `paged` |
 
 The fixture's own floors are `decode_speedup_floor` and
@@ -701,7 +708,16 @@ than run it.
 The ranked run scores the mean of the per-pair composites over the
 `official_pairs` pairs (section 5.1).
 
-The candidate's slowness gate is the two floors. The control leg's health band
+The candidate's slowness gate is the two floors. The plausibility gate is the
+fixture's `decode_speedup_ceiling` of 5.0: a pair whose decode gain is above
+5.0 refuses the run with `SPEEDUP-ABOVE-CEILING` and seals `score: null`; a
+gain of exactly 5.0 passes. There is no prefill ceiling.
+
+benchd does not round the score, so two runs tie only when their scores are
+equal. In the final ranking, ties go to the most recent submission (the same
+rule as the CUDA track's participant contract, section 5.7).
+
+The control leg's health band
 is the box calibration, and the fixture's decode band allows 3 percent upward
 (`decode_band_up_tolerance` 0.03).
 
@@ -949,9 +965,9 @@ target is pending, `./setup.sh` refuses by name.
 
 | Artifact | Identity |
 |---|---|
-| Target model | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), the Bonsai 2 9B pack of `Qwen/Qwen3.5-9B` |
-| Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (pending, no record) |
-| MTP head | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), `fixtures/reference_bonsai2_9b_mtp_head.sha256` (pending, no record) |
+| Target model | `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6` |
+| Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (13 records; the file name is inherited) |
+| Decoder slot (DFlash drafter) | Produced from `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7`; the artifact identity is the fixture's `mtp_head.artifact`; `fixtures/reference_bonsai2_9b_mtp_head.sha256` holds no record |
 | Geometry source | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` `config.json`, as `fixtures/qwen35_9b_base_config.json` (3,126 bytes) |
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, as `fixtures/bonsai2_27b_config.json` (58,145 bytes) |
 | Engine fork upstream base | tree `0391eacd84cb00ce4001d70763f2303fa2a01210`, the merge of `62cfabd5c67c6042edcfd812698bd34e4b5df7d7` and `443789360ddbf804d55d063ca9cda4ea2d3013a9` (a local merge branch, not pushed upstream; engine-local changes on top) |

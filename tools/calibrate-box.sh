@@ -19,7 +19,7 @@
 # the cool gate per pass,
 # one resident worker per pass, the same live goldens the ranked run scores
 # over -- and writes one file with one entry per live golden. Each entry holds
-# the mean, the coefficient of variation and the band on both axes. It REFUSES to write a file when the CV exceeds 1 % on either axis,
+# the mean, the coefficient of variation and the band on both axes. It REFUSES to write a file when the CV exceeds 1 % on either axis (the fixture's calibration_max_cv_percent, 1.0),
 # because a box that cannot repeat itself has no band worth recording. That
 # refusal is the point of the three passes, and this script does not soften it.
 #

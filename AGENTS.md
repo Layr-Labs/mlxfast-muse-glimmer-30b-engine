@@ -68,13 +68,11 @@ precision modelopt: 4-bit NVFP4 at group 16 on 213 modules and float8 on 180.
 The checkpoint also carries a 50-layer vision tower; this text-only track never
 loads that namespace.
 
-Official scoring is NOT armed. `fixtures/muse_glimmer_30b_mlx_v1_track.json`
-sets `official_scoring_enabled` to `false`, its `timed_prompt_pool` is empty,
-its `live_goldens` list is empty, and `hidden_correctness_golden` carries the
-sentinel `MUSE-GLIMMER-30B-MLX-V1-PENDING-ORGANIZER`. The benchmarker refuses to
-seal an official artifact in that state. The planned live prompts are the three
-coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token seed, recorded
-on that box.
+Official scoring is armed. `fixtures/muse_glimmer_30b_mlx_v1_track.json`
+sets `official_scoring_enabled` to `true`. Its `timed_prompt_pool` pins three
+goldens by `sha256` and `bytes`, and `live_goldens` names them: the three
+coding prompts `pool-9`, `pool-10` and `pool-11` at a 512-token seed.
+`hidden_correctness_golden` is pinned by digest.
 
 The track has no goldens. A track's goldens are organizer material: they are
 recorded on the track's own box, published in R2 under

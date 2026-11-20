@@ -52,7 +52,7 @@ cost is measured in that same session. No file stores it.
 > tools/ranked-box-preflight.sh
 > ```
 
-> Official scoring is NOT armed. Section [Current status](#current-status)
+> Official scoring is armed. Section [Current status](#current-status)
 > states each fact. `docs/bonsai2-9b-port-notes.md` is the engineering
 > record.
 
@@ -615,8 +615,8 @@ gate and the cool gate before each pass, one resident worker for each pass, and
 the live goldens the ranked run scores over. It writes one entry for each live
 golden: the mean, the coefficient of variation and the band for prefill and for
 decode. Decode is the decode window. It writes no file when the coefficient of
-variation is more than 2 percent on either axis: the fixture declares no
-`calibration_max_cv_percent`, so benchd applies its default of 2.0. A box that
+variation is more than 1 percent on either axis: the fixture's
+`calibration_max_cv_percent` is 1.0. A box that
 cannot repeat itself has no band. `tools/ranked-box-preflight.sh` accepts calibration file
 version 3 only.
 
@@ -721,7 +721,7 @@ and halts the resident when the command ends. The ranked path does not use it.
 | `pairsPerCohort` | 3 |
 | `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
-| `decodeSpeedupCeiling` | 5.0 (stated; the fixture declares no ceiling, so benchd applies none) |
+| `decodeSpeedupCeiling` | 5.0 (the fixture's `decode_speedup_ceiling`) |
 | `kvBackend` | `paged` |
 
 The scored width is fixed. A width the benchmarker has not certified has no
@@ -733,7 +733,12 @@ per-pair composites (`official_pair_combine: "mean"`). Every pair stays in the
 artifact as measured.
 
 The candidate's slowness gate is the two floors: 0.95 on the prefill gain and
-0.95 on the decode gain. The control leg's health band is the box calibration.
+0.95 on the decode gain. The plausibility gate is the fixture's
+`decode_speedup_ceiling` of 5.0: a pair whose decode gain is above 5.0 refuses
+the run with `SPEEDUP-ABOVE-CEILING` and seals `score: null`; a gain of exactly
+5.0 passes. There is no prefill ceiling. Two runs whose scores are equal tie;
+in the final ranking, ties go to the most recent submission. The control leg's
+health band is the box calibration.
 The decode band allows 3 percent upward.
 
 `kvBackend` is pinned `paged` on both legs. The model declares
@@ -765,12 +770,17 @@ whether an unmodified `main` fails at the same token position on your machine.
 
 Six statements are true right now.
 
-1. The target is pending. prism-ml has not published the Bonsai 2 9B MLX pack.
-   `target.upstream_model_id`, `target.upstream_revision`, the MTP head's
-   pins and the license carry the exact sentinel
-   `BONSAI-MLX-PENDING-ORGANIZER`. `fixtures/reference_bonsai2_9b_2bit.sha256`
-   and `fixtures/reference_bonsai2_9b_mtp_head.sha256` hold no record.
-   `./setup.sh` refuses the pending reference by name.
+1. The target is pinned: `target.upstream_model_id` is
+   `nvidia/Muse-Glimmer-30B-NVFP4` at `target.upstream_revision`
+   `47818374517751c48c55cde2621594926b1888b6`, and
+   `fixtures/reference_bonsai2_9b_2bit.sha256` pins it file by file (the file
+   name is inherited from the source track). The decoder slot's
+   `fixtures/reference_bonsai2_9b_mtp_head.sha256` holds no record: the DFlash
+   drafter is produced from `meta-models/Muse-Glimmer-30B-assistant`, and its
+   identity is the fixture's `mtp_head.artifact` pin. `./setup.sh` still
+   defaults its download repository and revision to the sentinel
+   `BONSAI-MLX-PENDING-ORGANIZER`, so it refuses by name unless
+   `MLXFAST_REFERENCE_MODEL_REPO` and `MLXFAST_REFERENCE_REVISION` name the pin.
 2. `fixtures/muse_glimmer_30b_mlx_v1_track.json` sets
    `official_scoring_enabled` to `true`. That flag is the single authority on
    the arm state, and the benchmarker enforces it. It refuses to seal an
@@ -862,9 +872,9 @@ No local run blocks the upload. Run the local test yourself before you submit.
 
 | Artifact | Identity |
 |---|---|
-| Target model | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), a Bonsai 2 pack of `Qwen/Qwen3.5-9B` |
-| Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (pending, no record) |
-| MTP head | Pending (`BONSAI-MLX-PENDING-ORGANIZER`), pinned by `fixtures/reference_bonsai2_9b_mtp_head.sha256` (pending, no record) |
+| Target model | `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6` |
+| Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (13 records; the file name is inherited) |
+| Decoder slot (DFlash drafter) | Produced from `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7`; the artifact identity is the fixture's `mtp_head.artifact`; `fixtures/reference_bonsai2_9b_mtp_head.sha256` holds no record |
 | Geometry source | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` `config.json`, checked in as `fixtures/qwen35_9b_base_config.json` |
 | Packing reference | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` @ `3f926b415992eaa2ae9dd7b573706494d6bbf787` `config.json`, checked in as `fixtures/bonsai2_27b_config.json` |
 | Benchmarker | The bench repository's `main` dist channel, resolved at run time (`benchd.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
