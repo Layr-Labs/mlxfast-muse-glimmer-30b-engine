@@ -90,6 +90,11 @@ correctness_prompts/*golden_prompt*.txt
 correctness_prompts/*private*.json
 correctness_prompts/*private*.txt
 correctness_prompts/*gpqa_reference_cases*.json
+# The track's capture directory is ignored by default; only the two public
+# captures are allowed, so a pool tape recorded there cannot enter a commit.
+correctness_prompts/muse-glimmer-30b-mlx-v1/*
+!correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-iterate.golden.json
+!correctness_prompts/muse-glimmer-30b-mlx-v1/public-local-submit.golden.json
 
 # IDE
 .vscode/
