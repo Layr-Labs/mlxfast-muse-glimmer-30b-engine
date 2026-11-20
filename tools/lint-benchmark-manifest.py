@@ -102,7 +102,7 @@ import sys
 # --- per-track scoring-constant registry ------------------------------------
 #
 # RE-AIMED 2026-08-24 (reviewer blocker on the qwen3.8-125b-a6b-mlx-v1 manifest
-# PR, orchestrator-adopted): this used to be ONE global EXPECTED_SCORING dict,
+# PR): this used to be ONE global EXPECTED_SCORING dict,
 # hardcoded to the qwen3.8-27b-mtp-v1 ruling, that every manifest's `scoring`
 # block was checked against regardless of track. That was never actually
 # universal -- it just had exactly one registrant -- and it broke the instant
@@ -151,13 +151,13 @@ _QWEN_MTP_V1_SCORING = {
 
 # QWEN3.8-125B-A6B-MLX-V1 sources -- each value pinned here (not read from
 # the fixture at check time, the same posture qwen's dict above always used)
-# because each is either David's own ruling or a benchd source constant this
+# because each is either the organizer's own ruling or a benchd source constant this
 # repository's manifest independently pins to and documents:
 #   mode
 #       mlxfast-bench crates/benchd/src/overlay.rs `SCORING_MODE`, which is
 #       the same string as measure_job.rs `MEASURE_JOB_MODE`: benchd's
 #       SINGLE-STREAM paired regime name. It replaced
-#       `COHORT_MEASURE_JOB_MODE` on 2026-08-27, when David ruled this track
+#       `COHORT_MEASURE_JOB_MODE` on 2026-08-27, when the organizer ruled this track
 #       single-stream ("Single-stream only": composite over a paired
 #       serial-against-MTP single-stream series, scored_batch_size 1, and no
 #       ContinuousBatchingV2 adaptation). Both names are read off benchd
@@ -166,7 +166,7 @@ _QWEN_MTP_V1_SCORING = {
 #       at all. A mismatch here is always an authoring error, never a
 #       legitimate temporary state, so it has NO caveat-based warn path.
 #   scoredBatchSize = 1
-#       RULED by David 2026-08-27 with the mode above. THIS IS A
+#       RULED by the organizer 2026-08-27 with the mode above. THIS IS A
 #       RULED-AHEAD-OF-PIN VALUE, like pairsPerCohort below: at the published
 #       channel tip `ScoredBatchPoint::certify` certifies B = 8 only, so a
 #       fixture declaring 1 is REFUSED at that width certification until the
@@ -182,19 +182,19 @@ _QWEN_MTP_V1_SCORING = {
 #       ScoredExponents::certify, kv_backend) lives in
 #       docs/participant-contract.md section 5, not in the manifest itself
 #       (benchmark.json and its contract fixture carry values only, no prose
-#       fields, per David's 2026-08-24 ruling -- see
+#       fields, per the organizer's 2026-08-24 ruling -- see
 #       docs/nemotron35-30b-a3b-port-notes.md section 4 for the full split).
 #   pairsPerCohort = 4
-#       RULED 4 by David 2026-08-26, verbatim: "you run it using 4 pairs
+#       RULED 4 by the organizer 2026-08-26, verbatim: "you run it using 4 pairs
 #       instead of 2 of 8 batches" -- 8 prompts x 4 pairs is the
 #       challenger-grade sample mass the ruling buys. SUPERSESSION CHAIN, each
 #       link superseding the one above it:
 #         1. batch-8 brief D2 -- default 4;
-#         2. David 2026-08-24 ("do 2") -- RULED 2, landed in benchd as commit
+#         2. organizer ruling 2026-08-24 ("do 2") -- RULED 2, landed in benchd as commit
 #            bb1a6216655912b8a57967bb9cd45cff973a82df, merged PR #184 at
 #            047e21833a66264310307e1cb86ae3a290b0fc27 on the
 #            qwen3.8-125b-a6b-mlx-v1 release branch;
-#         3. David 2026-08-26 -- RULED 4 (this value), returning to the
+#         3. organizer ruling 2026-08-26 -- RULED 4 (this value), returning to the
 #            brief's sample count on sample-mass grounds.
 #       CHANNEL AGREEMENT IS A TWO-PHASE LANDING HERE, and that is deliberate:
 #       the benchd side (PAIRS_PER_COHORT_TARGET 2 -> 4) must MERGE AND
@@ -242,9 +242,9 @@ _QWEN38_125B_A6B_MLX_V1_SCORING = {
 }
 
 # nemotron3.5-30b-a3b-mlx-v1: the manifest block states the values the contract
-# fixture enforces (official_pairs 3, decode_speedup_floor 0.95 -- David
+# fixture enforces (official_pairs 3, decode_speedup_floor 0.95 -- organizer
 # 2026-09-17, "3 pairs"; the ranked run scores the mean of the per-pair
-# composites, David 2026-10-06). benchd reads the fixture, not this block; the block is the manifest's
+# composites, organizer ruling 2026-10-06). benchd reads the fixture, not this block; the block is the manifest's
 # statement of the same numbers and this registry keeps the two in step.
 _NEMOTRON35_30B_A3B_MLX_V1_SCORING = {
     "mode": "nemotron-native-mtp-paired-composite",
@@ -277,8 +277,8 @@ _BONSAI2_27B_MLX_V1_SCORING = {
 
 # bonsai2-9b-mlx-v1: the source track. Stamped from bonsai2-27b-mlx-v1; the scoring
 # block is the family's (composite prefill^0.25 * decode^0.75, 3 pairs), and
-# the pairs combine by the mean (official_pair_combine in the contract, David
-# 2026-10-06). benchd reads the contract fixture, not this block.
+# the pairs combine by the mean (official_pair_combine in the contract,
+# organizer ruling 2026-10-06). benchd reads the contract fixture, not this block.
 _BONSAI2_9B_MLX_V1_SCORING = dict(_BONSAI2_27B_MLX_V1_SCORING)
 
 # muse-glimmer-30b-mlx-v1: THIS TRACK. The scoring block states the same numbers
@@ -319,7 +319,7 @@ EXPECTED_SCORING_BY_TRACK = {
 # is correctly ABSENT from this dict rather than given an empty or vacuous
 # entry.
 #
-# NOT RETARGETED by the 2026-08-24 manifest-notes-strip (David: benchmark.json
+# NOT RETARGETED by the 2026-08-24 manifest-notes-strip (organizer: benchmark.json
 # and its contract fixture carry values only, no prose fields -- see
 # docs/nemotron35-30b-a3b-port-notes.md section 4). This needle check is scoped entirely
 # to qwen3.8-27b-mtp-v1's OWN manifest, a different repository this PR does
@@ -417,7 +417,7 @@ FORBIDDEN_EDITABLE = (
 # about.
 #
 # `.github` and `tools` are a DELIBERATE DIVERGENCE from upstream's roster,
-# which omits both -- ruled by David 2026-08-20: "parity doctrine governs
+# which omits both -- ruled by the organizer 2026-08-20: "parity doctrine governs
 # measurement surfaces, not security posture." The gates themselves live in
 # those two directories (the overlay, the static review, the surface gate, this
 # linter, the hostile-archive suite, the CI tripwires). A contract that could
@@ -427,7 +427,7 @@ FORBIDDEN_EDITABLE = (
 # reason to leave them unclaimed. Divergences from upstream are normally debt --
 # this one is not, and must not be "reconciled" back to five.
 #
-# `fixtures` and `benchmark.json` -- ADDED 2026-08-24 (orchestrator, folding a
+# `fixtures` and `benchmark.json` -- ADDED 2026-08-24 (folding a
 # reviewer blocker into the qwen3.8-125b-a6b-mlx-v1 manifest PR). Before this,
 # `benchmark.json` claiming its OWN filename or `fixtures/` (the track
 # contract, the pinned reference/head `.sha256` manifests) as editable was
@@ -815,7 +815,7 @@ class Linter:
         # NON-VACUITY. The exclusion is only worth anything if the thing it
         # refuses to make editable actually exists in the tree. That used to be
         # `.gitmodules` (submodule era), then `benchd.pin` (sha-pin era). The
-        # pin is RETIRED (David ruling 2026-08-27: benchd resolves from the
+        # pin is RETIRED (organizer ruling 2026-08-27: benchd resolves from the
         # bench branch's dist channel, verified against the channel's
         # benchd.manifest.json, so measurement fixes ship bench-side with no
         # engine commit); the artifact carrying the same authority is now

@@ -11,7 +11,7 @@
 # not a mechanical interlock: NO STATUS CHECK IS REQUIRED ANYWHERE IN THIS
 # REPOSITORY -- branch protection is unavailable on this plan (403), there is no
 # CODEOWNERS, and a red run blocks neither a merge nor a dispatch. CI here is
-# ADVISORY by ruling (David 2026-08-20; the two-session red-team is the de facto
+# ADVISORY by ruling (organizer ruling 2026-08-20; the two-session red-team is the de facto
 # merge gate), and dispatch-time gating is deferred with the ranked runner
 # (docs/submission-restriction-spec.md section 9), so today a red gate stops a
 # dispatch only because a human reads it. Keep it hosted-runner-clean -- an
@@ -75,7 +75,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 # the number goes down: it drops in the same change that deletes the
 # assertions, never to make a red suite go green.
 #
-# 259 -> 236 on the Darkbloom CBv2 re-base, on the same rule. Section I (the
+# 259 -> 236 on the CBv2 re-base, on the same rule. Section I (the
 # target-quantization bind) asserted the bind lives in the non-editable
 # Sources/MLXFastHarness worker target; that target is deleted and the bind is
 # the fork's now. Section H's editable-model-file loop asserted four
@@ -262,7 +262,7 @@ for i in 1 2 3; do fill "${fx}/trusted/head/shard${i}.bin" 3000; done
 assert_exit "budget/exempt path over its own cap rejected" 1 "above the exempt-path limit" \
   "${fx}/trusted" budget verify benchmark.json
 
-# PER-FILE exempt cap (David BYO-512 ruling 2026-08-26). One 9 KB blob is over
+# PER-FILE exempt cap (organizer BYO-512 ruling 2026-08-26). One 9 KB blob is over
 # exemptPathMaxFileBytes (7000) on its own. Before this cap an exempt file had
 # no per-file bound at all -- maxFileBytes deliberately does not reach exempt
 # paths -- so a head shipped as one monolithic shard passed the budget and then
@@ -1208,7 +1208,7 @@ expected_shell_caps="$(printf '%s\n' "${manifest_caps}" | grep -v '^exemptPathMa
 assert_equal "drift/shell gate resolves the manifest caps" "${shell_caps}" "${expected_shell_caps}"
 
 # D1 SINGLE-SOURCE, BOTH ENFORCERS. Issue #20 / finding B6 / R1.15 is RULED
-# (David 2026-08-20): align shell to Swift, resolution is manifest > constant.
+# (organizer ruling 2026-08-20): align shell to Swift, resolution is manifest > constant.
 # The shell gate used to consult MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_* AHEAD of
 # the manifest while the Swift enforcer had no environment path at all, so "the
 # manifest is the single source" held for one enforcer and not the other.
@@ -1449,7 +1449,7 @@ done
 
 # 1. Every protected path must be refused when named exactly. All SEVEN: the
 #    last two, '.github' and 'tools', are this repository's deliberate
-#    divergence from upstream's five-entry roster (ruled by David 2026-08-20 --
+#    divergence from upstream's five-entry roster (ruled by the organizer 2026-08-20 --
 #    parity doctrine governs measurement surfaces, not security posture), and
 #    they are asserted here exactly like the inherited five so the divergence is
 #    a tested property rather than a comment.
@@ -1671,7 +1671,7 @@ done
 #                                        surface gate, the CI tripwires
 #   tools                                this linter, the hostile-archive
 #                                        suite, the fetch/verify scripts
-#     (those two are David's 2026-08-20 divergence: "parity doctrine governs
+#     (those two are the organizer's 2026-08-20 divergence: "parity doctrine governs
 #      measurement surfaces, not security posture" -- must not be reconciled
 #      back to five)
 #   fixtures                             the track contract and the pinned
@@ -1929,7 +1929,7 @@ assert_equal "requant-only/exemptPaths is absent from the real budget block" \
 # This track has ONE speculative arm: the native MTP head EMBEDDED in the
 # pinned target checkpoint. There is no drafter to stage and no organizer head
 # artifact to fetch, so `mtp-head/` holds no weight file and the DFlash arm is
-# gone entirely (David ruling 2026-08-27, "Remove it, MTP-only").
+# gone entirely (organizer ruling 2026-08-27, "Remove it, MTP-only").
 #
 # What must NEVER appear is a head WEIGHTS directory in `editablePaths`.
 # `mtp-head/` and `dflash-head/` left that list under the 2026-08-26
@@ -1974,7 +1974,7 @@ assert_equal "head-surface/the Swift count pin states 97" \
 
 # --- J. the docs may not describe a DISK re-quantization -------------------
 #
-# A re-quantization happens ON LOAD, in memory (David clarification
+# A re-quantization happens ON LOAD, in memory (organizer clarification
 # 2026-08-26). The mechanism was previously documented as a hook that REWROTE
 # the staged head directory, and that framing survived in several places after
 # the mechanism changed -- including inside the same file whose section 4.4

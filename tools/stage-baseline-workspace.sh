@@ -3,7 +3,7 @@
 # stage-baseline-workspace.sh -- build the organizer's REFERENCE tree on a
 # ranked box.
 #
-# WHAT THE REFERENCE TREE IS. A ranked run on this track is PAIRED (David ruling
+# WHAT THE REFERENCE TREE IS. A ranked run on this track is PAIRED (organizer ruling
 # 2026-09-08): it measures a SERIAL-CONTROL leg on the organizer's reference
 # tree and a CANDIDATE leg on the submission tree, in the same job, on the same
 # box. The score is the LIVE ratio of the two. The reference tree is therefore

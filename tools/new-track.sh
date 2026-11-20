@@ -145,7 +145,7 @@ note "  runner label     [self-hosted, ${OS_TOKEN}, ${TRACK_ID}]"
 # Files this pass must NOT rewrite. Each is a record of the SOURCE track, and
 # renaming the id inside it would falsify that record:
 #   * the port notes are the source track's porting history and citations;
-#   * the linter's per-track scoring registry pins David's rulings BY TRACK ID
+#   * the linter's per-track scoring registry pins the organizer's rulings BY TRACK ID
 #     -- the new track legitimately has no entry yet, and the linter reports
 #     that as a visible gap rather than a silent pass;
 #   * the new-track procedure cites precedent track ids by name;
@@ -320,7 +320,7 @@ sys.stderr.write("new-track.sh: pinned %d checkpoint files (%d bytes) in %s\n"
 PYEOF
 
 # --- 4. the benchd channel ---------------------------------------------------
-# David ruling 2026-09-07: benchd is published from `main`. There is no
+# organizer ruling 2026-09-07: benchd is published from `main`. There is no
 # per-track bench release branch any more, so a freshly stamped track resolves
 # the same channel every other track does.
 FETCH="tools/fetch-benchd.sh"

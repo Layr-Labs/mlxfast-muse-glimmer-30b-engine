@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
-# Bootstrap system tools and build the Swift-only Bonsai 2 9B harness.
+# Bootstrap system tools and build the Swift-only Muse Glimmer 30B harness.
 set -euo pipefail
 
-# THE TARGET IS PENDING. prism-ml has not published the Bonsai 2 9B MLX pack.
-# The repository and the revision below carry the exact sentinel
-# BONSAI-MLX-PENDING-ORGANIZER, in lockstep with
-# MLXFastConstants.referenceModelRepository / _Revision in
-# Sources/MLXFastCore/Constants.swift, the artifact fixture support under
-# Tests/MLXFastTests/Model/, and fixtures/muse_glimmer_30b_mlx_v1_track.json's
-# target.upstream_model_id / target.upstream_revision -- four independent
-# sources that must agree byte-for-byte on this pin. Until the pack is pinned,
-# this script refuses the reference download by name;
+# THE DEFAULT PIN BELOW IS A LEGACY SENTINEL. The target is pinned in
+# fixtures/muse_glimmer_30b_mlx_v1_track.json (target.upstream_model_id /
+# target.upstream_revision) and in MLXFastConstants.referenceModelRepository /
+# _Revision in Sources/MLXFastCore/Constants.swift: nvidia/Muse-Glimmer-30B-NVFP4
+# at 47818374517751c48c55cde2621594926b1888b6. The repository and the revision
+# below still default to the pending sentinel inherited from the source track,
+# so a run with no MLXFAST_REFERENCE_MODEL_REPO / MLXFAST_REFERENCE_REVISION
+# override refuses the reference download by name;
 # MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 still builds the harness and the engine.
 #
-# The pack will be fetched directly from the published MLX release, not
-# converted by us. Its MTP head is pending too; ./setup-mtp-head.sh stages it
-# once it is pinned. The default fetch is ANONYMOUS for a public repository.
+# The checkpoint is fetched directly from its published repository, not
+# converted by us. The DFlash drafter slot is provisioned by
+# ./setup-mtp-head.sh. The default fetch is ANONYMOUS for a public repository.
 # MLXFAST_REFERENCE_AUTH_HEADER remains as an OPTIONAL fallback for a private
 # mirror staged by an operator, or an anonymous fetch being rate-limited, and is
 # empty by default. Every variable here stays env-overridable.
@@ -24,9 +23,8 @@ REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-${PENDING_ORGANIZER_SENTIN
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-${PENDING_ORGANIZER_SENTINEL}}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# No organizer-hosted mirror exists for this checkpoint yet (the Darkbloom R2
-# mirror serves the retired Laguna target only). Resolve the immutable Hugging
-# Face revision directly and leave the fallback empty by default.
+# No organizer-hosted mirror exists for this checkpoint. Resolve the immutable
+# Hugging Face revision directly and leave the fallback empty by default.
 # download_url_for_file appends "?download=true" only for huggingface.co URLs,
 # so that resolves to the raw LFS/Xet bytes.
 DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/${REFERENCE_MODEL_REPO}/resolve/${REFERENCE_REVISION}"
@@ -44,9 +42,10 @@ REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto
 REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_bonsai2_9b_2bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
-# 22 GiB is the Ternary Bonsai 2 27B floor (an ~8.1 GiB snapshot, its head and
-# the transform's output). The Bonsai 2 9B pack is expected near a third of
-# that size, so the floor stays until the pack is pinned and measured.
+# 22 GiB is a floor inherited from the source track. It is below the pinned
+# target's 24,669,346,036 bytes (target.raw_checkpoint_total_size_bytes in the
+# contract fixture); keep more space free or raise the limit with
+# MLXFAST_REFERENCE_MIN_FREE_GIB.
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-22}"
 # Four jobs keep the link saturated for a checkpoint of up to four shards. Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-4}"
@@ -3478,9 +3477,9 @@ EOF
   return 0
 }
 
-# THE HEAD IS THE SECOND ARTIFACT. The pinned pack declares
-# `mtp_num_hidden_layers: 0` and ships no `mtp.*` tensor, so the MTP head is a
-# separate published export with its own pin file. ./setup-mtp-head.sh points
+# THE DRAFTER IS THE SECOND ARTIFACT. The pinned target carries no MTP layer
+# (target.components.mtp is false), so the DFlash drafter slot is a separate
+# artifact with its own pin file. ./setup-mtp-head.sh points
 # THIS downloader at it, which is why the head is fetched and verified by the
 # same resumable, hash-verified path the target is.
 #
@@ -3500,8 +3499,8 @@ provision_mtp_head() {
 }
 
 # A PENDING PIN IS REFUSED BY NAME, before anything is built or downloaded.
-# The target and the head pins carry the organizer sentinel until prism-ml
-# publishes the Bonsai 2 9B pack; there is nothing to download or verify.
+# The default repository and revision above are the legacy sentinel; a run
+# with no override has nothing to download or verify.
 refuse_pending_reference() {
   if [[ "${REFERENCE_MODEL_REPO}" == "${PENDING_ORGANIZER_SENTINEL}" \
      || "${REFERENCE_REVISION}" == "${PENDING_ORGANIZER_SENTINEL}" ]]; then

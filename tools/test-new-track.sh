@@ -65,7 +65,7 @@ OLD_CONTRACT="$(python3 -c 'import json;print(json.load(open("'"${ROOT}"'/benchm
 #   docs/bonsai2-27b-port-notes.md       the porting history of the track this
 #                                        one was stamped from.
 #   tools/lint-benchmark-manifest.py     the per-track scoring registry pins
-#                                        David's rulings BY TRACK ID. The new
+#                                        the organizer's rulings BY TRACK ID. The new
 #                                        track legitimately has no entry yet,
 #                                        and the linter reports that absence as
 #                                        a visible gap; renaming the qwen keys

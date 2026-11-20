@@ -30,7 +30,7 @@
 # stages the box; a `run:` step inherits it. Nothing here reads a GitHub secret,
 # and nothing here reaches the network.
 #
-# PAIRED, WITH A PER-BOX BAND (David 2026-09-08). This track scores TWO legs on
+# PAIRED, WITH A PER-BOX BAND (organizer ruling 2026-09-08). This track scores TWO legs on
 # the same box in the same job, over each live golden: a SERIAL-CONTROL leg
 # on the organizer-staged reference tree and the CANDIDATE leg on the submission
 # tree at its declared depth. The score is the LIVE ratio. Nothing stores a
@@ -132,7 +132,7 @@ done
 ok "no measurement-weakening override in the job environment"
 
 # --- 2b. the GPU temperature reader exists ----------------------------------
-# DAVID'S RULING 2026-08-26: no calibration without thermal control, and a
+# THE ORGANIZER'S RULING 2026-08-26: no calibration without thermal control, and a
 # missing reader REFUSES rather than silently self-disabling.
 #
 # This is the challenger's host-preflight line, same form, same variable:
@@ -267,7 +267,7 @@ $(jq -r '.timed_prompt_pool[] | [.r2_path, .sha256, (.bytes | tostring)] | @tsv'
 EOF
 ok "all ${pool_count} staged timed-pool tapes match their contract pins (bytes then sha256)"
 
-# Per-depth oracles (David ruling 2026-09-07): every live_golden_speculative
+# Per-depth oracles (organizer ruling 2026-09-07): every live_golden_speculative
 # entry (one per depth and live golden) must be a well-formed pin AND staged, so
 # a speculative submission never reaches the GPU to find its oracle missing.
 # Absent map = serial-only track.
@@ -379,7 +379,7 @@ armed="$(jq -r '.official_scoring_enabled // false' "${CONTRACT}")"
 ok "fixture is armed for official scoring (official_scoring_enabled: true)"
 
 # --- 6. the paired legs: the reference workspace and this box's band --------
-# THE RUN IS PAIRED, AND THE PAIR IS PER BOX (David ruling 2026-09-08). A ranked
+# THE RUN IS PAIRED, AND THE PAIR IS PER BOX (organizer ruling 2026-09-08). A ranked
 # run measures TWO legs on the same box in the same job: a SERIAL-CONTROL leg on
 # the organizer-staged reference tree and the CANDIDATE leg on the submission
 # tree. The score is the LIVE ratio of the two. Nothing stores a pair.
@@ -518,7 +518,7 @@ if not isinstance(cal, dict):
 
 # Version 3 holds one entry for each prompt in `prompts`, and its decode mean is
 # the DECODE WINDOW per token: decode-run time / N, with no seed prefill in it
-# (benchd ecd66fe, David 2026-10-07). Versions 1 and 2 recorded the whole window
+# (benchd ecd66fe, organizer ruling 2026-10-07). Versions 1 and 2 recorded the whole window
 # (seed prefill plus decode, over N) as decode, so their band does not describe
 # the control leg benchd measures now.
 version = cal.get("version")
