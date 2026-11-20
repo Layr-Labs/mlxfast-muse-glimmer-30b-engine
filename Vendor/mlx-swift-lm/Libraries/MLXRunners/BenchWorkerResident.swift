@@ -148,6 +148,33 @@ public final class BenchWorkerResident: @unchecked Sendable {
     private let condition = NSCondition()
     private var sessionActive = false
     private var stopped = false
+    private var anySessionTeardownUnproven = false
+
+    /// False once any phase's engine drain ran into its watchdog.
+    ///
+    /// A phase server ends its PROCESS through `_exit` when a drain was not
+    /// proven quiet (`BenchWorkerServer.processEnd`). In a resident the
+    /// process is shared by every later phase, so a session never ends it:
+    /// the resident records the fact here, keeps serving, and its owner skips
+    /// the runtime teardown when the window ends.
+    public var teardownProven: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return !anySessionTeardownUnproven
+    }
+
+    /// Wait, bounded, for a session that is still finishing (its drain can
+    /// take up to two engine watchdogs) so `teardownProven` covers it.
+    /// Returns false when a session is still active at the deadline.
+    public func waitForSessionEnd(timeout: TimeInterval) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while sessionActive, Date() < deadline {
+            _ = condition.wait(until: deadline)
+        }
+        return !sessionActive
+    }
 
     /// How long a new attach waits for a FINISHING session before it is
     /// refused. Teardown is microseconds — the client has already closed and
@@ -295,6 +322,15 @@ public final class BenchWorkerResident: @unchecked Sendable {
             residentIdentity: identity,
             residentWeights: weightsPath,
             nonce: nonceFactory())
+        // The session does not own this process: record an unproven drain
+        // instead of `_exit`, which would end the resident under the next
+        // phase (an attach then finds no listener).
+        server.endProcessWithoutTeardown = { [weak self] _ in
+            guard let self else { return }
+            self.condition.lock()
+            self.anySessionTeardownUnproven = true
+            self.condition.unlock()
+        }
 
         let finished = DispatchSemaphore(value: 0)
         Task {

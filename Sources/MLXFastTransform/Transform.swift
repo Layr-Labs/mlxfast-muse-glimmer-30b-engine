@@ -41,15 +41,18 @@ public struct TransformReport: Equatable {
 }
 
 /// Model family of the source reference checkpoint, detected from its
-/// config.json. The transform serves two packed families: the signed
+/// config.json. The transform serves this track's target, Muse Glimmer
+/// (`model_type` "muse_glimmer", modelopt NVFP4/FP8, pinned shards), and two
+/// packed families: the signed
 /// Hadamard-packed family (`model_type` "prism_hadamard_qwen35", packed
 /// Hadamard modules, untied head, no embedded speculative head) and the legacy
 /// Gemma 4 multimodal layout (nested `text_config`, tied head).
 ///
-/// Neither is this engine's ranked target. That checkpoint ships in its own
-/// runtime layout (modelopt NVFP4, no Hadamard transform), so the transform is
-/// not on its load path. The two families stay because the transform is
-/// editable surface and these are the source shapes it knows how to unpack.
+/// The ranked target ships in its own runtime layout (modelopt NVFP4, no
+/// Hadamard transform) and the runtime pins its index and shards by SHA-256,
+/// so its family is a byte pass-through: see `MuseGlimmerCheckpointLayout`.
+/// The two packed families stay because the transform is editable surface and
+/// these are the source shapes it knows how to unpack.
 ///
 /// The legacy `.gemma4` family no longer has a runtime consumer (the Gemma 4
 /// runtime and its MTP track were removed); it is retained here deliberately
@@ -58,6 +61,7 @@ public struct TransformReport: Equatable {
 /// small synthetic fixtures -- the packed family requires the exact pinned
 /// 1,033-tensor inventory with real shapes.
 enum TransformModelFamily: Equatable {
+    case museGlimmer
     case gemma4
     case prismHadamard
 }
@@ -67,9 +71,14 @@ enum TransformModelFamily: Equatable {
 /// tensors into dense safetensors shard(s) plus a
 /// `model.safetensors.index.json` and a runtime-authored `config.json`.
 ///
-/// Two source checkpoint families are supported, detected from the source
+/// Three source checkpoint families are supported, detected from the source
 /// config.json:
 ///
+/// - Muse Glimmer (`model_type` "muse_glimmer", this track's target): the
+///   transform checks that the index holds a `model.language_model.` text
+///   tower and no namespace beyond it and the known vision stack, then passes
+///   the pinned shards, the index and config.json through byte-identical. The
+///   runtime refuses any other bytes, and drops the vision tensors at load.
 /// - The packed Hadamard family (`model_type` "prism_hadamard_qwen35"): the
 ///   source is already MLX affine-quantized, so the transform validates and
 ///   passes through -- byte-for-byte, source tensor names unchanged -- the
@@ -136,12 +145,17 @@ public enum SwiftTransform {
         let sourceConfigRoot = try loadReferenceConfigRoot(referenceConfigPath)
         let modelFamily = try detectModelFamily(sourceConfigRoot: sourceConfigRoot)
         let runtimeConfigData = try makeRuntimeConfigData(
-            sourceConfigRoot: sourceConfigRoot,
-            family: modelFamily
+            sourceConfigPath: referenceConfigPath
         )
         let metadataSnapshot = try captureMetadataFiles(from: referenceDirectory)
 
-        let index = try loadIndex(referenceDirectory)
+        let sourceIndexData = try loadIndexData(referenceDirectory)
+        let index = try sourceIndexData.map {
+            try CheckpointIndex.load(
+                data: $0,
+                origin: referenceDirectory.appendingPathComponent("model.safetensors.index.json").path
+            )
+        } ?? CheckpointIndex.buildFromSafetensors(in: referenceDirectory)
         let indexSnapshot = try index.canonicalData()
         let validatedHeaders = try validateCheckpointIndex(
             index,
@@ -192,6 +206,13 @@ public enum SwiftTransform {
                     fromConfigRoot: sourceConfigRoot
                 )
             )
+        case .museGlimmer:
+            try MuseGlimmerCheckpointLayout.validateIndexKeys(index.weightMap.keys)
+            guard sourceIndexData != nil else {
+                throw MLXFastError.invalidInput(
+                    "muse_glimmer reference has no model.safetensors.index.json; the runtime loads only the pinned index"
+                )
+            }
         case .gemma4:
             break
         }
@@ -222,7 +243,15 @@ public enum SwiftTransform {
                 throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
             }
             let selectedNames = textKeysByShard[shardName, default: []].sorted()
-            if Set(selectedNames) == Set(header.tensors.keys) {
+            let wholeShard = Set(selectedNames) == Set(header.tensors.keys)
+            if modelFamily == .museGlimmer, !wholeShard {
+                // A subset copy rewrites the shard, and the runtime refuses a
+                // shard whose SHA-256 is not the pinned one.
+                throw MLXFastError.invalidInput(
+                    "muse_glimmer shard \(shardName) holds tensors outside the index; the pinned shard cannot be passed through whole"
+                )
+            }
+            if wholeShard {
                 // Poolside's reference is already text-only. Preserve the
                 // byte-identical shard and use an APFS copy-on-write clone
                 // when source/output share a volume; fall back to a normal
@@ -259,8 +288,8 @@ public enum SwiftTransform {
                 selectedKeys: textKeys,
                 destinationDirectory: stagingDirectory
             )
-        case .prismHadamard:
-            // That family has an untied `lm_head` and the runtime reads the
+        case .prismHadamard, .museGlimmer:
+            // Both families have an untied `lm_head` and the runtime reads the
             // pack's own packed tensors directly, so neither the projection
             // sidecar nor the tied-head packed13 sidecar of the `.gemma4`
             // family means anything here. Emitting one would publish a derived
@@ -293,12 +322,23 @@ public enum SwiftTransform {
         }
 
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
-        try index.writeStripped(
-            to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: textKeys,
-            totalTensorByteCount: outputTensorByteCount,
-            additionalWeightMap: generatedWeightMap
-        )
+        let stagedIndexPath = stagingDirectory.appendingPathComponent("model.safetensors.index.json")
+        switch modelFamily {
+        case .museGlimmer:
+            // The runtime pins the index by SHA-256: publish the source bytes
+            // the selection above was validated against.
+            guard let sourceIndexData else {
+                throw MLXFastError.invalidInput("muse_glimmer reference index bytes are missing")
+            }
+            try sourceIndexData.write(to: stagedIndexPath)
+        case .gemma4, .prismHadamard:
+            try index.writeStripped(
+                to: stagedIndexPath,
+                keeping: textKeys,
+                totalTensorByteCount: outputTensorByteCount,
+                additionalWeightMap: generatedWeightMap
+            )
+        }
 
         try runtimeConfigData.write(
             to: stagingDirectory.appendingPathComponent("config.json")
@@ -351,6 +391,15 @@ public enum SwiftTransform {
             configPath: configPath.path,
             indexPath: indexPath.path
         )
+    }
+
+    /// The source index file's bytes, or nil when the reference has none.
+    private static func loadIndexData(_ referenceDirectory: URL) throws -> Data? {
+        let indexPath = referenceDirectory.appendingPathComponent("model.safetensors.index.json")
+        guard FileManager.default.fileExists(atPath: indexPath.path) else {
+            return nil
+        }
+        return try Data(contentsOf: indexPath)
     }
 
     private static func loadIndex(_ referenceDirectory: URL) throws -> CheckpointIndex {
@@ -495,10 +544,13 @@ public enum SwiftTransform {
         key.hasPrefix(textTowerPrefix)
     }
 
-    /// Both families select the `language_model.*` namespace. The packed
-    /// family drops the pack's `vision_tower.*` tensors with the same test.
+    /// The legacy and packed families select the `language_model.*`
+    /// namespace and drop the vision tower. Muse Glimmer selects its text
+    /// tower AND carries the vision tensors its pinned shards hold beside it.
     static func isSelectedTextTowerKey(_ key: String, family: TransformModelFamily) -> Bool {
         switch family {
+        case .museGlimmer:
+            return MuseGlimmerCheckpointLayout.isSelectedKey(key)
         case .gemma4:
             return isTextTowerKey(key)
         case .prismHadamard:
@@ -589,7 +641,10 @@ public enum SwiftTransform {
     }
 
     private static func loadReferenceConfigRoot(_ sourceConfigPath: URL) throws -> [String: Any] {
-        let data = try Data(contentsOf: sourceConfigPath)
+        try parseReferenceConfigRoot(Data(contentsOf: sourceConfigPath))
+    }
+
+    private static func parseReferenceConfigRoot(_ data: Data) throws -> [String: Any] {
         let object = try JSONSerialization.jsonObject(with: data)
         guard let root = object as? [String: Any] else {
             throw MLXFastError.invalidInput("reference config.json must be a JSON object")
@@ -609,7 +664,11 @@ public enum SwiftTransform {
         // A packed config declares `prism_hadamard_qwen35` at the top level
         // AND carries a `text_config`, so it is checked FIRST: the
         // `text_config`-means-legacy-`.gemma4` fallthrough below is
-        // unconditional and would otherwise swallow it.
+        // unconditional and would otherwise swallow it. Muse Glimmer also
+        // carries a `text_config`, so it is matched first too, by exact name.
+        if root["model_type"] as? String == MuseGlimmerCheckpointLayout.modelType {
+            return .museGlimmer
+        }
         if let modelType = root["model_type"] as? String,
            modelType.hasPrefix(prismHadamardModelTypePrefix)
         {
@@ -624,12 +683,16 @@ public enum SwiftTransform {
         )
     }
 
+    /// The runtime config.json bytes. Muse Glimmer's is the source file
+    /// byte for byte: its runtime reads `text_config` from the whole file.
     static func makeRuntimeConfigData(sourceConfigPath: URL) throws -> Data {
-        let root = try loadReferenceConfigRoot(sourceConfigPath)
-        return try makeRuntimeConfigData(
-            sourceConfigRoot: root,
-            family: detectModelFamily(sourceConfigRoot: root)
-        )
+        let data = try Data(contentsOf: sourceConfigPath)
+        let root = try parseReferenceConfigRoot(data)
+        let family = try detectModelFamily(sourceConfigRoot: root)
+        if family == .museGlimmer {
+            return data
+        }
+        return try makeRuntimeConfigData(sourceConfigRoot: root, family: family)
     }
 
     /// Writes the runtime's `config.json`.
@@ -650,6 +713,10 @@ public enum SwiftTransform {
     ) throws -> Data {
         var runtimeConfig: [String: Any]
         switch family {
+        case .museGlimmer:
+            // The published bytes come from `makeRuntimeConfigData(sourceConfigPath:)`;
+            // from a parsed root, the closest form is the whole root.
+            runtimeConfig = root
         case .gemma4:
             guard let textConfig = root["text_config"] as? [String: Any] else {
                 throw MLXFastError.invalidInput("reference config.json is missing text_config")

@@ -205,19 +205,23 @@ func dflashEnvelopeIsExact() throws {
     #expect(envelope["verification_mode"] as? String == "exact")
 }
 
-// MARK: - not armed
+// MARK: - armed
 
-@Test("official scoring is NOT armed and the hidden golden is pending")
-func officialScoringIsNotArmed() throws {
+@Test("official scoring is armed on the pinned pool and the hidden golden is pinned")
+func officialScoringIsArmed() throws {
     let object = try trackContractObject()
-    #expect(trackContractIsArmed(object) == false)
-    #expect(object["official_scoring_enabled"] as? Bool == false)
-    #expect((object["live_goldens"] as? [Any])?.isEmpty == true)
-    #expect((object["timed_prompt_pool"] as? [Any])?.isEmpty == true)
+    #expect(trackContractIsArmed(object))
+    let liveGoldens = try #require(object["live_goldens"] as? [Any])
+    let timedPool = try #require(object["timed_prompt_pool"] as? [Any])
+    #expect(!liveGoldens.isEmpty)
+    #expect(timedPool.count == liveGoldens.count)
+    // Pair k measures live prompt (k - 1) mod N, so the pairs cover the pool evenly.
+    let pairs = try #require(object["official_pairs"] as? Int)
+    #expect(pairs % liveGoldens.count == 0)
     #expect((object["live_golden_speculative"] as? [String: Any])?.isEmpty == true)
     let hidden = try #require(object["hidden_correctness_golden"] as? [String: Any])
-    #expect(hidden["sha256"] as? String == trackGoldenSentinel)
-    #expect(hidden["bytes"] as? Int == 0)
+    #expect(isHex64(hidden["sha256"]))
+    #expect((hidden["bytes"] as? Int ?? 0) > 0)
     // No baseline pair is stored in the tree: the run times the reference leg
     // on the box instead.
     #expect(object["official_baseline"] == nil)

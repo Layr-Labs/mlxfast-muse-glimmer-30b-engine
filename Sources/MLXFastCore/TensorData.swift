@@ -14,10 +14,14 @@ public enum TensorDType: String, Codable, Equatable {
     case bf16 = "BF16"
     case f32 = "F32"
     case f64 = "F64"
+    /// OCP FP8 E4M3 ("FN": no infinities, NaN only at S.1111.111). The
+    /// pinned Muse Glimmer checkpoint stores its calibrated float8 (W8A8)
+    /// projection weights in this format.
+    case f8e4m3 = "F8_E4M3"
 
     public var byteWidth: Int {
         switch self {
-        case .bool, .u8, .i8:
+        case .bool, .u8, .i8, .f8e4m3:
             return 1
         case .i16, .u16, .f16, .bf16:
             return 2
@@ -88,6 +92,16 @@ public struct MaterializedTensor: Equatable {
         }
     }
 
+    /// Decodes F8_E4M3 elements exactly: exponent bias 7, three mantissa
+    /// bits, subnormals at exponent 0, finite range +-448, and NaN for the
+    /// one all-ones exponent-and-mantissa pattern of either sign.
+    public func float8E4M3Values() throws -> [Float] {
+        guard dtype == .f8e4m3 else {
+            throw MLXFastError.invalidInput("tensor \(name) has dtype \(dtype.rawValue), not F8_E4M3")
+        }
+        return bytes.map(decodeFloat8E4M3)
+    }
+
     public func float32Values() throws -> [Float] {
         guard dtype == .f32 else {
             throw MLXFastError.invalidInput("tensor \(name) has dtype \(dtype.rawValue), not F32")
@@ -99,6 +113,23 @@ public struct MaterializedTensor: Equatable {
             }
         }
     }
+}
+
+/// One OCP FP8 E4M3 ("FN") byte as a Float. Every finite value is exact in
+/// Float, so the decode loses nothing.
+public func decodeFloat8E4M3(_ byte: UInt8) -> Float {
+    let negative = byte & 0x80 != 0
+    let exponent = Int((byte >> 3) & 0x0F)
+    let mantissa = Float(byte & 0x07)
+    let magnitude: Float
+    if exponent == 0x0F, byte & 0x07 == 0x07 {
+        return .nan
+    } else if exponent == 0 {
+        magnitude = mantissa / 8 * 0x1p-6
+    } else {
+        magnitude = (1 + mantissa / 8) * Float(sign: .plus, exponent: exponent - 7, significand: 1)
+    }
+    return negative ? -magnitude : magnitude
 }
 
 public func expectedTensorByteCount(name: String, dtype: TensorDType, shape: [Int]) throws -> Int {
