@@ -58,6 +58,24 @@ enum PagedSegmentAttention {
         }
     }
 
+    nonisolated(unsafe) private static var unusedSinks: [Int: MLXArray] = [:]
+
+    /// The merge kernel's `sinks` binding when HAS_SINKS is false: the
+    /// shader never reads it (`if (HAS_SINKS)` guards the only load). A fresh
+    /// `zeros` per call was a broadcast that `ensureRowContiguous` copied, one
+    /// fill dispatch per layer per step. One materialized, never-mutated
+    /// buffer per size serves every call (same discipline as
+    /// `PagedAttentionKernel.zeroSinks`).
+    static func unusedMergeSinks(count: Int) -> MLXArray {
+        lock.withLock {
+            if let existing = unusedSinks[count] { return existing }
+            let made = MLXArray.zeros([count], dtype: .float32)
+            eval(made)
+            unusedSinks[count] = made
+            return made
+        }
+    }
+
     static func mergeKernel(key: PagedAttentionKernelKey, source: String)
         -> MLXFast.MLXFastKernel
     {
@@ -184,7 +202,7 @@ enum PagedSegmentAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let mergeSinks = sinks ?? MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
         return mergeKernel(key: mergeKey, source: source)(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
@@ -552,9 +570,9 @@ enum PagedMultiQueryAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
         return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials, meta, seqinfo, zeroSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, count, 1), threadGroup: (32, 1, 1),
             outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
