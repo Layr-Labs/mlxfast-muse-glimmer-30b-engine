@@ -273,11 +273,20 @@ package protocol CBv2MTPRectangularSerializing: AnyObject {
     /// Opt-in: attend a round's (row, column) pairs as rows of one decode
     /// dispatch. A cache without such a path keeps its column loop.
     var mtpBatchesRectangularColumnsAsRows: Bool { get set }
+    /// Opt-in: every this many layers of a rectangular verification forward,
+    /// submit the graph built so far (`asyncEval`) so the device starts on it
+    /// while the host builds the remaining layers. 0 is off. A cache without
+    /// such a hook ignores it.
+    var mtpEarlySubmitInterval: Int { get set }
 }
 
 extension CBv2MTPRectangularSerializing {
     package var mtpBatchesRectangularColumnsAsRows: Bool {
         get { false }
+        set {}
+    }
+    package var mtpEarlySubmitInterval: Int {
+        get { 0 }
         set {}
     }
 }

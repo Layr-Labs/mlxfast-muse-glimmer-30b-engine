@@ -952,3 +952,15 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ownerWorking: owner)
     }
 }
+
+// MARK: - Parameter residency
+
+/// The drafter's own parameters (about 2 GiB of quantized weights), keyed by
+/// its draft model, so `CBv2ParameterResidency.prepare` keeps them resident
+/// like the target's. Memory placement only; no value changes.
+extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(model) }
+    public func residentParameterArrays() -> [MLXArray] {
+        model.parameters().flattened().map(\.1)
+    }
+}

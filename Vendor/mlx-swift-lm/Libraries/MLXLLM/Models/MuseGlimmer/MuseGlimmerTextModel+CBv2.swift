@@ -88,8 +88,30 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// row runs each layer's attention and writes its K/V; the last layer's
 /// feed-forward half, the final norm and the readout run on the last row. Exact
 /// windows give a row the bytes it gets alone, so the logits do not change.
+///
+/// A prompt-length forward submits its trunk every
+/// `lastPositionTrunkSubmitEvery` layers, so the GPU runs the early layers
+/// while the host builds the later ones. Only the evaluation order changes:
+/// the same operations on the same inputs, and the caller's single
+/// `asyncEval` still roots the logits and every layer's K/V (each layer's
+/// attention reads its cache write, so a submitted layer's K/V goes with it).
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
+    /// Trunk layers per early submission; `0` builds the whole forward before
+    /// the caller's `asyncEval`.
+    public static let lastPositionTrunkSubmitEvery = 1
+    /// Shorter forwards keep one submission.
+    public static let lastPositionTrunkSubmitFromRows = 64
+
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        cbv2LastPositionLogits(
+            inputs, cache: cache, submittingEvery: Self.lastPositionTrunkSubmitEvery)
+    }
+
+    /// `submittingEvery` layers per early trunk submission (`0`: none). The
+    /// logits and K/V bytes do not depend on it.
+    public func cbv2LastPositionLogits(
+        _ inputs: MLXArray, cache: [KVCache]?, submittingEvery stride: Int
+    ) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
             let hidden = model(model.inputEmbeddings(inputs), cache: cache)
             return outputLogits(hidden[0..., (hidden.dim(1) - 1)..., 0...])
@@ -97,6 +119,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
         var h = model.inputEmbeddings(inputs)
         let last = model.layers.count - 1
         var shared: (positions: [Int], offsets: MLXArray)?
+        let submits = stride > 0 && h.dim(1) >= Self.lastPositionTrunkSubmitFromRows
         for (index, layer) in model.layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -113,6 +136,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
             }
             guard index == last else {
                 h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                if submits, (index + 1) % stride == 0 { asyncEval(h) }
                 continue
             }
             let attended = layer.postAttentionLayerNorm.addedTo(
