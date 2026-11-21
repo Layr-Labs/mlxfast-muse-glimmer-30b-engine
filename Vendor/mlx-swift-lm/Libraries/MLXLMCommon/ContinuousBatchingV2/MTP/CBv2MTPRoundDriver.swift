@@ -971,11 +971,15 @@ final class CBv2MTPRoundDriver {
 
     /// The acceptance window's probability that a round of `depth` drafts
     /// accepts every one: the product of the request's per-position
-    /// acceptance estimates. Nil when the window does not apply. Host
-    /// arithmetic over history already read back; no device work.
     func predictedFullAcceptance(for id: CBv2RequestID, depth: Int) -> Double? {
         guard usesFixedDepthAcceptanceWindow, depth > 0 else { return nil }
-        let probabilities = (requestAcceptance[id] ?? initialRequestAcceptance).probabilities
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        var probabilities = acceptance.probabilities
+        if let array = planDraftConfidence[id],
+            let confidence = Self.hostValuesIfAvailable(array)
+        {
+            probabilities = acceptance.confidenceAdjustedProbabilities(confidence)
+        }
         guard depth <= probabilities.count else { return nil }
         return probabilities.prefix(depth).reduce(1, *)
     }
