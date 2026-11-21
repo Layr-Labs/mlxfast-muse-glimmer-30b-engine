@@ -82,6 +82,52 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
     // Packed prefill keeps the protocol's fail-closed default.
 }
 
+// MARK: - Teacher-forced readout
+
+/// A multi-row teacher-forced forward is read at its last position only. Every
+/// row runs each layer's attention and writes its K/V; the last layer's
+/// feed-forward half, the final norm and the readout run on the last row. Exact
+/// windows give a row the bytes it gets alone, so the logits do not change.
+extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
+    public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        guard let cache, cache.first is any CBv2AttendingLayerCache else {
+            let hidden = model(model.inputEmbeddings(inputs), cache: cache)
+            return outputLogits(hidden[0..., (hidden.dim(1) - 1)..., 0...])
+        }
+        var h = model.inputEmbeddings(inputs)
+        let last = model.layers.count - 1
+        var shared: (positions: [Int], offsets: MLXArray)?
+        for (index, layer) in model.layers.enumerated() {
+            var ropeOffsets: MLXArray?
+            if layer.selfAttention.rope != nil,
+                let attending = cache[index] as? any CBv2AttendingLayerCache
+            {
+                let positions = attending.rows.map(\.absoluteOffset)
+                if let shared, shared.positions == positions {
+                    ropeOffsets = shared.offsets
+                } else {
+                    let offsets = attending.positionOffsets + 0
+                    shared = (positions, offsets)
+                    ropeOffsets = offsets
+                }
+            }
+            guard index == last else {
+                h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                continue
+            }
+            let attended = layer.postAttentionLayerNorm.addedTo(
+                h,
+                layer.selfAttention(
+                    layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                    ropeOffsets: ropeOffsets))
+            let row = attended[0..., (attended.dim(1) - 1)..., 0...]
+            h = layer.postFeedforwardLayerNorm.addedTo(
+                row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
+        }
+        return outputLogits(model.norm(h))
+    }
+}
+
 // MARK: - Complete prefix checkpoints
 
 // All persistent target state is attention K/V, every layer is causal, and no

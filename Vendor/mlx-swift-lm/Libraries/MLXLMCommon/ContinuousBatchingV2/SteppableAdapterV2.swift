@@ -14,6 +14,12 @@
 import Foundation
 import MLX
 
+/// A model whose multi-row forward can return only its last position's logits,
+/// `[B, 1, vocabulary]`; every row still writes its K/V. The stepper reads no other row.
+public protocol CBv2LastPositionLogitsForwardable {
+    func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+}
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
@@ -39,6 +45,11 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
         precondition(
             !(model is any CBv2RecurrentLanguageModelForwardable),
             "CBv2 recurrent model requires explicit request-owned recurrent state")
+        if tokens.ndim >= 2, tokens.dim(1) > 1,
+            let readout = model as? any CBv2LastPositionLogitsForwardable
+        {
+            return readout.cbv2LastPositionLogits(tokens, cache: asKVCaches(caches))
+        }
         return model(tokens, cache: asKVCaches(caches))
     }
 
