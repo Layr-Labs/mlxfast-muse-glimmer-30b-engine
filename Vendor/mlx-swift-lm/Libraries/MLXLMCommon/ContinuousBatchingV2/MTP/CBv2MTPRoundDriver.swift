@@ -971,11 +971,15 @@ final class CBv2MTPRoundDriver {
 
     /// The acceptance window's probability that a round of `depth` drafts
     /// accepts every one: the product of the request's per-position
-    /// acceptance estimates. Nil when the window does not apply. Host
-    /// arithmetic over history already read back; no device work.
     func predictedFullAcceptance(for id: CBv2RequestID, depth: Int) -> Double? {
         guard usesFixedDepthAcceptanceWindow, depth > 0 else { return nil }
-        let probabilities = (requestAcceptance[id] ?? initialRequestAcceptance).probabilities
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        var probabilities = acceptance.probabilities
+        if let array = planDraftConfidence[id],
+            let confidence = Self.hostValuesIfAvailable(array)
+        {
+            probabilities = acceptance.confidenceAdjustedProbabilities(confidence)
+        }
         guard depth <= probabilities.count else { return nil }
         return probabilities.prefix(depth).reduce(1, *)
     }
@@ -1004,11 +1008,70 @@ final class CBv2MTPRoundDriver {
                 acceptance: acceptance,
                 confidence: confidence)
         }
-        return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+        let historyWindow = CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
             acceptanceProbabilities: acceptance.probabilities)
+        // Low-acceptance regime without an available confidence, with the
+        // history window under the declared ceiling: read this round's block
+        // confidence with one host sync before the verify graph is built.
+        guard historyWindow < ceiling, let synced = syncedDraftConfidence(for: id) else {
+            return historyWindow
+        }
+        return CBv2MTPMarginalDepthPolicy.fixedWindowConfidenceDepth(
+            offeredDepth: ceiling,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptance: acceptance,
+            confidence: synced)
+    }
+
+    /// One-sync confidence window. Nonzero lets a low-acceptance row whose
+    /// block confidence is not already available read it with one host sync
+    /// at plan time (`syncedDraftConfidence`); 0 disables it (the history
+    /// window then sizes those rounds, as before).
+    static let oneSyncDraftConfidenceWindow = 1
+    /// Set per plan by the engine: false under native completion tracking,
+    /// whose root accounting a plan-time evaluation would bypass.
+    var allowsDraftConfidenceSync = false
+    /// Windows sized by a confidence read with the one plan-time sync.
+    private(set) var draftConfidenceWindowSyncs = 0
+
+    /// The round's block confidence read with one host sync: the in-flight
+    /// speculated block's, or else the block the next draft index 0 would
+    /// build, built now from the row's carry over the confirmed speculation
+    /// (`draftConfirmedOutcomeBlock`) and handed out at that index 0. Only
+    /// the confidence, the block's proposals and its hidden rows are
+    /// evaluated; nil (no sync) when no confirmed speculation applies.
+    private func syncedDraftConfidence(for id: CBv2RequestID) -> [Double]? {
+        guard Self.oneSyncDraftConfidenceWindow != 0, allowsDraftConfidenceSync,
+            let speculator = drafter as? any CBv2MTPPostVerifySpeculating,
+            let state = assistantStates[id], let carry = carries[id], carry.shortlist == nil
+        else { return nil }
+        let roots: [MLXArray]
+        if let speculated = speculator.speculatedDraftConfidence(requestState: state) {
+            roots = [speculated]
+        } else {
+            roots = speculator.draftConfirmedOutcomeBlock(
+                seedToken: carry.token, requestState: state)
+        }
+        guard let array = roots.first, array.ndim == 1, array.dtype == .float32 else {
+            return nil
+        }
+        do {
+            try withError { fault in
+                eval(roots)
+                try fault.check()
+            }
+        } catch {
+            speculator.dropSpeculation(requestState: state)
+            return nil
+        }
+        CBv2CoreInstrumentation.recordHostSync()
+        planDraftConfidence[id] = array
+        draftConfidenceWindowSyncs &+= 1
+        return array.asArray(Float.self).map(Double.init)
     }
 
     /// Start of a plan: forget the previous plan's draft confidences.
