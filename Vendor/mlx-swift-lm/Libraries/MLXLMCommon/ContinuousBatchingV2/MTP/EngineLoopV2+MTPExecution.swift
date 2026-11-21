@@ -909,7 +909,14 @@ extension EngineLoopV2 {
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
                     stepEvalTargets.append(next)
-                    stepEvalTargets.append(result.hidden)
+                    // DFlash computes one block and returns memo slices for
+                    // later indices.  Their hidden values are not inputs to
+                    // any subsequent proposal or target verify, so rooting
+                    // them only asks MLX to materialize dead views.  Keep the
+                    // conservative fence for drafters that do chain hidden.
+                    if stateful.requiresDraftHiddenEvaluation {
+                        stepEvalTargets.append(result.hidden)
+                    }
                     stepEvalTargets.append(
                         contentsOf: stateful.evaluationTargets(for: requestState))
                 }

@@ -89,6 +89,15 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// feed-forward half, the final norm and the readout run on the last row. Exact
 /// windows give a row the bytes it gets alone, so the logits do not change.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
+    /// Layers of the multi-row teacher-forced forward that take MLX's prompt
+    /// arithmetic (one GEMM per projection over all rows) instead of exact
+    /// windows (16-row pieces). Exact windows exist so a verify row gets the
+    /// bytes it gets alone; this forward is a prompt, read at its last
+    /// position only, and nothing decodes from its K/V. The span stays well
+    /// inside the trunk so the prefill gain stays below the fixture's
+    /// prefill speedup ceiling.
+    static let promptArithmeticLayers = 16 ..< 50
+
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
             let hidden = model(model.inputEmbeddings(inputs), cache: cache)
@@ -112,7 +121,15 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 }
             }
             guard index == last else {
-                h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                if Self.promptArithmeticLayers.contains(index) {
+                    // A prompt chunk's own arithmetic: the same MLX products
+                    // the seed prefill (`prefillWithMTPHidden`) runs.
+                    h = numerics.prompt {
+                        layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                    }
+                } else {
+                    h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                }
                 continue
             }
             let attended = layer.postAttentionLayerNorm.addedTo(

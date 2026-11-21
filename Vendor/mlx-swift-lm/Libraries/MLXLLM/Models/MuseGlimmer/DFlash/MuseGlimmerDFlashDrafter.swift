@@ -58,6 +58,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPPostVerifySpeculating,
     @unchecked Sendable
 {
+    /// `startRound` builds the complete block and every later `draftStep`
+    /// merely exposes a memo slice.  The proposal token roots the block and
+    /// head product; returned hidden slices are not chained into it.
+    public let requiresDraftHiddenEvaluation = false
+
     public struct Settings: Sendable, Equatable {
         /// Draft tokens per round, at most the engine's tested window of 7
         /// and the block's `blockSize - 1`.

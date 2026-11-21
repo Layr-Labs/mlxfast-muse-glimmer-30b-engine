@@ -446,6 +446,12 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Whether each `draftStep` result's hidden row needs to be an explicit
+    /// evaluation root.  Most stateful drafters chain it into the following
+    /// proposal and keep the conservative default.  A block drafter whose
+    /// later indices only hand out already-computed memo rows can opt out:
+    /// its token root already retains every value that affects verification.
+    var requiresDraftHiddenEvaluation: Bool { get }
     /// Opt in to submit every draft step's graph as soon as it is built,
     /// not only the first, so the GPU drafts while the engine still builds
     /// the target verification graph. Each step's graph is the same either
@@ -476,6 +482,7 @@ extension CBv2MTPRequestStatefulDrafter {
     public var supportsOrdinaryDecodeHistory: Bool { false }
     public var seedsFirstRoundFromPrefill: Bool { false }
     public var submitsEveryDraftStepEarly: Bool { false }
+    public var requiresDraftHiddenEvaluation: Bool { true }
     public var draftShortlistSize: Int? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
