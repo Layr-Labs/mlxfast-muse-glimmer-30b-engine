@@ -72,7 +72,7 @@
     "bytes": 38357,
     "sha256": "2f8e21a1c33e858a73f2239963c1b9e4b9f78e30efcb9557f49365e4dc510d8d"
   },
-  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "baseline_reference_commit": "841a7cc4405e600f7c9a7039f6902ce0fa9ce3e2",
   "baseline_reference_commit_note": "The control leg's tree: the first commit of this repository's two-commit history, the parent of the commit that sets this value. tools/stage-baseline-workspace.sh clones it by sha from MLXFAST_BASELINE_SOURCE, a mirror or bundle of this repository. Moving this value forces every ranked box to re-stage its reference tree and recalibrate.",
   "mlx_swift_lm_revision": "0391eacd84cb00ce4001d70763f2303fa2a01210",
   "mlx_swift_lm_revision_note": "a TREE, not a commit: the vendored tree is the local merge of 62cfabd5c67c6042edcfd812698bd34e4b5df7d7 and 443789360ddbf804d55d063ca9cda4ea2d3013a9, and no upstream commit names that merge. Nothing in the tree reads this field as a commit.",
