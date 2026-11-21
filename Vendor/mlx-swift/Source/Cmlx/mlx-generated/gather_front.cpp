@@ -67,3 +67,17 @@ template <typename T, typename IdxT, typename LocT, int N>
 }
 
 } // namespace mlx::core::metal
+
+// Host-only lookup of an evaluated array's Metal buffer, for the engine's
+// parameter residency sets. The generated Metal source above is unchanged.
+#include "mlx/array.h"
+extern "C" void* cbv2_array_backing(void* opaque) {
+  if (!opaque) {
+    return nullptr;
+  }
+  auto& a = *static_cast<mlx::core::array*>(opaque);
+  if (!a.is_available() || !a.data_shared_ptr()) {
+    return nullptr;
+  }
+  return a.buffer().ptr();
+}

@@ -147,6 +147,10 @@ extension EngineLoopV2 {
             }
             pagedMTPWork?.publish()
             try nativeWorkSubmitted()
+            // Behind the submitted verify: the drafter's next-round work for
+            // the all-accepted outcome, a separate submission the acceptance
+            // readback does not wait on.
+            if let verify = graph.verify { mtpSpeculateAfterVerify(verify, driver: mtp) }
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(
                     "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)

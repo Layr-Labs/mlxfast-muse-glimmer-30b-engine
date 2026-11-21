@@ -407,6 +407,13 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// prompt row may seed the first carry. Default false; ignored when
     /// `requiresCommittedObservationFence` is true.
     var supportsOrdinaryDecodeHistory: Bool { get }
+    /// Opt in when the final prompt row's observation already leaves the
+    /// state exactly where a seed step's would (context through the position
+    /// before the first token, no carry row awaited), so the first round may
+    /// follow the prompt with no seed step. Honored on targets with no
+    /// recurrent state, whose prompt rows are observed inside the MTP step
+    /// (and its committed-observation fence). Default false.
+    var seedsFirstRoundFromPrefill: Bool { get }
     func makeRequestState() -> any CBv2MTPRequestState
     /// Bind the admitted request's complete logical bound before the state
     /// allocates request-owned storage. Stateful assistants whose allocator
@@ -467,6 +474,7 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 extension CBv2MTPRequestStatefulDrafter {
     public var requiresCommittedObservationFence: Bool { false }
     public var supportsOrdinaryDecodeHistory: Bool { false }
+    public var seedsFirstRoundFromPrefill: Bool { false }
     public var submitsEveryDraftStepEarly: Bool { false }
     public var draftShortlistSize: Int? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}

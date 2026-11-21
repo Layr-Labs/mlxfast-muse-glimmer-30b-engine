@@ -43,6 +43,24 @@ extension MuseGlimmerTextModel: CBv2ModelCapabilityProviding {
     }
 }
 
+// MARK: - Speculative round command buffers
+
+/// DFlash rounds of decode and verification rows (at most
+/// `EngineLoopV2.speculativeCommandBufferRowTokens` tokens per row) take the
+/// plain-decode limits too. Under MLX's defaults every NVFP4/FP8 projection's
+/// weight read crosses the input bound, so the drafter's early submission
+/// alone opens more than MLX's ten in-flight command buffers and its
+/// `asyncEval` waits for the GPU before the verify graph can be built; the
+/// verify forward then commits after nearly every projection. A round's
+/// temporaries are small (depth + 1 rows; one 16-row block), and rounds that
+/// carry a prompt chunk keep the defaults. Results do not depend on the
+/// partitioning.
+extension MuseGlimmerCBv2Adapter {
+    public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+        MuseGlimmerDecodeCommandBuffers.limits
+    }
+}
+
 // MARK: - Prompt output
 
 /// A prompt chunk runs the whole trunk and writes every layer's K/V; only the
@@ -81,4 +99,15 @@ extension MuseGlimmerTextModel: CBv2CompleteCheckpointKVTypeProviding {
     }
 
     public var cbv2CompleteCheckpointKVDTypes: [DType]? { kvStorageDTypes }
+}
+
+// MARK: - Parameter residency
+
+/// The target's parameters, keyed by the target: the runner builds a new
+/// adapter for every engine around the same loaded tower.
+extension MuseGlimmerCBv2Adapter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(target) }
+    public func residentParameterArrays() -> [MLXArray] {
+        target.parameters().flattened().map(\.1)
+    }
 }

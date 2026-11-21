@@ -55,7 +55,8 @@ extension MuseGlimmerDFlashTarget {
 /// A round's accepted rows are then committed with the next round's carry,
 /// in that round's pass.
 public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
-    CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, @unchecked Sendable
+    CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPPostVerifySpeculating,
+    @unchecked Sendable
 {
     public struct Settings: Sendable, Equatable {
         /// Draft tokens per round, at most the engine's tested window of 7
@@ -190,6 +191,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Observation builds lazy writes into the context ring; they must be
     /// evaluated with the step that produced the observed rows.
     public var requiresCommittedObservationFence: Bool { true }
+    /// The prompt's observation commits every prompt row, the last one
+    /// included, and awaits no carry row; the first round's block then
+    /// anchors on the first token, exactly as after a seed step, which only
+    /// moved both one position on. Proposals change speed, never the output.
+    public var seedsFirstRoundFromPrefill: Bool { true }
     /// The ring is a fixed charge (`boundedRequestAllocation`), not a rate.
     public var requestStateBytesPerToken: Int { 0 }
     /// The context only decides what is proposed. It is not part of a prefix
@@ -220,6 +226,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var stagedInputCount = 0
         /// Why this request cannot continue; reported at the next fence.
         var refusal: String?
+        /// The next round's index-0 work for the all-accepted outcome,
+        /// built behind this round's verify (`speculateNextRound`). Not in
+        /// `arrays`: the round's fence never waits on it.
+        var speculation: Speculation?
+        /// The last finalized round accepted every draft.
+        var lastRoundFullyAccepted = false
 
         init(owner: ObjectIdentifier, context: MuseGlimmerDFlashContextState) {
             self.owner = owner
@@ -228,6 +240,23 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         var arrays: [MLXArray] { context.arrays + (memo.map { [$0.tokens, $0.hidden] } ?? []) }
         var materializedBytes: Int { arrays.reduce(0) { $0 + $1.nbytes } }
+    }
+
+    /// What `speculateNextRound` built and what the normal path must match
+    /// for it to be handed out.
+    struct Speculation {
+        let depth: Int
+        /// The context's `nextPosition` and `firstPosition` when built.
+        let anchor: Int
+        let first: Int
+        /// Keys and values of the `depth + 1` rows the next commit appends.
+        let keys: MLXArray
+        let values: MLXArray
+        let memo: (tokens: MLXArray, hidden: MLXArray)
+        /// The pending rows `finalizeRound` set (all accepted).
+        var pending: MLXArray?
+        /// The carry the engine stored for that outcome.
+        var carry: MLXArray?
     }
 
     private final class Prepared: CBv2MTPPreparedCapture {}
@@ -290,6 +319,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func observe(
         _ observation: CBv2MTPCommittedTargetObservation, at position: Int, state s: State
     ) {
+        s.speculation = nil
         guard s.refusal == nil else { return }
         guard s.stagedInputCount == 0, position >= 0, let rows = features(observation.hidden)
         else {
@@ -319,6 +349,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var observed: [(state: State, rows: Int)] = []
         for entry in observations {
             let s = state(entry.requestState)
+            s.speculation = nil
             guard s.refusal == nil else { continue }
             guard s.stagedInputCount == 0, entry.position.map({ $0 >= 0 }) ?? true,
                 let rows = features(entry.observation.hidden)
@@ -377,7 +408,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Builds the round's block and memo. Returns why it could not.
     private func startRound(_ s: State, tokens: MLXArray, hidden: MLXArray) -> String? {
         let c = model.configuration
+        let speculation = s.speculation
+        s.speculation = nil
         guard tokens.shape == [1, 1] else { return "seed token" }
+        if let speculation, takeSpeculation(speculation, state: s, hidden: hidden) { return nil }
         if settings.batchesRequests {
             guard let carry = commitCarry(s, hidden: hidden) else { return "carry" }
             if !carry.isEmpty { model.commit(carry) }
@@ -431,6 +465,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var commits: [MuseGlimmerDFlashDraftModel.ContextCommit] = []
         for seed in seeds {
             let s = state(seed.requestState)
+            s.speculation = nil
             guard s.refusal == nil, s.stagedInputCount == 0, !s.prestarted, seed.shortlist == nil,
                 seed.tokens.shape == [1, 1]
             else { continue }
@@ -473,6 +508,153 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
     }
 
+    // MARK: Post-verify speculation
+
+    /// The served round shape the speculation reproduces: batched requests,
+    /// argmax proposals.
+    var speculatesAfterVerify: Bool {
+        settings.batchesRequests && !settings.couplesSampledProposals
+    }
+
+    /// Builds the next round's index-0 work for the outcome in which this
+    /// round's `depth` drafts are all accepted, from the verify's lazy rows.
+    ///
+    /// That outcome's normal path is fixed without the acceptance count:
+    /// `finalizeRound` makes rows `0 ..< depth` of `targetHidden` pending,
+    /// the engine stores row `depth` and the verify's bonus target
+    /// `targetTokens[depth]` as the carry, and the next index 0 commits the
+    /// pending rows and the carry as one entry at the context's next
+    /// position, then drafts one block anchored after them. This builds
+    /// exactly those operations on the same values, except that the commit
+    /// writes into new wrappers of the ring arrays (the slots `append`
+    /// would write), so the request's context, pending rows and carry are
+    /// untouched until `takeSpeculation` confirms the outcome.
+    ///
+    /// Speculates only after a round that accepted every draft, and only
+    /// for the served one-row batched argmax round.
+    public func speculateNextRound(
+        targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        let s = state(requestState)
+        s.speculation = nil
+        let c = model.configuration
+        let context = s.context
+        let window = context.window
+        let n = k + 1
+        let ring = context.arrays
+        guard speculatesAfterVerify, s.lastRoundFullyAccepted, s.refusal == nil, s.memo != nil,
+            s.selection == nil, !s.prestarted, s.pending == nil, !s.awaitsCarry, k >= 1,
+            k == s.stagedInputCount,
+            n <= window, context.count > 0, ring.count == 2,
+            targetTokens.shape == [1, n], targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            targetHidden.dim(1) == n, targetHidden.dim(2) == c.contextWidth
+        else { return [] }
+
+        // finalizeRound's pending rows and the engine's carry row, sliced as
+        // they slice them; commitCarry's one entry.
+        let accepted = targetHidden[0 ..< 1, 0 ..< k, 0...].reshaped([k, c.contextWidth])
+        let carry = targetHidden[0 ..< 1, k ..< n, 0...].reshaped([1, c.contextWidth])
+        let features = concatenated([accepted, carry], axis: 0)
+        // model.commit for that entry: no duplicates, no restart, nothing
+        // unread (n <= window).
+        let start = context.nextPosition
+        let projected = model.contextKeyValues(
+            model.projectContext(features[0..., 0...]),
+            segments: [(rows: 0 ..< n, position: start)])[0]
+
+        // context.append on new wrappers. Slot zero holds a position
+        // congruent to the ring's base position modulo the window: the
+        // first held one before the ring wraps, the base lap's slot zero
+        // after (`heldPositions`).
+        let slotZero = context.heldPositions[0]
+        func slot(_ position: Int) -> Int { ((position - slotZero) % window + window) % window }
+        let keys = ring[0].sharingArray()
+        let values = ring[1].sharingArray()
+        var written = 0
+        while written < n {
+            let at = slot(start + written)
+            let run = min(n - written, window - at)
+            let source = written ..< (written + run)
+            keys[0..., 0..., at ..< (at + run), 0...] =
+                projected.keys[0..., 0..., source, 0...].asType(context.dtype)
+            values[0..., 0..., at ..< (at + run), 0...] =
+                projected.values[0..., 0..., source, 0...].asType(context.dtype)
+            written += run
+        }
+        let next = start + n
+        let first = max(context.firstPosition, next - window)
+        let count = next - first
+        // visibleContext of the appended ring.
+        let held: [Int]
+        if count == window {
+            let oldest = slot(first)
+            held = (0 ..< window).map { first + ($0 - oldest + window) % window }
+        } else {
+            held = Array(first ..< next)
+        }
+        let mask = MuseGlimmerDFlashContextState.visibility(
+            anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
+        ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
+
+        // startRound's block and memo from the bonus target as the seed.
+        let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
+        let anchor = target.dflashTokenEmbeddings(seed)
+        guard anchor.size == c.hiddenSize else { return [] }
+        let block = model.blockForward(
+            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+            context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
+            mask: mask)
+        let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
+        let logits = target.dflashHeadProduct(rows)
+        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+            return []
+        }
+        let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+        s.speculation = Speculation(
+            depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
+            values: projected.values, memo: memo)
+        return [memo.tokens, memo.hidden, projected.keys, projected.values]
+    }
+
+    public func confirmSpeculation(carryHidden: MLXArray, requestState: any CBv2MTPRequestState) {
+        let s = state(requestState)
+        guard var speculation = s.speculation, speculation.pending != nil,
+            speculation.carry == nil
+        else {
+            s.speculation = nil
+            return
+        }
+        speculation.carry = carryHidden
+        s.speculation = speculation
+    }
+
+    public func dropSpeculation(requestState: any CBv2MTPRequestState) {
+        state(requestState).speculation = nil
+    }
+
+    /// Index 0 of the round after an all-accepted one: when the state is
+    /// the one `speculateNextRound` assumed (the confirmed carry object, the
+    /// pending rows `finalizeRound` set, the context unchanged since), apply
+    /// commitCarry's transitions and the append it built, and hand out its
+    /// memo. False leaves the state as it was, for the normal path.
+    private func takeSpeculation(_ speculation: Speculation, state s: State, hidden: MLXArray)
+        -> Bool
+    {
+        guard settings.batchesRequests, s.selection == nil, s.awaitsCarry,
+            let carry = speculation.carry, carry === hidden,
+            let expected = speculation.pending, let pending = s.pending, pending === expected,
+            s.context.nextPosition == speculation.anchor,
+            s.context.firstPosition == speculation.first
+        else { return false }
+        s.pending = nil
+        s.awaitsCarry = false
+        s.committedInputCount += 1
+        s.context.append(keys: speculation.keys, values: speculation.values)
+        s.memo = speculation.memo
+        return true
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
     /// target's readout of them when it gives one per row.
     private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
@@ -505,6 +687,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     ) {
         let s = state(requestState)
         defer { clearRound(s) }
+        var speculation = s.speculation
+        s.speculation = nil
+        s.lastRoundFullyAccepted = false
+        let pendingBefore = s.pending
         guard s.refusal == nil else { return }
         let rows = confirmedInputTokens - 1
         guard s.stagedInputCount > 0, rows >= 0, rows <= s.stagedInputCount,
@@ -527,11 +713,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         s.awaitsCarry = true
         s.committedInputCount += rows
+        s.lastRoundFullyAccepted = rows == s.stagedInputCount
+        // Keep the speculation only for the outcome it assumed: all of its
+        // drafts accepted, the pending rows exactly this round's.
+        if speculation != nil, settings.batchesRequests, pendingBefore == nil,
+            rows == speculation!.depth, rows == s.stagedInputCount, let pending = s.pending
+        {
+            speculation!.pending = pending
+            s.speculation = speculation
+        }
     }
 
     /// Only the memo belongs to a round: a block never writes the context.
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        clearRound(state(requestState))
+        let s = state(requestState)
+        s.speculation = nil
+        clearRound(s)
     }
 
     private func clearRound(_ s: State) {
@@ -545,6 +742,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
         else { return }
         clearRound(s)
+        s.speculation = nil
         s.pending = nil
         s.context.release()
         s.awaitsCarry = false
@@ -619,9 +817,12 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             MuseGlimmerDFlashContextState.residentBytes(
                 configuration: c, dtype: model.activationDType) / 2
         let commitRows = min(max(limits.maximumPrefillTokens, c.blockSize), c.slidingWindow)
+        // A speculative block can still be in flight when its round's
+        // normal block is built.
         var owner = [
             CBv2MTPFixedBufferSpec(
-                logicalBytes: blockBytes, allocationCount: settings.maximumSpeculativeRows)
+                logicalBytes: blockBytes,
+                allocationCount: settings.maximumSpeculativeRows + (speculatesAfterVerify ? 1 : 0))
         ]
         if settings.backendScratchBytes > 0 {
             owner.append(.init(logicalBytes: settings.backendScratchBytes))
@@ -630,8 +831,10 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
         if pendingBytes > 0 { resident.append(.init(logicalBytes: pendingBytes)) }
         return CBv2MTPBoundedAllocationSpec(
             resident: resident,
+            // The speculation's copy of the ring (`speculateNextRound`) is a
+            // second pair of copies next to an in-flight commit's.
             working: [
-                .init(logicalBytes: buffer, allocationCount: 2),
+                .init(logicalBytes: buffer, allocationCount: speculatesAfterVerify ? 4 : 2),
                 .init(logicalBytes: commitBytes(rows: commitRows)),
             ],
             hostBytes: c.blockSize * (c.slidingWindow + c.blockSize),

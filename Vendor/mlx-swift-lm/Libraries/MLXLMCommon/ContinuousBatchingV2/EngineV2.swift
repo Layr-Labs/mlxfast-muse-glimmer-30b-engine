@@ -321,6 +321,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         let modelCapabilities =
             (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
         self.modelCapabilities = modelCapabilities
+        // Parameter buffers resident before the first step (memory only).
+        CBv2ParameterResidency.prepare([model as AnyObject] + (mtpDrafter.map { [$0 as AnyObject] } ?? []))
         if let violation = Self.backendCapabilityViolation(
             capabilities: modelCapabilities, backend: backend)
         {

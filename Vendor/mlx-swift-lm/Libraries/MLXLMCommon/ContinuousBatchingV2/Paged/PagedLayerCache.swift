@@ -66,7 +66,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     package func advanceGLM5NextOffsets(by count: Int) {
         precondition(glm5NextModelBinding != nil)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+        // Device-only advance: the host mirror deliberately stays put, so the
+        // device array is no longer derivable from it until the next rebuild.
+        devicePositionOffsets = cachedPositionOffsets + Int32(count)
+        deviceOffsetsDivergeFromHost = true
     }
     /// Optional attention-logit soft cap. Not part of the contract's
     /// `updateAndAttend` signature, so it is layer-cache configuration
@@ -87,14 +90,37 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     // step, and never syncs — the model reads this each step and feeds it
     // into the forward graph, which the step's `asyncEval` collapses so the
     // lazy `+ L` chain cannot grow O(steps).
-    private var cachedPositionOffsets: MLXArray = MLXArray([] as [Int32])
+    //
+    // The device array is materialized LAZILY from `hostPositionOffsets`,
+    // which advances in lockstep and holds exactly the values the `+ L`
+    // chain would evaluate to. A model reads `positionOffsets` once per step
+    // (Muse Glimmer: the first rotary layer; the rest share that snapshot),
+    // so every other layer's per-step `+ L` add dispatch, and its graph node
+    // in the step's eval set, is skipped. The upload is a host buffer copy,
+    // never a device sync, and the int32 values the RoPE kernels read are
+    // identical.
+    private var devicePositionOffsets: MLXArray?
+    /// True only after a device-only advance (`advanceGLM5NextOffsets`) left
+    /// the device array ahead of the host mirror; later advances then keep
+    /// the original on-device `+ L` chain until the next host rebuild.
+    private var deviceOffsetsDivergeFromHost = false
+    private var cachedPositionOffsets: MLXArray {
+        if let devicePositionOffsets { return devicePositionOffsets }
+        let made = MLXArray(hostPositionOffsets)
+        devicePositionOffsets = made
+        return made
+    }
     /// Item 25: the host values `cachedPositionOffsets` holds once evaluated,
     /// advanced in lockstep with every device advance. A per-step frontier
     /// check reads these instead of syncing the device array per layer.
     public private(set) var hostPositionOffsets: [Int32] = []
 
     private func advancePositionOffsets(by length: Int) {
-        cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+        if deviceOffsetsDivergeFromHost {
+            devicePositionOffsets = cachedPositionOffsets + Int32(length)
+        } else {
+            devicePositionOffsets = nil
+        }
         hostPositionOffsets = hostPositionOffsets.map { $0 + Int32(length) }
     }
     /// Times `positionOffsets` was rebuilt from host integers (test hook);
@@ -114,6 +140,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     /// One immutable metadata plan; never owns segment storage or a write fence.
     let segmentDispatchCache = PagedSegmentDispatchCache()
+    /// Merge scratch of `attendColumnsAsDecodeRows`, reused across verify
+    /// rounds (one call per layer per round; see `PagedSegmentMergeScratch`).
+    let columnsAsRowsScratch = PagedSegmentMergeScratch()
     /// Test hook: segmented decode as it ran before decode-metadata reuse —
     /// a fresh dispatch plan, zero-filled merge scratch and a private seqinfo
     /// upload on every call. It is the exactness reference; output and KV
@@ -374,7 +403,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         hostPositionOffsets = pagedRows.map { Int32($0.absoluteOffset) }
-        cachedPositionOffsets = MLXArray(hostPositionOffsets)
+        devicePositionOffsets = MLXArray(hostPositionOffsets)
+        deviceOffsetsDivergeFromHost = false
     }
 
     // MARK: - Attention
@@ -452,7 +482,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     }
 
     private func finishAttentionCall(_ output: MLXArray) -> MLXArray {
-        pool.activeAttentionWork?.retainRoots([output, cachedPositionOffsets])
+        pool.activeAttentionWork?.retainRoots([output] + (devicePositionOffsets.map { [$0] } ?? []))
         return output
     }
 
@@ -1284,7 +1314,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             softcap: attentionSoftcap != nil, source: pool.kernelSource,
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
-            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo)
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
@@ -1933,12 +1964,13 @@ extension PagedLayerCache: KVCache {
     /// The position chain also rides this set so it cannot grow with steps.
     public func innerState() -> [MLXArray] {
         guard !pool.writeValidation.isFaulted else { return [] }
+        // A lazily uploaded offset array has no chain to collapse; only a
+        // materialized (possibly lazy `+ L`) one rides the eval set.
+        let offsets = devicePositionOffsets.map { [$0] } ?? []
         guard kind.sharesKVWithLayer == nil, !pagedRows.isEmpty else {
-            return [cachedPositionOffsets]
+            return offsets
         }
-        var arrays = [
-            cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence,
-        ]
+        var arrays = offsets + [pool.group(pool.groupKey(forLayer: layerIndex)).writeFence]
         // The mirror's in-place writes ride the step evaluation, as a
         // contiguous row's buffer does, so the next chunk's update can donate.
         for mirror in prefillMirrors.values {
@@ -2020,7 +2052,8 @@ extension PagedLayerCache: CBv2Qwen4BatchScopeProviding {
             view.setRetainsChunkForBorrowers(retainsChunkForBorrowers)
             view.mtpSerializesRectangularAttention = mtpSerializesRectangularAttention
             view.pagedRows = [row]
-            view.cachedPositionOffsets = cachedPositionOffsets[index ..< index + 1]
+            view.devicePositionOffsets = cachedPositionOffsets[index ..< index + 1]
+            view.deviceOffsetsDivergeFromHost = deviceOffsetsDivergeFromHost
             view.hostPositionOffsets = [hostPositionOffsets[index]]
             _ = CBv2Qwen4IndexerBind.restore(view, from: row)
             return view

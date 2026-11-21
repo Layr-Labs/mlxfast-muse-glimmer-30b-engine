@@ -652,16 +652,27 @@ extension EngineLoopV2 {
                         (batchIndex * targetWidth + hiddenColumn) * 2
                     return Double(values[base] - values[base + 1])
                 }
+                let carryHidden = verify.lastHidden[
+                    batchIndex ..< (batchIndex + 1),
+                    hiddenColumn ..< (hiddenColumn + 1), 0...]
                 mtp.storeCarry(
                     id: id, token: kept[confirmed - 1],
-                    hidden: verify.lastHidden[
-                        batchIndex ..< (batchIndex + 1),
-                        hiddenColumn ..< (hiddenColumn + 1), 0...],
+                    hidden: carryHidden,
                     shortlist: carryShortlist,
                     previousTopTwoMargin: previousTopTwoMargin,
                     needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
+                // Every draft accepted and the carry token is the verify's own
+                // bonus target: exactly the outcome a post-verify speculation
+                // assumed. The drafter keeps it only for this carry object.
+                if confirmed == targetWidth, accepted == k, hiddenColumn == k,
+                    kept[k] == Int(host[draftCount + batchIndex * targetWidth + k]),
+                    let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
+                    let state = metadata.assistantState
+                {
+                    speculator.confirmSpeculation(carryHidden: carryHidden, requestState: state)
+                }
             }
         }
 
@@ -676,6 +687,67 @@ extension EngineLoopV2 {
         // Rejected suffixes advanced eager device offsets past host truth.
         if anyRejected {
             eagerCompositionStale = true
+        }
+    }
+}
+
+// MARK: - Post-verify speculation
+
+/// A request-stateful drafter that can build the next round's draft index 0
+/// work behind a submitted verify, for the outcome in which every draft is
+/// accepted, without reading the acceptance count.
+///
+/// Contract: building writes no request state the engine or any other call
+/// observes (context, pending rows, carries); it only holds the speculative
+/// arrays. The drafter hands them out at the next round's draft index 0 only
+/// when its state is exactly the one the normal path would then have, with
+/// every handed-out value equal to what the normal path computes; any other
+/// call on the state discards them first.
+public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
+    /// Right after a one-row round's verify is submitted. `targetTokens`
+    /// `[1, depth + 1]` are the verify's per-position target tokens and
+    /// `targetHidden` `[1, depth + 1, H]` its hidden rows, both lazy.
+    /// Returns the arrays to submit; empty when it does not speculate.
+    func speculateNextRound(
+        targetTokens: MLXArray, targetHidden: MLXArray, depth: Int,
+        requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Finalize accepted every draft of the round and stored `carryHidden`
+    /// (this object) as the row's carry, with the verify's bonus target as
+    /// its token.
+    func confirmSpeculation(carryHidden: MLXArray, requestState: any CBv2MTPRequestState)
+    /// Forget any speculation (its submission failed).
+    func dropSpeculation(requestState: any CBv2MTPRequestState)
+}
+
+extension EngineLoopV2 {
+    /// Submit the drafter's all-accepted next-round work behind a verify.
+    /// One-row rounds only (a batched round's drafter pass has other
+    /// shapes); no grammar, shortlist or typical-acceptance rounds, whose
+    /// carry token or drafter inputs are not the verify's own target row.
+    /// Never under native completion tracking, whose root accounting this
+    /// optional work would join.
+    func mtpSpeculateAfterVerify(
+        _ verify: CBv2MTPRoundInFlight.Verify, driver mtp: CBv2MTPRoundDriver
+    ) {
+        guard nativeShutdownState == nil, verify.rows.count == 1, verify.k > 0,
+            !verify.hasAcceptMask, verify.shortlistIDs == nil, verify.constraintLogits == nil,
+            let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
+            let state = verify.rows[0].assistantState
+        else { return }
+        let k = verify.k
+        // Packet: [1, k] drafts, then [1, k + 1] targets.
+        let targets = verify.acceptancePacket[k ..< (2 * k + 1)].reshaped([1, k + 1])
+        let roots = speculator.speculateNextRound(
+            targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
+            requestState: state)
+        guard !roots.isEmpty else { return }
+        do {
+            try withError { fault in
+                asyncEval(roots)
+                try fault.check()
+            }
+        } catch {
+            speculator.dropSpeculation(requestState: state)
         }
     }
 }

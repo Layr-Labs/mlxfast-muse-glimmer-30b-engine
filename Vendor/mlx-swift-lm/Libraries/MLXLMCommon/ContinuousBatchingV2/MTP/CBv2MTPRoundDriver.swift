@@ -302,6 +302,10 @@ final class CBv2MTPRoundDriver {
     /// committed-observation fence, and the target exposes the recurrent
     /// hidden-returning decode seam. Fixed at build.
     private let supportsOrdinaryDecodeHistory: Bool
+    /// The final prompt row may seed the first carry: either ordinary-decode
+    /// history above, or a stateful drafter on a target with no recurrent
+    /// state that opted in (`seedsFirstRoundFromPrefill`). Fixed at build.
+    private let supportsPrefillCarry: Bool
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -406,9 +410,18 @@ final class CBv2MTPRoundDriver {
         // Ordinary steps have no committed-observation fence (only MTP steps
         // run `finishStatefulMTPEvaluation`); drafters needing one keep MTP steps.
         let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
-        self.supportsOrdinaryDecodeHistory =
+        let supportsOrdinaryDecodeHistory =
             requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
             && stateful?.requiresCommittedObservationFence == false
+        self.supportsOrdinaryDecodeHistory = supportsOrdinaryDecodeHistory
+        // A target with no recurrent state observes its prompt rows in the
+        // MTP step's own prefill branch, fenced with that step; the last
+        // row's hidden produced the first token, so it is the seed's carry.
+        let recurrentTarget =
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+        self.supportsPrefillCarry =
+            supportsOrdinaryDecodeHistory
+            || (!recurrentTarget && stateful?.seedsFirstRoundFromPrefill == true)
         self.config = config
         self.drafter = drafter
         self.model = model
@@ -755,7 +768,7 @@ final class CBv2MTPRoundDriver {
 
     /// The final prompt row seeds the first carry (no seed step).
     var seedsCarryFromPrefill: Bool {
-        config.prefillCarry && tracksPersistentHistory && supportsOrdinaryDecodeHistory
+        config.prefillCarry && tracksPersistentHistory && supportsPrefillCarry
     }
 
     /// Whether the current plan's decode rows passed the batch and

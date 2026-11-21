@@ -8,6 +8,22 @@ enum PagedSegmentAttention {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
+    /// Front caches keyed by the structured variant identity, so a decode
+    /// call (one part bucket plus one merge per layer per step) never
+    /// formats a kernel name string to find an already-built kernel. Each
+    /// entry is the very object `kernels[name]` holds for that identity's
+    /// name; a miss falls through to the name-keyed path unchanged.
+    private struct PartKernelID: Hashable {
+        let key: PagedAttentionKernelKey
+        let bindings: Int
+        let kvHeads: Int
+        let allocatesScratch: Bool
+    }
+    nonisolated(unsafe) private static var partKernels: [PartKernelID: MLXFast.MLXFastKernel] =
+        [:]
+    nonisolated(unsafe) private static var mergeKernels:
+        [PagedAttentionKernelKey: MLXFast.MLXFastKernel] = [:]
+
     /// `allocatesScratch` is the first bucket's variant: `partials` and `meta`
     /// are its uninitialized outputs instead of mutable inputs. The body and
     /// arithmetic are identical; only the buffers' origin differs.
@@ -41,11 +57,17 @@ enum PagedSegmentAttention {
         key: PagedAttentionKernelKey, bindings: Int, kvHeads: Int,
         source: String, allocatesScratch: Bool = false
     ) -> MLXFast.MLXFastKernel {
-        let name =
-            key.kernelName + "_segments\(bindings)_kvh\(kvHeads)"
-            + (allocatesScratch ? "_scratch" : "")
+        let id = PartKernelID(
+            key: key, bindings: bindings, kvHeads: kvHeads, allocatesScratch: allocatesScratch)
         return lock.withLock {
-            if let existing = kernels[name] { return existing }
+            if let cached = partKernels[id] { return cached }
+            let name =
+                key.kernelName + "_segments\(bindings)_kvh\(kvHeads)"
+                + (allocatesScratch ? "_scratch" : "")
+            if let existing = kernels[name] {
+                partKernels[id] = existing
+                return existing
+            }
             let made = MLXFast.metalKernel(
                 name: name,
                 inputNames: inputNames(bindings: bindings, allocatesScratch: allocatesScratch),
@@ -54,6 +76,25 @@ enum PagedSegmentAttention {
                 mutableInputs: (allocatesScratch ? [] : ["partials", "meta"])
                     + (key.hasWrite ? (0 ..< bindings).map { "segment\($0)" } : []))
             kernels[name] = made
+            partKernels[id] = made
+            return made
+        }
+    }
+
+    nonisolated(unsafe) private static var unusedSinks: [Int: MLXArray] = [:]
+
+    /// The merge kernel's `sinks` binding when HAS_SINKS is false: the
+    /// shader never reads it (`if (HAS_SINKS)` guards the only load). A fresh
+    /// `zeros` per call was a broadcast that `ensureRowContiguous` copied, one
+    /// fill dispatch per layer per step. One materialized, never-mutated
+    /// buffer per size serves every call (same discipline as
+    /// `PagedAttentionKernel.zeroSinks`).
+    static func unusedMergeSinks(count: Int) -> MLXArray {
+        lock.withLock {
+            if let existing = unusedSinks[count] { return existing }
+            let made = MLXArray.zeros([count], dtype: .float32)
+            eval(made)
+            unusedSinks[count] = made
             return made
         }
     }
@@ -61,9 +102,13 @@ enum PagedSegmentAttention {
     static func mergeKernel(key: PagedAttentionKernelKey, source: String)
         -> MLXFast.MLXFastKernel
     {
-        let name = key.kernelName + "_segments_ordered"
         return lock.withLock {
-            if let existing = kernels[name] { return existing }
+            if let cached = mergeKernels[key] { return cached }
+            let name = key.kernelName + "_segments_ordered"
+            if let existing = kernels[name] {
+                mergeKernels[key] = existing
+                return existing
+            }
             // previous is a binding-only dependency. CustomKernel registers
             // every input with the Metal encoder, which inserts a full buffer
             // barrier when this prior kernel output is consumed. An alias-only
@@ -73,6 +118,7 @@ enum PagedSegmentAttention {
                 outputNames: ["out"], source: PagedAttentionMSL.mergeBody,
                 header: source, ensureRowContiguous: true)
             kernels[name] = made
+            mergeKernels[key] = made
             return made
         }
     }
@@ -83,7 +129,8 @@ enum PagedSegmentAttention {
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
-        seqinfoCache: PagedSegmentSeqinfoCache? = nil
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil,
+        mergeScratch: PagedSegmentMergeScratch? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -135,9 +182,18 @@ enum PagedSegmentAttention {
         // head's full partial and (m, l) — so no unwritten slot is ever read
         // and the output bytes cannot change. `zeroFilledScratch` keeps the
         // original zero fills as the exactness reference for tests.
+        // `mergeScratch` serves the same zero-initialised mutable-input pair
+        // from the caller's previous call instead of two fresh fills. Only
+        // the slots the merge reads must hold this call's values, and pass A
+        // writes every one of them (above), so earlier contents are dead.
+        let reused = zeroFilledScratch
+            ? mergeScratch?.buffers(partialsShape: partialsShape, metaCount: metaCount) : nil
         var partials: MLXArray? =
-            zeroFilledScratch ? MLXArray.zeros(partialsShape, dtype: .float32) : nil
-        var meta: MLXArray? = zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil
+            reused?.partials
+            ?? (zeroFilledScratch ? MLXArray.zeros(partialsShape, dtype: .float32) : nil)
+        var meta: MLXArray? =
+            reused?.meta
+            ?? (zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
@@ -184,12 +240,50 @@ enum PagedSegmentAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let mergeSinks = sinks ?? MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
         return mergeKernel(key: mergeKey, source: source)(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+    }
+}
+
+/// One merge-scratch pair per caller, zero-filled when its shape is first
+/// seen and passed to pass A as mutable inputs on every later call.
+///
+/// Exact: the merge reads, per row `b` and head, partitions `[0,
+/// ceil(len_b / PTOK))` at `maxPartitions` stride; the plan issues one work
+/// record per such (row, partition) with `maxPartitions` in `record[6]`; that
+/// record's threadgroups (one per kv head and head split) write every query
+/// head's full partial and `(m, l)` for it before the merge runs. So no slot
+/// the merge reads keeps a value from an earlier call, and the bytes it reads
+/// equal those it reads from a fresh zero fill.
+///
+/// Only for a caller with ONE decode per graph that depends on the previous
+/// call's output (a layer's verify window: the next round's queries derive
+/// from this round's logits), so the next pass A is encoded after this
+/// merge and MLX orders the write after the read (the scratch is registered
+/// as an output of pass A and an input of the merge). Never share one across
+/// independent decodes of one graph (serial verify columns).
+final class PagedSegmentMergeScratch {
+    private var shape: [Int] = []
+    private var metaCount = 0
+    private var pair: (partials: MLXArray, meta: MLXArray)?
+    /// Zero-filled pairs made (test hook).
+    private(set) var allocations = 0
+
+    func buffers(partialsShape: [Int], metaCount: Int) -> (partials: MLXArray, meta: MLXArray) {
+        if let pair, shape == partialsShape, self.metaCount == metaCount { return pair }
+        let made = (
+            partials: MLXArray.zeros(partialsShape, dtype: .float32),
+            meta: MLXArray.zeros([metaCount], dtype: .float32)
+        )
+        pair = made
+        shape = partialsShape
+        self.metaCount = metaCount
+        allocations += 1
+        return made
     }
 }
 
@@ -552,9 +646,9 @@ enum PagedMultiQueryAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
         return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials, meta, seqinfo, zeroSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, count, 1), threadGroup: (32, 1, 1),
             outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
