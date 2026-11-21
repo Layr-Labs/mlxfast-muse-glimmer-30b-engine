@@ -1,7 +1,9 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 // MARK: - Layer structure
 
@@ -112,19 +114,97 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 }
             }
             guard index == last else {
-                h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                h = wideLayer(layer, h, cache: cache[index], ropeOffsets: ropeOffsets)
                 continue
             }
             let attended = layer.postAttentionLayerNorm.addedTo(
                 h,
-                layer.selfAttention(
-                    layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                wideAttention(
+                    layer.selfAttention, layer.inputLayerNorm(h), cache: cache[index],
                     ropeOffsets: ropeOffsets))
             let row = attended[0..., (attended.dim(1) - 1)..., 0...]
             h = layer.postFeedforwardLayerNorm.addedTo(
                 row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
         }
         return outputLogits(model.norm(h))
+    }
+}
+
+// MARK: - Wide row-exact prompt projections
+
+/// The teacher-forced readout above runs every projection row-exact, and
+/// `MuseGlimmerNumerics.project` cuts a call into 16-row pieces, so a 512-row
+/// prompt reads each weight 32 times. Here the weight-only NVFP4 slots run
+/// 32 rows per call (`CBv2WideRowExactNVFP4`, the same kernel and the same
+/// order of operations per output element), so every row gets the bytes it
+/// gets in a 16-row piece or alone and the logits and the K/V written do not
+/// change. Every other operation is the layer's own, in the layer's order.
+/// `MUSE_GLIMMER_WIDE_PROMPT=0` restores the 16-row pieces.
+enum MuseGlimmerWidePrompt {
+    static let enabled = ProcessInfo.processInfo.environment["MUSE_GLIMMER_WIDE_PROMPT"] != "0"
+}
+
+extension MuseGlimmerTextModel {
+    /// `numerics.project(layer, x)`, with NVFP4 slots at up to 32 rows per call.
+    fileprivate func wideProject(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        let n = numerics
+        guard MuseGlimmerWidePrompt.enabled, n.isExact(x),
+            MuseGlimmerNumerics.rows(x) > MuseGlimmerNumerics.pieceRows,
+            let nvfp4 = layer as? ModelOptWeightOnlyNVFP4Linear,
+            nvfp4.supportsRowExactWindows(dtype: x.dtype),
+            nvfp4.weight.size >= 8, nvfp4.weightScale.size >= 8
+        else { return n.project(layer, x) }
+        return MuseGlimmerNumerics.inPieces(x, rows: CBv2WideRowExactNVFP4.maximumRows) { piece in
+            MuseGlimmerNumerics.rows(piece) > MuseGlimmerNumerics.pieceRows
+                ? CBv2WideRowExactNVFP4.product(
+                    piece, weight: nvfp4.weight, blockScales: nvfp4.weightScale,
+                    tensorScale: nvfp4.weightScale2)
+                : n.project(nvfp4, piece)
+        }
+    }
+
+    /// `MuseGlimmerTextAttention.callAsFunction` on a CBv2 attending cache,
+    /// operation for operation, with `wideProject` for the projections.
+    fileprivate func wideAttention(
+        _ a: MuseGlimmerTextAttention, _ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        guard let attending = cache as? any CBv2AttendingLayerCache else {
+            return a(x, mask: .none, cache: cache, ropeOffsets: ropeOffsets)
+        }
+        let (batch, length) = (x.dim(0), x.dim(1))
+        var queries = wideProject(a.queryProj, x).reshaped(batch, length, a.heads, a.headDimensions)
+        var keys = wideProject(a.keyProj, x).reshaped(batch, length, a.kvHeads, a.headDimensions)
+        var values = wideProject(a.valueProj, x).reshaped(
+            batch, length, a.kvHeads, a.headDimensions)
+        queries = a.qkNorm(queries)
+        queries = (queries.asType(.float32) * a.qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = a.qkNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+        if let rope = a.rope {
+            let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        output = MuseGlimmerFusion.sigmoidGate([output, wideProject(a.gateProj, x)])[0]
+        return wideProject(a.outputProj, output)
+    }
+
+    /// `MuseGlimmerDecoderLayer.callAsFunction` with the wide projections.
+    fileprivate func wideLayer(
+        _ layer: MuseGlimmerDecoderLayer, _ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        let h = layer.postAttentionLayerNorm.addedTo(
+            x, wideAttention(layer.selfAttention, layer.inputLayerNorm(x), cache: cache,
+                ropeOffsets: ropeOffsets))
+        let mlp = layer.mlp
+        let f = layer.preFeedforwardLayerNorm(h)
+        return layer.postFeedforwardLayerNorm.addedTo(
+            h, wideProject(mlp.downProj,
+                compiledSiluProduct(wideProject(mlp.gateProj, f), wideProject(mlp.upProj, f))))
     }
 }
 
