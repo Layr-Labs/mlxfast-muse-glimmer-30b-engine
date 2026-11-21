@@ -128,6 +128,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     public let settings: Settings
     /// `[1, hiddenSize]`, the target's raw embedding of the mask token.
     private let maskEmbedding: MLXArray
+    /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
+    /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
+    /// than the target's row-exact verify kernel: the same E2M1 x E4M3
+    /// weights, FP32 accumulation and `weight_scale_2`, in another order.
+    /// Proposals only decide acceptance; the target verifies every token.
+    private let draftHead: ModelOptWeightOnlyNVFP4Linear?
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -163,6 +169,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             throw MuseGlimmerDFlashError.target("embedding shape")
         }
         maskEmbedding = mask.asType(model.activationDType)
+        draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         try MLX.withError { errors in
             eval(maskEmbedding)
             try errors.check()
@@ -226,9 +233,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var stagedInputCount = 0
         /// Why this request cannot continue; reported at the next fence.
         var refusal: String?
-        /// The next round's index-0 work for the all-accepted outcome,
-        /// built behind this round's verify (`speculateNextRound`). Not in
-        /// `arrays`: the round's fence never waits on it.
+        /// The next round's index-0 work, built behind this round's verify
+        /// (`speculateNextRound`): the commit for every outcome, the block
+        /// for the all-accepted one. Not in `arrays`: the round's fence
+        /// never waits on it.
         var speculation: Speculation?
         /// The last finalized round accepted every draft.
         var lastRoundFullyAccepted = false
@@ -249,14 +257,34 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The context's `nextPosition` and `firstPosition` when built.
         let anchor: Int
         let first: Int
-        /// Keys and values of the `depth + 1` rows the next commit appends.
+        /// Keys and values `[layers, kvHeads, depth + 1, headDimensions]` of
+        /// every verify row at `anchor ..< anchor + depth + 1`. An outcome
+        /// with `a` accepted drafts commits the first `a + 1` of them.
         let keys: MLXArray
         let values: MLXArray
-        let memo: (tokens: MLXArray, hidden: MLXArray)
-        /// The pending rows `finalizeRound` set (all accepted).
-        var pending: MLXArray?
+        /// The next block for the all-accepted outcome, when built; dropped
+        /// at confirmation for any other outcome.
+        var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        /// `[maximumDraftTokens]` float32: each block row's top-1
+        /// probability under the target's readout, evaluated with the
+        /// speculation (`speculatedDraftConfidence`). Set with `memo`.
+        var confidence: MLXArray? = nil
+        /// The accepted draft count `finalizeRound` saw, and the pending rows
+        /// it set for it (nil when it accepted none).
+        var accepted: Int? = nil
+        var pending: MLXArray? = nil
         /// The carry the engine stored for that outcome.
-        var carry: MLXArray?
+        var carry: MLXArray? = nil
+    }
+
+    /// What `takeSpeculation` applied at a round's draft index 0.
+    private enum TakenSpeculation {
+        /// Nothing: the normal path runs.
+        case normal
+        /// The commit: the block still has to be drafted.
+        case committed
+        /// The commit and the all-accepted block's memo.
+        case drafted
     }
 
     private final class Prepared: CBv2MTPPreparedCapture {}
@@ -411,8 +439,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let speculation = s.speculation
         s.speculation = nil
         guard tokens.shape == [1, 1] else { return "seed token" }
-        if let speculation, takeSpeculation(speculation, state: s, hidden: hidden) { return nil }
-        if settings.batchesRequests {
+        let taken = speculation.map { takeSpeculation($0, state: s, hidden: hidden) } ?? .normal
+        if case .drafted = taken { return nil }
+        if case .committed = taken {
+            // The pending rows and the carry are in the ring: draft the block.
+        } else if settings.batchesRequests {
             guard let carry = commitCarry(s, hidden: hidden) else { return "carry" }
             if !carry.isEmpty { model.commit(carry) }
         } else if s.awaitsCarry {
@@ -427,7 +458,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             state: s.context)
         let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
-        let logits = target.dflashHeadProduct(rows)
+        let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
@@ -493,8 +524,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
             $0[1 ..< (1 + k), 0...]
         }
-        let logits = target.dflashHeadProduct(
-            rows.count == 1 ? rows[0] : concatenated(rows, axis: 0))
+        let logits = draftHeadProduct(
+            rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
+            readout: states.contains { $0.selection != nil })
         guard logits.shape == [states.count * k, target.dflashVocabularySize] else {
             for s in states { s.refusal = "head" }
             return
@@ -516,24 +548,28 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         settings.batchesRequests && !settings.couplesSampledProposals
     }
 
-    /// Builds the next round's index-0 work for the outcome in which this
-    /// round's `depth` drafts are all accepted, from the verify's lazy rows.
+    /// Builds the next round's index-0 work from the verify's lazy rows,
+    /// behind the submitted verify, before the acceptance count is known.
     ///
-    /// That outcome's normal path is fixed without the acceptance count:
-    /// `finalizeRound` makes rows `0 ..< depth` of `targetHidden` pending,
-    /// the engine stores row `depth` and the verify's bonus target
-    /// `targetTokens[depth]` as the carry, and the next index 0 commits the
-    /// pending rows and the carry as one entry at the context's next
-    /// position, then drafts one block anchored after them. This builds
-    /// exactly those operations on the same values, except that the commit
-    /// writes into new wrappers of the ring arrays (the slots `append`
-    /// would write), so the request's context, pending rows and carry are
-    /// untouched until `takeSpeculation` confirms the outcome.
+    /// For every outcome the next index 0 first commits one entry at the
+    /// context's next position: `finalizeRound`'s pending rows (verify rows
+    /// `0 ..< a` for `a` accepted drafts) and the engine's carry (verify row
+    /// `a`). Those are the first `a + 1` verify rows whatever `a` is, so this
+    /// projects all `depth + 1` rows once (`model.commit`'s projection, no
+    /// duplicates, no restart, nothing unread) and the next index 0 appends
+    /// the first `a + 1` of them instead of projecting them on the critical
+    /// path. Only the projection moves: the ring, the pending rows and the
+    /// carry are untouched until `takeSpeculation` confirms the outcome.
     ///
-    /// Speculates only after a round that accepted every draft, and only
-    /// for the served one-row batched argmax round.
+    /// With `draftsBlock`, after a round that accepted every draft, it also
+    /// drafts the next block for the all-accepted outcome, whose seed is the
+    /// verify's bonus target `targetTokens[depth]`: the append it implies is
+    /// written into new wrappers of the ring arrays (the slots `append`
+    /// would write).
+    ///
+    /// Only for the served one-row batched argmax round.
     public func speculateNextRound(
-        targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int,
+        targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int, draftsBlock: Bool,
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let s = state(requestState)
@@ -543,7 +579,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let window = context.window
         let n = k + 1
         let ring = context.arrays
-        guard speculatesAfterVerify, s.lastRoundFullyAccepted, s.refusal == nil, s.memo != nil,
+        guard speculatesAfterVerify, s.refusal == nil, s.memo != nil,
             s.selection == nil, !s.prestarted, s.pending == nil, !s.awaitsCarry, k >= 1,
             k == s.stagedInputCount,
             n <= window, context.count > 0, ring.count == 2,
@@ -551,17 +587,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             targetHidden.dim(1) == n, targetHidden.dim(2) == c.contextWidth
         else { return [] }
 
-        // finalizeRound's pending rows and the engine's carry row, sliced as
-        // they slice them; commitCarry's one entry.
-        let accepted = targetHidden[0 ..< 1, 0 ..< k, 0...].reshaped([k, c.contextWidth])
-        let carry = targetHidden[0 ..< 1, k ..< n, 0...].reshaped([1, c.contextWidth])
-        let features = concatenated([accepted, carry], axis: 0)
-        // model.commit for that entry: no duplicates, no restart, nothing
-        // unread (n <= window).
+        // The verify rows as finalizeRound and the engine slice them; the
+        // all-accepted outcome's entry is all of them.
+        let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
         let projected = model.contextKeyValues(
-            model.projectContext(features[0..., 0...]),
+            model.projectContext(features),
             segments: [(rows: 0 ..< n, position: start)])[0]
+        var speculation = Speculation(
+            depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
+            values: projected.values)
+        guard draftsBlock, s.lastRoundFullyAccepted else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
 
         // context.append on new wrappers. Slot zero holds a position
         // congruent to the ring's base position modulo the window: the
@@ -600,30 +639,64 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // startRound's block and memo from the bonus target as the seed.
         let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
         let anchor = target.dflashTokenEmbeddings(seed)
-        guard anchor.size == c.hiddenSize else { return [] }
+        guard anchor.size == c.hiddenSize else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
         let block = model.blockForward(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
             context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
             mask: mask)
         let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
-        let logits = target.dflashHeadProduct(rows)
+        // startRound's head: the speculated memo must equal the normal one.
+        let logits = draftHeadProduct(rows, readout: false)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
-            return []
+            s.speculation = speculation
+            return [projected.keys, projected.values]
         }
         let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
-        s.speculation = Speculation(
-            depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
-            values: projected.values, memo: memo)
-        return [memo.tokens, memo.hidden, projected.keys, projected.values]
+        // Per-row top-1 probability of the proposal, softmax over the
+        // target's readout scale: exp(max - logsumexp). Advisory only: it
+        // sizes the next verify window and never changes a proposal.
+        let scores = target.dflashReadout(logits).asType(.float32)
+        let confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
+        speculation.memo = memo
+        speculation.confidence = confidence
+        s.speculation = speculation
+        return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
     }
 
-    public func confirmSpeculation(carryHidden: MLXArray, requestState: any CBv2MTPRequestState) {
+    /// The confirmed speculation's per-row draft confidence, still lazy (the
+    /// caller reads it only once it is available); nil otherwise.
+    public func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray? {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released,
+            let speculation = s.speculation, speculation.carry != nil, speculation.memo != nil,
+            speculation.accepted == speculation.depth, speculation.pending != nil
+        else { return nil }
+        return speculation.confidence
+    }
+
+    /// Finalize stored `carryHidden` (this object) as the row's carry after
+    /// `acceptedDrafts` accepted drafts, the carry being verify row
+    /// `acceptedDrafts`. `carryTokenIsTarget`: its token is the verify's
+    /// own target at that row.
+    public func confirmSpeculation(
+        carryHidden: MLXArray, acceptedDrafts: Int, carryTokenIsTarget: Bool,
+        requestState: any CBv2MTPRequestState
+    ) {
         let s = state(requestState)
-        guard var speculation = s.speculation, speculation.pending != nil,
-            speculation.carry == nil
+        guard var speculation = s.speculation, speculation.carry == nil,
+            let accepted = speculation.accepted, accepted == acceptedDrafts,
+            (accepted == 0) == (speculation.pending == nil)
         else {
             s.speculation = nil
             return
+        }
+        // The block assumed every draft accepted and the bonus target as the
+        // seed; any other outcome keeps the commit only.
+        if accepted != speculation.depth || !carryTokenIsTarget {
+            speculation.memo = nil
+            speculation.confidence = nil
         }
         speculation.carry = carryHidden
         s.speculation = speculation
@@ -633,26 +706,54 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         state(requestState).speculation = nil
     }
 
-    /// Index 0 of the round after an all-accepted one: when the state is
-    /// the one `speculateNextRound` assumed (the confirmed carry object, the
-    /// pending rows `finalizeRound` set, the context unchanged since), apply
-    /// commitCarry's transitions and the append it built, and hand out its
-    /// memo. False leaves the state as it was, for the normal path.
+    /// Index 0 of the round after a speculated one: when the state is the
+    /// one `speculateNextRound` assumed for the outcome finalize confirmed
+    /// (that carry object, the pending rows `finalizeRound` set for it, the
+    /// context unchanged since), apply commitCarry's transitions and append
+    /// that outcome's rows, and hand out the block's memo when it was built
+    /// for this outcome. `.normal` leaves the state as it was.
     private func takeSpeculation(_ speculation: Speculation, state s: State, hidden: MLXArray)
-        -> Bool
+        -> TakenSpeculation
     {
-        guard settings.batchesRequests, s.selection == nil, s.awaitsCarry,
+        guard settings.batchesRequests, s.awaitsCarry,
             let carry = speculation.carry, carry === hidden,
-            let expected = speculation.pending, let pending = s.pending, pending === expected,
+            let accepted = speculation.accepted, accepted >= 0, accepted <= speculation.depth,
             s.context.nextPosition == speculation.anchor,
             s.context.firstPosition == speculation.first
-        else { return false }
+        else { return .normal }
+        if let expected = speculation.pending {
+            guard let pending = s.pending, pending === expected else { return .normal }
+        } else {
+            guard accepted == 0, s.pending == nil else { return .normal }
+        }
+        let memo = s.selection == nil ? speculation.memo : nil
         s.pending = nil
         s.awaitsCarry = false
         s.committedInputCount += 1
-        s.context.append(keys: speculation.keys, values: speculation.values)
-        s.memo = speculation.memo
-        return true
+        if accepted == speculation.depth {
+            s.context.append(keys: speculation.keys, values: speculation.values)
+        } else {
+            let rows = 0 ..< (accepted + 1)
+            s.context.append(
+                keys: speculation.keys[0..., 0..., rows, 0...],
+                values: speculation.values[0..., 0..., rows, 0...])
+        }
+        guard let memo else { return .committed }
+        s.memo = memo
+        return .drafted
+    }
+
+    /// The head product of draft rows `[rows, hiddenSize]`: MLX's NVFP4
+    /// product of the target's head when it is NVFP4, else the target's own.
+    /// Without `readout` (argmax proposals only) the NVFP4 product skips
+    /// `weight_scale_2`: a positive scalar, so the row argmax is the same up
+    /// to bf16 rounding ties. A coupled selection reads the target's readout
+    /// of the product and needs the scale.
+    private func draftHeadProduct(_ rows: MLXArray, readout: Bool) -> MLXArray {
+        guard let draftHead, rows.dim(-1) == draftHead.inputDimensions else {
+            return target.dflashHeadProduct(rows)
+        }
+        return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
     }
 
     /// The argmax of the head products, or a selection's proposals over the
@@ -687,7 +788,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     ) {
         let s = state(requestState)
         defer { clearRound(s) }
-        var speculation = s.speculation
+        let speculation = s.speculation
         s.speculation = nil
         s.lastRoundFullyAccepted = false
         let pendingBefore = s.pending
@@ -714,13 +815,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         s.awaitsCarry = true
         s.committedInputCount += rows
         s.lastRoundFullyAccepted = rows == s.stagedInputCount
-        // Keep the speculation only for the outcome it assumed: all of its
-        // drafts accepted, the pending rows exactly this round's.
-        if speculation != nil, settings.batchesRequests, pendingBefore == nil,
-            rows == speculation!.depth, rows == s.stagedInputCount, let pending = s.pending
+        // Keep the speculation for this outcome: the pending rows exactly
+        // this round's first `rows` verify rows (none when `rows` is 0).
+        if var kept = speculation, settings.batchesRequests, pendingBefore == nil,
+            kept.depth == s.stagedInputCount, rows <= kept.depth,
+            (rows == 0) == (s.pending == nil)
         {
-            speculation!.pending = pending
-            s.speculation = speculation
+            kept.accepted = rows
+            kept.pending = s.pending
+            s.speculation = kept
         }
     }
 
@@ -824,6 +927,14 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
                 logicalBytes: blockBytes,
                 allocationCount: settings.maximumSpeculativeRows + (speculatesAfterVerify ? 1 : 0))
         ]
+        if speculatesAfterVerify {
+            // The speculation's float32 readout of its head products and one
+            // elementwise temporary, for the draft confidence.
+            owner.append(
+                .init(
+                    logicalBytes: settings.maximumDraftTokens * target.dflashVocabularySize * 4,
+                    allocationCount: 2))
+        }
         if settings.backendScratchBytes > 0 {
             owner.append(.init(logicalBytes: settings.backendScratchBytes))
         }

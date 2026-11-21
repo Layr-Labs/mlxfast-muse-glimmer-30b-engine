@@ -663,15 +663,21 @@ extension EngineLoopV2 {
                     needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
-                // Every draft accepted and the carry token is the verify's own
-                // bonus target: exactly the outcome a post-verify speculation
-                // assumed. The drafter keeps it only for this carry object.
-                if confirmed == targetWidth, accepted == k, hiddenColumn == k,
-                    kept[k] == Int(host[draftCount + batchIndex * targetWidth + k]),
+                // The carry is verify row `accepted` after `accepted` committed
+                // drafts: an outcome a post-verify speculation covers. The
+                // drafter keeps it only for this carry object; its all-accepted
+                // block also needs the carry token to be the verify's own
+                // bonus target.
+                if confirmed == accepted + 1, committedDraftCount == accepted,
+                    hiddenColumn == accepted, accepted <= k,
                     let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
                     let state = metadata.assistantState
                 {
-                    speculator.confirmSpeculation(carryHidden: carryHidden, requestState: state)
+                    speculator.confirmSpeculation(
+                        carryHidden: carryHidden, acceptedDrafts: accepted,
+                        carryTokenIsTarget: kept[accepted]
+                            == Int(host[draftCount + batchIndex * targetWidth + accepted]),
+                        requestState: state)
                 }
             }
         }
@@ -694,8 +700,9 @@ extension EngineLoopV2 {
 // MARK: - Post-verify speculation
 
 /// A request-stateful drafter that can build the next round's draft index 0
-/// work behind a submitted verify, for the outcome in which every draft is
-/// accepted, without reading the acceptance count.
+/// work behind a submitted verify without reading the acceptance count: work
+/// every outcome shares (the context commit of the verify's rows), and work
+/// for the outcome in which every draft is accepted.
 ///
 /// Contract: building writes no request state the engine or any other call
 /// observes (context, pending rows, carries); it only holds the speculative
@@ -707,20 +714,44 @@ public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
     /// Right after a one-row round's verify is submitted. `targetTokens`
     /// `[1, depth + 1]` are the verify's per-position target tokens and
     /// `targetHidden` `[1, depth + 1, H]` its hidden rows, both lazy.
+    /// `draftsBlock`: the all-accepted outcome's next block may be drafted
+    /// too (work every outcome shares is always eligible).
     /// Returns the arrays to submit; empty when it does not speculate.
     func speculateNextRound(
-        targetTokens: MLXArray, targetHidden: MLXArray, depth: Int,
+        targetTokens: MLXArray, targetHidden: MLXArray, depth: Int, draftsBlock: Bool,
         requestState: any CBv2MTPRequestState) -> [MLXArray]
-    /// Finalize accepted every draft of the round and stored `carryHidden`
-    /// (this object) as the row's carry, with the verify's bonus target as
-    /// its token.
-    func confirmSpeculation(carryHidden: MLXArray, requestState: any CBv2MTPRequestState)
+    /// Finalize committed `acceptedDrafts` drafts of the round and stored
+    /// `carryHidden` (this object, verify row `acceptedDrafts`) as the row's
+    /// carry; `carryTokenIsTarget` when its token is the verify's own target
+    /// at that row.
+    func confirmSpeculation(
+        carryHidden: MLXArray, acceptedDrafts: Int, carryTokenIsTarget: Bool,
+        requestState: any CBv2MTPRequestState)
     /// Forget any speculation (its submission failed).
     func dropSpeculation(requestState: any CBv2MTPRequestState)
+    /// `[n]` float32, lazy: the confirmed speculation's per-row top-1
+    /// probability of each proposal (row `i` drafts position `i + 1`), or nil
+    /// without a confirmed speculation. Advisory: it may size the next
+    /// verify window and never changes a proposal or a committed token.
+    func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray?
+}
+
+extension CBv2MTPPostVerifySpeculating {
+    public func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray? {
+        nil
+    }
 }
 
 extension EngineLoopV2 {
-    /// Submit the drafter's all-accepted next-round work behind a verify.
+    /// The fewest predicted probability that a round accepts every draft
+    /// (the acceptance window's per-position estimates, multiplied) for the
+    /// all-accepted next block to be drafted behind its verify. A wrong
+    /// block occupies the device past the host gap and delays the next
+    /// round; the shared commit work is always submitted. 0 disables the
+    /// gate.
+    static var mtpSpeculativeBlockMinimumFullAcceptance: Double { 0.5 }
+
+    /// Submit the drafter's next-round work behind a verify.
     /// One-row rounds only (a batched round's drafter pass has other
     /// shapes); no grammar, shortlist or typical-acceptance rounds, whose
     /// carry token or drafter inputs are not the verify's own target row.
@@ -737,9 +768,13 @@ extension EngineLoopV2 {
         let k = verify.k
         // Packet: [1, k] drafts, then [1, k + 1] targets.
         let targets = verify.acceptancePacket[k ..< (2 * k + 1)].reshaped([1, k + 1])
+        let draftsBlock =
+            mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
+                $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
+            } ?? true
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
-            requestState: state)
+            draftsBlock: draftsBlock, requestState: state)
         guard !roots.isEmpty else { return }
         do {
             try withError { fault in

@@ -583,6 +583,43 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             0.85 * pow(0.98, Double($0))
         }
 
+    /// Draft-confidence calibration: per position, the mean logit of the
+    /// drafter's top-1 probability over rounds whose target outcome at that
+    /// position was observed, and how many such rounds there were. Only
+    /// rounds whose block confidence was read feed it.
+    private(set) var confidenceLogitMeans: [Double] =
+        Array(repeating: 0, count: CBv2MTPRequestAcceptanceState.maximumDepth)
+    private(set) var confidenceSamples: [Int] =
+        Array(repeating: 0, count: CBv2MTPRequestAcceptanceState.maximumDepth)
+    /// Observed rounds at a position before its confidence modulates it.
+    static let minimumConfidenceSamples = 4
+    private static let confidenceLogitLimit = 9.0
+
+    /// Request-level acceptance regime: an EWMA of each observed round's
+    /// accepted / drafted fraction. Starts at 1 (a request begins in the
+    /// high-acceptance regime). The fixed-depth window may shorten a round
+    /// below the declared depth only while this is under
+    /// `lowAcceptanceRegimeThreshold`; at or above it the declared depth
+    /// runs, so occasional rejections on a request that accepts nearly every
+    /// draft never shrink its window.
+    private(set) var roundAcceptanceFraction = 1.0
+    private static let regimeAlpha = 0.15
+    static let lowAcceptanceRegimeThreshold = 0.75
+
+    var inLowAcceptanceRegime: Bool {
+        roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
+    }
+
+    init() {}
+
+    /// Every position starts at `flatPrior`. The fixed-depth acceptance
+    /// window uses an optimistic prior so a request's first rounds run at
+    /// the declared depth, exactly as an unclamped fixed-depth engine does.
+    init(flatPrior: Double) {
+        let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
+        probabilities = Array(repeating: prior, count: Self.maximumDepth)
+    }
+
     /// Records positions whose target outcome was actually observed and, after
     /// a fully accepted round, transfers bounded optimism to the next position.
     /// A truncation (stop, token budget, or common-width clamp) passes
@@ -600,6 +637,16 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         for position in 0 ..< accepted {
             probabilities[position] += Self.alpha * (1.0 - probabilities[position])
         }
+        // Regime signal: only rounds whose outcome was fully observed (a
+        // rejection, or every draft accepted) count; a truncation does not.
+        if drafted > 0,
+            (rejectionObserved && accepted < drafted)
+                || (!rejectionObserved && !endedByTruncation && accepted == drafted)
+        {
+            let fraction = Double(accepted) / Double(drafted)
+            roundAcceptanceFraction +=
+                Self.regimeAlpha * (fraction - roundAcceptanceFraction)
+        }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
         } else if !rejectionObserved, !endedByTruncation,
@@ -610,6 +657,54 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             // may profitably extend one position farther.
             probabilities[drafted] += Self.alpha * (0.95 - probabilities[drafted])
         }
+    }
+
+    /// Records the drafter's per-position top-1 probabilities for a round at
+    /// the positions whose outcome the round observed (the same positions
+    /// `observe` updates, without the full-acceptance extension).
+    mutating func observeConfidence(
+        _ confidence: [Double],
+        draftedDepth: Int,
+        acceptedDepth: Int,
+        rejectionObserved: Bool
+    ) {
+        let drafted = min(max(draftedDepth, 0), Self.maximumDepth, confidence.count)
+        let accepted = min(max(acceptedDepth, 0), drafted)
+        let observed = rejectionObserved && accepted < drafted ? accepted + 1 : accepted
+        for position in 0 ..< observed {
+            let value = confidence[position]
+            guard value.isFinite else { continue }
+            let n = confidenceSamples[position]
+            let weight = max(Self.alpha, 1.0 / Double(n + 1))
+            confidenceLogitMeans[position] +=
+                weight * (Self.clampedLogit(value) - confidenceLogitMeans[position])
+            confidenceSamples[position] = n == Int.max ? n : n + 1
+        }
+    }
+
+    /// The acceptance history shifted, in logit space, by how far this
+    /// round's drafter confidence sits from its calibrated mean at each
+    /// position. A position with too few calibration rounds, or without a
+    /// finite confidence, keeps its history probability, so with no
+    /// calibration this is exactly `probabilities`.
+    func confidenceAdjustedProbabilities(_ confidence: [Double]) -> [Double] {
+        probabilities.indices.map { position in
+            guard position < confidence.count, confidence[position].isFinite,
+                confidenceSamples[position] >= Self.minimumConfidenceSamples
+            else { return probabilities[position] }
+            let shifted =
+                Self.clampedLogit(probabilities[position])
+                + Self.clampedLogit(confidence[position]) - confidenceLogitMeans[position]
+            return 1.0 / (1.0 + exp(-shifted))
+        }
+    }
+
+    private static func clampedLogit(_ probability: Double) -> Double {
+        let p = min(max(probability, 0), 1)
+        let raw = log(p) - log1p(-p)
+        return raw.isFinite
+            ? min(max(raw, -confidenceLogitLimit), confidenceLogitLimit)
+            : (p >= 0.5 ? confidenceLogitLimit : -confidenceLogitLimit)
     }
 }
 
@@ -755,6 +850,60 @@ enum CBv2MTPMarginalDepthPolicy {
             depth += 1
         }
         return depth
+    }
+
+    /// Fixed-depth acceptance window. A fixed declared depth is a ceiling:
+    /// each round verifies `min(declared, window)` drafts, where the window
+    /// is the marginal rule above over the request's own acceptance history
+    /// (no wall-clock input, so the choice is deterministic for a given
+    /// accept/reject sequence). The floor of one draft keeps the history
+    /// observing: a depth-zero plan would record no acceptance and could
+    /// never reopen the window. Emitted tokens are the target's own either
+    /// way; only the number of verify rows changes.
+    static let fixedWindowFlatPrior = 0.9
+    /// One extra verify row as a fraction of a full target step. Round costs
+    /// at declared depths 3/5/7 on a request that accepts every draft give a
+    /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
+    /// conservative so estimator noise does not open windows that pay for
+    /// rejected rows.
+    static let fixedWindowHeadStepCostRatio = 0.15
+
+    static func fixedWindowDepth(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int,
+        acceptanceProbabilities: [Double]
+    ) -> Int {
+        guard offeredDepth > 0 else { return 0 }
+        let selected = selectDepth(
+            offeredDepth: offeredDepth,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptanceProbabilities: acceptanceProbabilities,
+            previousTargetTopTwoMargin: nil,
+            headStepCostRatio: fixedWindowHeadStepCostRatio)
+        return min(offeredDepth, max(1, selected))
+    }
+
+    /// Draft-confidence window (LibraSpec, arXiv 2608.08721 §3.2-3.3, with a
+    /// per-request calibration): the fixed-depth acceptance window evaluated
+    /// on the history probabilities shifted by this round's drafter
+    /// confidence (`confidenceAdjustedProbabilities`). The marginal rule is
+    /// LibraSpec's greedy beneficial extension of E[accepted + 1] / round
+    /// cost with cost linear in verify rows. Same ceiling and floor as
+    /// `fixedWindowDepth`; equal to it before calibration.
+    static func fixedWindowConfidenceDepth(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int,
+        acceptance: CBv2MTPRequestAcceptanceState,
+        confidence: [Double]
+    ) -> Int {
+        fixedWindowDepth(
+            offeredDepth: offeredDepth,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptanceProbabilities: acceptance.confidenceAdjustedProbabilities(confidence))
     }
 
     /// A cost-confirmation probe is always at most one draft and obeys every

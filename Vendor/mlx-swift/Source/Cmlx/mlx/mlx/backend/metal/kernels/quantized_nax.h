@@ -1125,6 +1125,179 @@ struct QuantizedBlockLoaderStaged {
   }
 };
 
+// With M <= SM, qmm_t_nax_staged_impl leaves every simdgroup but the first
+// without rows. Here all simdgroups take the same rows, and simdgroup g takes
+// the 16 columns [16 g, 16 g + 16) of every BK step, so each one issues a
+// quarter of the MMAs. The loader, its dequantized tiles and the barriers are
+// the staged impl's own. The partial tiles are added in simdgroup order in
+// threadgroup memory at the end (fp32 throughout; only the summation order
+// differs from the staged impl).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    typename U,
+    int BM,
+    int BK,
+    int BN,
+    int SM>
+METAL_FUNC void qmm_t_nax_staged_ksplit_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device U* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const int k_end,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int WM = BM / SM;
+  static_assert(WM * 16 == BK, "One 16-column K slice per simdgroup");
+
+  constexpr int pack_factor = get_affine_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int tile_size = BN * BK_padded;
+  constexpr int n_frags = BN / 16;
+  constexpr int frag_elems = BaseNAXFrag::kElemsPerFrag;
+  static_assert(
+      (WM - 1) * n_frags * SIMD_SIZE * frag_elems * sizeof(float) <=
+          2 * tile_size * sizeof(T),
+      "The partial tiles fit the weight buffers");
+
+  using loader_w_t = QuantizedBlockLoaderStaged<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      WM * SIMD_SIZE,
+      group_size,
+      bits>;
+  using frag_t = typename BaseNAXFrag::template dtype_frag_t<T>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  loader_w_t loader_w(
+      (const device uint8_t*)w + y_col * K_w,
+      scales + y_col * K_g,
+      biases + y_col * K_g,
+      K,
+      simd_gid,
+      simd_lid);
+
+  const int tile_rows = min(BM, M - y_row);
+  const int ks = 16 * int(simd_gid);
+  const short2 sc = BaseNAXFrag::get_coord();
+  const int r0 = min(int(sc.y), tile_rows - 1);
+  const int r1 = min(int(sc.y) + 8, tile_rows - 1);
+  const device T* x0 = x + (y_row + r0) * static_cast<int64_t>(K) + ks + sc.x;
+  const device T* x1 = x + (y_row + r1) * static_cast<int64_t>(K) + ks + sc.x;
+
+  NAXTile<float, 1, BN / 16> Dtile;
+  Dtile.clear();
+
+  loader_w.fetch(0);
+  loader_w.store(Ws);
+  vec<T, 4> a_cur0 = *(const device vec<T, 4>*)x0;
+  vec<T, 4> a_cur1 = *(const device vec<T, 4>*)x1;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int k = 0, it = 0; k < k_end; k += BK, it++) {
+    const bool more = k + BK < k_end;
+    if (more) {
+      loader_w.fetch(k + BK);
+    }
+    const int kn = more ? k + BK : k;
+    const vec<T, 4> a_next0 = *(const device vec<T, 4>*)(x0 + kn);
+    const vec<T, 4> a_next1 = *(const device vec<T, 4>*)(x1 + kn);
+    frag_t a;
+    STEEL_PRAGMA_UNROLL
+    for (short c = 0; c < 4; c++) {
+      a[c] = a_cur0[c];
+      a[4 + c] = a_cur1[c];
+    }
+    const threadgroup T* ws =
+        Ws + (it & 1) * tile_size + sc.y * BK_padded + sc.x + ks;
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < BN / 16; j += 2) {
+      const threadgroup T* p0 = ws + (j * 16) * BK_padded;
+      const threadgroup T* p1 = p0 + 16 * BK_padded;
+      frag_t b0;
+      frag_t b1;
+      STEEL_PRAGMA_UNROLL
+      for (short h = 0; h < 2; h++) {
+        const vec<T, 4> u0 =
+            *(const threadgroup vec<T, 4>*)(p0 + h * 8 * BK_padded);
+        const vec<T, 4> u1 =
+            *(const threadgroup vec<T, 4>*)(p1 + h * 8 * BK_padded);
+        STEEL_PRAGMA_UNROLL
+        for (short c = 0; c < 4; c++) {
+          b0[h * 4 + c] = u0[c];
+          b1[h * 4 + c] = u1[c];
+        }
+      }
+      BaseNAXFrag::mma(
+          Dtile.frag_at(0, j),
+          Dtile.frag_at(0, j + 1),
+          a,
+          metal::bool_constant<false>{},
+          b0,
+          b1,
+          metal::bool_constant<true>{});
+    }
+    a_cur0 = a_next0;
+    a_cur1 = a_next1;
+    if (more) {
+      loader_w.store(Ws + ((it + 1) & 1) * tile_size);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // The loop's last barrier ends every read of Ws: it holds the partials.
+  threadgroup float* part = (threadgroup float*)Ws;
+  if (simd_gid > 0) {
+    threadgroup float* p =
+        part + ((int(simd_gid) - 1) * n_frags * SIMD_SIZE + simd_lid) * frag_elems;
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < n_frags; f++) {
+      STEEL_PRAGMA_UNROLL
+      for (short e = 0; e < frag_elems; e++) {
+        p[f * SIMD_SIZE * frag_elems + e] = Dtile.frag_at(0, f)[e];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid > 0) {
+    return;
+  }
+  STEEL_PRAGMA_UNROLL
+  for (short g = 0; g < WM - 1; g++) {
+    const threadgroup float* p =
+        part + (g * n_frags * SIMD_SIZE + simd_lid) * frag_elems;
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < n_frags; f++) {
+      STEEL_PRAGMA_UNROLL
+      for (short e = 0; e < frag_elems; e++) {
+        Dtile.frag_at(0, f)[e] += p[f * SIMD_SIZE * frag_elems + e];
+      }
+    }
+  }
+
+  y += y_row * static_cast<int64_t>(N) + y_col;
+  if (tile_rows == SM) {
+    Dtile.store(y, N);
+  } else {
+    Dtile.store_safe(y, N, short2(BN, tile_rows));
+  }
+}
+
 // Each simdgroup computes SM rows and prefetches the next activation tile.
 // Weights use two threadgroup buffers with one barrier between K steps.
 template <
@@ -1169,6 +1342,15 @@ METAL_FUNC void qmm_t_nax_staged_impl(
       group_size,
       bits>;
   using frag_t = typename BaseNAXFrag::template dtype_frag_t<T>;
+
+  // At most SM rows in all: split each BK step over the simdgroups instead.
+  if constexpr ((BM / SM) * 16 == BK) {
+    if (M <= SM) {
+      qmm_t_nax_staged_ksplit_impl<T, group_size, bits, U, BM, BK, BN, SM>(
+          w, scales, biases, x, y, Ws, K, N, M, k_end, tid, simd_gid, simd_lid);
+      return;
+    }
+  }
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;

@@ -13,6 +13,7 @@
 // a lock so the provider can poll them from any thread
 // (`EngineV2.mtpMetricsSnapshot()`).
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -325,6 +326,15 @@ final class CBv2MTPRoundDriver {
     /// Qwen acceptance is request-owned; raw nonchained wall cost is shared
     /// only within a compatible decode-row bucket.
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
+    /// Plan-scoped: the confirmed post-verify speculation's lazy draft
+    /// confidence for each row whose window this plan offered it to, kept
+    /// until that round's finalize calibrates with it. Cleared every plan.
+    private var planDraftConfidence: [CBv2RequestID: MLXArray] = [:]
+    /// Windows sized by an already-available draft confidence, and windows
+    /// that fell back to the acceptance history because it was still in
+    /// flight. Diagnostics only.
+    private(set) var draftConfidenceWindowHits = 0
+    private(set) var draftConfidenceWindowMisses = 0
     private var rawCostEstimators: [Int: CBv2MTPRawCostEstimator] = [:]
 
     /// Plan-scoped: rows the planner offered a 1+k round this plan.
@@ -937,6 +947,105 @@ final class CBv2MTPRoundDriver {
             headStepCostRatio: cost.headStepCostRatio)
     }
 
+    /// A fixed positive depth with a request-stateful drafter under exact
+    /// acceptance: the declared depth is the ceiling and each plan's verify
+    /// window is clamped by the request's own acceptance history
+    /// (`CBv2MTPMarginalDepthPolicy.fixedWindowDepth`). Exact acceptance
+    /// keeps every emitted token the target's own, so the window changes how
+    /// many rows are verified, never which tokens are committed. Scoped to
+    /// advisory-history drafters (`historyIsAdvisory`, which implies exact
+    /// acceptance): their request state reaches neither output nor prefix
+    /// checkpoints, so other fixed-depth drafters keep their exact shapes.
+    var usesFixedDepthAcceptanceWindow: Bool {
+        guard let fixed = config.fixedDraftTokens else { return false }
+        return fixed > 0 && config.maxDraftTokens > 0
+            && usesRequestStatefulDrafter && historyIsAdvisory
+    }
+
+    private var initialRequestAcceptance: CBv2MTPRequestAcceptanceState {
+        usesFixedDepthAcceptanceWindow
+            ? CBv2MTPRequestAcceptanceState(
+                flatPrior: CBv2MTPMarginalDepthPolicy.fixedWindowFlatPrior)
+            : CBv2MTPRequestAcceptanceState()
+    }
+
+    /// The acceptance window's probability that a round of `depth` drafts
+    /// accepts every one: the product of the request's per-position
+    /// acceptance estimates. Nil when the window does not apply. Host
+    /// arithmetic over history already read back; no device work.
+    func predictedFullAcceptance(for id: CBv2RequestID, depth: Int) -> Double? {
+        guard usesFixedDepthAcceptanceWindow, depth > 0 else { return nil }
+        let probabilities = (requestAcceptance[id] ?? initialRequestAcceptance).probabilities
+        guard depth <= probabilities.count else { return nil }
+        return probabilities.prefix(depth).reduce(1, *)
+    }
+
+    /// The verify window for one row under a fixed declared depth; at most
+    /// `offeredDepth` and at least one draft while `offeredDepth > 0`.
+    func fixedDepthAcceptanceWindow(
+        for id: CBv2RequestID,
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int
+    ) -> Int {
+        let ceiling = min(max(offeredDepth, 0), config.maxDraftTokens)
+        guard usesFixedDepthAcceptanceWindow, ceiling > 0 else { return ceiling }
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        // Read the round's draft confidence in either regime so its
+        // calibration keeps learning while the declared depth runs.
+        let confidence = availableDraftConfidence(for: id)
+        // High-acceptance regime: always the declared depth.
+        guard acceptance.inLowAcceptanceRegime else { return ceiling }
+        if let confidence {
+            return CBv2MTPMarginalDepthPolicy.fixedWindowConfidenceDepth(
+                offeredDepth: ceiling,
+                remainingTokens: remainingTokens,
+                verificationLimit: verificationLimit,
+                acceptance: acceptance,
+                confidence: confidence)
+        }
+        return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+            offeredDepth: ceiling,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptanceProbabilities: acceptance.probabilities)
+    }
+
+    /// Start of a plan: forget the previous plan's draft confidences.
+    func beginDraftConfidencePlan() {
+        if !planDraftConfidence.isEmpty { planDraftConfidence.removeAll(keepingCapacity: true) }
+    }
+
+    /// The next block's per-position draft confidence, when the drafter
+    /// built that block behind the previous verify (a confirmed post-verify
+    /// speculation) AND the device has already finished it. Never waits and
+    /// never schedules: an unfinished speculation leaves the history window
+    /// in charge, so the window adds no host-device sync to the round.
+    private func availableDraftConfidence(for id: CBv2RequestID) -> [Double]? {
+        guard let speculator = drafter as? any CBv2MTPPostVerifySpeculating,
+            let state = assistantStates[id],
+            let array = speculator.speculatedDraftConfidence(requestState: state)
+        else { return nil }
+        planDraftConfidence[id] = array
+        guard let values = Self.hostValuesIfAvailable(array) else {
+            draftConfidenceWindowMisses &+= 1
+            return nil
+        }
+        draftConfidenceWindowHits &+= 1
+        return values
+    }
+
+    /// Host copy of `array` only when its evaluation has already completed
+    /// (`_mlx_array_is_available` checks the completion event without
+    /// waiting); nil while it is unscheduled or in flight.
+    private static func hostValuesIfAvailable(_ array: MLXArray) -> [Double]? {
+        var available = false
+        guard _mlx_array_is_available(&available, array.ctx) == 0, available,
+            array.ndim == 1, array.dtype == .float32
+        else { return nil }
+        return array.asArray(Float.self).map(Double.init)
+    }
+
     func observeRequestAcceptance(
         id: CBv2RequestID,
         draftedDepth: Int,
@@ -944,13 +1053,26 @@ final class CBv2MTPRoundDriver {
         rejectionObserved: Bool,
         endedByTruncation: Bool
     ) {
-        guard usesRequestStatefulDrafter, config.fixedDraftTokens == nil else { return }
-        var state = requestAcceptance[id] ?? CBv2MTPRequestAcceptanceState()
+        guard usesRequestStatefulDrafter,
+            config.fixedDraftTokens == nil || usesFixedDepthAcceptanceWindow
+        else { return }
+        var state = requestAcceptance[id] ?? initialRequestAcceptance
         state.observe(
             draftedDepth: draftedDepth,
             acceptedDepth: acceptedDepth,
             rejectionObserved: rejectionObserved,
             endedByTruncation: endedByTruncation)
+        // The round's block confidence finished before its verify did, so it
+        // is available here without waiting.
+        if let array = planDraftConfidence.removeValue(forKey: id),
+            let confidence = Self.hostValuesIfAvailable(array)
+        {
+            state.observeConfidence(
+                confidence,
+                draftedDepth: draftedDepth,
+                acceptedDepth: acceptedDepth,
+                rejectionObserved: rejectionObserved)
+        }
         requestAcceptance[id] = state
     }
 
@@ -1028,6 +1150,7 @@ final class CBv2MTPRoundDriver {
         releaseAssistantState(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
+        planDraftConfidence.removeValue(forKey: id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -1041,6 +1164,7 @@ final class CBv2MTPRoundDriver {
         seedMarks.remove(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
+        planDraftConfidence.removeValue(forKey: id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1078,6 +1202,7 @@ final class CBv2MTPRoundDriver {
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
+        planDraftConfidence.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
