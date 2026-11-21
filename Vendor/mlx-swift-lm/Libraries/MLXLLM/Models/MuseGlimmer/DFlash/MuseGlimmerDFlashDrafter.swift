@@ -174,6 +174,69 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             eval(maskEmbedding)
             try errors.check()
         }
+        // Load-time scratch round (outside every timed window: the drafter is
+        // built once, when the runner loads, before the worker serves).
+        if Self.scratchRoundWarmEnabled, Self.claimScratchRoundWarm() {
+            warmScratchRounds()
+        }
+    }
+
+    // MARK: Load-time scratch warm
+
+    /// Kill switch for the load-time scratch rounds.
+    static let scratchRoundWarmEnabled = true
+    private static let scratchRoundWarmLock = NSLock()
+    nonisolated(unsafe) private static var scratchRoundWarmClaimed = false
+
+    /// One claim per process: the pipelines it compiles are process-wide.
+    private static func claimScratchRoundWarm() -> Bool {
+        scratchRoundWarmLock.lock()
+        defer { scratchRoundWarmLock.unlock() }
+        if scratchRoundWarmClaimed { return false }
+        scratchRoundWarmClaimed = true
+        return true
+    }
+
+    /// The drafter half of a speculative round, on a PRIVATE context state
+    /// with input-independent operands, for every commit width a round can
+    /// produce (1 ... 1 + maximumDraftTokens rows): context projection and
+    /// K/V, the block forward (single and batched entry), the draft head in
+    /// both its products, and the argmax. Its only effect that outlives it is
+    /// first use (Metal pipeline state, kernel libraries): the scratch state
+    /// is released, no request or engine state is read or written, and the
+    /// results are discarded. Without it those first uses fall in the first
+    /// timed speculative rounds, because the harness warm runs only the
+    /// plain stepper.
+    private func warmScratchRounds() {
+        let c = model.configuration
+        let scratch = model.makeContextState()
+        defer { scratch.release() }
+        let anchor = target.dflashTokenEmbeddings(MLXArray([Int32(c.maskTokenID)]))
+        guard anchor.size == c.hiddenSize else { return }
+        let embeddings = model.blockEmbeddings(anchor: anchor, mask: maskEmbedding)
+        let depth = settings.maximumDraftTokens
+        do {
+            try MLX.withError { errors in
+                for width in 1 ... (1 + depth) {
+                    let features = MLXArray.zeros(
+                        [width, c.contextWidth], dtype: model.activationDType)
+                    model.commit(features: features, at: scratch.nextPosition, to: scratch)
+                    let block = model.draftBlock(embeddings: embeddings, state: scratch)
+                    let batched = model.draftBlocks(embeddings: [embeddings], states: [scratch])
+                    var outputs = [block]
+                    outputs.append(contentsOf: batched)
+                    for rows in [block, batched.first].compactMap({ $0 }) {
+                        let draftRows = rows[1 ..< (1 + depth), 0...]
+                        outputs.append(argMax(draftHeadProduct(draftRows, readout: false), axis: -1))
+                        outputs.append(argMax(draftHeadProduct(draftRows, readout: true), axis: -1))
+                    }
+                    eval(outputs)
+                    try errors.check()
+                }
+            }
+        } catch {
+            // Best effort: a failed warm leaves first use where it was.
+        }
     }
 
     // MARK: Engine policy
@@ -602,6 +665,39 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return [projected.keys, projected.values]
         }
 
+        // startRound's block and memo from the bonus target as the seed.
+        let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
+        guard
+            let built = outcomeBlock(
+                context: context, keys: projected.keys, values: projected.values, rows: n,
+                seed: seed)
+        else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
+        speculation.memo = built.memo
+        speculation.confidence = built.confidence
+        s.speculation = speculation
+        return [
+            built.memo.tokens, built.memo.hidden, projected.keys, projected.values,
+            built.confidence,
+        ]
+    }
+
+    /// The block, proposals and per-row draft confidence that the next draft
+    /// index 0 builds once the first `n` rows of `projectedKeys` and
+    /// `projectedValues` are appended at the context's next position, seeded
+    /// by `seed` `[1, 1]`. The append is written into new wrappers of the
+    /// ring arrays (the slots `append` would write); the context is not
+    /// touched. Nil when the embedding or head shapes do not fit.
+    private func outcomeBlock(
+        context: MuseGlimmerDFlashContextState, keys projectedKeys: MLXArray,
+        values projectedValues: MLXArray, rows n: Int, seed: MLXArray
+    ) -> (memo: (tokens: MLXArray, hidden: MLXArray), confidence: MLXArray)? {
+        let c = model.configuration
+        let window = context.window
+        let ring = context.arrays
+        let start = context.nextPosition
         // context.append on new wrappers. Slot zero holds a position
         // congruent to the ring's base position modulo the window: the
         // first held one before the ring wraps, the base lap's slot zero
@@ -616,9 +712,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             let run = min(n - written, window - at)
             let source = written ..< (written + run)
             keys[0..., 0..., at ..< (at + run), 0...] =
-                projected.keys[0..., 0..., source, 0...].asType(context.dtype)
+                projectedKeys[0..., 0..., source, 0...].asType(context.dtype)
             values[0..., 0..., at ..< (at + run), 0...] =
-                projected.values[0..., 0..., source, 0...].asType(context.dtype)
+                projectedValues[0..., 0..., source, 0...].asType(context.dtype)
             written += run
         }
         let next = start + n
@@ -636,13 +732,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
         ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
 
-        // startRound's block and memo from the bonus target as the seed.
-        let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
         let anchor = target.dflashTokenEmbeddings(seed)
-        guard anchor.size == c.hiddenSize else {
-            s.speculation = speculation
-            return [projected.keys, projected.values]
-        }
+        guard anchor.size == c.hiddenSize else { return nil }
         let block = model.blockForward(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
             context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
@@ -651,8 +742,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // startRound's head: the speculated memo must equal the normal one.
         let logits = draftHeadProduct(rows, readout: false)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
-            s.speculation = speculation
-            return [projected.keys, projected.values]
+            return nil
         }
         let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
         // Per-row top-1 probability of the proposal, softmax over the
@@ -660,10 +750,45 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // sizes the next verify window and never changes a proposal.
         let scores = target.dflashReadout(logits).asType(.float32)
         let confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
-        speculation.memo = memo
-        speculation.confidence = confidence
+        return (memo, confidence)
+    }
+
+    /// After a confirmed speculation that built no block (an outcome other
+    /// than all accepted, or a gated block): the block the next draft index 0
+    /// would build from `seedToken`, the row's carry token, over the
+    /// speculation's commit rows for the confirmed outcome. Held in the
+    /// speculation, so `takeSpeculation` hands it out only for the state it
+    /// was confirmed for, and any other call drops it. Returns
+    /// `[confidence, proposals, hidden rows]`, lazy; empty when it does not
+    /// apply.
+    public func draftConfirmedOutcomeBlock(
+        seedToken: Int, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released,
+            speculatesAfterVerify, s.refusal == nil, s.selection == nil, !s.prestarted,
+            s.memo == nil, s.stagedInputCount == 0, s.awaitsCarry,
+            var speculation = s.speculation, speculation.carry != nil, speculation.memo == nil,
+            let accepted = speculation.accepted, accepted >= 0, accepted <= speculation.depth,
+            s.context.nextPosition == speculation.anchor,
+            s.context.firstPosition == speculation.first, s.context.count > 0,
+            s.context.arrays.count == 2, accepted + 1 <= s.context.window,
+            seedToken >= 0, seedToken <= Int(Int32.max)
+        else { return [] }
+        if let expected = speculation.pending {
+            guard let pending = s.pending, pending === expected else { return [] }
+        } else {
+            guard accepted == 0, s.pending == nil else { return [] }
+        }
+        let seed = MLXArray([Int32(seedToken)]).reshaped([1, 1])
+        guard
+            let built = outcomeBlock(
+                context: s.context, keys: speculation.keys, values: speculation.values,
+                rows: accepted + 1, seed: seed)
+        else { return [] }
+        speculation.memo = built.memo
+        speculation.confidence = built.confidence
         s.speculation = speculation
-        return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
+        return [built.confidence, built.memo.tokens, built.memo.hidden]
     }
 
     /// The confirmed speculation's per-row draft confidence, still lazy (the
@@ -950,5 +1075,17 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ],
             hostBytes: c.blockSize * (c.slidingWindow + c.blockSize),
             ownerWorking: owner)
+    }
+}
+
+// MARK: - Parameter residency
+
+/// The drafter's own parameters (about 2 GiB of quantized weights), keyed by
+/// its draft model, so `CBv2ParameterResidency.prepare` keeps them resident
+/// like the target's. Memory placement only; no value changes.
+extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(model) }
+    public func residentParameterArrays() -> [MLXArray] {
+        model.parameters().flattened().map(\.1)
     }
 }

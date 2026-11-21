@@ -272,7 +272,11 @@ extension EngineLoopV2 {
             // Host arithmetic over acceptance already read back at the
             // previous finalize, plus, after a fully accepted round, the
             // speculated next block's draft confidence when the device has
-            // already finished it (never waited for); no extra sync.
+            // already finished it (never waited for). A low-acceptance row
+            // without one may read its block's confidence with one host
+            // sync (`CBv2MTPRoundDriver.oneSyncDraftConfidenceWindow`).
+            mtp.allowsDraftConfidenceSync = nativeShutdownState == nil
+            defer { mtp.allowsDraftConfidenceSync = false }
             let verificationLimit = mtp.maximumAutomaticDepth(
                 plannedDecodeRows: rows.count)
             let window =
