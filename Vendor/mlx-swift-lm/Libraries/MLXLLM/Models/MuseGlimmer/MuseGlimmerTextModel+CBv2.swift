@@ -88,12 +88,24 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// row runs each layer's attention and writes its K/V; the last layer's
 /// feed-forward half, the final norm and the readout run on the last row. Exact
 /// windows give a row the bytes it gets alone, so the logits do not change.
+/// Without them the full forward runs.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        guard let cache, cache.first is any CBv2AttendingLayerCache else {
-            let hidden = model(model.inputEmbeddings(inputs), cache: cache)
-            return outputLogits(hidden[0..., (hidden.dim(1) - 1)..., 0...])
+        guard let cache, numerics.exactWindows, !numerics.buildingPrompt,
+            cache.first is any CBv2AttendingLayerCache
+        else {
+            let logits = self(inputs, cache: cache)
+            return logits[0..., (logits.dim(1) - 1)..., 0...]
         }
+        // Each layer is submitted as it is built, under the decode command-buffer limits: the
+        // device runs while the host builds the rest, in fewer and larger buffers. Values do
+        // not depend on either.
+        return GPU.withCommandBufferLimits(MuseGlimmerDecodeCommandBuffers.limits) {
+            lastPositionLogits(inputs, cache: cache)
+        }
+    }
+
+    private func lastPositionLogits(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
         var h = model.inputEmbeddings(inputs)
         let last = model.layers.count - 1
         var shared: (positions: [Int], offsets: MLXArray)?
@@ -113,6 +125,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
             }
             guard index == last else {
                 h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
+                asyncEval([h])
                 continue
             }
             let attended = layer.postAttentionLayerNorm.addedTo(
