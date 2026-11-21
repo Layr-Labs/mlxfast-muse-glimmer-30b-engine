@@ -272,6 +272,9 @@ struct FPQuantizedNAXBlockLoader {
   // nvfp4 tensor scale, folded into the group scale as fp_dequantize does.
   // Kept in float: it is ~1e-5, so in fp16 small scales lose most bits.
   float inv_scale_enc = 1.0f;
+  // fetch's packed weights and scales for store.
+  uint8_t w_regs[n_reads];
+  uint8_t s_regs[n_steps_per_read];
 
   FPQuantizedNAXBlockLoader(
       const device uint8_t* src_,
@@ -343,6 +346,38 @@ struct FPQuantizedNAXBlockLoader {
             dst[k * pack_factor + p] = T(0);
           }
         }
+        k++;
+      }
+    }
+  }
+
+  // load_unsafe in two halves: fetch reads this thread's packed weights and
+  // scales into registers, store dequantizes them into dst + offset with
+  // load_unsafe's exact arithmetic. The device reads of the next tile then
+  // overlap the current tile's MMAs.
+  void fetch() thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_steps_per_read; i++) {
+      s_regs[i] = scales[i];
+    }
+    for (int k = 0; k < n_reads; k++) {
+      w_regs[k] = src[k * bytes_per_pack];
+    }
+  }
+
+  void store(int offset) const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    threadgroup T* d = dst + offset;
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      float scale =
+          float(dequantize_scale<T, group_size>(s_regs[i])) * inv_scale_enc;
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize<T, bits>(w_regs[k], scale, d + k * pack_factor);
         k++;
       }
     }
@@ -453,17 +488,33 @@ METAL_FUNC void fp_qmm_t_impl(
 
   x += tm * K;
 
+  // Aligned N: two weight buffers and one barrier per K step; the next
+  // tile's packed weights are read before the current tile's MMAs and
+  // dequantized into the other buffer after them. Every product and its
+  // accumulation order are those of the one-buffer loop.
+  constexpr int tile_size = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
+      if constexpr (kAlignedN.value) {
+        loader_w.fetch();
+        loader_w.store(0);
+        loader_w.next();
+      }
+      for (int k = 0, it = 0; k < K; k += BK, it++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup Wtype* ws = Ws;
+        bool more = false;
         if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
+          more = k + BK < K;
+          if (more) {
+            loader_w.fetch();
+          }
+          ws += (it & 1) * tile_size;
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -478,7 +529,7 @@ METAL_FUNC void fp_qmm_t_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<Wtype, BK_padded, 1>(ws + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -491,7 +542,14 @@ METAL_FUNC void fp_qmm_t_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if constexpr (kAlignedN.value) {
+          if (more) {
+            loader_w.store(((it + 1) & 1) * tile_size);
+            loader_w.next();
+          }
+        } else {
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
@@ -789,7 +847,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -923,7 +981,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<has_global_scale>(
       x,
