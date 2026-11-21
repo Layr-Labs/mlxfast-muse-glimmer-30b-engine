@@ -1,0 +1,111 @@
+import MLX
+
+/// Native storage identity. Segmented roots also separate full and windowed
+/// ownership, so a rolling window never shares an allocator root with a full
+/// history. Uniform fixed-reference pools retain their historical grouping.
+public struct PagedKVGroupKey: Hashable, Sendable, CustomStringConvertible {
+    public let kvHeads: Int
+    public let headDim: Int
+    public let valueHeadDim: Int
+    public let dtype: DType
+    public let windowSize: Int?
+    public let quantization: PagedKVQuantizationConfig?
+
+    public init(
+        kvHeads: Int, headDim: Int, dtype: DType = .float16, windowSize: Int? = nil,
+        valueHeadDim: Int? = nil, quantization: PagedKVQuantizationConfig? = nil
+    ) {
+        self.kvHeads = kvHeads
+        self.headDim = headDim
+        self.valueHeadDim = valueHeadDim ?? headDim
+        self.dtype = dtype
+        self.windowSize = windowSize
+        self.quantization = quantization
+    }
+
+    public init(
+        _ kind: CBv2LayerKind, dtype: DType = .float16, separateWindow: Bool = false,
+        quantization: PagedKVQuantizationConfig? = nil
+    ) {
+        let window: Int?
+        if separateWindow, case .slidingWindow(let size) = kind.attention {
+            window = size
+        } else {
+            window = nil
+        }
+        self.init(
+            kvHeads: kind.kvHeads, headDim: kind.headDim, dtype: dtype, windowSize: window,
+            valueHeadDim: kind.valueHeadDim,
+            quantization: Self.quantization(for: kind, config: quantization))
+    }
+
+    static func quantization(for kind: CBv2LayerKind, config: PagedKVQuantizationConfig?)
+        -> PagedKVQuantizationConfig?
+    {
+        guard let config else { return nil }
+        if case .slidingWindow(let window) = kind.attention, window <= config.recentTokenCount {
+            return nil
+        }
+        return config
+    }
+
+    /// Every layer's key as a pool derives it; a borrowing layer follows its
+    /// owner's native choice.
+    static func storageKeys(
+        layerKinds: [CBv2LayerKind], dtypes: [DType], separateWindow: Bool,
+        quantization: PagedKVQuantizationConfig?, nativeLayerIndices: Set<Int>
+    ) -> [PagedKVGroupKey] {
+        layerKinds.enumerated().map { index, kind in
+            PagedKVGroupKey(
+                kind, dtype: dtypes[index], separateWindow: separateWindow,
+                quantization: nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
+                    ? nil : quantization)
+        }
+    }
+
+    var geometry: CBv2KVGeometry? {
+        .init(kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: valueHeadDim)
+    }
+    var isAsymmetric: Bool { headDim != valueHeadDim }
+    var sortKey: (Int, Int, String, Int, Int, String) {
+        (
+            headDim, kvHeads, String(describing: dtype), windowSize ?? 0, valueHeadDim,
+            quantization?.identity ?? "native"
+        )
+    }
+    public var description: String {
+        "kv\(kvHeads)xd\(headDim)\(isAsymmetric ? "v\(valueHeadDim)" : "")-\(dtype)-\(windowSize.map { "w\($0)" } ?? "full")"
+            + (quantization.map { "-\($0.identity)" } ?? "")
+    }
+}
+
+enum PagedKVStorageLayout {
+    static func resolve(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig) throws -> [DType] {
+        let types = config.layerDTypes ?? Array(repeating: config.dtype, count: layerKinds.count)
+        guard types.count == layerKinds.count,
+            types.allSatisfy({ [.float16, .bfloat16, .float32].contains($0) })
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged native dtype table is missing or unsupported")
+        }
+        for (index, kind) in layerKinds.enumerated() {
+            guard kind.kvGeometry != nil else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged layer \(index) has invalid native K/V geometry")
+            }
+            guard let source = kind.sharesKVWithLayer else { continue }
+            guard source >= 0, source < layerKinds.count, source != index,
+                layerKinds[source].sharesKVWithLayer == nil,
+                layerKinds[source].kvHeads == kind.kvHeads,
+                layerKinds[source].headDim == kind.headDim,
+                layerKinds[source].valueHeadDim == kind.valueHeadDim,
+                layerKinds[source].attention == kind.attention,
+                types[source] == types[index]
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged borrowed layer \(index) has a different native layout")
+            }
+        }
+        return types
+    }
+}

@@ -1,0 +1,2121 @@
+// PagedLayerCache.swift
+//
+// Batch-facing per-layer cache for the paged backend (WS-C): the
+// `CBv2AttendingLayerCache` that owns BOTH the KV update and the attention
+// dispatch, so models and the scheduler never see the storage layout.
+//
+// Attention paths (numerically pinned — one path per phase, never switching
+// mask representation across steps):
+//   - decode (`L == 1`, any B, including B == 1): the paged Metal kernel
+//     for Gemma/GPT-OSS. Qwen4 QSA (Flash-Next) writes the token into
+//     pages and attends with the same mask-free SDPA as contiguous —
+//     live 1K T=0 flipped by token 16 on the segmented kernel while
+//     prefill last-logits still matched. Native page-boundary writes and
+//     reads remain active.
+//   - prefill chunk (`B == 1`, `L > 1`): per-request SDPA over gathered
+//     pages. Qwen4 text blocks use `CBv2AttentionV1.maskMode` — the same
+//     `.causal` / window-array choice as the contiguous backend — so a
+//     multi-chunk Qwen4 prefill cannot drift across MLX's mask
+//     specializations (MLX #3384). Other models and vision keep absolute BOOL
+//     overlay; softcap still uses the composed reference (SDPA cannot
+//     express softcap). The chunk is attended in QUERY BLOCKS
+//     (`CBv2AttentionV1.queryBlockSize`, shared kill switch
+//     `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`), which bounds the materialized
+//     score tensor at `[1, queryHeads, block, visible]` instead of
+//     `[1, queryHeads, chunk, retained]`. Full-attention text chunks with a
+//     head geometry MLX fuses take ONE symbolic `.causal` call instead
+//     (`CBv2AttentionV1.usesFusedCausalPrefill`, shared with contiguous):
+//     the fused kernel materializes no scores, so there is nothing to bound.
+//   - PACKED prefill (`B > 1`, `L > 1`, WS-2.1): the SAME per-request chunk
+//     path, run once per row and concatenated on the batch axis — the
+//     storage-agnostic rectangular loop `CBv2AttentionV1.updateAndAttend`
+//     already uses, ported to paged storage. Each row gathers its OWN pages
+//     and masks in its OWN absolute coordinates, so a packed row is
+//     BIT-IDENTICAL to that row run alone and cross-row contamination is
+//     impossible by construction rather than by mask arithmetic. Requires
+//     WS-0.2p's query blocking to already bound the per-row score tensor,
+//     which it does.
+//   - VISION span chunk (`B == 1`, `L > 1`, spans bound through
+//     `CBv2SpanMaskBinding`, WS-2.2): the same mask, OR-ed with a
+//     bidirectional-within-block overlay. Because this file's mask is
+//     ALREADY materialized in absolute coordinates, the overlay is two
+//     comparisons against the block bounds — no chunk-end coordinate
+//     reconstruction, and no escape from a symbolic mode. Span chunks stay
+//     UNBLOCKED: a block's visible span is causal, and a bidirectional query
+//     may attend keys AFTER its own position.
+//   - MTP rectangular verification (`CBv2MTPRectangularSerializing`, `L > 1`
+//     with `B` rows): the decode kernel again, one query COLUMN at a time,
+//     so each column is bit-identical to that column run as a standalone
+//     `L == 1` decode. No new kernel and no multi-query attention.
+//
+// Rows with different retained lengths are handled internally: the caller
+// never pads and never builds masks.
+
+import Foundation
+import MLX
+import MLXFast
+
+public final class PagedLayerCache: CBv2AttendingLayerCache {
+    var attentionMetadata: CBv2AttentionMetadataForward?
+    var attentionPacket: CBv2AttentionPacketForward?
+
+    public let layerIndex: Int
+    public let kind: CBv2LayerKind
+    let pool: PagedKVPool
+    package var glm5NextModelBinding: GLM5NextPagedModelBinding?
+
+    package func advanceGLM5NextOffsets(by count: Int) {
+        precondition(glm5NextModelBinding != nil)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+    }
+    /// Optional attention-logit soft cap. Not part of the contract's
+    /// `updateAndAttend` signature, so it is layer-cache configuration
+    /// (from model config) instead.
+    public let attentionSoftcap: Float?
+    /// Dispatch identity, not a performance or parity qualification claim.
+    public var nativeAttentionPath: String {
+        kind.headDim != kind.valueHeadDim
+            ? "paged_native_gathered" : "paged_native_fused_or_existing_fallback"
+    }
+
+    private var pagedRows: [PagedSequenceKV] = []
+
+    // Per-row absolute RoPE offsets `[B]` (int32, device array). REBUILT from
+    // host integers only on membership changes (`setRows`); ADVANCED
+    // on-device (`+ L`) inside `updateAndAttend`, mirroring `CBv2LayerCache`.
+    // The step loop therefore never uploads a fresh host array per layer per
+    // step, and never syncs — the model reads this each step and feeds it
+    // into the forward graph, which the step's `asyncEval` collapses so the
+    // lazy `+ L` chain cannot grow O(steps).
+    private var cachedPositionOffsets: MLXArray = MLXArray([] as [Int32])
+    /// Item 25: the host values `cachedPositionOffsets` holds once evaluated,
+    /// advanced in lockstep with every device advance. A per-step frontier
+    /// check reads these instead of syncing the device array per layer.
+    public private(set) var hostPositionOffsets: [Int32] = []
+
+    private func advancePositionOffsets(by length: Int) {
+        cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+        hostPositionOffsets = hostPositionOffsets.map { $0 + Int32(length) }
+    }
+    /// Times `positionOffsets` was rebuilt from host integers (test hook);
+    /// must only move on batch membership changes, never inside the step loop.
+    private(set) var positionOffsetsHostRebuilds = 0
+
+    // Device block-table cache: rebuilt only when a row's page table
+    // changes (page allocated / rollback / composition change), not on
+    // every step. Fingerprinted by the pool-issued row SERIAL (never
+    // reused), not ObjectIdentifier — a heap address can be recycled after
+    // a finished request's row deallocates, and a same-shape decode would
+    // then attend the FINISHED request's page ids (cross-request read).
+    private var cachedTables: MLXArray?
+    private var cachedTablesFingerprint: [(serial: UInt64, tableVersion: Int)] = []
+    /// Times the device tables were rebuilt (test/telemetry hook).
+    private(set) var tablesRebuildCount = 0
+
+    /// One immutable metadata plan; never owns segment storage or a write fence.
+    let segmentDispatchCache = PagedSegmentDispatchCache()
+    /// Test hook: segmented decode as it ran before decode-metadata reuse —
+    /// a fresh dispatch plan, zero-filled merge scratch and a private seqinfo
+    /// upload on every call. It is the exactness reference; output and KV
+    /// bytes must not differ.
+    var segmentDecodeReference = false
+
+    // Kernel params `{softcap, scale, 0…}` are constant across steps for a
+    // layer; cache the device array keyed on the scale actually passed.
+    private var cachedParams: MLXArray?
+    private var cachedParamsScale: Float?
+
+    // Sinks prepared for the kernel (fp32, >= 8 elements). Models pass the
+    // same parameter array every step, so key the cache on object identity.
+    private var cachedSinks: MLXArray?
+    private var cachedSinksSource: ObjectIdentifier?
+
+    /// WS-3.4 (`CBv2MTPRectangularSerializing`): while set, a rectangular
+    /// `[B, *, L > 1, *]` call is attended one query column at a time, so
+    /// each column is bit-identical to that column run as a standalone
+    /// `L == 1` decode. The engine sets it for the duration of an MTP
+    /// verification round and clears it in a `defer`.
+    package var mtpSerializesRectangularAttention = false
+    package var mtpBatchesRectangularAttention = false
+    public private(set) var mtpBatchedAttentionCalls = 0
+    /// Opt-in, default off: a rectangular round writes its columns' K/V, then
+    /// attends every (row, column) pair as one row of a single segmented
+    /// decode dispatch, each over that column's own range. The decode kernel
+    /// gives a row the same arithmetic whatever its batchmates (fixed
+    /// partition length), and a row without a fused write reads from the
+    /// slab the bytes a fused-write step reads from its inputs. Rounds it
+    /// cannot take fall back to the column loop.
+    package var mtpBatchesRectangularColumnsAsRows = false
+    /// Rounds attended as decode rows (test hook).
+    public private(set) var mtpColumnsAsRowsCalls = 0
+    /// Diagnosis (`DARKBLOOM_PAGED_ENGINE_TRACE=1`): segment dispatch plan
+    /// hits/rebuilds and host nanoseconds, nil when tracing is off.
+    public static let engineTrace =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PAGED_ENGINE_TRACE"] == "1"
+    public var segmentDispatchTrace: String? {
+        guard let s = segmentDispatchCache.statistics else { return nil }
+        return "hits=\(s.hits) rebuilds=\(s.rebuilds) bypasses=\(s.bypasses)"
+            + " key_ns=\(s.keyNanoseconds) prep_ns=\(s.preparationNanoseconds)"
+    }
+
+    /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
+    /// layer's most recent prompt chunk, ONE ENTRY PER ROW of that chunk
+    /// pass (packed prefill runs `B` rows through it — WS-2.1). A borrower
+    /// runs AFTER the source wrote, so it cannot reproduce the pre-write
+    /// view by gathering; the source has to keep it.
+    ///
+    /// LOAD-BEARING UNDER THE RING THAT SHIPPED, and free today only by
+    /// model accident. Do not quote a formula here; read
+    /// `PagedKVPool.ringPageCount`. Its CACHE bound no longer carries a
+    /// `maxPrefillChunk` term — it sizes to `maxWindowExposure(window) +
+    /// maxSpeculativeSpan` — precisely BECAUSE this file gathers a chunk
+    /// before writing it. Under that ring a borrower can no longer
+    /// re-derive the view by gathering after the fact: the older part of
+    /// the chunk's window has already been overwritten by the chunk's own
+    /// tail, and no gather order recovers it. This array is where the
+    /// source keeps it.
+    ///
+    /// It costs nothing today only because neither supported model has a
+    /// borrower: gemma-4 and gpt-oss both run `num_kv_shared_layers: 0`, so
+    /// `LayerCacheBankV2` clears `retainsChunkForBorrowers` on every layer
+    /// (see this file's `CBv2KVSourceChunkRetaining` conformance). That is a
+    /// MODEL FACT, not a property of this design — a checkpoint with a
+    /// non-zero shared-KV tail switches the retention on and then depends on
+    /// it for correctness. Do not delete it as unused.
+    private var retainedPrefillKV: [PrefillKV] = []
+    private var retainedQuantizedViews: [PagedQuantizedBorrowedView] = []
+    /// Defaults to `true` so a cache used outside a bank is correct; the
+    /// bank turns it off for every layer no sibling borrows — which is all
+    /// of them for both supported models, so neither pays a byte.
+    private var retainsChunkForBorrowers = true
+    /// Prompt-chunk query blocks that reuse one sliding mask over equal-length,
+    /// one-block-strided key spans run as one batched SDPA call
+    /// (`attendUniformQueryBlocks`). Byte-identical to one call per block;
+    /// `false` (tests only) restores the per-block calls.
+    var batchesUniformQueryBlocks = true
+    /// Selection evidence for tests: batched calls issued by this cache.
+    private(set) var batchedQueryBlockCallsForTesting = 0
+    /// Selection evidence for tests: `writePromptKVWithoutAttention` calls.
+    private(set) var kvOnlyPromptWritesForTesting = 0
+
+    /// Item 23 (paged prefill reads its history once). A prompt chunk used to
+    /// gather the row's WHOLE history out of the pages per attention layer
+    /// (`gatherRange`: zero-filled destination, record kernel, fence) and then
+    /// concatenate the chunk onto it: O(context) bytes per chunk per layer,
+    /// O(context^2 / chunk) per prompt (9B at 30K: first token 9.2 s paged vs
+    /// 7.1 s contiguous). While a full-attention row is in its prompt, this
+    /// cache keeps a contiguous MIRROR of the row's attended range, written
+    /// in place chunk by chunk exactly as the contiguous row writes its own
+    /// buffer, so a chunk attends a VIEW of the mirror and the pages are only
+    /// written. The mirror holds the very bytes the pages hold (same dtype,
+    /// same values: the write path refuses a chunk whose dtype is not the
+    /// group's), so the attended keys/values are bit-identical to the gather.
+    /// It is transient: dropped when the row leaves the prompt (the first
+    /// decode or verification call), on any membership change, and on release.
+    /// Rows the mirror cannot serve exactly (windowed, frozen replay, a pool
+    /// with step-owned attention work, a dtype mismatch, a quantized KV layer)
+    /// keep the gather.
+    /// Kill switch: `DARKBLOOM_PAGED_PREFILL_MIRROR=0`.
+    ///
+    /// OPT-IN per cache (`prefillMirrorAllowed`): the mirror is transient
+    /// memory the pool does not charge (one copy of the prefilling row's KV),
+    /// so only an owner that budgets for it turns it on. The cluster's
+    /// one-request stage host does; the single-Mac engine does not.
+    public var prefillMirrorAllowed = false
+    package static let prefillMirrorEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PAGED_PREFILL_MIRROR"] != "0"
+    package final class PrefillMirror {
+        let serial: UInt64
+        let start: Int
+        var keys: MLXArray
+        var values: MLXArray
+        /// Tokens held, starting at absolute position `start`.
+        var count: Int
+        init(serial: UInt64, start: Int, keys: MLXArray, values: MLXArray, count: Int) {
+            self.serial = serial
+            self.start = start
+            self.keys = keys
+            self.values = values
+            self.count = count
+        }
+    }
+    private var prefillMirrors: [UInt64: PrefillMirror] = [:]
+    /// Test/telemetry hooks: history gathers issued by prompt chunks, and
+    /// chunks served from a mirror.
+    public private(set) var prefillHistoryGathers = 0
+    public private(set) var prefillMirrorChunks = 0
+    /// Verification windows served by the multi-query kernel (item 24).
+    public private(set) var mtpMultiQueryCalls = 0
+    public var prefillMirrorBytes: Int {
+        prefillMirrors.values.reduce(0) { $0 + $1.keys.nbytes + $1.values.nbytes }
+    }
+    package func dropPrefillMirrors() { if !prefillMirrors.isEmpty { prefillMirrors = [:] } }
+
+    /// Engine-queue-only observation of the ACTUAL retained source state.
+    /// Scalars only: no array/view, evaluation, loan close or accounting change.
+    package var retainedSourceChunkWitnessForTesting:
+        (retainsForBorrowers: Bool, chunks: Int, workLoans: Int)
+    {
+        (
+            retainsChunkForBorrowers, retainedPrefillKV.count,
+            retainedPrefillKV.reduce(0) { $0 + ($1.workLoan == nil ? 0 : 1) }
+        )
+    }
+
+    /// WS-2.2 (`CBv2SpanMaskBinding`). The bidirectional image spans of the
+    /// ONE vision prefill chunk currently being built, in ABSOLUTE token
+    /// coordinates — the same coordinates this file's masks already live in,
+    /// so the overlay needs no translation. The engine binds it immediately
+    /// before that chunk's graph build and unbinds it immediately after, so
+    /// it is ALWAYS nil for decode, text chunks, and other requests' chunks.
+    private(set) var boundSpanContext: CBv2SpanChunkContext?
+
+    /// Qwen4 QSA indexer side-state for the currently bound B1 row.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
+
+    public init(
+        layerIndex: Int, kind: CBv2LayerKind, pool: PagedKVPool,
+        attentionSoftcap: Float? = nil
+    ) {
+        self.layerIndex = layerIndex
+        self.kind = kind
+        self.pool = pool
+        self.attentionSoftcap = attentionSoftcap
+        if Self.engineTrace { segmentDispatchCache.statistics = .init() }
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            pool.quantizedAttentionCaches[layerIndex] = .init(self)
+        }
+        if pool.usesStepOwnedAttention {
+            if pool.attentionWorkCaches[layerIndex]?.value != nil {
+                pool.attentionWorkEngineRefusal =
+                    "step-owned paging requires one exact cache per layer"
+            } else {
+                pool.attentionWorkCaches[layerIndex] = .init(self)
+            }
+        }
+    }
+
+    /// Called only after the actual producer/borrower step has completed.
+    /// Drop aliases before native recent generations retire their charges.
+    func completeQuantizedAttentionStep() {
+        retainedQuantizedViews = []
+    }
+
+    // MARK: - Rows
+
+    public var rows: [CBv2SequenceKV] { pagedRows }
+
+    /// Set the current batch rows (row order == batch row order). O(B);
+    /// join = append a row object, leave = drop it — no storage moves.
+    /// (Contract `CBv2AttendingLayerCache.setRows` — the canonical binding.)
+    public func setRows(_ rows: [CBv2SequenceKV]) {
+        if kind.headDim != kind.valueHeadDim {
+            let valid = rows.allSatisfy { row in
+                guard let row = row as? PagedSequenceKV else { return false }
+                return row.pool === pool && !row.isReleased
+                    && row.groupKey == pool.groupKey(forLayer: layerIndex)
+            }
+            guard valid, Set(rows.map(ObjectIdentifier.init)).count == rows.count,
+                rows.count <= (pool.config.gatheredAttention?.maximumBatchSize ?? 0)
+            else {
+                pool.writeValidation.refuse(
+                    "invalid/released/aliased asymmetric row binding or explicit batch limit",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return
+            }
+        }
+        precondition(
+            kind.sharesKVWithLayer == nil || rows.isEmpty,
+            "KV-shared layers own no rows; attention borrows via attendBorrowing")
+        if pagedRows.count == 1 {
+            CBv2Qwen4IndexerBind.harvest(self, into: pagedRows[0])
+        }
+        let nextRows = rows.map { row -> PagedSequenceKV in
+            guard let paged = row as? PagedSequenceKV else {
+                fatalError("[PagedLayerCache] rows must be PagedSequenceKV from the same backend")
+            }
+            precondition(
+                paged.pool === pool && paged.groupKey == pool.groupKey(forLayer: layerIndex),
+                "row group \(paged.groupKey) does not match layer kind")
+            return paged
+        }
+        if nextRows.count != pagedRows.count
+            || !zip(nextRows, pagedRows).allSatisfy({ $0.serial == $1.serial })
+        {
+            segmentDispatchCache.clear()
+            pool.segmentSeqinfo.clear()
+        }
+        retainedQuantizedViews = []
+        pagedRows = nextRows
+        if !prefillMirrors.isEmpty {
+            let bound = Set(nextRows.map(\.serial))
+            prefillMirrors = prefillMirrors.filter { bound.contains($0.key) }
+        }
+        rebuildPositionOffsets()
+        retainedPrefillKV = []
+        if pagedRows.count == 1, CBv2Qwen4IndexerBind.restore(self, from: pagedRows[0]) {
+            return
+        }
+        clearQwen4IndexerState()
+    }
+
+    /// Per-row absolute RoPE offsets `[B]` (device int32). Read BEFORE
+    /// `updateAndAttend` for the step — it holds the PRE-update offsets of
+    /// the tokens about to be processed (snapshot semantics). KV-shared
+    /// layers own no rows, so their own value is empty (they reuse the
+    /// source layer's pre-update capture).
+    public var positionOffsets: MLXArray { cachedPositionOffsets }
+
+    private func rebuildPositionOffsets() {
+        positionOffsetsHostRebuilds += 1
+        CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
+        hostPositionOffsets = pagedRows.map { Int32($0.absoluteOffset) }
+        cachedPositionOffsets = MLXArray(hostPositionOffsets)
+    }
+
+    // MARK: - Attention
+
+    private func faultOutput(_ queries: MLXArray) -> MLXArray {
+        // Preserve the legacy dtype-fault identity contract for uniform rows.
+        if kind.headDim == kind.valueHeadDim { return queries }
+        return MLXArray.zeros(
+            [
+                queries.ndim == 4 ? queries.dim(0) : max(1, pagedRows.count),
+                kind.queryHeads, queries.ndim == 4 ? queries.dim(2) : 1, kind.valueHeadDim,
+            ], dtype: queries.dtype)
+    }
+
+    /// Scalar/shape checks only; no eval, item, page allocation or cursor edit.
+    private func validateGatheredCall(
+        queries: MLXArray, rows: [PagedSequenceKV],
+        writing: Bool, sinks: MLXArray?
+    ) -> Bool {
+        guard kind.headDim != kind.valueHeadDim else { return true }
+        guard !pool.writeValidation.isFaulted else { return false }
+        guard let limits = pool.config.gatheredAttention, pool.gatheredAttentionIsPrepared,
+            pool.segmentGrant != nil, boundSpanContext == nil,
+            !mtpSerializesRectangularAttention, !mtpBatchesRectangularAttention,
+            attentionMetadata == nil, attentionPacket == nil
+        else {
+            return pool.writeValidation.refuse(
+                "asymmetric gathered attention owner is unprepared or optional MTP/span/packet path is unqualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+        }
+        guard queries.ndim == 4, queries.dim(0) == rows.count, !rows.isEmpty,
+            rows.count <= limits.maximumBatchSize, queries.dim(1) == kind.queryHeads,
+            queries.dim(2) > 0, queries.dim(2) <= limits.maximumQueryTokens,
+            queries.dim(3) == kind.headDim,
+            [.float16, .bfloat16, .float32].contains(queries.dtype),
+            queries.dtype == pool.layerDTypes[layerIndex],
+            Set(rows.map(\.serial)).count == rows.count,
+            rows.allSatisfy({ row in
+                guard row.pool === pool, !row.isReleased,
+                    let end = CBv2KVGeometry.add(row.absoluteOffset, writing ? queries.dim(2) : 0)
+                else { return false }
+                return row.groupKey == pool.groupKey(forLayer: layerIndex)
+                    && end <= row.maxLength && end <= limits.maximumContextTokens
+                    && (!writing || row.windowSize == nil
+                        || queries.dim(2) <= pool.config.maxPrefillChunk)
+                    && (!writing || row.absoluteOffset >= row.frozenHighWater
+                        || end <= row.frozenHighWater)
+                    && (writing || queries.dim(2) <= row.absoluteOffset)
+            }),
+            !kind.hasSinks || sinks == nil
+                || (sinks!.shape == [kind.queryHeads]
+                    && [.float16, .bfloat16, .float32].contains(sinks!.dtype)
+                    && (queries.dtype == .float32 || sinks!.dtype == queries.dtype))
+        else {
+            return pool.writeValidation.refuse(
+                "asymmetric query/row/sink geometry or explicit execution bound exceeded",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+        }
+        return true
+    }
+
+    private func beginAttentionWork(queries: MLXArray, rows: [PagedSequenceKV]) -> Bool {
+        guard pool.usesStepOwnedAttention else { return true }
+        guard pool.activeAttentionLayer == nil,
+            pool.activeAttentionWork?.consume(
+                layer: layerIndex, rows: rows,
+                queries: queries.dim(2), softcap: attentionSoftcap != nil) == true
+        else {
+            return pool.writeValidation.refuse(
+                "missing/stale/repeated attention cache ticket",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+        }
+        pool.activeAttentionLayer = layerIndex
+        return true
+    }
+
+    private func finishAttentionCall(_ output: MLXArray) -> MLXArray {
+        pool.activeAttentionWork?.retainRoots([output, cachedPositionOffsets])
+        return output
+    }
+
+    /// Append already-projected trusted K/V without evaluating attention.
+    /// This is used by embedded assistants when authoritative target history
+    /// advances their private paged cache. It deliberately shares the same
+    /// native write validation and page ownership as `updateAndAttend`.
+    public func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray] {
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex)
+        else { return [keys, values] }
+        guard kind.headDim == kind.valueHeadDim else {
+            pool.writeValidation.refuse(
+                "asymmetric assistant trusted-append path is not qualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            return []
+        }
+        precondition(kind.sharesKVWithLayer == nil && pagedRows.count == keys.dim(0))
+        precondition(keys.ndim == 4 && values.shape == keys.shape)
+        var roots: [MLXArray] = []
+        roots.reserveCapacity(pagedRows.count * 2)
+        for (index, row) in pagedRows.enumerated() {
+            let k = keys[index]
+            let v = values[index]
+            row.write(keys: k, values: v)
+            roots.append(k)
+            roots.append(v)
+        }
+        rebuildPositionOffsets()
+        retainedPrefillKV = []
+        // The slab mutation is represented by the group's write fence, not
+        // by the projected source tensors. Return it so callers that publish
+        // one trusted chunk before constructing the next establish the same
+        // generation ordering as updateAndAttend.
+        roots.append(contentsOf: innerState())
+        return roots
+    }
+
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex)
+        else { return faultOutput(queries) }
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: queries.ndim == 4 ? queries.dim(2) : nil, layerIndex: layerIndex),
+            validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: sinks)
+        else {
+            return faultOutput(queries)
+        }
+        precondition(kind.sharesKVWithLayer == nil, "shared layers must call attendBorrowing")
+        guard beginAttentionWork(queries: queries, rows: pagedRows) else {
+            return faultOutput(queries)
+        }
+        defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
+        let b = queries.dim(0)
+        let l = queries.dim(2)
+        precondition(b == pagedRows.count, "queries batch \(b) != rows \(pagedRows.count)")
+        // Sinks apply only to layers that declare them (same gate as
+        // CBv2AttentionV1) — a sink-free layer must ignore a passed array.
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+
+        let metadata = attentionMetadata?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap, spans: boundSpanContext != nil)
+        let packet = attentionPacket?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap, spans: boundSpanContext != nil)
+        let output: MLXArray
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            guard boundSpanContext == nil || b == 1 else {
+                pool.writeValidation.refuse(
+                    "packed vision spans require a single source row",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return faultOutput(queries)
+            }
+            retainedPrefillKV = []
+            let result = PagedQuantizedLayerOperation.write(
+                queries: queries, keys: keys, values: values, rows: pagedRows, kind: kind,
+                params: params(scale: scale), sinks: preparedSinks(effectiveSinks),
+                softcap: attentionSoftcap != nil, spans: boundSpanContext,
+                source: pool.kernelSource,
+                windowProducer: { [self] row, k, v in
+                    let raw = prefillKVWritingChunk(
+                        row: row, chunkKeys: k, chunkValues: v,
+                        dtype: pool.layerDTypes[layerIndex])
+                    return PagedQuantizedNativeView(
+                        start: raw.start,
+                        keys: raw.keys.squeezed(axis: 0), values: raw.values.squeezed(axis: 0),
+                        owner: nil)
+                })
+            guard !pool.writeValidation.isFaulted else {
+                retainedQuantizedViews = []
+                return faultOutput(queries)
+            }
+            retainedQuantizedViews = retainsChunkForBorrowers ? result.views : []
+            output = result.output
+        } else if l == 1 {
+            retainedPrefillKV = []
+            dropPrefillMirrors()
+            if usesGatheredNativeDecode {
+                output = decodeExactSDPA(
+                    queries: queries, keys: keys, values: values,
+                    rows: pagedRows, scale: scale, sinks: effectiveSinks)
+            } else {
+                // Decode: reserve each row's destination host-side; the kernel
+                // writes the tiles IN PLACE before attending (fused write —
+                // the slabs are never versioned through MLX ops).
+                let targets = pagedRows.map { $0.prepareDecodeWrite() }
+                output = dispatchDecode(
+                    queries: queries,
+                    newKeys: keys.squeezed(axis: 2),
+                    newValues: values.squeezed(axis: 2),
+                    writeTargets: targets,
+                    rows: pagedRows, scale: scale, sinks: effectiveSinks, metadata: metadata,
+                    packet: packet)
+            }
+        } else if mtpSerializesRectangularAttention {
+            // MTP rectangular verification: the round batches the
+            // weight-bound model body across the `1 + k` columns, but
+            // attention is serialised per column. Each column reserves its
+            // own destination and the kernel fuses the write, exactly as a
+            // standalone decode step would. This branch is checked BEFORE
+            // the prompt-chunk branch: an MTP round's `[B, 1 + k]` call is
+            // rectangular VERIFICATION, never a packed prompt chunk.
+            retainedPrefillKV = []
+            dropPrefillMirrors()
+            output = attendRectangularColumns(
+                queries: queries, keys: keys, values: values,
+                rows: pagedRows, scale: scale, sinks: effectiveSinks)
+        } else {
+            precondition(
+                boundSpanContext == nil || b == 1,
+                "[PagedLayerCache] span-bearing chunks are never packed")
+            // Prompt chunk. `b == 1` is the ordinary per-request shape;
+            // `b > 1` is WS-2.1 PACKED prefill, which is the SAME work run
+            // once per row. Nothing here reads a batchmate: the gather
+            // walks THIS row's page table, the write lands in THIS row's
+            // pages, and the mask is built from THIS row's absolute
+            // positions. That is why a packed row is bit-identical to the
+            // row run alone, and why cross-row contamination is not a
+            // property the mask has to establish.
+            //
+            // WS-1.2: assemble each chunk's KV BEFORE writing it, so this
+            // path only ever asks the ring for `window - 1` tokens. The
+            // chunk's own K/V need no gather at all — they are the
+            // arguments. A row in a FROZEN REPLAY is the one exception, and
+            // it is why the write lives inside `prefillKVWritingChunk`
+            // instead of out here: that row's chunk half comes from the
+            // pages too, and it has to be read AFTER the cursor moves.
+            //
+            // Gathering AFTER the write instead asks for
+            // `window - 1 + chunk` (`retainedCount` with
+            // `lastUpdateTokens == chunk`), which is exactly the term that
+            // would force `ringPageCount` to carry `maxPrefillChunk` again
+            // and put gemma-4's windowed layers back at the 97 pages a
+            // 1,024-token window used to cost. With the gather hoisted the
+            // ring only has to satisfy `ringPages * pageSize >= window - 1`,
+            // which is what let it drop to `window + maxSpeculativeSpan`
+            // (65 pages; derive it from `ringPageCount`). Under that sizing a
+            // post-write gather is not merely wasteful, it aborts the
+            // process on `gatherRange`'s eviction precondition for any
+            // windowed chunk past `pageSize + 1` tokens.
+            //
+            // The batch-axis decomposition is `CBv2AttentionV1.packedPerRow`,
+            // shared with the contiguous backend so "packed" cannot mean two
+            // different things depending on storage. Only the per-row BODY
+            // is paged's own, and it has to be: contiguous updates the row
+            // and masks in relative coordinates, this gathers pages before
+            // writing and masks in absolute ones.
+            var views: [PrefillKV] = []
+            views.reserveCapacity(b)
+            let chunkSinks = prefillSinks(effectiveSinks, queryDType: queries.dtype)
+            output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+                let row = pagedRows[index]
+                let rawKV = prefillKVWritingChunk(
+                    row: row, chunkKeys: slice(keys), chunkValues: slice(values),
+                    dtype: queries.dtype)
+                let kv = prepareRetainedWork(rawKV, row: row)
+                views.append(kv)
+                return prefillAttend(
+                    queries: slice(queries), kv: kv, scale: scale, sinks: chunkSinks)
+            }
+            retainedPrefillKV = retainsChunkForBorrowers ? views : []
+        }
+        // Advance offsets ON-DEVICE (uniform L for every row in the call:
+        // decode is [B,1], a prompt chunk is [1,chunk], and a packed group
+        // is [B,chunk] with one common chunk length) — the rows just
+        // advanced their absolute counters by exactly L, so the cached
+        // device array tracks them without a per-step host rebuild.
+        advancePositionOffsets(by: l)
+        return finishAttentionCall(output)
+    }
+
+    /// Whether `writePromptKVWithoutAttention` may stand in for this layer's
+    /// prompt-chunk `updateAndAttend`: plain native K/V whose attention call
+    /// carries nothing beyond the write and the offset advance — no quantized
+    /// group, step-owned tickets, metadata/packet observer, span, MTP mode,
+    /// borrower retention or asymmetric heads. Scalars only.
+    public var acceptsPromptKVWithoutAttention: Bool {
+        !pagedRows.isEmpty && !pool.writeValidation.isFaulted
+            && kind.headDim == kind.valueHeadDim && kind.sharesKVWithLayer == nil
+            && pool.groupKey(forLayer: layerIndex).quantization == nil
+            && !pool.usesStepOwnedAttention && attentionMetadata == nil
+            && attentionPacket == nil && boundSpanContext == nil
+            && !mtpSerializesRectangularAttention && !mtpBatchesRectangularAttention
+            && !retainsChunkForBorrowers
+    }
+
+    /// Commit a `[B, Hkv, L > 1, D]` prompt chunk exactly as `updateAndAttend`
+    /// would — same validation, same per-row `PagedSequenceKV.write` of the
+    /// same tensors, same on-device offset advance — but build no history
+    /// view and attend nothing. For a caller that never reads the layer's
+    /// output (the final layer of a `.evaluationOnly` prompt chunk). The
+    /// write is committed through `innerState()`, as for every prompt chunk.
+    public func writePromptKVWithoutAttention(keys: MLXArray, values: MLXArray) {
+        precondition(acceptsPromptKVWithoutAttention, "KV-only prompt write is not qualified")
+        precondition(keys.ndim == 4 && keys.dim(2) > 1, "KV-only write is for prompt chunks")
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: keys.dim(2), layerIndex: layerIndex)
+        else { return }
+        let b = keys.dim(0)
+        precondition(b == pagedRows.count, "keys batch \(b) != rows \(pagedRows.count)")
+        for (index, row) in pagedRows.enumerated() {
+            let rowKeys = b == 1 ? keys : keys[index ..< (index + 1)]
+            let rowValues = b == 1 ? values : values[index ..< (index + 1)]
+            row.write(keys: rowKeys.squeezed(axis: 0), values: rowValues.squeezed(axis: 0))
+        }
+        retainedPrefillKV = []
+        kvOnlyPromptWritesForTesting += 1
+        advancePositionOffsets(by: keys.dim(2))
+    }
+
+    /// Write K/V without leftover dense SDPA so gathered QSA can attend the
+    /// selected blocks only. B1 full-attention rows only.
+    public func updateKVAndAdvanceOffsets(
+        keys: MLXArray, values: MLXArray
+    ) -> [(keys: MLXArray, values: MLXArray)] {
+        guard kind.headDim == kind.valueHeadDim else {
+            pool.writeValidation.refuse(
+                "asymmetric Qwen selected/last-query specialization is unqualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            return []
+        }
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "PagedLayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(
+            pagedRows.count == keys.dim(0), "PagedLayerCache: K/V batch does not match rows")
+        var views: [(keys: MLXArray, values: MLXArray)] = []
+        views.reserveCapacity(pagedRows.count)
+        let length = keys.dim(2)
+        if length == 1 {
+            for (rowIndex, row) in pagedRows.enumerated() {
+                row.write(
+                    keys: keys[rowIndex ..< rowIndex + 1].squeezed(axis: 0),
+                    values: values[rowIndex ..< rowIndex + 1].squeezed(axis: 0))
+                views.append(row.attendableViews())
+            }
+        } else {
+            for (rowIndex, row) in pagedRows.enumerated() {
+                let kv = prefillKVWritingChunk(
+                    row: row,
+                    chunkKeys: keys[rowIndex ..< rowIndex + 1],
+                    chunkValues: values[rowIndex ..< rowIndex + 1],
+                    dtype: keys.dtype)
+                views.append((kv.keys, kv.values))
+            }
+        }
+        advancePositionOffsets(by: length)
+        return views
+    }
+
+    public func qwen4CanGatherSelectedKV(keys: MLXArray, values: MLXArray) -> Bool {
+        guard !pool.writeValidation.isFaulted, pagedRows.count == 1, kind.sharesKVWithLayer == nil,
+            !retainsChunkForBorrowers, boundSpanContext == nil,
+            // Five chained drafts plus the target seed use six columns.
+            keys.ndim == 4, keys.dim(0) == 1, (1 ... 6).contains(keys.dim(2)),
+            keys.shape == values.shape, keys.dtype == values.dtype,
+            pagedRows[0].supportsQwen4SelectedGather
+        else { return false }
+        let group = pool.group(pagedRows[0].groupKey)
+        return keys.dtype == group.dtype && keys.dim(1) == group.key.kvHeads
+            && keys.dim(3) == group.key.headDim
+    }
+
+    public func qwen4UpdateAndGatherSelectedKV(
+        keys: MLXArray, values: MLXArray, tokenIndices: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray) {
+        precondition(qwen4CanGatherSelectedKV(keys: keys, values: values))
+        let row = pagedRows[0]
+        row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
+        advancePositionOffsets(by: keys.dim(2))
+        return row.gatherSelected(tokenIndices)
+    }
+
+    public func attendBorrowing(
+        source: CBv2AttendingLayerCache,
+        queries: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
+        if kind.headDim != kind.valueHeadDim {
+            // A shared storage group proves geometry, not model-layer ownership.
+            // Refuse the wrong producer before gathering or borrowing chunk views.
+            guard let owner = kind.sharesKVWithLayer,
+                let source = source as? PagedLayerCache, source.pool === pool,
+                source.layerIndex == owner, source.kind.sharesKVWithLayer == nil,
+                source.kind.headDim == kind.headDim, source.kind.valueHeadDim == kind.valueHeadDim,
+                source.kind.kvHeads == kind.kvHeads, source.kind.attention == kind.attention,
+                validateGatheredCall(
+                    queries: queries, rows: source.pagedRows, writing: false, sinks: sinks)
+            else {
+                pool.writeValidation.refuse(
+                    "invalid asymmetric borrower/source binding",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return faultOutput(queries)
+            }
+        }
+        precondition(kind.sharesKVWithLayer != nil, "attendBorrowing requires a KV-shared layer")
+        guard let src = source as? PagedLayerCache else {
+            fatalError("[PagedLayerCache] can only borrow from another PagedLayerCache")
+        }
+        guard beginAttentionWork(queries: queries, rows: src.pagedRows) else {
+            return faultOutput(queries)
+        }
+        defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
+        precondition(
+            kind.attention == src.kind.attention,
+            "KV-shared layer must share the source layer's attention type")
+        let l = queries.dim(2)
+        // Same sink gate as updateAndAttend, keyed on THIS layer's kind.
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            guard src.layerIndex == kind.sharesKVWithLayer, src.pool === pool,
+                src.retainedQuantizedViews.count == queries.dim(0)
+            else {
+                pool.writeValidation.refuse(
+                    "packed borrower requires its actual source view",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return faultOutput(queries)
+            }
+            let outputs = src.retainedQuantizedViews.enumerated().map { index, view in
+                PagedQuantizedLayerOperation.attend(
+                    queries: queries[index ..< index + 1], view: view, kind: kind,
+                    params: params(scale: scale), sinks: preparedSinks(effectiveSinks),
+                    softcap: attentionSoftcap != nil, spans: boundSpanContext,
+                    source: pool.kernelSource)
+            }
+            return finishAttentionCall(
+                outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+        } else if l == 1 {
+            if usesGatheredNativeDecode {
+                return finishAttentionCall(
+                    decodeExactSDPA(
+                        queries: queries, keys: nil, values: nil,
+                        rows: src.pagedRows, scale: scale, sinks: effectiveSinks))
+            }
+            return dispatchDecode(
+                queries: queries, rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
+                tableProvider: src)
+        } else if mtpSerializesRectangularAttention {
+            // Same per-column serialisation, minus the writes: the source
+            // layer owns the KV and already wrote all L columns. That is
+            // precisely why the columns need an explicit `qPosFromEnd` —
+            // the source rows' `absoluteOffset` has ALREADY advanced by L,
+            // so `decodeAttendRange` on its own would resolve every column
+            // to the last one.
+            return attendRectangularColumns(
+                queries: queries, keys: nil, values: nil,
+                rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
+                tableProvider: src)
+        } else {
+            let b = queries.dim(0)
+            precondition(
+                b == src.pagedRows.count,
+                "borrowed chunk batch \(b) != source rows \(src.pagedRows.count)")
+            // The source assembled `gather(window history) ++ chunk` before
+            // it wrote, and the post-write ring cannot reproduce the older
+            // part of it (WS-1.2), so the borrower attends the SOURCE's
+            // retained views rather than re-gathering — one per packed row,
+            // in row order. `retainsChunkForBorrowers` is only ever cleared
+            // for a layer no sibling borrows from, so reaching this with no
+            // retained views means the bank wired the KV-sharing graph
+            // wrong.
+            guard src.retainedPrefillKV.count == b else {
+                if pool.usesStepOwnedAttention {
+                    pool.writeValidation.refuse(
+                        "sealed borrower has no producer chunk loan",
+                        expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                    return faultOutput(queries)
+                }
+                fatalError(
+                    "[PagedLayerCache] layer \(layerIndex) borrows from layer "
+                        + "\(src.layerIndex), which retained \(src.retainedPrefillKV.count) "
+                        + "chunk views for \(b) rows — the source was told it has no "
+                        + "borrowers, or it last ran a decode step")
+            }
+            // Same shared batch-axis decomposition as the owning path.
+            let chunkSinks = prefillSinks(effectiveSinks, queryDType: queries.dtype)
+            let output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+                let kv = src.retainedPrefillKV[index]
+                if pool.usesStepOwnedAttention {
+                    let row = src.pagedRows[index]
+                    guard let work = pool.activeAttentionWork, let loan = kv.workLoan,
+                        loan.generation == work.generation, loan.layer == src.layerIndex,
+                        loan.serial == row.serial,
+                        loan.range == (kv.queryStart ..< (kv.queryStart + l))
+                    else {
+                        pool.writeValidation.refuse(
+                            "borrowed prefill loan does not match the sealed producer generation/range",
+                            expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                        return faultOutput(slice(queries))
+                    }
+                }
+                precondition(
+                    kv.queryCount == l,
+                    "borrowed chunk is \(kv.queryCount) tokens, queries are \(l)")
+                return prefillAttend(
+                    queries: slice(queries), kv: kv, scale: scale, sinks: chunkSinks)
+            }
+            return finishAttentionCall(output)
+        }
+    }
+
+    // MARK: - Decode path (paged kernel)
+
+    /// Flash-Next QSA: page write + gather + contiguous SDPA. The segmented
+    /// Metal decode kernel is still native paging, but it is not 1K-exact
+    /// on this artifact. Default stays on the exact path.
+    private var usesGatheredNativeDecode: Bool {
+        kind.headDim != kind.valueHeadDim
+            || (kind.qwen4IndexerCompressRatio != nil
+                && attentionSoftcap == nil
+                && !kind.isBidirectional)
+    }
+
+    /// Write (when this layer owns KV), gather the visible page range, and
+    /// attend with mask-free SDPA — the same terminal contiguous decode uses.
+    private func decodeExactSDPA(
+        queries: MLXArray, keys: MLXArray?, values: MLXArray?,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
+        qPosFromEnd: Int = 0
+    ) -> MLXArray {
+        precondition((keys == nil) == (values == nil))
+        let b = queries.dim(0)
+        precondition(b == rows.count, "exact paged decode batch \(b) != rows \(rows.count)")
+        let querySinks = prefillSinks(sinks, queryDType: queries.dtype)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(b)
+        for index in 0 ..< b {
+            let row = rows[index]
+            if let keys, let values {
+                precondition(qPosFromEnd == 0, "owning exact decode writes the frontier column")
+                row.write(
+                    keys: keys[index ..< index + 1].squeezed(axis: 0),
+                    values: values[index ..< index + 1].squeezed(axis: 0))
+            }
+            let range = attendRange(row: row, qPosFromEnd: qPosFromEnd)
+            let (gatheredKeys, gatheredValues) = row.gatherRange(
+                start: range.start, count: range.length)
+            let query = queries[index ..< index + 1]
+            if let softcap = attentionSoftcap {
+                outputs.append(
+                    PagedAttentionReference.composedAttention(
+                        queries: query,
+                        keys: cast(gatheredKeys, to: query.dtype),
+                        values: cast(gatheredValues, to: query.dtype),
+                        scale: scale, sinks: querySinks, softcap: softcap))
+            } else {
+                outputs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: query,
+                        keys: cast(gatheredKeys, to: query.dtype),
+                        values: cast(gatheredValues, to: query.dtype),
+                        scale: scale, mask: .none, sinks: querySinks))
+            }
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// Write every owning column, gather the final visible range once, then
+    /// mask-free SDPA each query against the prefix it already used. Sliding
+    /// windows can move `start` per column, so those stay on the per-column
+    /// gather. Same terminal as `decodeExactSDPA`; only the gather is shared.
+    /// One symbolic-`.causal` SDPA on the rectangle failed frozen 1K
+    /// (`c3040910…` vs `54e2a1f5…`); do not reopen that path.
+    private func decodeExactRectangularSDPA(
+        queries: MLXArray, keys: MLXArray?, values: MLXArray?,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        precondition((keys == nil) == (values == nil))
+        let width = queries.dim(2)
+        guard width > 1, rows.allSatisfy({ $0.windowSize == nil }) else { return nil }
+        let b = queries.dim(0)
+        precondition(b == rows.count, "exact rectangular batch \(b) != rows \(rows.count)")
+        if let keys, let values {
+            for index in 0 ..< b {
+                rows[index].write(
+                    keys: keys[index ..< index + 1].squeezed(axis: 0),
+                    values: values[index ..< index + 1].squeezed(axis: 0))
+            }
+        }
+        let querySinks = CBv2AttentionV1.sdpaSinks(sinks, queryDType: queries.dtype)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(b)
+        for index in 0 ..< b {
+            let row = rows[index]
+            let finalRange = row.decodeAttendRange
+            let (gatheredKeys, gatheredValues) = row.gatherRange(
+                start: finalRange.start, count: finalRange.length)
+            let attnKeys = cast(gatheredKeys, to: queries.dtype)
+            let attnValues = cast(gatheredValues, to: queries.dtype)
+            var columns: [MLXArray] = []
+            columns.reserveCapacity(width)
+            for t in 0 ..< width {
+                let visible = attendRange(row: row, qPosFromEnd: width - 1 - t)
+                precondition(
+                    visible.start == finalRange.start,
+                    "unwindowed rectangular column moved gather start")
+                precondition(
+                    visible.length <= finalRange.length,
+                    "unwindowed rectangular column exceeds the shared gather")
+                let query = queries[index ..< index + 1, 0..., t ..< (t + 1), 0...]
+                columns.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: query,
+                        keys: attnKeys[0..., 0..., 0 ..< visible.length, 0...],
+                        values: attnValues[0..., 0..., 0 ..< visible.length, 0...],
+                        scale: scale, mask: .none, sinks: querySinks))
+            }
+            outputs.append(concatenated(columns, axis: 2))
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// One fused kernel dispatch for the batch. `newKeys`/`newValues`
+    /// (`[B, kvHeads, D]`) with per-row `writeTargets` make pass A write
+    /// the step's tiles in place before attending; both are nil on the
+    /// KV-borrowing path (the owning layer already wrote).
+    ///
+    /// `qPosFromEnd` is how many positions BEFORE each row's frontier this
+    /// query sits: 0 (the default) is the row's last written position, i.e.
+    /// ordinary decode. Only MTP rectangular verification on a KV-borrowing
+    /// layer passes a non-zero value.
+    private func dispatchDecode(
+        queries: MLXArray,
+        newKeys: MLXArray? = nil,
+        newValues: MLXArray? = nil,
+        writeTargets: [(page: Int32, slot: Int)]? = nil,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
+        tableProvider: PagedLayerCache? = nil,
+        qPosFromEnd: Int = 0, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
+    ) -> MLXArray {
+        precondition((newKeys == nil) == (writeTargets == nil))
+        let provider = tableProvider ?? self
+        let group = pool.group(rows[0].groupKey)
+        guard !group.key.isAsymmetric else {
+            pool.writeValidation.refuse(
+                "asymmetric direct fused dispatch is unqualified", expected: group.dtype,
+                layerIndex: layerIndex)
+            return faultOutput(queries)
+        }
+        if group.segmentLayout != nil {
+            let descriptors = rows.enumerated().map { index, row in
+                PagedSegmentDispatchPlan.Row(
+                    pages: row.table,
+                    info: row.seqInfoRow(
+                        attending: attendRange(row: row, qPosFromEnd: qPosFromEnd),
+                        writeTarget: writeTargets?[index]),
+                    identity: .init(serial: row.serial, tableVersion: row.tableVersion))
+            }
+            let result = PagedSegmentAttention.decode(
+                queries: queries, newKeys: newKeys, newValues: newValues,
+                group: group, rows: descriptors, sinks: preparedSinks(sinks),
+                params: params(scale: scale), softcap: attentionSoftcap != nil,
+                source: pool.kernelSource,
+                dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+                // Keep the merge scratch zero-filled. With uninitialized scratch,
+                // CI's paravirtual GPU saw batched rows diverge from rows run alone.
+                zeroFilledScratch: true,
+                seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo
+            ).expandedDimensions(axis: 2)
+            let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
+            metadata?.finishPaged(
+                group: group, kernelOutputDType: result.dtype, output: output,
+                dispatch: "paged_segmented_decode")
+            packet?.finishPaged(
+                group: group, row: rows[0], kernelOutputDType: result.dtype, output: output,
+                dispatch: "paged_segmented_decode")
+            return output
+        }
+        let tables = provider.deviceTables(rows: rows)
+
+        let (seqinfo, maxAttendLength) = PagedAttentionKernel.seqinfo(
+            rows.enumerated().map { i, row in
+                row.seqInfoRow(
+                    attending: attendRange(row: row, qPosFromEnd: qPosFromEnd),
+                    writeTarget: writeTargets?[i])
+            })
+
+        let out: MLXArray
+        let nextFence: MLXArray?
+        do {
+            (out, nextFence) = try PagedAttentionKernel.decode(
+                queries: queries,
+                newKeys: newKeys,
+                newValues: newValues,
+                kSlab: group.kSlab,
+                vSlab: group.vSlab,
+                tables: tables,
+                seqinfo: seqinfo,
+                maxAttendLength: maxAttendLength,
+                sinks: preparedSinks(sinks),
+                params: params(scale: scale),
+                softcap: attentionSoftcap != nil,
+                pageSize: pool.config.pageSize,
+                writeFence: group.writeFence,
+                kernelSource: pool.kernelSource
+            )
+        } catch {
+            pool.writeValidation.record(error)
+            return queries
+        }
+
+        // The fused write advanced the group's write-fence chain: later
+        // slab readers (KV-borrowing layers, next steps' dispatches,
+        // gathers) consume it and order after this dispatch's writes.
+        if let nextFence {
+            group.writeFence = nextFence
+        }
+        // [B, QH, D] -> [B, QH, 1, D], back in the model dtype.
+        var result = out.expandedDimensions(axis: 2)
+        if result.dtype != queries.dtype {
+            result = result.asType(queries.dtype)
+        }
+        metadata?.finishPaged(
+            group: group, kernelOutputDType: out.dtype, output: result,
+            dispatch: "paged_fixed_decode")
+        packet?.finishPaged(
+            group: group, row: rows[0], kernelOutputDType: out.dtype, output: result,
+            dispatch: "paged_fixed_decode")
+        return result
+    }
+
+    /// The absolute range a query `qPosFromEnd` positions before `row`'s
+    /// frontier may attend, in the `(start, length)` form the kernel wants.
+    ///
+    /// `qPosFromEnd == 0` DELEGATES to the row's own `decodeAttendRange`, so
+    /// the ordinary decode path keeps exactly one definition of the range
+    /// and this generalisation cannot drift from it.
+    private func attendRange(
+        row: PagedSequenceKV, qPosFromEnd: Int
+    ) -> (start: Int, length: Int) {
+        guard qPosFromEnd > 0 else { return row.decodeAttendRange }
+        let qPos = row.absoluteOffset - 1 - qPosFromEnd
+        precondition(
+            qPos >= row.baseOffset,
+            "[PagedLayerCache] rectangular column \(qPosFromEnd) back from "
+                + "\(row.absoluteOffset) precedes the row's base \(row.baseOffset)")
+        var start = row.baseOffset
+        if let window = row.windowSize {
+            start = max(start, qPos - window + 1)
+        }
+        return (start, qPos - start + 1)
+    }
+
+    /// MTP rectangular verification (WS-3.4): attend `[B, *, L, *]` one
+    /// query column at a time over the EXISTING fused decode dispatch.
+    ///
+    /// Non-nil `keys`/`values` mean this layer OWNS the KV: each column
+    /// reserves its own destination (`prepareDecodeWrite`) and the kernel
+    /// fuses the write, so column `t` attends `[max(base, qPos - window + 1),
+    /// qPos]` with `qPos` its own absolute position — bit-identical to that
+    /// column run as a standalone `L == 1` decode. Nil means a KV-borrowing
+    /// layer whose source already wrote every column, so the columns walk
+    /// BACKWARD from the source rows' already-advanced frontier.
+    private func attendRectangularColumns(
+        queries: MLXArray, keys: MLXArray?, values: MLXArray?,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
+        tableProvider: PagedLayerCache? = nil
+    ) -> MLXArray {
+        precondition((keys == nil) == (values == nil))
+        precondition(
+            rows.count == queries.dim(0),
+            "rectangular verification needs one row per query batch entry")
+        let l = queries.dim(2)
+        var outputs: [MLXArray] = []
+        if usesGatheredNativeDecode {
+            if let fused = decodeExactRectangularSDPA(
+                queries: queries, keys: keys, values: values,
+                rows: rows, scale: scale, sinks: sinks)
+            {
+                return fused
+            }
+            outputs.reserveCapacity(l)
+            for t in 0 ..< l {
+                let column = queries[0..., 0..., t ..< (t + 1), 0...]
+                if let newKeys = keys, let newValues = values {
+                    outputs.append(
+                        decodeExactSDPA(
+                            queries: column,
+                            keys: newKeys[0..., 0..., t ..< (t + 1), 0...],
+                            values: newValues[0..., 0..., t ..< (t + 1), 0...],
+                            rows: rows, scale: scale, sinks: sinks))
+                } else {
+                    outputs.append(
+                        decodeExactSDPA(
+                            queries: column, keys: nil, values: nil,
+                            rows: rows, scale: scale, sinks: sinks,
+                            qPosFromEnd: l - 1 - t))
+                }
+            }
+            return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        }
+        if mtpBatchesRectangularColumnsAsRows, tableProvider == nil, let keys, let values,
+            let output = attendColumnsAsDecodeRows(
+                queries: queries, keys: keys, values: values, rows: rows, scale: scale,
+                sinks: sinks)
+        {
+            return output
+        }
+        if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
+            let keys, let values
+        {
+            let group = pool.group(rows[0].groupKey)
+            if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
+                mtpBatchedAttentionCalls += 1
+                let before = PagedMultiQueryAttention.dispatches
+                defer {
+                    if PagedMultiQueryAttention.dispatches != before { mtpMultiQueryCalls += 1 }
+                }
+                return PagedMTPBatchedColumns.attend(
+                    queries: queries, keys: keys, values: values,
+                    row: rows[0], group: group, sinks: preparedSinks(sinks),
+                    params: params(scale: scale),
+                    softcap: attentionSoftcap != nil, source: pool.kernelSource,
+                    dispatchCache: segmentDispatchCache)
+            }
+        }
+        outputs.reserveCapacity(l)
+        for t in 0 ..< l {
+            let column = queries[0..., 0..., t ..< (t + 1), 0...]
+            if let newKeys = keys, let newValues = values {
+                let targets = rows.map { $0.prepareDecodeWrite() }
+                outputs.append(
+                    dispatchDecode(
+                        queries: column,
+                        newKeys: newKeys[0..., 0..., t ..< (t + 1), 0...].squeezed(axis: 2),
+                        newValues: newValues[0..., 0..., t ..< (t + 1), 0...].squeezed(axis: 2),
+                        writeTargets: targets,
+                        rows: rows, scale: scale, sinks: sinks,
+                        tableProvider: tableProvider))
+            } else {
+                outputs.append(
+                    dispatchDecode(
+                        queries: column, rows: rows, scale: scale, sinks: sinks,
+                        tableProvider: tableProvider, qPosFromEnd: l - 1 - t))
+            }
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// `mtpBatchesRectangularColumnsAsRows`: `[B, QH, L, D]` as `B * L`
+    /// decode rows of one segmented dispatch. Nil, before anything is
+    /// written, for a round this path does not take.
+    ///
+    /// Each row first writes its `L` columns as one chunk. Column `t` of a
+    /// row then attends `[max(base, qPos - window + 1), qPos]` with `qPos`
+    /// its own position, the range a one-token step at `qPos` attends. The
+    /// windowed ring holds the window plus a speculative span, so the
+    /// round's writes leave every column's window in place.
+    private func attendColumnsAsDecodeRows(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+        guard (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !rows.isEmpty,
+            !pool.usesStepOwnedAttention, !pool.writeValidation.isFaulted,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            boundSpanContext == nil, attentionMetadata == nil, attentionPacket == nil,
+            keys.dim(0) == b, keys.dim(2) == l, values.shape == keys.shape
+        else { return nil }
+        let group = pool.group(rows[0].groupKey)
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil,
+            keys.dtype == group.dtype, values.dtype == group.dtype,
+            rows.allSatisfy({ row in
+                row.groupKey == rows[0].groupKey && !row.isReleased
+                    && row.absoluteOffset >= row.frozenHighWater
+                    && row.absoluteOffset + l <= row.maxLength
+                    && (row.windowSize == nil
+                        || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
+            })
+        else { return nil }
+        for (index, row) in rows.enumerated() {
+            row.write(keys: keys[index], values: values[index])
+        }
+        guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(b * l)
+        for row in rows {
+            for t in 0 ..< l {
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        }
+        let result = PagedSegmentAttention.decode(
+            queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
+            newKeys: nil, newValues: nil, group: group, rows: descriptors,
+            sinks: preparedSinks(sinks), params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo)
+        mtpColumnsAsRowsCalls += 1
+        let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
+        return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
+    }
+
+    /// Kernel params `{softcap, scale, 0…}`, cached across steps.
+    private func params(scale: Float) -> MLXArray {
+        if let cached = cachedParams, cachedParamsScale == scale {
+            return cached
+        }
+        var values: [Float] = [attentionSoftcap ?? 1.0, scale]
+        values.append(contentsOf: [Float](repeating: 0, count: 8 - values.count))
+        let params = MLXArray(values)
+        cachedParams = params
+        cachedParamsScale = scale
+        return params
+    }
+
+    /// Sinks prepared for the merge kernel: fp32, padded to >= 8 elements
+    /// so the generated signature keeps the `device` address space.
+    private func preparedSinks(_ sinks: MLXArray?) -> MLXArray? {
+        guard let sinks else { return nil }
+        if let cached = cachedSinks, cachedSinksSource == ObjectIdentifier(sinks) {
+            return cached
+        }
+        var s = sinks.asType(.float32).reshaped([-1])
+        if s.dim(0) < 8 {
+            s = concatenated([s, MLXArray.zeros([8 - s.dim(0)], dtype: .float32)])
+        }
+        cachedSinks = s
+        cachedSinksSource = ObjectIdentifier(sinks)
+        return s
+    }
+
+    /// Sinks prepared for the PREFILL SDPA terminal (`attendQueryBlock`),
+    /// computed ONCE per `updateAndAttend` / `attendBorrowing` call.
+    ///
+    /// The narrowing itself is `CBv2AttentionV1.sdpaSinks` — the shared
+    /// primitive that documents why fp16 queries with fp32 sinks are a
+    /// SIGTRAP rather than a rounding wart. Only the hoisting is paged's
+    /// own, and it has to be: `attendQueryBlock` runs once per query BLOCK
+    /// per packed ROW, so casting at the terminal rebuilds the same
+    /// one-element conversion for every row, block and layer of a chunk.
+    /// Slicing preserves dtype, so the top-level `queries.dtype` is exactly
+    /// the dtype every per-row / per-block slice presents.
+    ///
+    /// This is the SDPA terminal's contract only. The decode leg's
+    /// `preparedSinks` (fp32, padded to 8) is the KERNEL's, and the two must
+    /// not be merged: narrowing before `preparedSinks` widens back to fp32
+    /// would round-trip fp32 sinks through fp16, and a fresh array per step
+    /// would also miss that function's identity cache.
+    private func prefillSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
+        guard let sinks else { return nil }
+        // A softcap routes `attendQueryBlock` to the composed fp32
+        // reference, which widens the sinks itself — narrowing first would
+        // be a real precision loss. Same carve-out as
+        // `CBv2AttentionV1.dispatchSinks`.
+        guard attentionSoftcap == nil else { return sinks }
+        return CBv2AttentionV1.sdpaSinks(sinks, queryDType: queryDType)
+    }
+
+    /// Device `[B, maxPages]` int32 block tables, rebuilt only when some
+    /// row's identity (pool serial) or page table changed since the last
+    /// dispatch. Internal (not private) for regression tests.
+    func deviceTables(rows: [PagedSequenceKV]) -> MLXArray {
+        let fingerprint = rows.map { (serial: $0.serial, tableVersion: $0.tableVersion) }
+        if let cached = cachedTables,
+            fingerprint.count == cachedTablesFingerprint.count,
+            zip(fingerprint, cachedTablesFingerprint).allSatisfy({ $0 == $1 })
+        {
+            return cached
+        }
+        tablesRebuildCount += 1
+        // Pad to >= 8 columns so the kernel signature's address space is
+        // stable across batch shapes (see PagedAttentionKernel), and pad
+        // with the group's POISON page rather than the literal `0` (WS-0.5).
+        // Page 0 is not a sentinel: the free list used to be built reversed
+        // and popped with `removeLast()`, so page 0 was the FIRST page handed
+        // to the first tenant, and a table slot padded with it named that
+        // tenant's live KV. The poison page is reserved out of the free list,
+        // refcount-pinned and permanently zeroed, so a slot the kernel should
+        // never reach reads zeros instead of another request's tokens.
+        let maxPages = max(8, rows.map { $0.table.count }.max() ?? 0)
+        let poison = pool.poisonPage(group: pool.groupKey(forLayer: layerIndex))
+        var flat = [Int32](repeating: poison, count: rows.count * maxPages)
+        for (i, row) in rows.enumerated() {
+            flat.replaceSubrange(
+                (i * maxPages) ..< (i * maxPages + row.table.count), with: row.table)
+        }
+        let tables = MLXArray(flat, [rows.count, maxPages])
+        cachedTables = tables
+        cachedTablesFingerprint = fingerprint
+        return tables
+    }
+
+    // MARK: - Prefill path (per-request SDPA over `gather ++ chunk`)
+
+    /// Exactly the KV one prompt chunk attends: the window history gathered
+    /// from the ring BEFORE the chunk was written, followed by the chunk
+    /// itself, plus the absolute position of the first key.
+    ///
+    /// Assembling this before the write is WS-1.2. It is also what a
+    /// KV-borrowing sibling has to be handed, because after the write the
+    /// older part of it is no longer in the ring.
+    private struct PrefillKV {
+        /// `[1, kvHeads, historyCount + queryCount, headDim]`.
+        let keys: MLXArray
+        let values: MLXArray
+        /// Absolute position of key column 0.
+        let start: Int
+        /// Absolute position of the chunk's first query, which is also the
+        /// first key column contributed by the chunk itself.
+        let queryStart: Int
+        var workLoan: CBv2PagedAttentionLoan? = nil
+
+        /// Keys that predate the chunk — the index of the first query
+        /// within `keys`, and the offset every block bound is shifted by.
+        var historyCount: Int { queryStart - start }
+        var queryCount: Int { keys.dim(2) - historyCount }
+    }
+
+    private func prepareRetainedWork(_ value: PrefillKV, row: PagedSequenceKV) -> PrefillKV {
+        guard let owner = pool.activeAttentionWork else { return value }
+        // An H=0 direct projection may be a tiny view of a much larger parent.
+        // Detach its raw bits so a cache loan never retains that unknown parent
+        // beyond this producer step. History concat/gather already owns a fresh
+        // exact role-shaped destination. No dtype or attention math changes.
+        //
+        // When every input of `where` holds one element (a broadcast
+        // scalar), MLX keeps the one-element buffer and the broadcast
+        // strides. `contiguous` then writes the full row-major destination.
+        // For the usual full result it shares the buffer and copies nothing.
+        func compact(_ input: MLXArray) -> MLXArray {
+            let dtype: DType = input.dtype.size == 2 ? .uint16 : .uint32
+            let bits = input.view(dtype: dtype)
+            return contiguous(MLX.where(MLXArray(true), bits, bits)).view(dtype: input.dtype)
+        }
+        let direct = value.historyCount == 0 && row.frozenHighWater <= value.queryStart
+        let keys = direct ? compact(value.keys) : value.keys
+        let values = direct ? compact(value.values) : value.values
+        owner.retainCompactRoots([keys, values])
+        var result = PrefillKV(
+            keys: keys, values: values, start: value.start, queryStart: value.queryStart)
+        result.workLoan = owner.makeLoan(
+            keys: keys, values: values, layer: layerIndex,
+            serial: row.serial, range: value.queryStart ..< (value.queryStart + value.queryCount))
+        return result
+    }
+
+    /// Write this chunk into `row` and return exactly the KV it attends.
+    ///
+    /// The write lives in here rather than at the call site because the two
+    /// shapes below need the gather on OPPOSITE sides of it, and a caller
+    /// that has to remember which order applies gets it wrong.
+    ///
+    /// ORDINARY (`frozenHighWater <= absoluteOffset` — every windowed row,
+    /// and every row that never adopted a frozen prefix). Gather the window
+    /// history BEFORE the write and splice on the chunk tensor the layer was
+    /// handed. That order is WS-1.2: it is the only reason the ring can be
+    /// `window + span` rather than `window - 1 + chunk + span`, and gathering
+    /// after the write here aborts the process on `gatherRange`'s eviction
+    /// precondition. The chunk's own K/V need no gather at all — they are
+    /// the arguments.
+    ///
+    /// FROZEN REPLAY (`frozenHighWater > absoluteOffset`). Gather the WHOLE
+    /// view, chunk included, from the row's pages AFTER the write. During
+    /// prefix reuse's `.frozenFullReplay` the layer is handed projections
+    /// computed by SLIDING rows that do not have their windows back yet, so
+    /// the chunk tensor is POISONED — but this row's storage through M is the
+    /// adopted, exact K/V, so the chunk's own positions can simply be read.
+    /// That is what `CBv2FrozenReplayFullSequenceKV.update` does on the
+    /// contiguous backend (it discards the replayed projections and returns
+    /// the cached keys for the whole chunk, diagonal included), and matching
+    /// it is what makes a frozen paged replay exact from the same position
+    /// contiguous is — no `+ maxPrefillChunk` of extra replay.
+    ///
+    /// Four things make the post-write gather here safe, and it is safe ONLY
+    /// because all four hold:
+    ///  1. `PagedSequenceKV.adoptFrozen` refuses windowed rows, so a frozen
+    ///     row has `ringPages == nil`. There is no ring, so no page the
+    ///     chunk could have recycled and no eviction branch to trip.
+    ///  2. `PagedSequenceKV.write` is CURSOR-ONLY below M: it advances
+    ///     `absoluteOffset` and touches no storage. There is no
+    ///     read-after-write to order, and the bytes read are the adopted
+    ///     ones, written once at adoption and host-synced since.
+    ///  3. Moving the cursor first is what makes the read legal:
+    ///     `gatherRange` bounds at `absoluteOffset`, which after the write
+    ///     is exactly `queryStart + chunk`. (Same range as post-write
+    ///     `attendableViews()`, spelled out because it is the frozen region
+    ///     that is wanted, not whatever `retainedCount` currently means.)
+    ///  4. A frozen chunk never straddles M — `CBv2PrefixReusePlan
+    ///     .clampedChunk` splits there and `write` traps if it did not — so
+    ///     the range read is wholly cached.
+    private func prefillKVWritingChunk(
+        row: PagedSequenceKV, chunkKeys: MLXArray, chunkValues: MLXArray, dtype: DType
+    ) -> PrefillKV {
+        let queryStart = row.absoluteOffset
+        let chunkLength = chunkKeys.dim(2)
+        let rowKeys = chunkKeys.squeezed(axis: 0)
+        let rowValues = chunkValues.squeezed(axis: 0)
+
+        if row.frozenHighWater > queryStart {
+            precondition(
+                row.windowSize == nil,
+                "[PagedLayerCache] layer \(layerIndex): a windowed row cannot be frozen")
+            row.write(keys: rowKeys, values: rowValues)
+            let start = row.baseOffset
+            let (frozenKeys, frozenValues) = row.gatherRange(
+                start: start, count: queryStart + chunkLength - start)
+            return PrefillKV(
+                keys: cast(frozenKeys, to: dtype), values: cast(frozenValues, to: dtype),
+                start: start, queryStart: queryStart)
+        }
+
+        var start = row.baseOffset
+        if let window = row.windowSize {
+            start = max(start, queryStart - window + 1)
+        }
+        // The chunk lands in the slab under the POOL dtype, so attend the
+        // values the slab will hold. Otherwise prefill would score these
+        // tokens at a precision no later decode over them can reproduce,
+        // which is exactly the kind of per-phase drift this file pins out.
+        let chunkK = chunkKeys
+        let chunkV = chunkValues
+        if let mirrored = mirroredPrefillKV(
+            row: row, start: start, queryStart: queryStart, chunkKeys: chunkK,
+            chunkValues: chunkV, rowKeys: rowKeys, rowValues: rowValues, dtype: dtype)
+        {
+            return mirrored
+        }
+        guard start < queryStart else {
+            row.write(keys: rowKeys, values: rowValues)
+            return PrefillKV(
+                keys: cast(chunkK, to: dtype), values: cast(chunkV, to: dtype),
+                start: queryStart, queryStart: queryStart)
+        }
+        prefillHistoryGathers += 1
+        let (historyKeys, historyValues) = row.gatherRange(
+            start: start, count: queryStart - start)
+        row.write(keys: rowKeys, values: rowValues)
+        return PrefillKV(
+            keys: concatenated([cast(historyKeys, to: dtype), cast(chunkK, to: dtype)], axis: 2),
+            values: concatenated(
+                [cast(historyValues, to: dtype), cast(chunkV, to: dtype)], axis: 2),
+            start: start, queryStart: queryStart)
+    }
+
+    /// Item 23: serve a full-attention prompt chunk from the row's contiguous
+    /// mirror (see `prefillMirrors`). Returns nil when the mirror cannot serve
+    /// the chunk exactly; the caller then gathers as before. The first chunk
+    /// of a row that already holds history (an adopted prefix) seeds the
+    /// mirror with ONE gather; every later chunk reads none.
+    private func mirroredPrefillKV(
+        row: PagedSequenceKV, start: Int, queryStart: Int,
+        chunkKeys: MLXArray, chunkValues: MLXArray,
+        rowKeys: MLXArray, rowValues: MLXArray, dtype: DType
+    ) -> PrefillKV? {
+        guard prefillMirrorAllowed, Self.prefillMirrorEnabled, row.windowSize == nil,
+            start == row.baseOffset,
+            pool.groupKey(forLayer: layerIndex).quantization == nil,
+            !pool.usesStepOwnedAttention, kind.sharesKVWithLayer == nil,
+            kind.headDim == kind.valueHeadDim, boundSpanContext == nil,
+            chunkKeys.dim(0) == 1, chunkKeys.dtype == row.groupKey.dtype,
+            chunkValues.dtype == row.groupKey.dtype
+        else {
+            prefillMirrors[row.serial] = nil
+            return nil
+        }
+        let n = chunkKeys.dim(2)
+        let end = queryStart + n
+        let capacity = row.maxLength - start
+        guard end - start <= capacity else {
+            prefillMirrors[row.serial] = nil
+            return nil
+        }
+        var mirror = prefillMirrors[row.serial]
+        if let existing = mirror, existing.start != start || existing.count != queryStart - start {
+            mirror = nil
+        }
+        if mirror == nil {
+            let keys = MLXArray.zeros(
+                [1, chunkKeys.dim(1), capacity, chunkKeys.dim(3)], dtype: chunkKeys.dtype)
+            let values = MLXArray.zeros(
+                [1, chunkValues.dim(1), capacity, chunkValues.dim(3)], dtype: chunkValues.dtype)
+            let made = PrefillMirror(
+                serial: row.serial, start: start, keys: keys, values: values, count: 0)
+            if queryStart > start {
+                // One gather seeds the history this row already holds.
+                prefillHistoryGathers += 1
+                let (historyKeys, historyValues) = row.gatherRange(
+                    start: start, count: queryStart - start)
+                made.keys[0..., 0..., 0 ..< (queryStart - start), 0...] = historyKeys
+                made.values[0..., 0..., 0 ..< (queryStart - start), 0...] = historyValues
+                made.count = queryStart - start
+            }
+            mirror = made
+        }
+        guard let mirror else { return nil }
+        row.write(keys: rowKeys, values: rowValues)
+        let lo = queryStart - start
+        let hi = end - start
+        mirror.keys[0..., 0..., lo ..< hi, 0...] = chunkKeys
+        mirror.values[0..., 0..., lo ..< hi, 0...] = chunkValues
+        mirror.count = hi
+        prefillMirrors[row.serial] = mirror
+        prefillMirrorChunks += 1
+        return PrefillKV(
+            keys: cast(mirror.keys[0..., 0..., 0 ..< hi, 0...], to: dtype),
+            values: cast(mirror.values[0..., 0..., 0 ..< hi, 0...], to: dtype),
+            start: start, queryStart: queryStart)
+    }
+
+    @inline(__always)
+    private func cast(_ array: MLXArray, to dtype: DType) -> MLXArray {
+        array.dtype == dtype ? array : array.asType(dtype)
+    }
+
+    /// Per-request SDPA over the assembled chunk view, in QUERY BLOCKS
+    /// (WS-0.2p).
+    ///
+    /// The score tensor is MATERIALIZED at `[1, queryHeads, L, kL]` whenever
+    /// MLX takes its composed fallback (every head_dim it does not fuse, and
+    /// the softcap reference), so an unblocked chunk holds a tensor linear in
+    /// the chunk length AND the history. Blocking pins it at
+    /// `[1, queryHeads, block, visible]` — that is what keeps the activation
+    /// reserve independent of `prefillChunkSize` — and on a sliding layer it
+    /// also drops the attention work that lies outside every query's window.
+    /// The fused causal route at the top materializes no scores at all, so
+    /// it sits inside that bound without blocking.
+    ///
+    /// Three things this loop deliberately does NOT do:
+    ///  1. It does not call `CBv2AttentionV1.attendQueryBlocks`: that is
+    ///     private. Qwen4 text blocks use that type's public `maskMode`
+    ///     and the same `queryBlockBounds`, so paged and contiguous cannot
+    ///     pick different MLX mask specializations for the same (L, kL,
+    ///     window). Other models and vision preserve the absolute BOOL mask.
+    ///  2. It does not gather per block. Consecutive blocks' visible spans
+    ///     overlap by `window - 1` on a sliding layer and completely on a
+    ///     full layer (`visibleStart == 0` for every block), so a per-block
+    ///     gather is a 3-4x pessimisation. `prefillKVWritingChunk` gathers
+    ///     ONCE and each block SLICES the result.
+    ///  3. It does not rebuild the position vectors per block. They are host
+    ///     `arange`s that get uploaded; rebuilding them in the loop repeats
+    ///     nearly the whole history once per block on a full layer.
+    ///
+    /// The kill switch is `CBv2AttentionV1`'s, shared with the contiguous
+    /// backend: `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=0` restores the single
+    /// unblocked call on BOTH backends. There is no paged-only knob. Likewise
+    /// `DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL=0` returns fused-eligible chunks
+    /// to each backend's blocked path.
+    ///
+    /// `sinks` arrives already prepared for the SDPA terminal (see
+    /// `prefillSinks`) — this function and `attendQueryBlock` forward it
+    /// unchanged rather than casting inside the block loop.
+    private func prefillAttend(
+        queries: MLXArray, kv: PrefillKV, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        let l = queries.dim(2)
+        let historyCount = kv.historyCount
+        precondition(
+            kv.queryCount == l,
+            "[PagedLayerCache] chunk view holds \(kv.queryCount) query columns, got \(l)")
+        let k = cast(kv.keys, to: queries.dtype)
+        let v = cast(kv.values, to: queries.dtype)
+        let keyCount = k.dim(2)
+
+        // Fused causal route (`CBv2AttentionV1.usesFusedCausalPrefill`, the
+        // same predicate contiguous uses). Every `prefillKVWritingChunk` view
+        // holds keys `[start, queryStart + l)`, so the queries are its trailing
+        // `l` columns and MLX's bottom-right `.causal` is exactly the absolute
+        // `kpos <= qpos` mask below. No mask, positions or blocks.
+        if CBv2AttentionV1.usesFusedCausalPrefill(
+            kind: kind, queries: queries, values: v, softcap: attentionSoftcap,
+            hasSpanContext: boundSpanContext != nil)
+        {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: k, values: v, scale: scale, mask: .causal, sinks: sinks)
+        }
+
+        // Absolute positions: the queries are the trailing `l` key columns.
+        // Built ONCE and sliced per block — because they are absolute, a
+        // block's mask is exactly the corresponding slice of the whole
+        // chunk's mask.
+        let qStart = kv.queryStart
+        let kStart = kv.start
+        let qpos = MLXArray(Int32(qStart) ..< Int32(qStart + l)).expandedDimensions(axis: 1)
+        let kpos = MLXArray(Int32(kStart) ..< Int32(kStart + keyCount)).expandedDimensions(
+            axis: 0)
+
+        // Span-bearing vision chunks (WS-2.2) keep the SINGLE unblocked
+        // call. A block's key slice ends at the LATEST query's own position,
+        // which is exactly the causal bound a bidirectional span is there to
+        // escape: an image query must be able to attend keys AFTER itself
+        // inside its own block, and those columns are not in the slice.
+        // The overlay itself lives in `attendQueryBlock`, so the mask stays
+        // defined in one place either way.
+        guard boundSpanContext == nil, !kind.isBidirectional,
+            CBv2AttentionV1.shouldBlockQueries(l)
+        else {
+            return attendQueryBlock(
+                queries: queries, keys: k, values: v,
+                qpos: qpos, kpos: kpos, queryStart: qStart,
+                scale: scale, sinks: sinks)
+        }
+
+        // Block bounds are SHARED with the contiguous backend
+        // (`CBv2AttentionV1.queryBlockBounds`), with this chunk's own
+        // `historyCount`. That arithmetic is the activation-reserve bound;
+        // two copies of it can drift into attending different spans.
+        var window: Int?
+        if case .slidingWindow(let w) = kind.attention { window = w }
+        let blockSize = CBv2AttentionV1.queryBlockSize
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity((l + blockSize - 1) / blockSize)
+        let canReuseSlidingMask =
+            boundSpanContext == nil && !kind.isBidirectional && attentionSoftcap == nil
+            && kind.qwen4IndexerCompressRatio == nil
+        // Each block's first query is (visible keys - queries) positions after
+        // its first visible key, clamped or not, so equal (query, key) counts
+        // give identical Boolean masks. Retain only the last shape within this
+        // row's call; never retain Q/K/V or page views.
+        var cachedSlidingMask: (queryCount: Int, keyCount: Int, mask: MLXArray)?
+        var offset = 0
+        while offset < l {
+            let count = min(blockSize, l - offset)
+            let (visibleStart, visibleEnd) = CBv2AttentionV1.queryBlockBounds(
+                historyCount: historyCount, offset: offset, count: count, window: window)
+            let blockQPos = qpos[offset ..< (offset + count), 0...]
+            let blockKPos = kpos[0..., visibleStart ..< visibleEnd]
+            let visibleCount = visibleEnd - visibleStart
+            var preparedMask: MLXArray?
+            if canReuseSlidingMask, let window, count > 1, visibleCount > window {
+                if let cached = cachedSlidingMask,
+                    cached.queryCount == count, cached.keyCount == visibleCount
+                {
+                    preparedMask = cached.mask
+                } else {
+                    let mask = prefillCausalMask(qpos: blockQPos, kpos: blockKPos, window: window)
+                    cachedSlidingMask = (count, visibleCount, mask)
+                    preparedMask = mask
+                }
+            }
+            // A run of full blocks that share this block's reused mask, key
+            // count and one-block key stride is the same per-block work; it
+            // goes to MLX as ONE batched call (`attendUniformQueryBlocks`).
+            if let mask = preparedMask, count == blockSize,
+                usesBatchedQueryBlocks(queries: queries, keys: k, values: v)
+            {
+                var blocks = 1
+                while offset + (blocks + 1) * blockSize <= l {
+                    let next = CBv2AttentionV1.queryBlockBounds(
+                        historyCount: historyCount, offset: offset + blocks * blockSize,
+                        count: blockSize, window: window)
+                    guard next.visibleStart == visibleStart + blocks * blockSize,
+                        next.visibleEnd - next.visibleStart == visibleCount
+                    else { break }
+                    blocks += 1
+                }
+                if blocks > 1 {
+                    outputs.append(
+                        attendUniformQueryBlocks(
+                            queries: queries, keys: k, values: v, queryOffset: offset,
+                            blocks: blocks, blockSize: blockSize, visibleStart: visibleStart,
+                            visibleCount: visibleCount, mask: mask, scale: scale, sinks: sinks))
+                    offset += blocks * blockSize
+                    continue
+                }
+            }
+            outputs.append(
+                attendQueryBlock(
+                    queries: queries[0..., 0..., offset ..< (offset + count), 0...],
+                    keys: k[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    values: v[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    qpos: blockQPos, kpos: blockKPos,
+                    queryStart: qStart, scale: scale, sinks: sinks, preparedMask: preparedMask))
+            offset += count
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// Whether uniform query blocks may share one SDPA call: one source row,
+    /// the GPU stream, and a head geometry MLX serves with its fused
+    /// full-attention kernel for an array mask (both the NAX and the legacy
+    /// steel kernel). Those kernels compute every (block, head, query tile)
+    /// in its own threadgroup from per-batch strides, so a block's bytes do
+    /// not depend on how many blocks share the launch. The composed fallback
+    /// (head_dim 192/256/512) would route through batched GEMMs whose tiling
+    /// MLX picks from the batch size, so it keeps one call per block.
+    private func usesBatchedQueryBlocks(queries: MLXArray, keys: MLXArray, values: MLXArray)
+        -> Bool
+    {
+        guard batchesUniformQueryBlocks, queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dim(0) == 1, keys.dim(0) == 1, values.dim(0) == 1,
+            queries.dim(3) == values.dim(3), keys.dim(3) == queries.dim(3),
+            [64, 72, 80, 96, 128].contains(queries.dim(3))
+        else { return false }
+        return MiMoV26NAXGatherQMM.gpuStream(.default)
+    }
+
+    /// `blocks` consecutive full query blocks starting at `queryOffset`, whose
+    /// visible key spans all hold `visibleCount` keys and start one block
+    /// apart, attended as ONE SDPA call over the batch axis:
+    /// Q `[blocks, H, blockSize, D]` (a reshape of the chunk's queries),
+    /// K/V `[blocks, Hkv, visibleCount, D]` (overlapping strided windows of
+    /// the assembled view — no gather or copy) and the shared reused mask.
+    ///
+    /// Each block sees exactly the queries, keys, values, `kL`, mask bits,
+    /// sinks and kernel specialization (alignment/mask/sink constants) of its
+    /// own `attendQueryBlock` call, so its output bytes are identical. The
+    /// result is the `[1, H, blocks * blockSize, Dv]` view of MLX's
+    /// query-major output, which is already the o_proj row layout.
+    private func attendUniformQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, queryOffset: Int,
+        blocks: Int, blockSize: Int, visibleStart: Int, visibleCount: Int,
+        mask: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        let heads = queries.dim(1)
+        let q = queries[0..., 0..., queryOffset ..< (queryOffset + blocks * blockSize), 0...]
+            .reshaped(1, heads, blocks, blockSize, queries.dim(3))
+            .transposed(0, 2, 1, 3, 4)
+            .squeezed(axis: 0)
+        // Strides address the row-major `[1, Hkv, kL, D]` layout `asStrided`
+        // flattens to (the assembled view is already row-contiguous).
+        func windows(_ x: MLXArray) -> MLXArray {
+            let (kvHeads, keyCount, dim) = (x.dim(1), x.dim(2), x.dim(3))
+            precondition(visibleStart + (blocks - 1) * blockSize + visibleCount <= keyCount)
+            return asStrided(
+                x, [blocks, kvHeads, visibleCount, dim],
+                strides: [blockSize * dim, keyCount * dim, dim, 1], offset: visibleStart * dim)
+        }
+        let output = MLXFast.scaledDotProductAttention(
+            queries: q, keys: windows(keys), values: windows(values), scale: scale,
+            mask: .array(mask), sinks: sinks)
+        batchedQueryBlockCallsForTesting += 1
+        return output.transposed(0, 2, 1, 3)
+            .reshaped(1, blocks * blockSize, heads, output.dim(3))
+            .transposed(0, 2, 1, 3)
+    }
+
+    /// Preserve the absolute Boolean expression for every paged prefill
+    /// block, including cold blocks and one-query tails. Reuse never changes
+    /// the SDPA mask representation to symbolic causal or mask-free.
+    private func prefillCausalMask(qpos: MLXArray, kpos: MLXArray, window: Int?) -> MLXArray {
+        var mask = kpos .<= qpos
+        if let window {
+            mask = mask & (kpos .> (qpos - Int32(window)))
+        }
+        return mask
+    }
+
+    /// One query block. Qwen4 text blocks share `CBv2AttentionV1.maskMode` with
+    /// contiguous SDPA so a 512+512+remainder Qwen4 prefill cannot flip
+    /// tokens just because paged used `.array` and contiguous used
+    /// `.causal`. `qpos`/`kpos` stay absolute for vision-span overlay and
+    /// the softcap BOOL path; those callers still materialize the same
+    /// causal-and-window base the unblocked call would have produced.
+    ///
+    /// A bound span context (WS-2.2) OR-s a bidirectional-within-block
+    /// overlay onto that base, matching MLXVLM Gemma4's
+    /// `gemma4BidirectionalVisionMask` (`baseMask ∨ sameBlock`) and
+    /// `CBv2AttentionV1.spanChunkMask` term for term. This is where paged
+    /// composes MORE directly than contiguous: contiguous builds its base in
+    /// RELATIVE coordinates (`boolMask(L:kL:window:)`) and has to
+    /// reconstruct absolute `qAbs`/`kAbs` from `context.chunkEnd` to place
+    /// the blocks; `qpos`/`kpos` are already absolute here, so the block
+    /// bounds are compared directly against them and the two coordinate
+    /// systems cannot drift apart.
+    private func attendQueryBlock(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        qpos: MLXArray, kpos: MLXArray, queryStart: Int,
+        scale: Float, sinks: MLXArray?, preparedMask: MLXArray? = nil
+    ) -> MLXArray {
+        var window: Int?
+        if case .slidingWindow(let w) = kind.attention { window = w }
+
+        if kind.qwen4IndexerCompressRatio != nil,
+            boundSpanContext == nil, attentionSoftcap == nil
+        {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                mask: CBv2AttentionV1.maskMode(
+                    L: queries.dim(2), kL: keys.dim(2), window: window,
+                    bidirectional: kind.isBidirectional),
+                sinks: sinks)
+        }
+
+        var mask = preparedMask ?? prefillCausalMask(qpos: qpos, kpos: kpos, window: window)
+        if kind.isBidirectional {
+            var reverse = (kpos .>= qpos) .&& (kpos .>= Int32(queryStart))
+            if let window {
+                reverse = reverse .&& (kpos .< (qpos + Int32(window)))
+            }
+            mask = mask .|| reverse
+        }
+        if let spans = boundSpanContext {
+            for block in spans.blocks {
+                let lo = Int32(block.tokenOffset)
+                let hi = Int32(block.end)
+                let qIn = (qpos .>= lo) .&& (qpos .< hi)  // [q, 1]
+                let kIn = (kpos .>= lo) .&& (kpos .< hi)  // [1, kL]
+                mask = mask .|| (qIn .&& kIn)
+            }
+        }
+
+        if let softcap = attentionSoftcap {
+            // SDPA cannot express logit softcapping — composed path, pinned
+            // for softcap configs. It takes the same blocking, or a capped
+            // config would keep the full unblocked peak.
+            return PagedAttentionReference.composedAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                boolMask: mask, sinks: sinks, softcap: softcap)
+        }
+
+        // `sinks` already promotes to the output dtype: the caller narrowed
+        // it once per dispatch through `prefillSinks`. Do not re-cast here —
+        // that is the per-block, per-row rebuild the hoist exists to remove.
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale,
+            mask: .array(mask), sinks: sinks)
+    }
+}
+
+// MARK: - Legacy KVCache conformance
+
+/// Same shape as `CBv2LayerCache`'s conformance: lets the paged cache
+/// travel through existing `[KVCache]` model plumbing (the models' v2
+/// branches downcast to `CBv2AttendingLayerCache`); every legacy mutation
+/// path TRAPS — v2-adapted models must call `updateAndAttend`.
+extension PagedLayerCache: KVCache {
+    /// Legacy scalar offset: max row offset. Host integers only — no sync.
+    public var offset: Int {
+        pagedRows.reduce(0) { max($0, $1.absoluteOffset) }
+    }
+
+    public var maxSize: Int? {
+        switch kind.attention {
+        case .full: return nil
+        case .slidingWindow(let window): return window
+        }
+    }
+
+    /// Prompt attention can use its direct chunk tensors without reading the
+    /// freshly written pages. Include that write explicitly in the step eval
+    /// set, even when the prompt produces the terminal token: otherwise the
+    /// lazy fence can retain source/segment arrays after the row is retired.
+    /// The position chain also rides this set so it cannot grow with steps.
+    public func innerState() -> [MLXArray] {
+        guard !pool.writeValidation.isFaulted else { return [] }
+        guard kind.sharesKVWithLayer == nil, !pagedRows.isEmpty else {
+            return [cachedPositionOffsets]
+        }
+        var arrays = [
+            cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence,
+        ]
+        // The mirror's in-place writes ride the step evaluation, as a
+        // contiguous row's buffer does, so the next chunk's update can donate.
+        for mirror in prefillMirrors.values {
+            arrays.append(mirror.keys)
+            arrays.append(mirror.values)
+        }
+        if pagedRows.count > 1 {
+            arrays.append(contentsOf: pagedRows.flatMap(CBv2Qwen4IndexerFrontier.evaluationState))
+        }
+        arrays.append(contentsOf: pagedRows.flatMap(\.nativeRecentEvaluationRoots))
+        return arrays
+    }
+
+    public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(
+            "PagedLayerCache.update(keys:values:) is unsupported — v2-adapted models must call updateAndAttend (layer \(layerIndex))"
+        )
+    }
+
+    public var state: [MLXArray] {
+        get { [] }
+        set {
+            fatalError("PagedLayerCache has no serializable state (layer \(layerIndex))")
+        }
+    }
+
+    public var metaState: [String] {
+        get { [] }
+        set {
+            fatalError("PagedLayerCache has no metaState (layer \(layerIndex))")
+        }
+    }
+
+    public var isTrimmable: Bool { false }
+
+    @discardableResult
+    public func trim(_ n: Int) -> Int { 0 }
+
+    public func makeMask(n: Int, windowSize: Int?, returnArray: Bool)
+        -> MLXFast.ScaledDotProductAttentionMaskMode
+    {
+        fatalError(
+            "PagedLayerCache.makeMask is unsupported — v2 attention owns its masks (layer \(layerIndex))"
+        )
+    }
+
+    public func copy() -> any KVCache {
+        fatalError(
+            "PagedLayerCache.copy is unsupported — v2 rows are engine-owned (layer \(layerIndex))")
+    }
+}
+
+// MARK: - MTP rectangular verification
+
+/// WS-3.4. `PagedLayerCache` honours the flag with a per-column loop over
+/// the existing fused decode dispatch (`attendRectangularColumns`), so a
+/// paged bank takes the rectangular verification path instead of the
+/// `preconditionFailure` the engine used to hit on any cache that is not the
+/// `final` `CBv2LayerCache`. See `PagedSeamContract.swift`.
+extension PagedLayerCache: CBv2Qwen4GatheredCache {
+    public var qwen4HasWriteFault: Bool { pool.writeValidation.isFaulted }
+    public func qwen4ValidateProjectedKV(keys: MLXArray, values: MLXArray) -> Bool {
+        pool.writeValidation.validate(
+            keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+            layerIndex: layerIndex)
+    }
+    public var qwen4SerializesRectangularAttention: Bool { mtpSerializesRectangularAttention }
+}
+
+extension PagedLayerCache: CBv2Qwen4BatchScopeProviding {
+    public func qwen4BeginBatchScope() -> CBv2Qwen4BatchScope {
+        precondition(kind.sharesKVWithLayer == nil && kind.attention == .full)
+        precondition(boundSpanContext == nil, "Qwen4 batched decode cannot bind a prefill span")
+        let owners = pagedRows
+        let views = owners.enumerated().map { index, row -> PagedLayerCache in
+            let view = PagedLayerCache(
+                layerIndex: layerIndex, kind: kind, pool: pool,
+                attentionSoftcap: attentionSoftcap)
+            view.setRetainsChunkForBorrowers(retainsChunkForBorrowers)
+            view.mtpSerializesRectangularAttention = mtpSerializesRectangularAttention
+            view.pagedRows = [row]
+            view.cachedPositionOffsets = cachedPositionOffsets[index ..< index + 1]
+            view.hostPositionOffsets = [hostPositionOffsets[index]]
+            _ = CBv2Qwen4IndexerBind.restore(view, from: row)
+            return view
+        }
+        return CBv2Qwen4BatchScope(rows: owners, caches: views) { [self] length in
+            precondition(
+                pagedRows.count == owners.count && zip(pagedRows, owners).allSatisfy { $0 === $1 })
+            advancePositionOffsets(by: length)
+            retainedPrefillKV = retainsChunkForBorrowers ? views.flatMap(\.retainedPrefillKV) : []
+            clearQwen4IndexerState()
+        }
+    }
+}
+
+extension PagedLayerCache: CBv2MTPRectangularSerializing {}
+
+// MARK: - KV-borrow chunk retention
+
+/// WS-1.2. A KV-shared sibling attends this layer's assembled chunk view,
+/// and the shrunk ring cannot reproduce the older part of it once the chunk
+/// is written, so the source has to keep it. Retention is ON by default (a
+/// cache used without a bank stays correct) and `CBv2LayerCacheBank` turns
+/// it off for every layer no sibling borrows — all of them for gemma-4
+/// (`num_kv_shared_layers: 0`) and gpt-oss, so neither model pays for it.
+extension PagedLayerCache: CBv2KVSourceChunkRetaining {
+    public func setRetainsChunkForBorrowers(_ retains: Bool) {
+        retainsChunkForBorrowers = retains
+        if !retains {
+            retainedPrefillKV = []
+            retainedQuantizedViews = []
+        }
+    }
+}
+
+// MARK: - Packed prefill (WS-2.1)
+
+/// The affirmative claim `CBv2LayerCacheBank.supportsPackedPrefill` reads.
+///
+/// `updateAndAttend`'s prompt-chunk branch loops over the bound rows and
+/// runs each one through the SAME `prefillKVWritingChunk` / `prefillAttend`
+/// sequence a `[1, chunk]` call runs, then concatenates on the batch axis.
+/// No tensor in that sequence spans two rows: the gather walks one row's
+/// page table, the write lands in one row's pages, and the mask is built
+/// from one row's absolute positions. A packed row is therefore
+/// bit-identical to that row run alone, which is what this claim asserts.
+extension PagedLayerCache: CBv2PackedPrefillCapableCache {
+    /// Type-level form of the same claim, for callers that must decide
+    /// BEFORE any pool or cache exists — see
+    /// `honorsSpanMaskContextsByConstruction` for why that matters.
+    public static let keepsRowsIndependentWhenPackedByConstruction = true
+
+    public var keepsRowsIndependentWhenPacked: Bool {
+        Self.keepsRowsIndependentWhenPackedByConstruction
+    }
+}
+
+// MARK: - Vision span masks (WS-2.2)
+
+/// The affirmative claim `CBv2LayerCacheBank.supportsMultimodalSpans` reads,
+/// plus the binding it refines.
+///
+/// The bound context reaches the mask: `prefillAttend` forces the single
+/// unblocked call while it is set, and `attendQueryBlock` OR-s the
+/// bidirectional-within-block overlay onto the absolute-coordinate base
+/// mask. Both are exercised by `CBv2PagedPackedSpanTests`.
+extension PagedLayerCache: CBv2MultimodalSpanCapableCache {
+    /// The SAME claim, readable without an instance.
+    ///
+    /// The provider's slot policy has to decide whether a VLM slot may
+    /// route to paged before it builds anything, so it cannot ask a live
+    /// cache. It could hardcode `true` on its side; that is precisely the
+    /// "capability ASSUMED rather than asked" defect, because the assumption
+    /// would then live in a different repository from the implementation and
+    /// would not move when this file does.
+    ///
+    /// Instead there is exactly ONE boolean. The engine's own submit-time
+    /// gate (`CBv2LayerCacheBank.supportsMultimodalSpans`) reads the instance
+    /// property below, which returns this constant; the provider's routing
+    /// gate reads this constant directly. Regress the overlay and both flip
+    /// together — production stops routing vision here in the same edit that
+    /// stops honouring it.
+    ///
+    /// The residual gap a type-level claim cannot close is that the constant
+    /// is not derived from the mask code. That is what
+    /// `CBv2PagedPackedSpanTests.typeLevelClaimsMatchARealPagedBank` and the
+    /// span-behaviour tests are for: the first pins the constant to what a
+    /// real bank of real caches answers, the rest pin the answer to the
+    /// numbers.
+    public static let honorsSpanMaskContextsByConstruction = true
+
+    public func bindSpanContext(_ context: CBv2SpanChunkContext?) {
+        boundSpanContext = context
+    }
+
+    public var honorsSpanMaskContexts: Bool {
+        !pool.usesStepOwnedAttention && Self.honorsSpanMaskContextsByConstruction
+    }
+}

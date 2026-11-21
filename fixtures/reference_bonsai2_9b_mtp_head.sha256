@@ -1,0 +1,23 @@
+# SHA256 manifest for the DFlash drafter SOURCE of track muse-glimmer-30b-mlx-v1:
+# meta-models/Muse-Glimmer-30B-assistant.
+# Revision: c676cce91658f9568aaf264a416211e2782735b7
+#
+# The speculative decoder for this track is `dflash`. The drafter the engine
+# loads is PRODUCED, not downloaded: ./setup-mtp-head.sh downloads the two BF16
+# files below through ./setup.sh's verified downloader, and tools/make-drafter.sh
+# runs the pinned writer on them. The quantized result (model.safetensors and
+# config.json, 1,968,222,936 bytes) is checked against the contract fixture's
+# mtp_head.artifact pins (weights 38f92e9a..., configuration af24b73c...).
+#
+# These two records are the fixture's mtp_head.source_artifact sha256 values.
+# model.safetensors is the LFS object's own sha256 (lfs.oid). The fixture's
+# source_artifact.bytes (5,112,013,325) also counts the four files of the
+# published tree that the writer does not read (.gitattributes 1519, LICENSE
+# 11358, README.md 17727, USAGE_POLICY.md 5230); they are not pinned here.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 2
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   5111977491
+#
+# Format: <sha256> <byte_count> <relative_path>
+38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a 883 config.json
+fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84 5111976608 model.safetensors

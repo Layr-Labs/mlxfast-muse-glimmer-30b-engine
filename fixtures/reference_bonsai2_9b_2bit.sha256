@@ -1,0 +1,27 @@
+# SHA256 manifest for nvidia/Muse-Glimmer-30B-NVFP4.
+# Revision: 47818374517751c48c55cde2621594926b1888b6
+#
+# The target checkpoint for track muse-glimmer-30b-mlx-v1. Written by
+# tools/new-track.sh from the published tree. LFS-backed entries use the
+# LFS object's own sha256 (lfs.oid).
+#
+# .gitattributes, LICENSE and image files are DELIBERATELY NOT pinned: none
+# is engine-loaded, and setup.sh derives what it downloads from this file.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 13
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   24698213722
+#
+# Format: <sha256> <byte_count> <relative_path>
+b0c600f9f2c429567b795f2b5b17291267bce8ffd132e098b8bc972169638749 13973 README.md
+98a14dab9fd97de1666dc8589d399efab1e7fc3ba4e6230d037d6637ba9481d3 5230 USAGE_POLICY.md
+114f55ebdc1804c1af371197b9fdf2d6bb925966c9dfe46b73782a71bc07965e 7167 chat_template.jinja
+f3add3cfff62038fc7087e72f7df5a560660707aba7c8e65761bfa6bf8f08774 88682 config.json
+9d62b496fee012cd1981b8b0fa70fc6493859d18153dc4cc3a4813b981db1fe1 190 generation_config.json
+97b68b91007adab31b684c102b5f2c22253a66c80a7fe497ed6b70848e1b139c 54217 hf_quant_config.json
+0e260a8f2c5e16bcc2ad8e90a8a59f1e889431b0de82f4c490c31d9ea9114ce4 9961191764 model-00001-of-00003.safetensors
+6a04e8f3e9e68b9d7e0ed8a5d762694eb73e76d2a13ad4951d909238059a6cc5 9963335980 model-00002-of-00003.safetensors
+017293c10a76b131f36116c597f6a4eb9a4dd52d8773318b8df4b6afcc625132 4745091980 model-00003-of-00003.safetensors
+71823cd92701dfd1632fe37bb7dfcf432a0d068cee2cc26dcc1b94189c3c3b04 213580 model.safetensors.index.json
+97e2a486dd9866b81f40cf4b8bc0c9ced9a7cd8a5bc65aa4cc2f4de0712dae77 1084 processor_config.json
+c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d 28129897 tokenizer.json
+ee60d284ed7857ba89155f437cc915951e16056453ca7ae2491c5ae87a395c39 79978 tokenizer_config.json

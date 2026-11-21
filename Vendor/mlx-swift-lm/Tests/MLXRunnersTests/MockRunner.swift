@@ -1,0 +1,579 @@
+// MockRunner.swift
+//
+// A scripted `Runner` for the protocol tests: no weights, no Metal, no MLX
+// allocator. Its token outputs are a pure function of the input, chosen to
+// reproduce the shared conformance fixture
+// (`Resources/engine-wire-v1-adapter.ndjson`, pinned on both sides).
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXRunners
+
+// MARK: - Token rules
+
+enum MockTokens {
+    /// Which answer block a prompt lands in.
+    ///
+    /// In the fixture, a prompt whose first token is in the 20s or 50s is a
+    /// DECODE seed (`decode_begin`, `free_decode_begin`) and answers in the
+    /// 200000 block; every other prompt is a prefill/correctness anchor and
+    /// answers in the 100000 block.
+    static func block(_ prompt: [Int]) -> Int {
+        guard let first = prompt.first else { return 100_000 }
+        return [2, 5].contains(first / 10) ? 200_000 : 100_000
+    }
+
+    /// A whole-prompt forward answers the block base plus the prompt length.
+    static func promptAnswer(_ prompt: [Int]) -> Int {
+        block(prompt) + prompt.count
+    }
+
+    /// A single forced token answers itself plus one.
+    static func stepAnswer(_ token: Int) -> Int { token + 1 }
+
+    /// First token an engine free-run emits.
+    ///
+    /// A decode window has already answered its seed forward
+    /// (`promptAnswer`), so its stream continues from there; a `correctness`
+    /// window has no seed response and starts at the block base.
+    static func freeRunStart(_ prompt: [Int]) -> Int {
+        block(prompt) == 200_000 ? promptAnswer(prompt) : block(prompt)
+    }
+}
+
+// MARK: - Stepper
+
+final class MockStepper: TeacherForcedStepper {
+    private(set) var forwards = 0
+    private var begun = false
+
+    func begin() throws {
+        begun = true
+        forwards = 0
+    }
+
+    func forward(_ tokens: [Int]) throws -> StepOutput {
+        guard begun else { throw StepperError.notBegun }
+        guard !tokens.isEmpty else { throw StepperError.emptyForward }
+        forwards += 1
+        let argmax =
+            tokens.count == 1
+            ? MockTokens.stepAnswer(tokens[0])
+            : MockTokens.promptAnswer(tokens)
+        // A descending ladder from 10.0, so the top-logit margin is 1.0 and
+        // the ordering is unambiguous.
+        let top = (0 ..< 8).map { index in
+            (token: argmax + index, logit: 10.0 - Double(index))
+        }
+        return StepOutput(argmax: argmax, topLogits: top, margin: 1.0)
+    }
+}
+
+// MARK: - Engine
+
+/// The per-round journal a scripted engine replays for one free-run window.
+///
+/// Written as records, not as summary numbers: the worker derives every
+/// audit field from the engine build's `RunnerRoundJournaling` records, so the
+/// mock has to exercise that same path or the test proves nothing about it.
+struct MockRoundScript: Sendable {
+    /// One round: draft depth, the pre-min accept-walk length, and the
+    /// committed width.
+    struct Round: Sendable {
+        var k: Int
+        var accepted: Int
+        var confirmed: Int
+    }
+
+    var rounds: [Round]
+    /// Rows the rounds are attributed to, in SLOT ORDER. bench-worker submits
+    /// slot s as request id s + 1.
+    var requestIDs: [UInt64] = [1]
+    /// Rounds already finalized when `free_decode_begin` reads the journal:
+    /// the engine ran ahead while the seed drained.
+    var journalAtBegin: [Round] = []
+    /// Records the journal has evicted. Reported on the read a RUN makes, and
+    /// never on the one `free_decode_begin` makes, so a test can put a cursor
+    /// behind the retained range.
+    var dropped: UInt64 = 0
+    /// Tokens the scripted engine yields in ONE delta. Above 1, a run can be
+    /// handed more tokens than the count it asked for.
+    var deltaWidth: Int = 1
+
+    /// The fixture's window: three rounds at depth 2, committing 3, 1 and 2
+    /// tokens, with accept walks of 2, 1 and 1. That gives the fixture's
+    /// `acceptance_lengths [3,1,2]`, `drafted_total 6`, `accepted_total 4`
+    /// (the sum of `min(accepted, committed)`) and `committed_total 6`.
+    static let fixtureWindow = MockRoundScript(rounds: [
+        Round(k: 2, accepted: 2, confirmed: 3),
+        Round(k: 2, accepted: 1, confirmed: 1),
+        Round(k: 2, accepted: 1, confirmed: 2),
+    ])
+
+    /// The journal in finalize order: one record per (row, round).
+    var journal: [RunnerRoundRecord] {
+        Self.records(for: journalAtBegin + rounds, requestIDs: requestIDs)
+    }
+
+    /// The records the run's read sees.
+    var journalAfterBegin: [RunnerRoundRecord] {
+        Self.records(for: rounds, requestIDs: requestIDs)
+    }
+
+    static func records(
+        for rounds: [Round], requestIDs: [UInt64]
+    ) -> [RunnerRoundRecord] {
+        rounds.flatMap { round in
+            requestIDs.map { requestID in
+                RunnerRoundRecord(
+                    requestID: requestID,
+                    drafted: round.k,
+                    accepted: round.accepted,
+                    committed: round.confirmed)
+            }
+        }
+    }
+}
+
+final class MockEngine:
+    CBv2Engine, CBv2MTPCountersReporting, RunnerRoundJournaling, @unchecked Sendable
+{
+    private let script: MockRoundScript?
+    private let lock = NSLock()
+    private var reads = 0
+    private var journalReads = 0
+
+    /// The engine's own serial queue, as the pair of the loop's queue: work put
+    /// here runs in order, so a shutdown that queues behind a successor step
+    /// cannot return before that step finished.
+    let engineQueue = DispatchQueue(label: "mock.cbv2.engine")
+
+    /// The step the loop had already launched when the first drain was
+    /// accepted. It runs on `engineQueue`, outliving that drain, the way a
+    /// chained decode outlives the loop's shutdown.
+    var queuedSuccessor: (@Sendable () -> Void)?
+
+    /// A shutdown that takes at least this long models one that ran into the
+    /// loop's drain watchdog.
+    var shutdownDelay: Duration?
+
+    /// Thrown from `submit` when set, so a test can drive a worker error path.
+    var submitFailure: Error?
+
+    init(script: MockRoundScript?) {
+        self.script = script
+    }
+
+    func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        if let submitFailure { throw submitFailure }
+        let start = MockTokens.freeRunStart(request.promptTokens)
+        let maxTokens = request.maxTokens
+        let deltaWidth = max(1, script?.deltaWidth ?? 1)
+        return AsyncStream { continuation in
+            var index = 0
+            while index < maxTokens {
+                let width = min(deltaWidth, maxTokens - index)
+                let tokens = (0 ..< width).map { start + index + $0 }
+                continuation.yield(.delta(text: "", tokens: tokens, logprobs: nil))
+                index += width
+            }
+            continuation.yield(
+                .finished(
+                    reason: .length,
+                    usage: CBv2Usage(
+                        promptTokens: request.promptTokens.count,
+                        completionTokens: maxTokens)))
+            continuation.finish()
+        }
+    }
+
+    func cancel(_ id: CBv2RequestID) {}
+
+    func capacity() -> CBv2CapacitySnapshot {
+        CBv2CapacitySnapshot(
+            activeRequests: 0, waitingRequests: 0, kvBytesInUse: 0,
+            kvBytesCapacity: 0, kvBytesBackendCapacity: 0, kvBytesReserved: 0,
+            activeTokens: 0)
+    }
+
+    /// How many times this engine has been asked to shut down. The worker
+    /// drains, then waits for the queue with a second (idempotent) shutdown, so
+    /// a count of 2 is "the loop is quiet", and 1 is "the drain was requested".
+    private(set) var shutdowns = 0
+
+    func shutdown() async {
+        let call = recordShutdown()
+        if let delay = shutdownDelay { try? await Task.sleep(for: delay) }
+        if call == 1 {
+            // The first drain is accepted while the loop's own work runs on:
+            // the successor is queued, not awaited.
+            if let successor = queuedSuccessor {
+                queuedSuccessor = nil
+                engineQueue.async(execute: successor)
+            }
+            return
+        }
+        // The second drain queues behind whatever the queue already holds.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            engineQueue.async { continuation.resume() }
+        }
+    }
+
+    /// Locking is not async-safe, so the async entry point hands the counter to
+    /// a synchronous helper.
+    @discardableResult
+    private func recordShutdown() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        shutdowns += 1
+        return shutdowns
+    }
+
+    /// Cumulative and monotonic, like the real engine's: the FIRST read is
+    /// the baseline `free_decode_begin` takes after its seed forward, when no
+    /// verify round has finalized yet; every read after it is the drained
+    /// window's journal.
+    func mtpMetricsSnapshot() -> CBv2MTPMetrics? {
+        guard let script else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        defer { reads += 1 }
+        var metrics = CBv2MTPMetrics()
+        guard reads > 0 else { return metrics }
+        metrics.rounds = script.rounds.count
+        return metrics
+    }
+
+    /// The journal, with the same first-read-is-empty rule as the counters:
+    /// the seed forward has finalized no round when the window opens. The
+    /// FIRST read (the one `free_decode_begin` makes, before its seed drain)
+    /// reports whatever the script says had already finalized, and no
+    /// eviction; every read after it reports the window's records plus the
+    /// script's eviction count.
+    func roundJournal() -> RunnerRoundJournal {
+        guard let script else { return RunnerRoundJournal() }
+        lock.lock()
+        defer { lock.unlock() }
+        defer { journalReads += 1 }
+        guard journalReads > 0 else {
+            return RunnerRoundJournal(
+                records: MockRoundScript.records(
+                    for: script.journalAtBegin, requestIDs: script.requestIDs),
+                dropped: 0)
+        }
+        return RunnerRoundJournal(
+            records: MockRoundScript.records(
+                for: script.journalAtBegin + script.rounds,
+                requestIDs: script.requestIDs),
+            dropped: script.dropped)
+    }
+
+    /// The library's retention cap, so a test can build a journal that is
+    /// exactly full (which states the window) or one that has evicted past the
+    /// cursor (which refuses it).
+    static let retainedRecordCap = 8192
+    var roundRecordCap: Int { Self.retainedRecordCap }
+}
+
+// MARK: - Runner
+
+/// Manifests the CONTRACT itself pins, built here from the document.
+///
+/// The shared conformance fixture's hello carries the mock adapter's runner
+/// identity and manifest digest, and both are readings of ONE declaration:
+/// the file benchd checked in beside the fixture. A test that pins the digest
+/// and a hello driven over this value therefore cannot drift apart.
+enum ContractManifests {
+    /// The mock adapter's manifest — the only runner this repository ships.
+    static let shared = MockRunner.manifest
+}
+
+/// The mock adapter's manifest, DECODED from the file benchd checked in
+/// beside the fixture (`Resources/engine-wire-v1-adapter.manifest.json`).
+///
+/// Decoded rather than declared in Swift on purpose: both sides load the
+/// SAME bytes, so the hello's `manifest_sha256` is a digest this repo
+/// actually computed over the other repo's file, not two declarations that
+/// happen to agree today.
+enum FixtureManifest {
+    static let mockAdapter: RunnerManifest = {
+        guard
+            let url = Bundle.module.url(
+                forResource: "engine-wire-v1-adapter.manifest", withExtension: "json"),
+            let data = try? Data(contentsOf: url),
+            let manifest = try? JSONDecoder().decode(RunnerManifest.self, from: data)
+        else {
+            fatalError("the shared mock-adapter manifest is missing or undecodable")
+        }
+        return manifest
+    }()
+}
+
+/// The scripted runner the conformance fixture is driven over.
+///
+/// Its manifest is the shared mock-adapter file, so `hello.backend` and
+/// `hello.runner.manifest_sha256` are two readings of ONE declaration —
+/// which is what §6.1 requires and what a hand-written hello field would
+/// break.
+final class MockRunner: Runner, @unchecked Sendable {
+
+    static var manifest: RunnerManifest { FixtureManifest.mockAdapter }
+
+    /// The window audit the scripted engine replays.
+    let script: MockRoundScript?
+
+    var servingModel: any LanguageModel {
+        preconditionFailure("mock runner holds no model")
+    }
+    var tokenizer: any MLXLMCommon.Tokenizer {
+        preconditionFailure("mock runner holds no tokenizer")
+    }
+    let eosTokenIDs: Set<Int> = []
+    let layerKinds: [CBv2LayerKind] = []
+    let loadedDecoders: [DecoderID] = [.serial, .mtp]
+    let headProvenance: HeadProvenance? = nil
+    let loadedModelType = "qwen4_exp_text"
+
+    /// Every engine this runner builds, so a test can read what the worker did
+    /// to it: the wire has no verb that reports an engine's lifetime.
+    var onEngine: ((MockEngine) -> Void)?
+
+    /// Passed to every engine this runner builds: see `MockEngine`.
+    var successor: (@Sendable () -> Void)?
+    var shutdownDelay: Duration?
+    var submitFailure: Error?
+
+    init(script: MockRoundScript? = .fixtureWindow) {
+        self.script = script
+    }
+
+    /// The mock holds no module, so adoption is the whole of its
+    /// construction — but it still reads the two checkpoint facts every real
+    /// runner reads, so a directory holding only those two files is enough
+    /// for it too.
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> MockRunner {
+        _ = try RunnerCheckpoint.modelType(at: directory)
+        return MockRunner()
+    }
+
+    func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
+        guard loadedDecoders.contains(build.decoder) else {
+            throw RunnerError.decoderNotLoaded(
+                requested: build.decoder.rawValue,
+                loaded: loadedDecoders.map(\.rawValue))
+        }
+        let engine = MockEngine(script: build.decoder == .serial ? nil : script)
+        engine.queuedSuccessor = successor
+        engine.shutdownDelay = shutdownDelay
+        engine.submitFailure = submitFailure
+        onEngine?(engine)
+        return engine
+    }
+
+    func makeStepper() throws -> any TeacherForcedStepper { MockStepper() }
+}
+
+/// The same mock with a COHORT free-run regime added, so the batched verbs
+/// and the cohort-only audit fields can be driven. Its manifest is not the
+/// shared fixture's, and nothing in the byte-for-byte replay uses it.
+final class CohortMockRunner: Runner, @unchecked Sendable {
+
+    static let manifest: RunnerManifest = {
+        let base = MockRunner.manifest
+        return RunnerManifest(
+            schemaVersion: base.schemaVersion,
+            runnerID: "layr/mock-cohort",
+            modelTypes: ["mock-cohort"],
+            backend: base.backend,
+            engine: base.engine,
+            kvBackends: base.kvBackends,
+            decoders: base.decoders,
+            regimes: base.regimes + [
+                RegimeDeclaration(batch: .upTo(8), timing: .freeRun, perStreamTiming: false)
+            ],
+            multimodal: base.multimodal,
+            recurrentLayers: base.recurrentLayers,
+            requiresKeepMask: base.requiresKeepMask)
+    }()
+
+    private let inner: MockRunner
+
+    init(script: MockRoundScript?) {
+        self.inner = MockRunner(script: script)
+    }
+
+    var servingModel: any LanguageModel { inner.servingModel }
+    var tokenizer: any MLXLMCommon.Tokenizer { inner.tokenizer }
+    var eosTokenIDs: Set<Int> { inner.eosTokenIDs }
+    var layerKinds: [CBv2LayerKind] { inner.layerKinds }
+    var loadedDecoders: [DecoderID] { inner.loadedDecoders }
+    var headProvenance: HeadProvenance? { inner.headProvenance }
+    var loadedModelType: String { inner.loadedModelType }
+
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> CohortMockRunner {
+        CohortMockRunner(script: .fixtureWindow)
+    }
+
+    func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
+        try inner.makeEngine(build)
+    }
+    func makeStepper() throws -> any TeacherForcedStepper { try inner.makeStepper() }
+}
+
+/// The same mock with every FREE-RUN regime removed. A worker over this one
+/// must REFUSE `free_decode_begin` rather than serve a regime the manifest
+/// does not declare (contract §6.2 rule 3).
+final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
+
+    static let manifest = RunnerManifest(
+        runnerID: "layr/mock-teacher-forced",
+        modelTypes: ["mock-teacher-forced"],
+        engine: MockRunner.manifest.engine,
+        kvBackends: [.contiguous],
+        decoders: MockRunner.manifest.decoders,
+        regimes: [
+            RegimeDeclaration(batch: .single, timing: .teacherForced, perStreamTiming: false)
+        ],
+        multimodal: false,
+        recurrentLayers: false,
+        requiresKeepMask: false)
+
+    private let inner = MockRunner()
+
+    var servingModel: any LanguageModel { inner.servingModel }
+    var tokenizer: any MLXLMCommon.Tokenizer { inner.tokenizer }
+    var eosTokenIDs: Set<Int> { inner.eosTokenIDs }
+    var layerKinds: [CBv2LayerKind] { inner.layerKinds }
+    var loadedDecoders: [DecoderID] { inner.loadedDecoders }
+    var headProvenance: HeadProvenance? { inner.headProvenance }
+    var loadedModelType: String { inner.loadedModelType }
+
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> TeacherForcedOnlyMockRunner {
+        TeacherForcedOnlyMockRunner()
+    }
+
+    func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
+        try inner.makeEngine(build)
+    }
+    func makeStepper() throws -> any TeacherForcedStepper { try inner.makeStepper() }
+}
+
+// MARK: - Transport
+
+/// Scripted transport: the request lines go in, the response lines come out.
+final class ScriptedTransport: BenchWorkerTransport {
+    private let lock = NSLock()
+    private var pending: [String]
+    private var lines: [String] = []
+    private var flushes = 0
+
+    /// Lines written so far. Locked, because a test that watches the worker's
+    /// ordering reads this while the worker is still serving.
+    var written: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines
+    }
+
+    init(lines: [String]) {
+        self.pending = lines
+    }
+
+    func readLine() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.isEmpty ? nil : pending.removeFirst()
+    }
+
+    func write(line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        lines.append(line)
+    }
+
+    /// How many times the worker asked for a flush. The end path that skips the
+    /// runtime's teardown must flush before it leaves.
+    var flushCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return flushes
+    }
+
+    func flush() {
+        lock.lock()
+        defer { lock.unlock() }
+        flushes += 1
+    }
+}
+
+/// A worker with no MLX allocator: it reports the peak RSS the fixture
+/// pins and nothing else. Absence is a real answer — the schema reads an
+/// absent `cache_memory` as "not asserted", which is a different claim
+/// from zero.
+struct FixtureMemoryReporter: WorkerMemoryReporter {
+    func preDrainSnapshot() -> (active: Int, cache: Int, peak: Int)? { nil }
+    func drain() {}
+    func cacheMemoryAfterDrain() -> Int? { nil }
+    func peakRAMGB() -> Double? { 18.5 }
+}
+
+// MARK: - Stand-ins for the adoption seam
+
+/// A tokenizer that answers only what adoption asks of it.
+struct StubTokenizer: MLXLMCommon.Tokenizer {
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], chatTemplate: String
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], chatTemplate: String,
+        tools: [[String: any Sendable]]?, additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+/// A resident drafter: identity is all the adoption seam needs of it. Every
+/// engine-facing member traps, because adoption binds a drafter and never
+/// drives one.
+final class StubDrafter: CBv2MTPDrafter, @unchecked Sendable {
+    var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
+        preconditionFailure("the stub drafter never drafts")
+    }
+
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        preconditionFailure("the stub drafter never drafts")
+    }
+}

@@ -1,0 +1,295 @@
+/* Copyright © 2023-2024 Apple Inc.                   */
+/*                                                    */
+/* This file is auto-generated. Do not edit manually. */
+/*                                                    */
+
+#ifndef MLX_FAST_H
+#define MLX_FAST_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "mlx/c/array.h"
+#include "mlx/c/closure.h"
+#include "mlx/c/distributed_group.h"
+#include "mlx/c/io_types.h"
+#include "mlx/c/map.h"
+#include "mlx/c/stream.h"
+#include "mlx/c/string.h"
+#include "mlx/c/vector.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * \defgroup fast Fast custom operations
+ */
+/**@{*/
+
+int mlx_fast_cross_entropy(
+    mlx_array* res,
+    const mlx_array logits,
+    const mlx_array targets,
+    const mlx_stream s);
+
+typedef struct mlx_fast_cuda_kernel_config_ {
+  void* ctx;
+} mlx_fast_cuda_kernel_config;
+mlx_fast_cuda_kernel_config mlx_fast_cuda_kernel_config_new(void);
+void mlx_fast_cuda_kernel_config_free(mlx_fast_cuda_kernel_config cls);
+
+int mlx_fast_cuda_kernel_config_add_output_arg(
+    mlx_fast_cuda_kernel_config cls,
+    const int* shape,
+    size_t size,
+    mlx_dtype dtype);
+int mlx_fast_cuda_kernel_config_set_grid(
+    mlx_fast_cuda_kernel_config cls,
+    int grid1,
+    int grid2,
+    int grid3);
+int mlx_fast_cuda_kernel_config_set_thread_group(
+    mlx_fast_cuda_kernel_config cls,
+    int thread1,
+    int thread2,
+    int thread3);
+int mlx_fast_cuda_kernel_config_set_init_value(
+    mlx_fast_cuda_kernel_config cls,
+    float value);
+int mlx_fast_cuda_kernel_config_set_verbose(
+    mlx_fast_cuda_kernel_config cls,
+    bool verbose);
+int mlx_fast_cuda_kernel_config_add_template_arg_dtype(
+    mlx_fast_cuda_kernel_config cls,
+    const char* name,
+    mlx_dtype dtype);
+int mlx_fast_cuda_kernel_config_add_template_arg_int(
+    mlx_fast_cuda_kernel_config cls,
+    const char* name,
+    int value);
+int mlx_fast_cuda_kernel_config_add_template_arg_bool(
+    mlx_fast_cuda_kernel_config cls,
+    const char* name,
+    bool value);
+
+typedef struct mlx_fast_cuda_kernel_ {
+  void* ctx;
+} mlx_fast_cuda_kernel;
+
+mlx_fast_cuda_kernel mlx_fast_cuda_kernel_new(
+    const char* name,
+    const mlx_vector_string input_names,
+    const mlx_vector_string output_names,
+    const char* source,
+    const char* header,
+    bool ensure_row_contiguous,
+    int shared_memory);
+
+void mlx_fast_cuda_kernel_free(mlx_fast_cuda_kernel cls);
+
+int mlx_fast_cuda_kernel_apply(
+    mlx_vector_array* outputs,
+    mlx_fast_cuda_kernel cls,
+    const mlx_vector_array inputs,
+    const mlx_fast_cuda_kernel_config config,
+    const mlx_stream stream);
+
+int mlx_fast_gated_delta_update(
+    mlx_vector_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array values,
+    const mlx_array gates,
+    const mlx_array beta_,
+    const mlx_array initial_state /* may be null */,
+    const mlx_array mask /* may be null */,
+    const mlx_stream s);
+int mlx_fast_layer_norm(
+    mlx_array* res,
+    const mlx_array x,
+    const mlx_array weight /* may be null */,
+    const mlx_array bias /* may be null */,
+    float eps,
+    const mlx_stream s);
+
+typedef struct mlx_fast_metal_kernel_config_ {
+  void* ctx;
+} mlx_fast_metal_kernel_config;
+mlx_fast_metal_kernel_config mlx_fast_metal_kernel_config_new(void);
+void mlx_fast_metal_kernel_config_free(mlx_fast_metal_kernel_config cls);
+
+int mlx_fast_metal_kernel_config_add_output_arg(
+    mlx_fast_metal_kernel_config cls,
+    const int* shape,
+    size_t size,
+    mlx_dtype dtype);
+int mlx_fast_metal_kernel_config_set_grid(
+    mlx_fast_metal_kernel_config cls,
+    int grid1,
+    int grid2,
+    int grid3);
+int mlx_fast_metal_kernel_config_set_thread_group(
+    mlx_fast_metal_kernel_config cls,
+    int thread1,
+    int thread2,
+    int thread3);
+int mlx_fast_metal_kernel_config_set_init_value(
+    mlx_fast_metal_kernel_config cls,
+    float value);
+int mlx_fast_metal_kernel_config_set_verbose(
+    mlx_fast_metal_kernel_config cls,
+    bool verbose);
+int mlx_fast_metal_kernel_config_add_template_arg_dtype(
+    mlx_fast_metal_kernel_config cls,
+    const char* name,
+    mlx_dtype dtype);
+int mlx_fast_metal_kernel_config_add_template_arg_int(
+    mlx_fast_metal_kernel_config cls,
+    const char* name,
+    int value);
+int mlx_fast_metal_kernel_config_add_template_arg_bool(
+    mlx_fast_metal_kernel_config cls,
+    const char* name,
+    bool value);
+
+typedef struct mlx_fast_metal_kernel_ {
+  void* ctx;
+} mlx_fast_metal_kernel;
+
+mlx_fast_metal_kernel mlx_fast_metal_kernel_new(
+    const char* name,
+    const mlx_vector_string input_names,
+    const mlx_vector_string output_names,
+    const char* source,
+    const char* header,
+    bool ensure_row_contiguous,
+    bool atomic_outputs);
+
+void mlx_fast_metal_kernel_free(mlx_fast_metal_kernel cls);
+
+mlx_fast_metal_kernel mlx_fast_metal_kernel_new_mutable(
+    const char* name,
+    const mlx_vector_string input_names,
+    const mlx_vector_string output_names,
+    const char* source,
+    const char* header,
+    bool ensure_row_contiguous,
+    bool atomic_outputs,
+    const mlx_vector_string mutable_input_names);
+
+/**
+ * As mlx_fast_metal_kernel_new_mutable. A fenced input can come from a CPU
+ * stream in the same eval (a CPU-stream all-sum); with
+ * MLX_METAL_FENCED_INPUTS=1 the kernel waits for it itself, and MLX encodes
+ * no separate fence wait. The source calls MLX_FENCED_INPUT_WAIT(name) for
+ * each fenced input before it reads it, where every thread of the
+ * threadgroup reaches the call.
+ */
+mlx_fast_metal_kernel mlx_fast_metal_kernel_new_fenced(
+    const char* name,
+    const mlx_vector_string input_names,
+    const mlx_vector_string output_names,
+    const char* source,
+    const char* header,
+    bool ensure_row_contiguous,
+    bool atomic_outputs,
+    const mlx_vector_string mutable_input_names,
+    const mlx_vector_string fenced_input_names);
+
+/** Compiler math mode for one custom kernel; legacy constructors stay safe. */
+typedef enum mlx_fast_metal_kernel_math_mode_ {
+  MLX_FAST_METAL_MATH_SAFE = 0,
+  MLX_FAST_METAL_MATH_RELAXED = 1,
+  MLX_FAST_METAL_MATH_FAST = 2
+} mlx_fast_metal_kernel_math_mode;
+
+/**
+ * Create one kernel with explicit compiler options and mutable-input metadata.
+ * Pass a valid empty vector when no input is mutable. This does not change
+ * global defaults. Different modes may produce different numerical results;
+ * the caller must qualify the selected mode. Invalid modes return an empty
+ * handle after invoking the error handler. Backend OS restrictions still apply.
+ */
+mlx_fast_metal_kernel mlx_fast_metal_kernel_new_with_options(
+    const char* name,
+    const mlx_vector_string input_names,
+    const mlx_vector_string output_names,
+    const char* source,
+    const char* header,
+    bool ensure_row_contiguous,
+    bool atomic_outputs,
+    const mlx_vector_string mutable_input_names,
+    mlx_fast_metal_kernel_math_mode math_mode);
+
+int mlx_fast_metal_kernel_apply(
+    mlx_vector_array* outputs,
+    mlx_fast_metal_kernel cls,
+    const mlx_vector_array inputs,
+    const mlx_fast_metal_kernel_config config,
+    const mlx_stream stream);
+
+/**
+ * A prepared launch: `cls` with a fixed config (template arguments, grid,
+ * threadgroup, output shapes and dtypes, init value), bound once and applied
+ * to new inputs without rebuilding the config. `cls` must outlive it.
+ */
+typedef struct mlx_fast_metal_kernel_launch_ {
+  void* ctx;
+} mlx_fast_metal_kernel_launch;
+mlx_fast_metal_kernel_launch mlx_fast_metal_kernel_launch_new(
+    mlx_fast_metal_kernel cls,
+    const mlx_fast_metal_kernel_config config);
+void mlx_fast_metal_kernel_launch_free(mlx_fast_metal_kernel_launch launch);
+int mlx_fast_metal_kernel_launch_apply(
+    mlx_vector_array* outputs,
+    mlx_fast_metal_kernel_launch launch,
+    const mlx_vector_array inputs,
+    const mlx_stream stream);
+
+int mlx_fast_rms_norm(
+    mlx_array* res,
+    const mlx_array x,
+    const mlx_array weight /* may be null */,
+    float eps,
+    const mlx_stream s);
+int mlx_fast_rope(
+    mlx_array* res,
+    const mlx_array x,
+    int dims,
+    bool traditional,
+    mlx_optional_float base,
+    float scale,
+    int offset,
+    const mlx_array freqs /* may be null */,
+    const mlx_stream s);
+int mlx_fast_rope_dynamic(
+    mlx_array* res,
+    const mlx_array x,
+    int dims,
+    bool traditional,
+    mlx_optional_float base,
+    float scale,
+    const mlx_array offset,
+    const mlx_array freqs /* may be null */,
+    const mlx_stream s);
+int mlx_fast_scaled_dot_product_attention(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array values,
+    float scale,
+    const char* mask_mode,
+    const mlx_array mask_arr /* may be null */,
+    const mlx_array sinks /* may be null */,
+    bool force_fused,
+    const mlx_stream s);
+
+/**@}*/
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

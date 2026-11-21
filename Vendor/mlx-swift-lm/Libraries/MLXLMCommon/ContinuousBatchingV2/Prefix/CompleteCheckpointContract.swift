@@ -1,0 +1,503 @@
+import Foundation
+import MLX
+
+/// Disk compatibility, distinct from a process-local assistant identity.
+/// The provider supplies verified artifact/template identities and a fingerprint
+/// of the binary, native implementation and numerical execution settings.
+public struct CBv2CompleteCheckpointIdentity: Codable, Sendable, Equatable {
+    public let modelAggregateHash: String
+    public let promptContractID: String
+    public let buildID: String
+    public let numericsFingerprint: String
+
+    public init(
+        modelAggregateHash: String, promptContractID: String,
+        buildID: String, numericsFingerprint: String
+    ) {
+        self.modelAggregateHash = modelAggregateHash
+        self.promptContractID = promptContractID
+        self.buildID = buildID
+        self.numericsFingerprint = numericsFingerprint
+    }
+
+    var isValid: Bool {
+        [modelAggregateHash, promptContractID, buildID, numericsFingerprint]
+            .allSatisfy { !$0.isEmpty && $0.utf8.count <= 512 }
+    }
+}
+
+public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
+    case keys, values, convolution, recurrent
+    case assistantHidden, assistantTokens, assistantFrontier
+    case assistantKeys, assistantValues, assistantCacheMetadata
+    case indexKeys, indexPositions, pooledIndexKeys
+}
+
+public enum CBv2CheckpointDType: String, Codable, Sendable {
+    case float16, bfloat16, float32, int32, int64, uint8
+
+    public var isFloatingPoint: Bool {
+        self == .float16 || self == .bfloat16 || self == .float32
+    }
+
+    public var mlxDType: DType {
+        switch self {
+        case .float16: .float16
+        case .bfloat16: .bfloat16
+        case .float32: .float32
+        case .int32: .int32
+        case .int64: .int64
+        case .uint8: .uint8
+        }
+    }
+
+    public init?(_ dtype: DType) {
+        switch dtype {
+        case .float16: self = .float16
+        case .bfloat16: self = .bfloat16
+        case .float32: self = .float32
+        case .int32: self = .int32
+        case .int64: self = .int64
+        case .uint8: self = .uint8
+        default: return nil
+        }
+    }
+}
+
+/// Describes logical packed bytes, without the donor's allocation slack.
+public struct CBv2CheckpointTensorDescriptor: Codable, Sendable, Equatable {
+    public let role: CBv2CheckpointTensorRole
+    public let layer: Int?
+    public let shape: [Int]
+    public let dtype: CBv2CheckpointDType
+    public let byteCount: Int
+
+    public init(
+        role: CBv2CheckpointTensorRole, layer: Int? = nil,
+        shape: [Int], dtype: CBv2CheckpointDType
+    ) throws {
+        self.role = role
+        self.layer = layer
+        self.shape = shape
+        self.dtype = dtype
+        self.byteCount = try Self.checkedByteCount(shape: shape, dtype: dtype.mlxDType)
+    }
+
+    func validate() throws {
+        guard byteCount == (try Self.checkedByteCount(shape: shape, dtype: dtype.mlxDType)),
+            layer == nil || layer! >= 0
+        else { throw CBv2CompleteCheckpointError.invalidManifest }
+    }
+
+    static func checkedByteCount(shape: [Int], dtype: DType) throws -> Int {
+        guard !shape.isEmpty, shape.count <= 8 else {
+            throw CBv2CompleteCheckpointError.invalidManifest
+        }
+        var bytes = dtype.size
+        for dimension in shape {
+            guard dimension > 0, dimension <= Int(Int32.max) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            let (next, overflow) = bytes.multipliedReportingOverflow(by: dimension)
+            guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
+            bytes = next
+        }
+        return bytes
+    }
+}
+
+/// This entire manifest, including token IDs and tenant scope, is encrypted.
+/// Public disk metadata must contain only opaque lookup keys and envelope data.
+public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+    public static let maximumEncodedBytes = 1 << 20
+    public static let maximumSegmentBytes = 4 << 20
+    public static let maximumProviderScratchBytes = 20 << 20
+    public static let layout = "native-contiguous-full-recurrent-v1"
+    public static let contiguousAsymmetricLayout = "native-contiguous-full-recurrent-v2"
+    public static let contiguousAsymmetricMTPLayout = "native-contiguous-asymmetric-mtp-v1"
+    public static let pagedLayout = "native-paged-full-recurrent-v1"
+    public static let quantizedPagedLayout = "affine-paged-full-recurrent-v1"
+    public static let quantizedHistoricalLayout = "affine-paged-historical-attention-v1"
+    public static let nativeQuantizedPagedLayout =
+        "native-paged-affine-checkpoint-full-recurrent-v1"
+    public static let nativeQuantizedHistoricalLayout =
+        "native-paged-affine-checkpoint-historical-attention-v1"
+    public static let nativeQuantizedContiguousLayout =
+        "native-contiguous-affine-checkpoint-full-recurrent-v1"
+    public static let nativeQuantizedContiguousHistoricalLayout =
+        "native-contiguous-affine-checkpoint-historical-attention-v1"
+    /// `nativeQuantizedPagedLayout` plus the exact prefix history of an
+    /// assistant that declares `CBv2MTPExactHistoryPrefixCheckpointCoding`.
+    public static let nativeQuantizedPagedMTPLayout =
+        "native-paged-affine-checkpoint-full-recurrent-mtp-v1"
+    /// `glm5NextPagedLayout` whose older latent rows use the checkpoint
+    /// profile. Index/gate/validity rows, KDA state and MTP history stay exact.
+    public static let glm5NextQuantizedPagedLayout =
+        "native-paged-glm5next-affine-checkpoint-full-state-v1"
+    public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
+    public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
+    public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
+    public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
+    /// v2 records each GLM payload role's wire dtype in
+    /// `CBv2GLM5NextCheckpointState.storage` and writes half-precision roles
+    /// narrow. The retired all-FP32 v1 spelling is refused; its different
+    /// layout epoch already keeps v1 files out of a v2 store's namespace.
+    public static let glm5NextPagedLayout = "native-paged-glm5next-full-state-v2"
+    public static let retiredGLM5NextPagedLayout = "native-paged-glm5next-full-state-v1"
+    public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
+
+    public let schemaVersion: Int
+    public let identity: CBv2CompleteCheckpointIdentity
+    public let backendLayout: String
+    public let position: Int
+    public let chunkSize: Int
+    /// Read-only array aliases borrow the manifest's host ownership. Serving
+    /// callers retain this manifest while using an alias; independently retained
+    /// copies belong to the caller's own host-memory budget.
+    public var prefixTokens: [Int] { metadata.tokens }
+    public let cacheSalt: String?
+    public let assistantCodecID: String?
+    public let mediaIdentity: CBv2HybridPrefixIdentity?
+    public let mediaTargetOnly: Bool
+    public let nativeBlockState: CBv2NativeBlockCheckpointState?
+    public let glm5NextState: CBv2GLM5NextCheckpointState?
+    /// Present only for lossy checkpoint encoding restored to native execution.
+    /// Live-packed v1 formats retain their original external contract.
+    public let checkpointQuantization: PagedKVQuantizationConfig?
+    public let checkpointNativeDTypes: [CBv2CheckpointDType]?
+    public var usesLossyNativeCheckpoint: Bool {
+        [
+            Self.nativeQuantizedPagedLayout, Self.nativeQuantizedHistoricalLayout,
+            Self.nativeQuantizedContiguousLayout, Self.nativeQuantizedContiguousHistoricalLayout,
+            Self.nativeQuantizedPagedMTPLayout, Self.glm5NextQuantizedPagedLayout,
+        ]
+        .contains(backendLayout)
+    }
+    /// Either GLM5-Next full-state layout; both carry `glm5NextState`.
+    public var usesGLM5NextLayout: Bool { Self.isGLM5NextLayout(backendLayout) }
+
+    public static func isGLM5NextLayout(_ layout: String) -> Bool {
+        layout == glm5NextPagedLayout || layout == glm5NextQuantizedPagedLayout
+    }
+    /// Shares the same ownership boundary as prefixTokens, including shape arrays.
+    public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
+    public var attentionLayers: [CBv2CheckpointAttentionLayer]? { metadata.attentionLayers }
+    private(set) var metadata: CBv2CheckpointManifestMemory
+
+    public init(
+        identity: CBv2CompleteCheckpointIdentity, position: Int, chunkSize: Int,
+        prefixTokens: [Int], cacheSalt: String?, assistantCodecID: String?,
+        tensors: [CBv2CheckpointTensorDescriptor], backendLayout: String = Self.layout,
+        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+        nativeBlockState: CBv2NativeBlockCheckpointState? = nil,
+        glm5NextState: CBv2GLM5NextCheckpointState? = nil,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
+        checkpointNativeDTypes: [CBv2CheckpointDType]? = nil
+    ) {
+        self.init(
+            schemaVersion: Self.currentSchemaVersion, identity: identity,
+            backendLayout: backendLayout, position: position, chunkSize: chunkSize,
+            cacheSalt: cacheSalt, assistantCodecID: assistantCodecID,
+            mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
+            nativeBlockState: nativeBlockState,
+            glm5NextState: glm5NextState,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
+            metadata: .init(
+                tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers))
+    }
+
+    init(
+        schemaVersion: Int, identity: CBv2CompleteCheckpointIdentity, backendLayout: String,
+        position: Int, chunkSize: Int, cacheSalt: String?, assistantCodecID: String?,
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+        nativeBlockState: CBv2NativeBlockCheckpointState? = nil,
+        glm5NextState: CBv2GLM5NextCheckpointState? = nil,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
+        checkpointNativeDTypes: [CBv2CheckpointDType]? = nil,
+        metadata: CBv2CheckpointManifestMemory
+    ) {
+        self.schemaVersion = schemaVersion
+        self.identity = identity
+        self.backendLayout = backendLayout
+        self.position = position
+        self.chunkSize = chunkSize
+        self.cacheSalt = cacheSalt
+        self.assistantCodecID = assistantCodecID
+        self.mediaIdentity = mediaIdentity
+        self.mediaTargetOnly = mediaTargetOnly
+        self.nativeBlockState = nativeBlockState
+        self.glm5NextState = glm5NextState
+        self.checkpointQuantization = checkpointQuantization
+        self.checkpointNativeDTypes = checkpointNativeDTypes
+        self.metadata = metadata
+    }
+
+    func replacingMetadata(_ metadata: CBv2CheckpointManifestMemory) -> Self {
+        var copy = self
+        copy.metadata = metadata
+        return copy
+    }
+
+    public func validateStructure() throws -> Int {
+        defer { withExtendedLifetime(metadata) {} }
+        guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
+            usesLossyNativeCheckpoint || backendLayout == Self.layout
+                || backendLayout == Self.pagedLayout
+                || backendLayout == Self.quantizedPagedLayout
+                || backendLayout == Self.quantizedHistoricalLayout
+                || backendLayout == Self.historicalAttentionLayout
+                || backendLayout == Self.nativeContiguousHistoricalLayout
+                || backendLayout == Self.diffusionBlockLayout
+                || backendLayout == Self.contiguousAsymmetricLayout
+                || backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricLayout
+                || backendLayout == Self.pagedAsymmetricMTPLayout
+                || backendLayout == Self.glm5NextPagedLayout,
+            backendLayout == Self.historicalAttentionLayout
+                || backendLayout == Self.nativeQuantizedHistoricalLayout
+                || backendLayout == Self.nativeQuantizedContiguousHistoricalLayout
+                || backendLayout == Self.nativeContiguousHistoricalLayout
+                || backendLayout == Self.quantizedHistoricalLayout
+                || backendLayout == Self.contiguousAsymmetricLayout
+                || backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricLayout
+                || backendLayout == Self.pagedAsymmetricMTPLayout
+                || usesGLM5NextLayout
+                ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
+                : attentionLayers == nil,
+            position > 1,
+            // A chunk of 1 would put every position on a chunk end; only the
+            // diffusion block layout, which sits on its media identity rather
+            // than on a chunk, may record one.
+            backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1,
+            // Historical and diffusion layouts sit on their recorded stride;
+            // a recurrent checkpoint sits on any 256-token boundary (its
+            // `chunkSize` is the chunk that ended there, provenance only) or,
+            // for files written under the earlier uniform-chunk rule, on a
+            // multiple of that chunk.
+            (backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
+                || position % chunkSize == 0
+                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
+                    || backendLayout == Self.quantizedPagedLayout
+                    || backendLayout == Self.nativeQuantizedPagedLayout
+                    || backendLayout == Self.nativeQuantizedPagedMTPLayout
+                    || backendLayout == Self.nativeQuantizedContiguousLayout
+                    || usesGLM5NextLayout)
+                    && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens
+                        == 0),
+            prefixTokens.count == position,
+            position <= Self.maximumEncodedBytes / 2,
+            prefixTokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
+            !tensors.isEmpty, tensors.count <= 4096,
+            (cacheSalt?.utf8.count ?? 0) <= 4096,
+            (assistantCodecID?.utf8.count ?? 0) <= 512,
+            !mediaTargetOnly || (mediaIdentity != nil && assistantCodecID == nil)
+        else { throw CBv2CompleteCheckpointError.invalidManifest }
+        guard usesGLM5NextLayout == (glm5NextState != nil) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        if usesLossyNativeCheckpoint {
+            // Only the MTP layout and GLM (whose structure check owns its
+            // assistant rows) carry exact assistant history beside lossy rows.
+            let assistantAllowed =
+                backendLayout == Self.nativeQuantizedPagedMTPLayout
+                ? assistantCodecID?.isEmpty == false
+                : usesGLM5NextLayout || assistantCodecID == nil
+            guard let checkpointQuantization,
+                (try? checkpointQuantization.validateParameters()) != nil,
+                let checkpointNativeDTypes, !checkpointNativeDTypes.isEmpty,
+                checkpointNativeDTypes.count <= 2048,
+                checkpointNativeDTypes.allSatisfy(\.isFloatingPoint), assistantAllowed,
+                attentionLayers.map({ $0.map(\.dtype) == checkpointNativeDTypes }) ?? true
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        } else if checkpointQuantization != nil || checkpointNativeDTypes != nil {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        if backendLayout == Self.diffusionBlockLayout {
+            guard let nativeBlockState, assistantCodecID == nil, !mediaTargetOnly else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            try nativeBlockState.validate()
+        } else if nativeBlockState != nil {
+            throw CBv2CompleteCheckpointError.invalidManifest
+        }
+        var total = 0
+        var roles = Set<String>()
+        var keyDescriptors: [Int: CBv2CheckpointTensorDescriptor] = [:]
+        var valueDescriptors: [Int: CBv2CheckpointTensorDescriptor] = [:]
+        for tensor in tensors {
+            try tensor.validate()
+            guard roles.insert("\(tensor.role.rawValue):\(tensor.layer ?? -1)").inserted else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            let (next, overflow) = total.addingReportingOverflow(tensor.byteCount)
+            guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
+            total = next
+            let layer = tensor.layer ?? -1
+            if tensor.role == .keys { keyDescriptors[layer] = tensor }
+            if tensor.role == .values { valueDescriptors[layer] = tensor }
+        }
+        if usesGLM5NextLayout {
+            try validateGLM5NextStructure()
+            return total
+        }
+        if usesLossyNativeCheckpoint || backendLayout == Self.quantizedPagedLayout
+            || backendLayout == Self.quantizedHistoricalLayout
+        {
+            // The loaded model codec validates the exact mixed owner/profile
+            // descriptors before any allocation. Encoded roles are byte
+            // streams; every auxiliary tensor keeps its original dtype.
+            for (layer, keys) in keyDescriptors {
+                guard let values = valueDescriptors[layer],
+                    keys.dtype == values.dtype,
+                    keys.dtype == .uint8
+                        ? keys.shape.count == 3 && values.shape.count == 3
+                            && keys.shape.prefix(2).elementsEqual(values.shape.prefix(2))
+                        : keys.dtype.isFloatingPoint
+                            && (keys.shape == values.shape
+                                || (usesLossyNativeCheckpoint && keys.shape.count == 4
+                                    && values.shape.count == 4
+                                    && keys.shape.prefix(3).elementsEqual(values.shape.prefix(3))))
+                else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            }
+            guard keyDescriptors.count == valueDescriptors.count,
+                tensors.allSatisfy({ $0.dtype != .uint8 || $0.role == .keys || $0.role == .values })
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            return total
+        }
+        guard tensors.allSatisfy({ $0.dtype != .uint8 }) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        if backendLayout == Self.nativeContiguousHistoricalLayout
+            || backendLayout == Self.contiguousAsymmetricLayout
+            || backendLayout == Self.contiguousAsymmetricMTPLayout
+            || backendLayout == Self.pagedAsymmetricLayout
+            || backendLayout == Self.pagedAsymmetricMTPLayout
+        {
+            let includesAssistant =
+                backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricMTPLayout
+            guard includesAssistant ? assistantCodecID?.isEmpty == false : assistantCodecID == nil,
+                mediaIdentity == nil, !mediaTargetOnly,
+                let layers = attentionLayers,
+                backendLayout == Self.nativeContiguousHistoricalLayout
+                    ? layers.allSatisfy({ $0.headDim == $0.valueHeadDim })
+                    : layers.contains(where: { $0.headDim != $0.valueHeadDim })
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            let kinds = layers.enumerated().map { index, layer in
+                CBv2LayerKind(
+                    attention: layer.window.map { .slidingWindow($0) } ?? .full,
+                    sharesKVWithLayer: layer.owner == index ? nil : layer.owner,
+                    hasSinks: layer.hasSinks,
+                    headDim: layer.headDim, valueHeadDim: layer.valueHeadDim,
+                    kvHeads: layer.kvHeads, queryHeads: layer.queryHeads,
+                    modelLayerIndex: layer.modelLayer)
+            }
+            let layout = try CBv2HistoricalAttentionLayout(
+                layerKinds: kinds,
+                dtypes: layers.map { $0.dtype.mlxDType }, allowAsymmetric: true)
+            let target = try layout.tensorDescriptors(position: position)
+            guard layout.layers == layers, tensors.prefix(target.count).elementsEqual(target) else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            if includesAssistant {
+                try validateHistoricalAssistantStructure(targetTensorCount: target.count)
+            } else if tensors != target {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            return total
+        }
+        guard attentionLayers?.allSatisfy({ $0.headDim == $0.valueHeadDim }) ?? true else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        // Old persistent layouts continue to require equal K/V widths.
+        // Partial descriptor sets are used by metadata-only ownership probes.
+        // Complete model codecs independently require their exact tensor set.
+        for (layer, keys) in keyDescriptors {
+            if let values = valueDescriptors[layer],
+                keys.shape != values.shape || keys.dtype != values.dtype
+            {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+        }
+        return total
+    }
+}
+
+public enum CBv2CompleteCheckpointError: Error, Sendable, Equatable {
+    case invalidManifest
+    case incompatibleCheckpoint
+    case invalidSegment
+    case incompleteTransfer
+    case closed
+    case allocationFailed
+}
+
+/// Explicit loaded-model contract. A recurrent dtype alone does not establish
+/// the dtype of attention K/V. The list follows the compact CBv2 layer layout.
+public protocol CBv2CompleteCheckpointKVTypeProviding {
+    var cbv2CompleteCheckpointKVDTypes: [DType]? { get }
+}
+
+/// Disk codecs reconstruct a checkpoint belonging to this loaded assistant;
+/// they never deserialize mutable assistant KV or speculative state.
+public protocol CBv2MTPPrefixCheckpointCoding: CBv2MTPPrefixCheckpointDrafter {
+    var prefixCheckpointCodecID: String { get }
+    func prefixCheckpointTensorDescriptors(targetInputCount: Int)
+        -> [CBv2CheckpointTensorDescriptor]?
+    func encodePrefixCheckpoint(_ checkpoint: any CBv2MTPPrefixCheckpoint) -> [MLXArray]?
+    func decodePrefixCheckpoint(tensors: [MLXArray], prefixTokens: [Int])
+        -> (any CBv2MTPPrefixCheckpoint)?
+}
+
+/// A persistent assistant whose encoded prefix history is its own state,
+/// restored bit for bit, never re-derived from the target's stored attention
+/// rows. Its checkpoints may carry lossy older target rows beside that exact
+/// history (`nativeQuantizedPagedMTPLayout`, `glm5NextQuantizedPagedLayout`);
+/// other persistent assistants keep native storage. Drafts are verified by the
+/// target, so the assistant affects acceptance, never the served tokens.
+public protocol CBv2MTPExactHistoryPrefixCheckpointCoding: CBv2MTPPrefixCheckpointCoding {}
+
+/// Provider-owned durable I/O. Neither lookup nor engine adoption performs I/O.
+/// All methods must be thread-safe; each transfer object serializes its owner.
+public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
+    var identity: CBv2CompleteCheckpointIdentity { get }
+
+    /// Allocation-free policy probe. Refusing a later endpoint must preserve
+    /// the donor's earlier reusable checkpoint. packedBytes excludes envelope
+    /// and the bounded encrypted manifest, which the store accounts separately.
+    func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool
+
+    /// Consume one fully authenticated stage ticket, identified by submission
+    /// receipt ID, not the potentially reused sampling request ID.
+    func takeStaged(
+        requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?, maximumSequenceLength: Int
+    ) -> CBv2StagedCompleteCheckpoint?
+
+    /// Always calls completion, including refusal/cancel. Nonempty positions
+    /// mean durable commit. Close source before completion to release its
+    /// tensor aliases; the engine keeps donor ownership until this callback.
+    func donate(
+        _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
+        tokens: [Int], cacheSalt: String?, completion: @escaping @Sendable ([Int]) -> Void
+    )
+
+    func close()
+
+    /// A recurrent donor stopped capturing because one of its prompt ranges
+    /// ran in a packed prefill cohort (`CBv2RecurrentCheckpointGeometry
+    /// .DisarmReason.packed`): once per request, on the engine queue, since
+    /// the disarm holds for the rest of the prompt. `position` is the token
+    /// offset at which the packed range began, a number only. Geometry
+    /// disarms (a non-contiguous range, an overrun past the prompt) and
+    /// preemption or media refusals are not reported.
+    func recordRecurrentCaptureDisarmed(packedAt position: Int)
+}
+
+extension CBv2CompletePrefixCache {
+    public func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { true }
+    public func recordRecurrentCaptureDisarmed(packedAt position: Int) {}
+}

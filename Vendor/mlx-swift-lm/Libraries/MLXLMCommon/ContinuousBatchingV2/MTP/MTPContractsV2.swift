@@ -1,0 +1,921 @@
+// MTPContractsV2.swift
+//
+// ContinuousBatchingV2 — Gemma-4-style MTP (multi-token prediction /
+// speculative decoding) integration contracts.
+//
+// Design (mirrors the KV-less frozen-KV drafter that vLLM and SGLang
+// independently converged on for Gemma 4, and our own v1 engine shipped):
+//
+//   - The DRAFTER writes no KV. Each round it attends a snapshot of the
+//     target's KV at exactly TWO layers (the last non-shared full-attention
+//     layer and the last non-shared sliding-attention layer), with a
+//     CONSTANT query RoPE position per round (the anchor = the absolute
+//     position of the row's newest confirmed-but-unfed token).
+//   - Per round, for each speculating row: chain k drafter forwards
+//     (greedy argmax, seed = newest confirmed token + the target's pre-norm
+//     hidden at the position before it), then verify [seed, d_1..d_k] in ONE
+//     rectangular [B, 1+k] target forward. The accept-walk
+//     (`Gemma4SpeculativeWalk` semantics: accept while target argmax ==
+//     draft, always emit target argmax at the first divergence / bonus
+//     position) emits a+1 tokens; the k−a rejected tokens are rolled back
+//     per row (exact — see `CBv2SequenceKV.supportsSpeculativeWrites`).
+//   - GREEDY-ONLY losslessness is the parity invariant: MTP-on output is
+//     token-exact vs MTP-off for temperature-0 requests. Non-greedy rows
+//     never speculate.
+//
+// Layering: everything here is model-family-agnostic. The Gemma-4 drafter
+// module, its masks, and the accept-walk live in MLXLLM; they reach the
+// engine through `CBv2MTPDrafter` / `CBv2MTPForwardable` (same pattern as
+// `CBv2EmbeddingForwardable` for multimodal).
+
+import Foundation
+import MLX
+
+// MARK: - Model seam (verify forward + capture geometry)
+
+/// Additive target capability for extracting exact top-two policy evidence
+/// from logits without forcing device evaluation.
+public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
+    func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
+}
+
+/// Runtime availability for type-erased model adapters whose static wrapper
+/// type cannot express whether the wrapped target implements top-two.
+public protocol CBv2MTPPolicyTopTwoCapabilityProviding: AnyObject {
+    var cbv2MTPPolicyTopTwoAvailable: Bool { get }
+}
+
+/// Which layer indices the engine snapshots for the drafter's frozen KV.
+/// Indices are MODEL layer indices (== positions in the engine's per-layer
+/// caches array). Both referenced layers must OWN storage (non-KV-shared).
+public struct CBv2MTPCaptureLayers: Sendable, Equatable {
+    /// Last non-shared full-attention layer.
+    public var full: Int
+    /// Last non-shared sliding-attention layer.
+    public var sliding: Int
+    public init(full: Int, sliding: Int) {
+        self.full = full
+        self.sliding = sliding
+    }
+}
+
+/// Model-level surface for `LanguageModel` conformers reached through
+/// `CBv2SteppableLanguageModelAdapter` (Gemma4TextModel conforms): the
+/// KVCache-shaped twin of the `CBv2MTPSteppableModel` requirements.
+public protocol CBv2MTPForwardable: AnyObject {
+    /// nil when this model cannot drive MTP (no capture layers).
+    var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// Forward returning (softcapped) logits [B, L, vocab] AND the pre-norm
+    /// last-decoder-layer hidden [B, L, hidden] — the tensor the Gemma-4
+    /// drafter was trained against. Must be numerically identical to the
+    /// plain forward on the logits side.
+    func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2MTPForwardable {
+    /// Identity may normalize an outer language-model wrapper to the inner
+    /// text target that actually owns embeddings, logits, hidden, and KV.
+    public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+}
+
+/// Recurrent target counterpart to `CBv2MTPForwardable`. Hybrid targets must
+/// receive the same request-owned transaction objects used by ordinary CBv2
+/// decode; the assistant never owns or aliases these states.
+public protocol CBv2RecurrentMTPForwardable:
+    AnyObject, CBv2RecurrentLanguageModelForwardable
+{
+    var cbv2MTPTargetIdentity: ObjectIdentifier { get }
+    func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2RecurrentMTPForwardable {
+    public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+}
+
+/// Capture-verify refinement of `CBv2RecurrentMTPForwardable` (MTPLX GDN
+/// capture-commit pattern): ONE forward over the whole `[B, 1+k]` verify
+/// window during which every recurrent layer stages per-position captured
+/// conv/SSM stacks via `CBv2RecurrentStateEvaluation.stageCaptured`. Commit
+/// selects the captured state at the accepted position on device; rollback
+/// keeps the pre-verify committed state. Attention KV rolls back by trim as
+/// usual, so no repair forward is ever needed.
+public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable {
+    /// Same contract as `cbv2ForwardWithHidden`, but each recurrent
+    /// transaction receives captured `[L, ...]` per-position stacks
+    /// (`L == tokens.dim(1)`) instead of a single final state.
+    func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+/// Steppable models that can drive MTP rounds. Additive refinement of
+/// `CBv2SteppableModel`; the engine speculates only when the bound model
+/// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
+public protocol CBv2RecurrentPrefillHiddenForwardable: CBv2RecurrentMTPForwardable {
+    /// Preserve every trusted hidden row needed by the assistant, while
+    /// projecting vocabulary logits only at the positions the caller needs.
+    /// Retain one position axis: logits are [B, 1, 1] for evaluation-only and
+    /// [B, 1, vocab] for last-position logits. The recurrent MTP consumer
+    /// performs the final narrowing; hidden rows remain [B, L, hidden].
+    func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
+    /// nil when the underlying model cannot drive MTP (adapters over
+    /// arbitrary models answer at runtime).
+    var mtpCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// True only when this exact target implements the hidden/history contract
+    /// required by its request-stateful assistant. Attention-only targets may
+    /// opt in; recurrent targets still require their separate transaction seam.
+    var supportsRequestStatefulMTP: Bool { get }
+    /// Identity of the exact target instance that owns verification logits,
+    /// hidden states, and KV. nil means compatibility cannot be proven and
+    /// must fail safe to plain decode.
+    var mtpTargetIdentity: ObjectIdentifier? { get }
+    /// Forward returning logits [B, L, vocab] and target hidden [B, L, hidden]
+    /// at the trained boundary agreed with this exact drafter (for example,
+    /// MiMo next-N consumes post-final-norm features). Existing families retain
+    /// their original boundary. Same cache/attention semantics as `forward`.
+    func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2MTPSteppableModel {
+    public var mtpTargetIdentity: ObjectIdentifier? { nil }
+    public var supportsRequestStatefulMTP: Bool { false }
+}
+
+/// Optional attention-only prefill refinement. Preserve every hidden row needed
+/// by the assistant while projecting only the vocabulary rows requested by the
+/// engine. Nonconforming targets keep their existing full-logit fallback.
+/// The logits result is already narrowed: `[B, 1]` for evaluation-only and
+/// `[B, vocab]` for last-position logits. Hidden rows remain `[B, L, hidden]`.
+/// Consumers must not apply the full `[B, L, vocab]` fallback slicing again.
+public protocol CBv2MTPPrefillSteppableModel: CBv2MTPSteppableModel {
+    func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+/// Engine-facing recurrent hidden-capture refinement. A recurrent MTP target
+/// is only activated when this seam and request-owned recurrent state are both
+/// present, so no call can silently fall through to the stateless forward.
+public protocol CBv2RecurrentMTPSteppableModel:
+    CBv2MTPSteppableModel, CBv2RecurrentSteppableModel
+{
+    func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+    func forwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// True only when `forwardWithHiddenCaptured` stages per-position
+    /// captured recurrent stacks (MTP capture-verify). Without it,
+    /// rectangular verification over a recurrent target is impossible and
+    /// the driver falls back to the serial oracle.
+    var supportsCapturedVerifyWindow: Bool { get }
+    /// Capture-verify forward over the whole verify window. Only called when
+    /// `supportsCapturedVerifyWindow == true`.
+    func forwardWithHiddenCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+
+    /// Fail-safe defaults for first-generation recurrent targets: no
+    /// captured-window support (the serial oracle remains the verify path).
+    public var supportsCapturedVerifyWindow: Bool { false }
+
+    public func forwardWithHiddenCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        preconditionFailure(
+            "CBv2 capture-verify forward called on a model without captured-window support")
+    }
+}
+
+// MARK: - Drafter seam
+
+/// One speculating row's frozen-KV capture for a round: snapshot views of
+/// the target's retained KV at the two capture layers, plus the row's
+/// anchor geometry. Views are per-row (no padding — the drafter pads and
+/// masks internally, so mixed retained lengths across rows are fine).
+public struct CBv2MTPRowCapture {
+    /// Full-attention capture layer: [1, kvHeads, Tfull, headDim], temporal
+    /// order, post-RoPE (captured from storage the target attended).
+    public var fullKeys: MLXArray
+    public var fullValues: MLXArray
+    /// Sliding-attention capture layer: [1, kvHeads, Tslide, headDim],
+    /// temporal order. Window-limited by storage eviction.
+    public var slidingKeys: MLXArray
+    public var slidingValues: MLXArray
+    /// Absolute position of the FIRST retained sliding entry (the sliding
+    /// KV covers positions [slidingStart, anchor)). The full capture always
+    /// starts at 0.
+    public var slidingStart: Int
+    /// The round's frozen query position: absolute position of the row's
+    /// newest confirmed-but-unfed token (== the row's absoluteOffset).
+    public var anchor: Int
+
+    public init(
+        fullKeys: MLXArray, fullValues: MLXArray,
+        slidingKeys: MLXArray, slidingValues: MLXArray,
+        slidingStart: Int, anchor: Int
+    ) {
+        self.fullKeys = fullKeys
+        self.fullValues = fullValues
+        self.slidingKeys = slidingKeys
+        self.slidingValues = slidingValues
+        self.slidingStart = slidingStart
+        self.anchor = anchor
+    }
+}
+
+/// Opaque round-scoped state a drafter builds once per round from the
+/// per-row captures (padded/stacked batch KV, per-row masks, positions).
+public protocol CBv2MTPPreparedCapture: AnyObject {}
+
+/// The engine's view of a drafter. Implemented in MLXLLM by an adapter over
+/// `Gemma4AssistantDraftModel` bound to the engine's target model (the
+/// adapter owns target-embedding lookup, mask construction, and greedy
+/// argmax). All methods are called on the engine thread while building the
+/// step graph; they MUST NOT force evaluation (no host syncs).
+public protocol CBv2MTPDrafter: AnyObject {
+    /// Identity of the exact target instance whose embeddings and geometry
+    /// this drafter consumes. nil means compatibility cannot be proven and
+    /// must fail safe to plain decode.
+    var mtpTargetIdentity: ObjectIdentifier? { get }
+    /// A drafter may narrow target verification, depth, or batch policy for
+    /// correctness. nil preserves the Gemma/default engine configuration.
+    var requiredVerificationMode: CBv2MTPVerificationMode? { get }
+    var maximumDraftTokens: Int? { get }
+    var maximumSpeculativeBatch: Int? { get }
+    /// True when this drafter's rounds may accept via target-prefix
+    /// pre-sampling; see the extension default for the full contract.
+    var supportsTargetPrefixAcceptance: Bool { get }
+    /// The first stateless draft token may be submitted while target graph
+    /// construction continues. Its graph must only read immutable weights
+    /// and the engine's fenced captures, with no mutable assistant state.
+    var supportsEarlyDraftSubmission: Bool { get }
+    /// True when this model's paged full-attention layers may represent an
+    /// exact rectangular window as independent native decode rows.
+    var prefersBatchedRectangularAttention: Bool { get }
+    /// True when the target's paged layers may attend a rectangular round's
+    /// (row, column) pairs as rows of one decode dispatch
+    /// (`mtpBatchesRectangularColumnsAsRows`). Default false.
+    var batchesVerifyColumnsAsDecodeRows: Bool { get }
+    /// True when this drafter may run only under `.exact` acceptance; the
+    /// engine then does not activate MTP with any other rule. Default false.
+    var requiresExactAcceptance: Bool { get }
+    /// True only when the bound target's arithmetic for one verify row never
+    /// depends on the other rows or on the next step's batch shape (row-exact
+    /// products). Each row then commits its own accepted prefix. False keeps
+    /// one common committed width for every row of the rectangular step.
+    var commitsAcceptedPrefixPerRow: Bool { get }
+    /// Variable request-owned residency outside target KV. Admission charges
+    /// this conservatively for every reserved token when the drafter is active.
+    var requestStateBytesPerToken: Int { get }
+    /// Physical allocation granularity of the request-owned state, in tokens.
+    /// A value greater than one makes admission charge whole allocation blocks.
+    var requestStateTokenGranularity: Int { get }
+    /// Maximum physical high-water tokens retained beyond committed logical state.
+    var requestStateTokenAllocationPadding: Int { get }
+    /// Physical buffer families for allocator-aware request admission. A nil
+    /// declaration uses the conservative fragmented-byte fallback.
+    var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { get }
+    /// Build round-scoped batch state from per-row captures. `rows` order
+    /// == the round's speculating-row order.
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
+    /// One draft-chain step over all speculating rows.
+    ///  - tokens: [B, 1] int32 (lazy) — seed tokens (round start: each
+    ///    row's newest confirmed token; later steps: previous draft).
+    ///  - hidden: [B, 1, H] — round start: the target's pre-norm hidden at
+    ///    the position BEFORE the seed token; later steps: the drafter's
+    ///    own previous output hidden.
+    ///  - Returns greedy next-token ids [B] int32 (lazy) and the drafter's
+    ///    output hidden [B, 1, H] for chaining.
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray)
+}
+
+extension CBv2MTPDrafter {
+    public var mtpTargetIdentity: ObjectIdentifier? { nil }
+    public var requiredVerificationMode: CBv2MTPVerificationMode? { nil }
+    public var maximumDraftTokens: Int? { nil }
+    public var maximumSpeculativeBatch: Int? { nil }
+    public var requestStateBytesPerToken: Int { 0 }
+    public var requestStateTokenGranularity: Int { 1 }
+    public var requestStateTokenAllocationPadding: Int { 0 }
+    public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { nil }
+    /// True when this drafter's rounds may accept via target-prefix
+    /// pre-sampling (accept draft iff it equals a token pre-sampled from the
+    /// target's real per-request sampler distribution; the committed token is
+    /// always that target sample — exact for the output distribution at ANY
+    /// temperature/top-p/top-k). Lifts the engine's `temperature == 0`
+    /// eligibility gate when the installed sampler also supports MTP verify
+    /// sampling. Default false: greedy argmax acceptance only.
+    public var supportsTargetPrefixAcceptance: Bool { false }
+    public var supportsEarlyDraftSubmission: Bool { false }
+    public var prefersBatchedRectangularAttention: Bool { false }
+    public var batchesVerifyColumnsAsDecodeRows: Bool { false }
+    public var requiresExactAcceptance: Bool { false }
+    public var commitsAcceptedPrefixPerRow: Bool { false }
+}
+
+/// Opaque, request-owned assistant state. It is deliberately distinct from
+/// target recurrent state and target attention KV.
+public protocol CBv2MTPRequestState: AnyObject {
+    var committedInputCount: Int { get }
+    var stagedInputCount: Int { get }
+    /// Actual materialized device-array residency currently owned by this state.
+    /// A state refining CBv2MTPRequestResidencyReporting may expose a measured
+    /// retained subset during lazy transitions, but MUST set its unknown flag.
+    /// This telemetry is not process-ledger materialization credit.
+    var materializedBytes: Int { get }
+    /// Before drafting: true when queued history requires preparation beyond
+    /// a normal steady decode round. Accounting only; never suppresses work.
+    var hasPendingPrefillForCostAccounting: Bool { get }
+}
+
+extension CBv2MTPRequestState {
+    public var materializedBytes: Int { 0 }
+    public var hasPendingPrefillForCostAccounting: Bool { false }
+}
+
+/// Explicit precision for assistants that retain measured old backing while a
+/// new lazy generation is in flight. Never present a partial measurement as the
+/// full current residency or use it to reduce conservative admission reserves.
+public protocol CBv2MTPRequestResidencyReporting: CBv2MTPRequestState {
+    var hasUnmeasuredResidency: Bool { get }
+}
+
+/// Trusted target inputs and corresponding hidden rows at the target/drafter's
+/// declared trained boundary. No cross-family normalization is performed here.
+/// Both arrays remain lazy and device-resident until the engine's existing
+/// finalize fence. After their step finishes, the engine drops that step's
+/// completion event from the arrays they view (`CBv2MTPHistoryEvents`), so a
+/// drafter may keep lazy views of them across any number of steps.
+public struct CBv2MTPCommittedTargetObservation {
+    public let tokens: MLXArray
+    public let hidden: MLXArray
+
+    public init(tokens: MLXArray, hidden: MLXArray) {
+        self.tokens = tokens
+        self.hidden = hidden
+    }
+}
+
+/// Alternate drafter seam for autoregressive assistants such as Qwen3.5/3.6.
+/// Calls are row-local so histories and assistant-cache offsets may differ;
+/// the target verifier may still batch the resulting columns as `[B,1]`.
+public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
+    /// Opt in only when observation builds lazy assistant-state mutations that
+    /// must join the current target-step fence. Default false preserves existing
+    /// drafters' scheduling. The engine retains evaluation roots after EACH
+    /// observation, including a preceding carry, before another mutation occurs.
+    var requiresCommittedObservationFence: Bool { get }
+    /// Opt in when observation only queues lazy views of target rows and every
+    /// committed position (prompt or decode) hands over the same hidden
+    /// boundary as a seed. Rows that cannot speculate may then run ordinary,
+    /// chainable decode whose finalize feeds this history, and the final
+    /// prompt row may seed the first carry. Default false; ignored when
+    /// `requiresCommittedObservationFence` is true.
+    var supportsOrdinaryDecodeHistory: Bool { get }
+    func makeRequestState() -> any CBv2MTPRequestState
+    /// Bind the admitted request's complete logical bound before the state
+    /// allocates request-owned storage. Stateful assistants whose allocator
+    /// needs an up-front promise (notably native paged KV) use this instead
+    /// of guessing a process-wide maximum. The call is idempotent.
+    func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int) throws
+    /// Queue trusted target inputs/hidden rows without evaluating them.
+    func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation,
+        requestState: any CBv2MTPRequestState)
+
+    /// Draft-head shortlist opt-in. Non-nil K asks target verification to
+    /// additionally surface each verify position's top-K token ids and
+    /// their probability mass; finalize threads the accepted position's ids
+    /// into the next round's carry when the mass clears the engine coverage
+    /// threshold. nil keeps full-head draft scoring and adds zero verify
+    /// work. Default nil.
+    var draftShortlistSize: Int? { get }
+    /// One request-local draft proposal.
+    /// - shortlist: [K] int32 target top-K token ids captured at the carry
+    ///   position, non-nil only when `draftShortlistSize` is set AND the
+    ///   captured mass cleared the coverage threshold. When present the
+    ///   drafter MUST propose a token from these ids (it may score only the
+    ///   matching head rows instead of the full vocabulary).
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// Device arrays that make assistant-cache mutation part of the round's
+    /// evaluation fence.
+    func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Opt in to submit every draft step's graph as soon as it is built,
+    /// not only the first, so the GPU drafts while the engine still builds
+    /// the target verification graph. Each step's graph is the same either
+    /// way, so outputs are unchanged. Default false.
+    var submitsEveryDraftStepEarly: Bool { get }
+    /// Opt-in observation-fenced assistants receive this after all current
+    /// evaluationTargets have completed, before finalization/retirement. A
+    /// model may drain its retained construction stream and reconcile measured
+    /// owners here, never in telemetry getters. Errors terminate that request
+    /// recoverably after the native work drains. Default is a no-op.
+    func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws
+    /// Complete one staged round. The drafter stages the seed plus every
+    /// proposal it consumes while chaining; `confirmedInputTokens` is the
+    /// exact prefix of those inputs that became canonical target history.
+    func finalizeRound(
+        requestState: any CBv2MTPRequestState,
+        confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray)
+    /// Reject/discard all assistant writes made by the current round.
+    func discardRound(requestState: any CBv2MTPRequestState)
+    /// Explicitly sever device-array ownership on finish/cancel/preemption.
+    func releaseRequestState(_ requestState: any CBv2MTPRequestState)
+}
+
+extension CBv2MTPRequestStatefulDrafter {
+    public var requiresCommittedObservationFence: Bool { false }
+    public var supportsOrdinaryDecodeHistory: Bool { false }
+    public var submitsEveryDraftStepEarly: Bool { false }
+    public var draftShortlistSize: Int? { nil }
+    public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
+    public func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
+    ) throws {}
+}
+
+/// One sampled row's coupled proposals for one round: draft logits
+/// `[n, vocab]`, row j for the round's draft index j, raced with the noise
+/// the target's verify draw uses at that row's output index
+/// (`CBv2StepSampler.mtpCoupledDraftProposal`). The engine builds it; a
+/// drafter only applies it.
+public struct CBv2MTPProposalSelection {
+    private let race: (MLXArray) -> MLXArray?
+
+    public init(_ race: @escaping (MLXArray) -> MLXArray?) {
+        self.race = race
+    }
+
+    /// Lazy `[n]` int32 proposals, or nil when the sampler has no coupled
+    /// race (the drafter then keeps its own rule).
+    public func propose(_ logits: MLXArray) -> MLXArray? {
+        race(logits)
+    }
+}
+
+/// A request-stateful drafter that can propose with its row's verify noise.
+///
+/// Exact acceptance keeps a draft only when it equals the target's own
+/// draw, and that draw is what is emitted, so which proposal is made never
+/// changes the output; a proposal raced with the same noise as the draw
+/// only agrees with it more often. Opt-in and default off.
+public protocol CBv2MTPCoupledProposalDrafter: CBv2MTPRequestStatefulDrafter {
+    /// True to receive a selection for sampled rows.
+    var couplesSampledProposals: Bool { get }
+    /// Before draft index 0 of every round, for every row of the round: the
+    /// row's selection, or nil when it has none (greedy, a free span,
+    /// typical acceptance, or no target-prefix verify). A drafter uses it
+    /// for that round only.
+    func setProposalSelection(
+        _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState)
+}
+
+/// One request's committed target observation, handed over with the others
+/// of its step (`CBv2MTPBatchedRequestDrafter`).
+public struct CBv2MTPRequestObservation {
+    public let observation: CBv2MTPCommittedTargetObservation
+    /// Absolute target position of the first hidden row, for an advisory
+    /// drafter (`CBv2MTPAdvisoryHistoryDrafter`); nil otherwise.
+    public let position: Int?
+    public let requestState: any CBv2MTPRequestState
+
+    public init(
+        _ observation: CBv2MTPCommittedTargetObservation, startingAt position: Int?,
+        requestState: any CBv2MTPRequestState
+    ) {
+        self.observation = observation
+        self.position = position
+        self.requestState = requestState
+    }
+}
+
+/// One row's draft index 0 inputs, handed over with the other rows of its
+/// round (`CBv2MTPBatchedRequestDrafter.startRounds`).
+public struct CBv2MTPRoundSeed {
+    /// `[1, 1]`, the row's seed token.
+    public let tokens: MLXArray
+    /// The row's carry hidden row.
+    public let hidden: MLXArray
+    public let shortlist: MLXArray?
+    public let requestState: any CBv2MTPRequestState
+
+    public init(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) {
+        self.tokens = tokens
+        self.hidden = hidden
+        self.shortlist = shortlist
+        self.requestState = requestState
+    }
+}
+
+/// A request-stateful drafter that does several requests' work in one pass,
+/// so its weights are read once per step instead of once per request.
+///
+/// Each request state must end as the per-request calls would leave it, up
+/// to the accumulation order of the shared matmuls. Proposals may therefore
+/// differ in low bits; the target's verify and acceptance are unchanged, so
+/// with exact acceptance the emitted tokens are too. Opt-in and default off;
+/// without it, or with `batchesRequests` false, the engine keeps its
+/// per-request calls.
+public protocol CBv2MTPBatchedRequestDrafter: CBv2MTPRequestStatefulDrafter {
+    /// True to receive the batched calls.
+    var batchesRequests: Bool { get }
+    /// In place of one `observeCommittedTarget` per entry, in order, for a
+    /// step that observes more than one request. Entries of one request
+    /// keep their order.
+    func observeCommittedTargets(_ observations: [CBv2MTPRequestObservation])
+    /// Before draft index 0 of a round of more than one row, after the
+    /// rows' proposal selections: every row's index-0 inputs at once. The
+    /// engine then calls `draftStep` for every row and index as usual; at
+    /// index 0 a drafter returns what this call prepared.
+    func startRounds(_ seeds: [CBv2MTPRoundSeed])
+}
+
+// MARK: - Config
+
+/// How the target scores one MTP draft chain.
+///
+/// `serialTarget` is the correctness baseline: every column uses the same
+/// `[B, 1]` eager target forward as ordinary decode. It works independently
+/// of chip-specific multi-position kernel numerics. `rectangular` is an
+/// explicit optimization that scores all `1+k` columns in one `[B, 1+k]`
+/// forward and therefore requires separate numerical certification.
+public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
+    case serialTarget = "serial_target"
+    case rectangular
+    /// One captured rectangular target transaction whose shape-sensitive
+    /// arithmetic is explicitly M1-equivalent at the model boundary.
+    case rectangularExact = "rectangular_exact"
+    case automatic
+}
+
+/// How the finalize walk decides whether to keep one draft token at one
+/// verify position.
+public enum CBv2MTPAcceptance: Sendable, Equatable {
+    /// Keep a draft only when it equals the target's own token at that
+    /// position: the argmax for greedy rows, the pre-sampled target token for
+    /// stochastic rows (target-prefix acceptance). Exact for the output
+    /// distribution at any temperature.
+    case exact
+    /// Keep a draft when the sampler-filtered target row gives it probability
+    /// strictly above `min(1, delta * exp(-H))`, `H` the row's Shannon entropy
+    /// in nats. Deterministic and consumes no RNG. The token committed at the
+    /// first rejection and at the bonus position stays the pre-sampled target
+    /// token, so no new draw is needed. The emitted stream is NOT
+    /// distribution-exact. Greedy rows keep the exact comparison. Port of
+    /// mlx-serve PR #427 (`--mtp-typical`).
+    case typical(delta: Float)
+
+    /// The mlx-serve default threshold.
+    public static let defaultTypicalDelta: Float = 0.2
+
+    /// Stable wire spelling for config and telemetry.
+    public var name: String {
+        switch self {
+        case .exact: return "exact"
+        case .typical: return "typical"
+        }
+    }
+}
+
+/// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
+public struct CBv2MTPConfig: Sendable {
+    /// The largest draft depth covered by the production rectangular-shape
+    /// validation matrix (`verify width = 1 + k`, widths 1...8).
+    public static let testedMaxDraftTokens = 7
+    /// CBv2's production rectangular batch ceiling.
+    public static let testedMaxSpeculativeBatch = 8
+
+    /// Master switch. The engine also requires a drafter instance and a
+    /// conforming model; `enabled == true` without both is inert.
+    public var enabled: Bool
+    /// Max draft tokens per round (k). Rounds verify 1+k and emit 1...k+1.
+    /// Clamped to the production-tested `0...7` range.
+    public var maxDraftTokens: Int
+    /// Optional deterministic override. nil selects the adaptive controller;
+    /// a value selects a fixed step-global depth, clamped to
+    /// `0...maxDraftTokens`. Fixed zero is an explicit target-only mode that
+    /// keeps MTP construction and metrics active for bring-up.
+    public var fixedDraftTokens: Int?
+    /// Optional width-dependent fixed depth: with `fixedDraftTokens`, a plan
+    /// of N decode rows uses `min(fixedDraftTokens, table[min(N, count) - 1])`
+    /// (the last entry covers every larger width). nil, or no fixed depth,
+    /// keeps one depth for every width. Every depth verifies exactly; only
+    /// the work per round changes.
+    public var fixedDraftTokensByDecodeRows: [Int]?
+    /// Hard operational gate on decode rows in one plan, clamped to 1...8.
+    /// Together with the k<=7 bound this caps staged window-KV to 64 token
+    /// rows per storage-owning layer and one in-flight step. The adaptive
+    /// controller is separately keyed by a planned-decode-row bucket.
+    public var maxSpeculativeBatch: Int
+    /// Target scoring strategy. Automatic verification is the safe default:
+    /// it uses rectangular scoring only within the configured work envelope
+    /// and otherwise clamps depth before draft work. Serial target scoring
+    /// remains an explicit correctness fallback.
+    public var verificationMode: CBv2MTPVerificationMode
+    /// Maximum `batch * (1+k)` target rows eligible for automatic
+    /// rectangular verification. The planner clamps larger work to a safe
+    /// depth, including ordinary target-only decode when no positive depth
+    /// fits. Defaults to ZERO: a positive envelope is the integrator's
+    /// explicit claim that rectangular target evaluation is argmax-exact for
+    /// the deployed chip/OS/MLX/model tuple at every shape inside it. With
+    /// no envelope, automatic mode performs no speculative work. Ignored by
+    /// explicit serial/rectangular modes.
+    public var maxAutomaticRectangularTokens: Int
+    /// Draft acceptance rule for stochastic rows. `.exact` (default) keeps
+    /// target-prefix acceptance. `.typical` engages only for rows that reach
+    /// target-prefix pre-sampling (drafter and sampler opt-in, temperature
+    /// above the greedy epsilon); every other row is unchanged.
+    public var acceptance: CBv2MTPAcceptance
+    /// Whether the adaptive controller may launch serial-target rounds.
+    /// Serial scoring spends one ordinary `[B, 1]` target forward per draft
+    /// column, so an adaptive serial round can never commit tokens faster
+    /// than target-only decode. `false` keeps adaptive plans at depth zero
+    /// under serial scoring while request-stateful history stays live; an
+    /// explicit `fixedDraftTokens` and batched strategies are unaffected.
+    public var allowsAdaptiveSerialRounds: Bool
+    /// For drafters with `supportsOrdinaryDecodeHistory`: while no row can
+    /// speculate (decode rows above `maxSpeculativeBatch`), steps run as
+    /// ordinary chainable decode with no policy top-two, and finalize feeds
+    /// the persistent history. False keeps hidden-returning seed steps.
+    public var ordinaryDecodeHistory: Bool
+    /// For the same drafters: the final prompt chunk's last hidden row seeds
+    /// the first carry, so a round can follow the first token without a
+    /// seed step. False keeps the seed step.
+    public var prefillCarry: Bool
+    /// Opt-in grammar-aware target-prefix verification. Unset/off preserves
+    /// target-only constrained rows. Enabled by `DARKBLOOM_CBV2_MTP_GRAMMAR=1`.
+    public var constrainedSpeculation: Bool
+    public static var envConstrainedSpeculation: Bool {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_GRAMMAR"]
+        return value.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
+    }
+
+    /// Draft only through opted-in grammar spans. Off preserves request-wide exclusion.
+    public var freeSpanSpeculation: Bool
+    /// Explicit opt-in shared with the provider; unset and unknown values are off.
+    public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+    /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
+    /// disables MTP even when the provider enables it (same convention as
+    /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
+    public static let envEnabled: Bool = envSwitch("DARKBLOOM_CBV2_MTP")
+    /// `DARKBLOOM_TTFT_QWEN_MTP_CHAINED=0/false/no/off` defaults
+    /// `ordinaryDecodeHistory` off.
+    public static let envOrdinaryDecodeHistory = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CHAINED")
+    /// `DARKBLOOM_TTFT_QWEN_MTP_CARRY=0/false/no/off` defaults `prefillCarry` off.
+    public static let envPrefillCarry = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CARRY")
+
+    /// False only for `0`, `false`, `no` or `off` in any letter case.
+    private static func envSwitch(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+
+    public init(
+        enabled: Bool = false,
+        maxDraftTokens: Int = Self.testedMaxDraftTokens,
+        maxSpeculativeBatch: Int = 8,
+        fixedDraftTokens: Int? = nil,
+        fixedDraftTokensByDecodeRows: [Int]? = nil,
+        verificationMode: CBv2MTPVerificationMode = .automatic,
+        maxAutomaticRectangularTokens: Int = 0,
+        allowsAdaptiveSerialRounds: Bool = true,
+        acceptance: CBv2MTPAcceptance = .exact,
+        ordinaryDecodeHistory: Bool = Self.envOrdinaryDecodeHistory,
+        prefillCarry: Bool = Self.envPrefillCarry,
+        constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
+        freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation
+    ) {
+        self.enabled = enabled
+        self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
+        self.acceptance = acceptance
+        self.ordinaryDecodeHistory = ordinaryDecodeHistory
+        self.prefillCarry = prefillCarry
+        self.constrainedSpeculation = constrainedSpeculation
+        self.freeSpanSpeculation = freeSpanSpeculation
+        let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
+        self.maxDraftTokens = resolvedMax
+        self.maxSpeculativeBatch = min(
+            max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
+        self.fixedDraftTokens = fixedDraftTokens.map {
+            min(max($0, 0), resolvedMax)
+        }
+        self.fixedDraftTokensByDecodeRows = fixedDraftTokensByDecodeRows.flatMap { table in
+            table.isEmpty ? nil : table.map { min(max($0, 0), resolvedMax) }
+        }
+        self.verificationMode = verificationMode
+        self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)
+    }
+
+    /// The effective on/off state (config AND env kill switch).
+    public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+}
+
+// MARK: - Metrics
+
+/// One controller wall-cost input exposed in a lock-safe metrics snapshot.
+/// Cost is measured at the existing finalize boundary; collecting it adds no
+/// MLX evaluation or tensor readback.
+public struct CBv2MTPCostInput: Sendable, Equatable {
+    public var decodeRowBucket: Int
+    public var depth: Int
+    public var samples: Int
+    /// Whole-window elapsed time for adaptive stateless MTP; per-step time
+    /// for ordinary and legacy policies. Use normalized cadence to compare.
+    public var ewmaWallTimeNanos: UInt64
+    public var totalWallTimeNanos: UInt64
+    /// Per-row committed-token cadence used by adaptive stateless MTP.
+    public var ewmaNanosPerCommittedToken: UInt64?
+
+    public init(
+        decodeRowBucket: Int, depth: Int, samples: Int,
+        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64,
+        ewmaNanosPerCommittedToken: UInt64? = nil
+    ) {
+        self.decodeRowBucket = decodeRowBucket
+        self.depth = depth
+        self.samples = samples
+        self.ewmaWallTimeNanos = ewmaWallTimeNanos
+        self.totalWallTimeNanos = totalWallTimeNanos
+        self.ewmaNanosPerCommittedToken = ewmaNanosPerCommittedToken
+    }
+}
+
+/// Cumulative MTP counters (engine-thread mutated, snapshot under the
+/// engine's stats lock). Per-position acceptance is the tuning signal for
+/// `maxDraftTokens`.
+public struct CBv2MTPMetrics: Sendable {
+    /// True for every non-nil `EngineV2.mtpMetricsSnapshot()`. Kept explicit
+    /// so provider telemetry can serialize one stable shape.
+    public var active: Bool = true
+    /// Target scoring strategy used by every round in this engine.
+    public var verificationMode: CBv2MTPVerificationMode = .automatic
+    /// Draft acceptance rule installed on every round in this engine.
+    public var acceptance: CBv2MTPAcceptance = .exact
+    /// Configured automatic rectangular work cap, exposed so benchmark
+    /// validators can distinguish intentional target-only fallback from a
+    /// failure to run the requested fixed depth.
+    public var maxAutomaticRectangularTokens: Int = 0
+    /// Actual target-verification rounds by strategy. Automatic mode can use
+    /// both across batch/depth regimes.
+    public var rectangularVerificationRounds: Int = 0
+    public var serialVerificationRounds: Int = 0
+    /// Most recently selected step-global depth (zero means target-only).
+    public var selectedDepth: Int = 0
+    /// Planned decode-row bucket used for the most recent selection.
+    public var decodeRowBucket: Int = 0
+    /// Rounds that drafted (k ≥ 1) and verified.
+    public var rounds: Int = 0
+    /// Seed steps (eligible rows that decoded eagerly with hidden capture
+    /// to establish the drafter carry — no drafts yet).
+    public var seedSteps: Int = 0
+    // engine-local: per-round audit record (benchmark free-run audit)
+    /// Engine STEPS that seeded at least one row. `seedSteps` counts ROWS, so a
+    /// step that seeds several rows adds several there and one here; the
+    /// audit needs the round count, which is one per step.
+    public var seedRounds: Int = 0
+    /// Nonblocking assistant graph submissions before target verification.
+    public var earlyDraftSubmissions: Int = 0
+    /// Total draft tokens proposed across all rounds.
+    public var draftedTokens: Int = 0
+    /// Total draft tokens accepted across all rounds.
+    public var acceptedTokens: Int = 0
+    /// Total tokens emitted by MTP rounds (accepted + bonus/correction).
+    public var emittedTokens: Int = 0
+    /// perPositionAccepted[i] = rounds in which draft position i (0-based)
+    /// was accepted. Monotonically non-increasing over i within a run.
+    public var perPositionAccepted: [Int] = []
+    /// Rows that were round-eligible but clamped to plain decode, keyed by
+    /// reason ("batch_gate", "kv_headroom", "carry_invalid", ...).
+    public var skippedRows: [String: Int] = [:]
+    /// Step selections by depth, including depth zero.
+    public var depthSelections: [Int: Int] = [:]
+    /// Stable controller/fallback reasons (warmup, exploration, hysteresis,
+    /// unprofitable depth zero, batch gate, token/KV headroom, and so on).
+    public var controllerFallbacks: [String: Int] = [:]
+    /// Conditional acceptance rate at each draft position: P(position i is
+    /// accepted | every earlier draft position was accepted).
+    public var conditionalAcceptance: [Double] = []
+    /// Outlier-clamped wall-cost EWMAs and raw cumulative inputs, sorted by
+    /// decode-row bucket then depth in snapshots.
+    public var costInputs: [CBv2MTPCostInput] = []
+    /// Sum of measured wall time for cost-eligible speculative rounds.
+    public var totalRoundWallTimeNanos: UInt64 = 0
+
+    // engine-local: per-round audit record (benchmark free-run audit)
+    /// Per-verify-round records in finalize order. A bounded ring: a full log
+    /// overwrites its OLDEST entry instead of shifting the array.
+    public var roundAudits = CBv2MTPRoundAuditLog()
+
+    public init() {}
+
+    /// Preferred proposal-count spelling. `draftedTokens` remains stored for
+    /// compatibility with the first engine/provider seam.
+    public var proposedTokens: Int { draftedTokens }
+
+    /// Mean accepted drafts per round (nil before any round).
+    public var meanAcceptedPerRound: Double? {
+        rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+}
+
+// engine-local: per-round audit record (benchmark free-run audit)
+/// One finalized verify round, read off values the finalize boundary already
+/// holds: drafted, accepted, committed. No readback, no MLX evaluation.
+public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
+    public static let retainedRecordCap = 8192
+    public var requestID: UInt64
+    public var drafted: Int
+    public var accepted: Int
+    public var committed: Int
+    public init(requestID: UInt64, drafted: Int, accepted: Int, committed: Int) {
+        self.requestID = requestID
+        self.drafted = drafted
+        self.accepted = accepted
+        self.committed = committed
+    }
+}
+
+// engine-local: per-round audit record (benchmark free-run audit)
+/// The round log as a fixed-capacity ring.
+///
+/// `append` is O(1): a full ring overwrites its oldest slot and advances the
+/// head, so a long window costs no shift per round. `dropped` counts the
+/// records evicted since the engine was built, which is what lets a reader
+/// tell "the head was evicted" (a real truncation) from "the ring is exactly
+/// full" (nothing lost).
+public struct CBv2MTPRoundAuditLog: Sendable {
+    private var storage: [CBv2MTPRoundAuditRecord] = []
+    /// Index of the OLDEST record once the ring has wrapped.
+    private var head = 0
+    /// Records evicted. The record at index `i` of ``records`` was appended
+    /// as number `dropped + i`.
+    public private(set) var dropped: UInt64 = 0
+
+    public var capacity: Int { CBv2MTPRoundAuditRecord.retainedRecordCap }
+    public var count: Int { storage.count }
+
+    public init() {}
+
+    public mutating func append(_ record: CBv2MTPRoundAuditRecord) {
+        if storage.count < capacity {
+            if storage.isEmpty { storage.reserveCapacity(capacity) }
+            storage.append(record)
+            return
+        }
+        storage[head] = record
+        head = (head + 1) % capacity
+        dropped &+= 1
+    }
+
+    /// Retained records, oldest first.
+    public var records: [CBv2MTPRoundAuditRecord] {
+        guard head > 0 else { return storage }
+        return Array(storage[head...]) + Array(storage[..<head])
+    }
+}

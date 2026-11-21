@@ -1,0 +1,37 @@
+name: Lint
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2 # the merge commit and the tip of the base branch
+
+      - name: Select Xcode
+        # The formatter is the swift-format of the Xcode that this action
+        # selects.
+        uses: ./.github/actions/select-xcode
+
+      - name: Show the formatter version
+        run: swift format --version
+
+      - name: Check the format of the Swift files that this pull request changes
+        # Runs the formatter of .pre-commit-config.yaml with .swift-format on
+        # the Swift files that the pull request adds or changes. The step
+        # fails when the formatter changed a file. Main is not formatted, so
+        # the step checks only the changed files. HEAD is the merge commit of
+        # the pull request, and HEAD^1 is the tip of the base branch.
+        run: |
+          set -o pipefail
+          git diff -z --name-only --diff-filter=ACMR HEAD^1...HEAD -- '*.swift' \
+            | xargs -0 swift format format --in-place --configuration .swift-format
+          git diff --exit-code

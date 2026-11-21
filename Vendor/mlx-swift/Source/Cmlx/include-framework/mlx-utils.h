@@ -1,0 +1,281 @@
+#ifdef __cplusplus
+// Copyright © 2023-2024 Apple Inc.
+
+#pragma once
+
+#include <exception>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <thread>
+#include <variant>
+
+#include <Cmlx/mlx-api.h>
+#include <Cmlx/mlx-array.h>
+#include <Cmlx/mlx-device.h>
+#include <Cmlx/mlx-dtype.h>
+#include <Cmlx/mlx-stream.h>
+
+namespace mlx::core {
+
+using StreamOrDevice = std::variant<
+    std::monostate,
+    Stream,
+    ThreadLocalStream,
+    Device,
+    Device::DeviceType>;
+MLX_API Stream to_stream(StreamOrDevice s);
+MLX_API Stream to_stream(StreamOrDevice s, Device default_);
+
+struct StreamContext {
+ public:
+  StreamContext(StreamOrDevice s)
+      : _stream(default_stream(default_device())),
+        _owner(std::this_thread::get_id()) {
+    if (std::holds_alternative<std::monostate>(s)) {
+      throw std::runtime_error(
+          "[StreamContext] Invalid argument, please specify a stream or device.");
+    }
+    auto _s = to_stream(s);
+    set_default_device(_s.device);
+    set_default_stream(_s);
+  }
+
+  // noexcept(false) so the thread check below can throw. A destructor that
+  // throws while another exception unwinds this thread calls std::terminate.
+  ~StreamContext() noexcept(false) {
+    if (std::this_thread::get_id() != _owner) {
+      throw std::runtime_error(
+          "[StreamContext] Destroyed in a different thread than it was "
+          "constructed in.");
+    }
+    set_default_device(_stream.device);
+    set_default_stream(_stream);
+  }
+
+ private:
+  Stream _stream;
+  std::thread::id _owner;
+};
+
+struct MLX_API PrintOptions {
+  int precision{-1};
+};
+
+struct PrintFormatter {
+  inline void print(std::ostream& os, bool val);
+  inline void print(std::ostream& os, int16_t val);
+  inline void print(std::ostream& os, uint16_t val);
+  inline void print(std::ostream& os, int32_t val);
+  inline void print(std::ostream& os, uint32_t val);
+  inline void print(std::ostream& os, int64_t val);
+  inline void print(std::ostream& os, uint64_t val);
+  inline void print(std::ostream& os, float16_t val);
+  inline void print(std::ostream& os, bfloat16_t val);
+  inline void print(std::ostream& os, float val);
+  inline void print(std::ostream& os, double val);
+  inline void print(std::ostream& os, complex64_t val);
+
+  bool capitalize_bool{false};
+  PrintOptions format_options;
+};
+
+MLX_API void set_printoptions(PrintOptions options);
+
+MLX_API PrintFormatter& get_global_formatter();
+
+/** Return whether current thread is the first one that called this function. */
+bool is_main_thread();
+
+/** Holds information about floating-point types. */
+struct MLX_API finfo {
+  explicit finfo(Dtype dtype);
+  Dtype dtype;
+  int bits;
+  double min;
+  double max;
+  double eps;
+  double smallest_normal;
+};
+
+/** Holds information about integral types. */
+struct MLX_API iinfo {
+  explicit iinfo(Dtype dtype);
+  Dtype dtype;
+  int64_t min;
+  uint64_t max;
+};
+
+/** The type from promoting the arrays' types with one another. */
+inline Dtype result_type(const array& a, const array& b) {
+  return promote_types(a.dtype(), b.dtype());
+}
+inline Dtype result_type(const array& a, const array& b, const array& c) {
+  return promote_types(result_type(a, b), c.dtype());
+}
+MLX_API Dtype result_type(const std::vector<array>& arrays);
+
+MLX_API Shape broadcast_shapes(const Shape& s1, const Shape& s2);
+
+template <typename T>
+inline ShapeElem safe_cast(T dim, std::string_view op = "") {
+  constexpr int64_t lo = std::numeric_limits<ShapeElem>::min();
+  constexpr int64_t hi = std::numeric_limits<ShapeElem>::max();
+  auto v = static_cast<int64_t>(dim);
+  if (v < lo || v > hi) {
+    std::ostringstream msg;
+    if (!op.empty()) {
+      msg << "[" << op << "] ";
+    }
+    msg << "Shape dimension " << v << " is outside the supported range [" << lo
+        << ", " << hi
+        << "]. MLX currently uses 32-bit integers for shape dimensions.";
+    throw std::overflow_error(msg.str());
+  }
+  return static_cast<ShapeElem>(v);
+}
+
+/**
+ * Returns the axis normalized to be in the range [0, ndim).
+ */
+MLX_API int
+normalize_axis_index(int axis, int ndim, const std::string& msg_prefix = "");
+
+MLX_API std::ostream& operator<<(std::ostream& os, const Device& d);
+MLX_API std::ostream& operator<<(std::ostream& os, const Stream& s);
+MLX_API std::ostream& operator<<(std::ostream& os, const Dtype& d);
+MLX_API std::ostream& operator<<(std::ostream& os, const Dtype::Kind& k);
+MLX_API std::ostream& operator<<(std::ostream& os, array a);
+inline std::ostream& operator<<(std::ostream& os, const complex64_t& v) {
+  return os << v.real() << (v.imag() >= 0 ? "+" : "") << v.imag() << "j";
+}
+inline std::ostream& operator<<(std::ostream& os, const float16_t& v) {
+  return os << static_cast<float>(v);
+}
+inline std::ostream& operator<<(std::ostream& os, const bfloat16_t& v) {
+  return os << static_cast<float>(v);
+}
+
+template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
+inline std::ostream& operator<<(std::ostream& os, const Vec& v) {
+  os << "(";
+  for (auto it = v.begin(); it != v.end(); ++it) {
+    os << *it;
+    if (it != std::prev(v.end())) {
+      os << ",";
+    }
+  }
+  os << ")";
+  return os;
+}
+
+inline bool is_power_of_2(int n) {
+  return ((n & (n - 1)) == 0) && n != 0;
+}
+
+inline int next_power_of_2(int n) {
+  if (is_power_of_2(n)) {
+    return n;
+  }
+  return pow(2, std::ceil(std::log2(n)));
+}
+
+namespace env {
+
+int get_var(const char* name, int default_value);
+std::string get_var(const char* name, const char* default_value);
+
+inline int bfs_max_width() {
+  static int bfs_max_width_ = get_var("MLX_BFS_MAX_WIDTH", 20);
+  return bfs_max_width_;
+}
+
+inline int max_ops_per_buffer(int default_value) {
+  static int max_ops_per_buffer_ =
+      get_var("MLX_MAX_OPS_PER_BUFFER", default_value);
+  return max_ops_per_buffer_;
+}
+
+inline int max_mb_per_buffer(int default_value) {
+  static int max_mb_per_buffer_ =
+      get_var("MLX_MAX_MB_PER_BUFFER", default_value);
+  return max_mb_per_buffer_;
+}
+
+// Per-set residency-set size, as a percentage of the device's recommended
+// max working-set size. Controls only how wired memory is distributed across
+// residency sets, never how much is wired; see metal::ResidencySets. A value
+// <= 0 or >= 100 puts everything in a single set.
+inline int residency_set_max_pct() {
+  static int residency_set_max_pct_ = get_var("MLX_RESIDENCY_SET_MAX_PCT", 5);
+  return residency_set_max_pct_;
+}
+
+// Log each residency set as it is created.
+inline bool residency_debug() {
+  static bool residency_debug_ = get_var("MLX_RESIDENCY_DEBUG", 0);
+  return residency_debug_;
+}
+
+// Output tile of the steel affine quantized matmul on GPUs without neural
+// accelerators (see `qmm` in backend-metal-quantized.cpp): 32, 64, 6432,
+// 3264 or 6464, or 0 (default) for the input width's own tile. Builds whose
+// kernels come only from the precompiled library keep 32 x 32.
+inline int qmm_steel_tile() {
+  static int tile_ = get_var("MLX_QMM_STEEL_TILE", 0);
+  return tile_;
+}
+
+// Fewest 64 x 64 threadgroups a product must fill to take a tile other than
+// 32 x 32 (fewer keep 32 x 32 and their GPU occupancy).
+inline int qmm_steel_tile_min_groups() {
+  static int groups_ = get_var("MLX_QMM_STEEL_TILE_MIN_GROUPS", 0);
+  return groups_;
+}
+
+// Quantized matmuls (x @ w.T) with fewer rows than the vector limit use only
+// the vector kernels (see `QuantizedMatmul::eval_gpu` in
+// backend-metal-quantized.cpp). Then a row has the same bits at each row count
+// from 2 to the limit - 1.
+inline bool qmv_batch_invariant() {
+  static bool invariant_ = get_var("MLX_QMV_BATCH_INVARIANT", 0);
+  return invariant_;
+}
+
+inline bool metal_fast_synch() {
+  static bool metal_fast_synch = get_var("MLX_METAL_FAST_SYNCH", 0);
+  return metal_fast_synch;
+}
+
+// A cross-device fast fence update in one dispatch (fence_update_coherent).
+inline bool metal_fused_fence_update() {
+  static bool fused = get_var("MLX_METAL_FUSED_FENCE_UPDATE", 0);
+  return fused;
+}
+
+// Custom kernels wait for their fenced inputs from a CPU stream themselves.
+inline bool metal_fenced_inputs() {
+  static bool fenced = get_var("MLX_METAL_FENCED_INPUTS", 0);
+  return fenced;
+}
+
+inline bool enable_tf32() {
+  static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
+  return enable_tf32_;
+}
+
+inline int nccl_timeout(int default_value) {
+  static int nccl_timeout = get_var("MLX_NCCL_TIMEOUT", default_value);
+  return nccl_timeout;
+}
+
+inline const std::string& metal_gpu_arch() {
+  static std::string gpu_arch_ = get_var("MLX_METAL_GPU_ARCH", "");
+  return gpu_arch_;
+}
+
+} // namespace env
+
+} // namespace mlx::core
+#endif

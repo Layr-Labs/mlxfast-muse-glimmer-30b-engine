@@ -1,0 +1,38 @@
+name: Lint
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Fetch the merge commit and its parents. The first parent is the base branch.
+          fetch-depth: 2
+
+      - name: Select the newest release of Xcode 26
+        uses: ./.github/actions/select-xcode
+
+      - name: Show the swift-format version
+        run: swift format --version
+
+      - name: Check the format of the Swift files that this pull request changes
+        # Main does not pass this check yet, so check only the changed files.
+        # Like pre-commit, format the files in place. Then fail if git sees a change.
+        run: |
+          echo "Swift files that this pull request changes:"
+          git diff --name-only --diff-filter=d HEAD^1 HEAD -- '*.swift'
+          git diff -z --name-only --diff-filter=d HEAD^1 HEAD -- '*.swift' \
+            | xargs -0 swift format format --in-place --configuration .swift-format
+          if ! git diff --exit-code; then
+            echo "::error::swift-format changed the files above. Run swift format format --in-place --configuration .swift-format on them and push the result."
+            exit 1
+          fi

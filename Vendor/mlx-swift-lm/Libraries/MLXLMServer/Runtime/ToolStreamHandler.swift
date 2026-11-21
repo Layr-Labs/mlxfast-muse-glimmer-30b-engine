@@ -1,0 +1,59 @@
+// Copyright © 2026 Eigen Labs Inc.
+
+import Foundation
+import MLXLMCommon
+
+/// Sendable wrapper around the non-Sendable `MLXLMCommon.ToolCallProcessor` for
+/// capture in a streaming-completion Task closure. Only touched from
+/// that single Task.
+///
+/// Extracted from the deleted `MLXBatchedEngineServerEngine+ToolCallParser`
+/// (the legacy continuous-batching server adapter died with the v1 engine —
+/// v0.7.5 one-engine): the handler itself is engine-agnostic and is the
+/// tool-call stream parser the Darkbloom provider drives over its
+/// ContinuousBatchingV2 generation events.
+public final class BatchedToolStreamHandler: @unchecked Sendable {
+    public let format: ToolCallFormat
+    private let processor: ToolCallProcessor
+    private var residualText: String?
+
+    public init(
+        format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false,
+        streaming: ToolCallStreamingOptions? = nil
+    ) {
+        self.format = format
+        self.processor = ToolCallProcessor(
+            format: format, tools: tools, strictGemma: strictGemma, streaming: streaming)
+    }
+
+    /// True when calls are exposed while generated; use the segment API.
+    public var streamsCalls: Bool { processor.streamsCalls }
+
+    public func processChunk(_ chunk: String) -> String? {
+        processor.processChunk(chunk)
+    }
+
+    public func processChunkSegments(_ chunk: String) -> [ToolCallStreamSegment] {
+        processor.processChunkSegments(chunk)
+    }
+
+    public func finish() -> [ToolCall] {
+        residualText = processor.processEOS(returnBufferedText: true)
+        return processor.toolCalls
+    }
+
+    /// End of generation for the segment API; replaces `finish` and
+    /// `takeResidualText`.
+    public func finishSegments() -> [ToolCallStreamSegment] {
+        processor.processEOSSegments()
+    }
+
+    public func takeResidualText() -> String? {
+        defer { residualText = nil }
+        return residualText
+    }
+
+    public var parseFailureCount: Int {
+        processor.parseFailureCount
+    }
+}

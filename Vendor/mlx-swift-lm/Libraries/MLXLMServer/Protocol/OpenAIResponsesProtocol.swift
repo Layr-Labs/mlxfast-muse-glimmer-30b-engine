@@ -1,0 +1,367 @@
+// Copyright © 2026 Eigen Labs Inc.
+
+import Foundation
+import MLXLMCommon
+
+public enum OpenAIResponseInput: Codable, Sendable, Equatable {
+    case text(String)
+    case messages([OpenAIChatMessage])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let text = try? container.decode(String.self) {
+            self = .text(text)
+            return
+        }
+        let items = try container.decode([OpenAIResponseInputMessage].self)
+        var messages: [OpenAIChatMessage] = []
+        var previousKind: OpenAIResponseInputMessage.Kind?
+        for item in items {
+            let message = item.message
+            // A reasoning item and its following function calls form one
+            // assistant turn. Explicit messages/tool outputs remain boundaries.
+            let followsSameTurnItem = previousKind == .reasoning || previousKind == .functionCall
+            if item.kind == .functionCall, followsSameTurnItem,
+                let calls = message.toolCalls, let last = messages.indices.last,
+                messages[last].role == .assistant
+            {
+                messages[last].toolCalls = (messages[last].toolCalls ?? []) + calls
+            } else {
+                messages.append(message)
+            }
+            previousKind = item.kind
+        }
+        self = .messages(messages)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .text(let text):
+            try container.encode(text)
+        case .messages(let messages):
+            try container.encode(messages)
+        }
+    }
+
+    public func messages(instructions: String?) -> [OpenAIChatMessage] {
+        var result: [OpenAIChatMessage] = []
+        if let instructions, !instructions.isEmpty {
+            result.append(.init(role: .system, content: .text(instructions)))
+        }
+        switch self {
+        case .text(let text):
+            result.append(.init(role: .user, content: .text(text)))
+        case .messages(let messages):
+            result.append(contentsOf: messages)
+        }
+        return result
+    }
+}
+
+public struct OpenAIResponseReasoningOptions: Codable, Sendable, Equatable {
+    public var parser: ReasoningParserFormat?
+    public var effort: String?
+
+    public init(parser: ReasoningParserFormat? = nil, effort: String? = nil) {
+        self.parser = parser
+        self.effort = effort
+    }
+}
+
+public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
+    public var model: String
+    public var input: OpenAIResponseInput
+    public var instructions: String?
+    public var tools: [OpenAITool]?
+    public var toolChoice: OpenAIToolChoice?
+    public var parallelToolCalls: Bool?
+    public var reasoning: OpenAIResponseReasoningOptions?
+    public var stream: Bool?
+    public var store: Bool?
+    public var temperature: Float?
+    public var topP: Float?
+    public var maxOutputTokens: Int?
+    public var metadata: [String: JSONValue]?
+
+    private enum CodingKeys: String, CodingKey {
+        case model
+        case input
+        case instructions
+        case tools
+        case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
+        case reasoning
+        case stream
+        case store
+        case temperature
+        case topP = "top_p"
+        case maxOutputTokens = "max_output_tokens"
+        case metadata
+    }
+
+    public init(
+        model: String,
+        input: OpenAIResponseInput,
+        instructions: String? = nil,
+        tools: [OpenAITool]? = nil,
+        toolChoice: OpenAIToolChoice? = nil,
+        parallelToolCalls: Bool? = nil,
+        reasoning: OpenAIResponseReasoningOptions? = nil,
+        stream: Bool? = nil,
+        store: Bool? = nil,
+        temperature: Float? = nil,
+        topP: Float? = nil,
+        maxOutputTokens: Int? = nil,
+        metadata: [String: JSONValue]? = nil
+    ) {
+        self.model = model
+        self.input = input
+        self.instructions = instructions
+        self.tools = tools
+        self.toolChoice = toolChoice
+        self.parallelToolCalls = parallelToolCalls
+        self.reasoning = reasoning
+        self.stream = stream
+        self.store = store
+        self.temperature = temperature
+        self.topP = topP
+        self.maxOutputTokens = maxOutputTokens
+        self.metadata = metadata
+    }
+
+    public var chatCompletionRequest: OpenAIChatCompletionRequest {
+        .init(
+            model: model,
+            messages: input.messages(instructions: instructions),
+            tools: tools,
+            toolChoice: toolChoice,
+            parallelToolCalls: parallelToolCalls,
+            reasoningParser: reasoning?.parser,
+            reasoning: reasoning.flatMap(\.effort).map { .init(effort: $0) },
+            stream: stream,
+            temperature: temperature,
+            topP: topP,
+            maxTokens: maxOutputTokens
+        )
+    }
+}
+
+public enum OpenAIResponseStatus: String, Codable, Sendable, Equatable {
+    case inProgress = "in_progress"
+    case completed
+    case cancelled
+    case failed
+    case incomplete
+}
+
+public struct OpenAIResponseIncompleteDetails: Codable, Sendable, Equatable {
+    public var reason: String
+    public init(reason: String) { self.reason = reason }
+}
+
+public struct OpenAIResponseError: Codable, Sendable, Equatable {
+    public var code: String
+    public var message: String
+    public init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
+}
+
+public struct OpenAIResponseOutputContent: Codable, Sendable, Equatable {
+    public var type: String
+    public var text: String
+    public var annotations: [JSONValue]?
+
+    public init(type: String = "output_text", text: String, annotations: [JSONValue]? = nil) {
+        self.type = type
+        self.text = text
+        self.annotations = annotations
+    }
+}
+
+public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
+    public var id: String
+    public var type: String
+    public var status: OpenAIResponseStatus?
+    public var role: OpenAIRole?
+    public var content: [OpenAIResponseOutputContent]?
+    public var summary: [OpenAIResponseOutputContent]?
+    public var callID: String?
+    public var name: String?
+    public var arguments: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case type
+        case status
+        case role
+        case content
+        case summary
+        case callID = "call_id"
+        case name
+        case arguments
+    }
+
+    public static func message(id: String, text: String) -> Self {
+        .init(
+            id: id,
+            type: "message",
+            status: .completed,
+            role: .assistant,
+            content: [.init(text: text, annotations: [])],
+            summary: nil,
+            callID: nil,
+            name: nil,
+            arguments: nil
+        )
+    }
+
+    public static func reasoning(id: String, text: String) -> Self {
+        .init(
+            id: id,
+            type: "reasoning",
+            status: .completed,
+            role: nil,
+            content: [.init(type: "reasoning_text", text: text)],
+            summary: [.init(type: "summary_text", text: text)],
+            callID: nil,
+            name: nil,
+            arguments: nil
+        )
+    }
+
+    public static func functionCall(id: String, toolCall: OpenAIToolCall) -> Self {
+        .init(
+            id: id,
+            type: "function_call",
+            status: .completed,
+            role: nil,
+            content: nil,
+            summary: nil,
+            callID: toolCall.id,
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments
+        )
+    }
+}
+
+public struct OpenAIResponseUsage: Codable, Sendable, Equatable {
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var totalTokens: Int
+    public var inputTokensDetails: OpenAICachedTokenDetails?
+
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case totalTokens = "total_tokens"
+        case inputTokensDetails = "input_tokens_details"
+    }
+
+    public init(inputTokens: Int, outputTokens: Int, cachedInputTokens: Int? = nil) {
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.totalTokens = inputTokens + outputTokens
+        self.inputTokensDetails = cachedInputTokens.map {
+            .init(cachedTokens: min(max(0, $0), max(0, inputTokens)))
+        }
+    }
+
+    public init(chatUsage: OpenAIUsage) {
+        self.init(
+            inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens,
+            cachedInputTokens: chatUsage.promptTokensDetails?.cachedTokens)
+    }
+
+    public var chatUsage: OpenAIUsage {
+        OpenAIUsage(
+            promptTokens: inputTokens, completionTokens: outputTokens,
+            cachedPromptTokens: inputTokensDetails?.cachedTokens)
+    }
+}
+
+public struct OpenAIResponse: Codable, Sendable, Equatable {
+    public var id: String
+    public var object: String
+    public var createdAt: Int
+    public var status: OpenAIResponseStatus
+    public var model: String
+    public var output: [OpenAIResponseOutputItem]
+    public var outputText: String
+    public var parallelToolCalls: Bool? = true
+    /// Responses uses flat function descriptors and named choices, unlike Chat.
+    public var toolChoice: JSONValue? = .string("none")
+    public var tools: [JSONValue]? = []
+    public var usage: OpenAIResponseUsage?
+    public var metadata: [String: JSONValue]?
+    public var incompleteDetails: OpenAIResponseIncompleteDetails?
+    public var error: OpenAIResponseError?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case object
+        case createdAt = "created_at"
+        case status
+        case model
+        case output
+        case outputText = "output_text"
+        case parallelToolCalls = "parallel_tool_calls"
+        case toolChoice = "tool_choice"
+        case tools
+        case usage
+        case metadata
+        case incompleteDetails = "incomplete_details"
+        case error
+    }
+
+    public init(
+        id: String,
+        status: OpenAIResponseStatus,
+        model: String,
+        output: [OpenAIResponseOutputItem],
+        outputText: String,
+        usage: OpenAIResponseUsage?,
+        metadata: [String: JSONValue]? = nil,
+        createdAt: Int = Int(Date().timeIntervalSince1970),
+        incompleteDetails: OpenAIResponseIncompleteDetails? = nil,
+        error: OpenAIResponseError? = nil
+    ) {
+        self.id = id
+        self.object = "response"
+        self.createdAt = createdAt
+        self.status = status
+        self.model = model
+        self.output = output
+        self.outputText = outputText
+        self.usage = usage
+        self.metadata = metadata
+        self.incompleteDetails = incompleteDetails
+        self.error = error
+    }
+}
+
+// Keep collection, initial streaming snapshots and terminal stored objects on
+// one request-derived representation. This does not change Chat tool coding.
+extension OpenAIResponse {
+    mutating func setToolConfiguration(from request: OpenAIResponseRequest) {
+        parallelToolCalls = request.parallelToolCalls ?? true
+        tools = (request.tools ?? []).map { tool in
+            var fields: [String: JSONValue] = [
+                "type": .string(tool.type), "name": .string(tool.function.name),
+            ]
+            if let description = tool.function.description {
+                fields["description"] = .string(description)
+            }
+            if let parameters = tool.function.parameters { fields["parameters"] = parameters }
+            if let strict = tool.function.strict { fields["strict"] = .bool(strict) }
+            return .object(fields)
+        }
+        switch request.toolChoice ?? .mode((request.tools ?? []).isEmpty ? .none : .auto) {
+        case .mode(let mode): toolChoice = .string(mode.rawValue)
+        case .function(let name):
+            toolChoice = .object(["type": .string("function"), "name": .string(name)])
+        }
+    }
+}

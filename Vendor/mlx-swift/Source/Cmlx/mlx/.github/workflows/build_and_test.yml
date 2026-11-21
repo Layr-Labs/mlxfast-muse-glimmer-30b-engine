@@ -1,0 +1,90 @@
+name: Build and Test
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      # For testing CI without starting a pull request:
+      - test/*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check_lint:
+    name: Check Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pre-commit
+        run: |
+          python -m pip install pre-commit
+          python -m pip freeze --local
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-3|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Run pre-commit
+        run: pre-commit run --show-diff-on-failure --color=always --all-files
+
+  linux_sanitizer_build_and_test:
+    name: Linux Sanitizer Tests (${{ matrix.sanitizer }})
+    needs: check_lint
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ASAN, UBSAN]
+        # todo 12/16/2025: enable TSAN later + consider enabling ASAN for GPU backend tests.
+        # sanitizer: [ASAN, UBSAN, TSAN]
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            libblas-dev \
+            liblapacke-dev \
+            libopenblas-dev \
+            cmake \
+            clang \
+            git
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Linux Build and Test with ${{ matrix.sanitizer }}
+        run: |
+          bash .github/scripts/build-sanitizer-tests.sh ${{ matrix.sanitizer }}
+
+  linux_fedora_build_cpp:
+    name: Linux Fedora (${{ matrix.arch }})
+    needs: check_lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-22.04
+            arch: x86_64
+          - host: ubuntu-22.04-arm
+            arch: aarch64
+
+    runs-on: ${{ matrix.host }}
+    container:
+      image: fedora:42
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: CPP Build Test - No Release
+        run: |
+          bash ./.github/scripts/setup+build-cpp-linux-fedora-container.sh

@@ -1,0 +1,684 @@
+//
+//  GPTOSS.swift
+//  mlx-swift-lm
+//
+//  Created by John Mai on 2025/8/6.
+//
+
+// port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gpt_oss.py
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+
+// MARK: - Configuration
+
+public struct GPTOSSConfiguration: Codable, Sendable {
+    public var modelType: String = "gpt_oss"
+    public var hiddenLayers: Int = 36
+    public var localExperts: Int = 128
+    public var expertsPerToken: Int = 4
+    public var vocabularySize: Int = 201088
+    public var rmsNormEps: Float = 1e-5
+    public var hiddenSize: Int = 2880
+    public var intermediateSize: Int = 2880
+    public var headDim: Int = 64
+    public var attentionHeads: Int = 64
+    public var kvHeads: Int = 8
+    public var slidingWindow: Int = 128
+    public var ropeTheta: Float = 150000
+    public var ropeScaling: [String: StringOrNumber]? = nil
+    public var layerTypes: [String]? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case hiddenLayers = "num_hidden_layers"
+        case localExperts = "num_local_experts"
+        case expertsPerToken = "num_experts_per_tok"
+        case vocabularySize = "vocab_size"
+        case rmsNormEps = "rms_norm_eps"
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case headDim = "head_dim"
+        case attentionHeads = "num_attention_heads"
+        case kvHeads = "num_key_value_heads"
+        case slidingWindow = "sliding_window"
+        case ropeTheta = "rope_theta"
+        case ropeScaling = "rope_scaling"
+        case layerTypes = "layer_types"
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        self.localExperts = try container.decode(Int.self, forKey: .localExperts)
+        self.expertsPerToken = try container.decode(Int.self, forKey: .expertsPerToken)
+        self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        self.rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        self.headDim = try container.decode(Int.self, forKey: .headDim)
+        self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        self.slidingWindow = try container.decode(Int.self, forKey: .slidingWindow)
+        self.ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 150000
+        self.ropeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeScaling)
+        self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+    }
+}
+
+private func mlxTopK(_ a: MLXArray, k: Int, axis: Int = -1) -> (values: MLXArray, indices: MLXArray)
+{
+    let partitionedIndices = argPartition(a, kth: -k, axis: axis)
+    let topKIndices = partitionedIndices[.ellipsis, (-k)...]
+    let topKValues = takeAlong(a, topKIndices, axis: axis)
+    return (topKValues, topKIndices)
+}
+
+/// History serializer for GPT-OSS.
+///
+/// Relies entirely on structured `Chat.Message.tool` metadata. It never
+/// reconstructs tool calls by sniffing JSON out of `content` — that was both
+/// incorrect for Harmony (where content must not contain channel frames) and
+/// unsafe (any JSON-shaped assistant reply could be re-dispatched).
+///
+/// Harmony analysis is not serialized: the live tool continuation retains the
+/// exact generated tokens in the KV cache, while a later transcript rebuild
+/// keeps the response + tool-call structure without replaying private reasoning.
+package struct GPTOSSMessageGenerator: MessageGenerator {
+    package init() {}
+
+    package func generate(messages: [Chat.Message]) -> [Message] {
+        messages.map { generate(message: $0) }
+    }
+
+    package func generate(message: Chat.Message) -> Message {
+        var dictionary: Message = [
+            "role": message.role.rawValue,
+            "content": message.content,
+        ]
+        addToolMetadata(to: &dictionary, for: message)
+
+        // GPT-OSS template reads tool_calls[0] only. The Harmony router emits
+        // at most one call per turn, so this is a defensive clamp for history
+        // assembled by other paths.
+        if let calls = dictionary["tool_calls"] as? [[String: any Sendable]], calls.count > 1 {
+            dictionary["tool_calls"] = [calls[0]]
+        }
+        return dictionary
+    }
+}
+
+class AttentionBlock: Module {
+    let headDim: Int
+    let numAttentionHeads: Int
+    let numKeyValueHeads: Int
+    let numKeyValueGroups: Int
+    let smScale: Float
+
+    @ParameterInfo(key: "sinks") var sinks: MLXArray
+    @ModuleInfo(key: "q_proj") var qProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "o_proj") var oProj: Linear
+
+    let rope: YarnRoPE
+    private var cachedSinksActive: Bool?
+
+    public init(_ config: GPTOSSConfiguration) {
+        self.headDim = config.headDim
+        self.numAttentionHeads = config.attentionHeads
+        self.numKeyValueHeads = config.kvHeads
+        self.numKeyValueGroups = config.attentionHeads / config.kvHeads
+
+        _sinks.wrappedValue = zeros([config.attentionHeads])
+
+        _qProj.wrappedValue = Linear(
+            config.hiddenSize, config.attentionHeads * config.headDim, bias: true)
+        _kProj.wrappedValue = Linear(config.hiddenSize, config.kvHeads * config.headDim, bias: true)
+        _vProj.wrappedValue = Linear(config.hiddenSize, config.kvHeads * config.headDim, bias: true)
+        _oProj.wrappedValue = Linear(
+            config.headDim * config.attentionHeads, config.hiddenSize, bias: true)
+
+        self.smScale = 1.0 / sqrt(Float(config.headDim))
+
+        if let ropeScaling = config.ropeScaling {
+            self.rope = YarnRoPE(
+                dimensions: headDim,
+                base: config.ropeTheta,
+                scalingFactor: ropeScaling["factor"]?.asFloat() ?? 32.0,
+                originalMaxPositionEmbeddings: ropeScaling["original_max_position_embeddings"]?
+                    .asInt() ?? 4096,
+                betaFast: ropeScaling["beta_fast"]?.asFloat() ?? 32.0,
+                betaSlow: ropeScaling["beta_slow"]?.asFloat() ?? 1.0
+            )
+        } else {
+            self.rope = YarnRoPE(
+                dimensions: headDim,
+                base: config.ropeTheta
+            )
+        }
+    }
+
+    /// Whether the learned per-head sinks parameter is active (non-zero).
+    /// The probe is a host readback (`.item()`), so it runs at most once per
+    /// block: `prepareSinksActivation()` primes the cached Bool at model
+    /// load / CBv2 engine build so the decode hot path never host-syncs.
+    func sinksActiveResolved() -> Bool {
+        if let cached = cachedSinksActive { return cached }
+        let active = (sinks * sinks).max().item(Float.self) > 0
+        cachedSinksActive = active
+        return active
+    }
+
+    /// Prime `cachedSinksActive` eagerly (off the step path). Called by
+    /// `GPTOSSModel.newCacheV2` after weights are loaded.
+    func prepareSinksActivation() {
+        _ = sinksActiveResolved()
+    }
+
+    public func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
+    ) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let D = headDim
+
+        let independent = cache is any GPTOSSPerRowAttentionCache
+        func project(_ layer: Linear) -> MLXArray {
+            independent ? GPTOSSBatchDecodeProjection.linear(layer, x) : layer(x)
+        }
+        var q = project(qProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var k = project(kProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var v = project(vProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+
+        // Cluster stages can batch projections while retaining each request's
+        // ordinary full/sliding attention order. This model-owned hook avoids
+        // pretending a physical rotating cache has CBv2's chronological views.
+        if let perRow = cache as? any GPTOSSPerRowAttentionCache {
+            let offsets = perRow.scalarPositionOffsets
+            precondition(
+                offsets.count == B && offsets.allSatisfy { $0 >= 0 && $0 < Int(Int32.max) })
+            q = concatenated((0 ..< B).map { rope(q[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            k = concatenated((0 ..< B).map { rope(k[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            let attended = perRow.updateAndAttend(
+                queries: q, keys: k, values: v,
+                scale: smScale, sinks: sinksActiveResolved() ? sinks : nil)
+            return GPTOSSBatchDecodeProjection.linear(
+                oProj, attended.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
+
+        // ContinuousBatchingV2: the layer cache owns the KV update and the
+        // attention computation (per-row storage, no masks, no padding).
+        // Sinks are passed straight through — the contract guarantees
+        // denominator-only handling, and `sinksActiveResolved()` reads the
+        // Bool cached at load (`prepareSinksActivation`), so this path never
+        // performs the `.item()` sinks probe on the step loop.
+        if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
+            // Snapshot per-row absolute RoPE offsets BEFORE updateAndAttend
+            // advances the rows (`+ 0` = graph-safe copy; invariant 1).
+            let offsets = layerCacheV2.positionOffsets + 0
+            q = rope(q, offset: offsets)
+            k = rope(k, offset: offsets)
+            let vHat = layerCacheV2.updateAndAttend(
+                queries: q, keys: k, values: v,
+                scale: smScale,
+                sinks: sinksActiveResolved() ? sinks : nil)
+            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
+
+        let sinksActive = sinksActiveResolved()
+
+        // Quantized cache path (taken when the cache conforms to
+        // QuantizedKVCacheProtocol, i.e. the native quantized-attention kernel).
+        // Attention sinks are threaded through so the kernel folds them into the
+        // softmax denominator and stays correct for sink models — no fatalError.
+        // (Note: GPT-OSS defaults to the dequant cache for decode speed; this
+        // path is used only when the kernel cache is selected.)
+        if let qcache = cache as? QuantizedKVCacheProtocol {
+            q = applyRotaryPosition(rope, to: q, cache: cache)
+            k = applyRotaryPosition(rope, to: k, cache: cache)
+
+            let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
+            let vHat = quantizedScaledDotProductAttention(
+                queries: q,
+                quantizedKeys: qKeys,
+                quantizedValues: qValues,
+                scale: smScale,
+                mask: mask,
+                groupSize: qcache.groupSize,
+                bits: qcache.bits,
+                mode: qcache.mode,
+                sinks: sinksActive ? sinks : nil
+            )
+
+            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
+
+        q = applyRotaryPosition(rope, to: q, cache: cache)
+        k = applyRotaryPosition(rope, to: k, cache: cache)
+
+        if let cache {
+            (k, v) = cache.update(keys: k, values: v)
+        }
+
+        let vHat = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v,
+            scale: smScale,
+            mask: mask,
+            sinks: sinksActive ? sinks : nil)
+
+        return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+    }
+}
+
+class MLPBlock: Module {
+    let hiddenSize: Int
+    let numLocalExperts: Int
+    let numExpertsPerTok: Int
+
+    @ModuleInfo(key: "experts") var experts: SwiGLUSwitchGLU
+    @ModuleInfo(key: "router") var router: Linear
+
+    public init(_ config: GPTOSSConfiguration) {
+        self.hiddenSize = config.hiddenSize
+        self.numLocalExperts = config.localExperts
+        self.numExpertsPerTok = config.expertsPerToken
+
+        _experts.wrappedValue = SwiGLUSwitchGLU(
+            inputDims: config.hiddenSize,
+            hiddenDims: config.intermediateSize,
+            numExperts: config.localExperts,
+            bias: true
+        )
+        _router.wrappedValue = Linear(config.hiddenSize, config.localExperts, bias: true)
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let g = router(x)
+        let (experts, indices) = mlxTopK(g, k: numExpertsPerTok, axis: -1)
+        let stopIndices = MLX.stopGradient(indices)
+        let expertWeights = softmax(experts, axis: -1, precise: true)
+
+        var x = self.experts(x, stopIndices)
+
+        x = x * expandedDimensions(expertWeights, axis: -1)
+        return x.sum(axis: -2)
+    }
+}
+
+class GPTOSSTransformerBlock: Module {
+    @ModuleInfo(key: "self_attn") var selfAttn: AttentionBlock
+    @ModuleInfo(key: "mlp") var mlp: MLPBlock
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+
+    public init(_ config: GPTOSSConfiguration) {
+        _selfAttn.wrappedValue = AttentionBlock(config)
+        _mlp.wrappedValue = MLPBlock(config)
+        _inputLayerNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+    }
+
+    public func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
+    ) -> MLXArray {
+        let independent = cache is any GPTOSSPerRowAttentionCache
+        var residual = x
+        var x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, inputLayerNorm.callAsFunction) : inputLayerNorm(x)
+        x = selfAttn(x, mask: mask, cache: cache)
+        x = residual + x
+
+        residual = x
+        x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, postAttentionLayerNorm.callAsFunction)
+            : postAttentionLayerNorm(x)
+        // Keep router top-k, MXFP4 expert dispatch and weighted reduction on
+        // the complete singleton graph; no cross-request routing rectangle.
+        x = independent ? GPTOSSBatchDecodeProjection.rows(x, mlp.callAsFunction) : mlp(x)
+        x = residual + x
+        return x
+    }
+}
+
+public class GPTOSSModelInner: Module {
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    let layerTypes: [String]
+    fileprivate let layers: [GPTOSSTransformerBlock]
+    let windowSize: Int
+    let slidingAttentionIndex: Int
+    let fullAttentionIndex: Int
+
+    public init(_ config: GPTOSSConfiguration) {
+        _embedTokens.wrappedValue = Embedding(
+            embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
+        _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.layerTypes =
+            config.layerTypes
+            ?? Array(
+                repeating: [
+                    "sliding_attention",
+                    "full_attention",
+                ], count: config.hiddenLayers / 2
+            ).flatMap { $0 }
+        self.layers = (0 ..< config.hiddenLayers).map { _ in GPTOSSTransformerBlock(config) }
+        self.windowSize = config.slidingWindow
+        self.slidingAttentionIndex =
+            self.layerTypes.firstIndex(of: "sliding_attention") ?? 0
+        self.fullAttentionIndex =
+            self.layerTypes.firstIndex(of: "full_attention") ?? 0
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache]? = nil,
+        inputEmbeddings: MLXArray? = nil,
+        lastLayerLastQuery: Bool = false
+    ) -> MLXArray {
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        defer { shapeCall?.end() }
+        var x: MLXArray
+        if let inputEmbeddings {
+            x = inputEmbeddings
+        } else {
+            x = embedTokens(inputs)
+        }
+
+        let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
+
+        let seqLen = x.dim(1)
+        var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
+        var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
+
+        for (i, layer) in layers.enumerated() {
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+            if cache[i] is any GPTOSSPerRowAttentionCache
+                || (cache[i] as? (any CBv2AttendingLayerCache)) != nil
+            {
+                // ContinuousBatchingV2: attention and any masking are owned
+                // by the layer cache object — the model never builds masks
+                // (no left padding / shared frontier exists by construction).
+                maskMode = .none
+            } else if let mask {
+                maskMode = mask
+            } else if layerTypes[i] == "full_attention" {
+                if fullMask == nil {
+                    fullMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[fullAttentionIndex],
+                        windowSize: nil
+                    )
+                }
+                maskMode = fullMask!
+            } else {
+                if slidingMask == nil {
+                    slidingMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[slidingAttentionIndex],
+                        windowSize: windowSize
+                    )
+                }
+                maskMode = slidingMask!
+            }
+
+            if lastLayerLastQuery,
+                gptossLastQueryPrefillEligible(
+                    sequenceLength: seqLen,
+                    isFinalFullLayer: i == layers.count - 1 && layerTypes[i] == "full_attention",
+                    cache: cache[i]),
+                let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
+            {
+                x = layer.prefillLastQuery(x, cache: lastQueryCache)
+            } else {
+                x = layer(x, mask: maskMode, cache: cache[i])
+            }
+        }
+
+        x =
+            cache.contains { $0 is any GPTOSSPerRowAttentionCache }
+            ? GPTOSSBatchDecodeProjection.rows(x, norm.callAsFunction) : norm(x)
+
+        return x
+    }
+
+    /// Prime every attention block's sinks-activation flag (one `.item()`
+    /// probe per layer, off the step path). Called at CBv2 engine build so
+    /// the decode hot loop never host-syncs on the sinks probe.
+    func prepareSinksActivation() {
+        for layer in layers {
+            layer.selfAttn.prepareSinksActivation()
+        }
+    }
+}
+
+private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray {
+    precondition(
+        blocks.shape.dropLast() == scales.shape,
+        "blocks.shape=\(blocks.shape) does not match scales.shape=\(scales.shape)"
+    )
+
+    var scales = scales.asType(.int32) - 127
+    let lut = MLXArray([
+        +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ]).asType(.bfloat16)
+
+    let (prefixShape, G, B) = (Array(blocks.shape.dropLast(2)), blocks.dim(-2), blocks.dim(-1))
+
+    let blocks = blocks.reshaped(-1, B)
+    scales = scales.reshaped(-1, 1)
+
+    let idxLo = blocks & 0x0F
+    let idxHi = blocks >> 4
+
+    var out = stacked([lut[idxLo], lut[idxHi]], axis: -1).flattened(start: -2)
+    out = (2.0 ** scales) * out
+    out = out.reshaped(prefixShape.count, G * B * 2)
+    return out.asType(.bfloat16)
+}
+
+public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
+    public let modelType: String
+    public let vocabularySize: Int
+    public let kvHeads: [Int]
+    public let model: GPTOSSModelInner
+    private let configuration: GPTOSSConfiguration
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+    var savedFusedExpertPaths = Set<String>()
+    static let fusedGateUpEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GPTOSS_FUSED_GATE_UP"] != "0"
+    private var useFusedGateUp: Bool {
+        Self.fusedGateUpEnabled && configuration.hiddenSize == 2880
+            && configuration.intermediateSize == 2880 && configuration.localExperts == 32
+    }
+    @ModuleInfo(key: "lm_head") var lmHead: Linear
+
+    public init(_ config: GPTOSSConfiguration) {
+        self.configuration = config
+        self.modelType = config.modelType
+        self.model = GPTOSSModelInner(config)
+        self.vocabularySize = config.vocabularySize
+        self.kvHeads = (0 ..< config.hiddenLayers).map { _ in config.kvHeads }
+        _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        let hidden = model(inputs, cache: cache)
+        return lmHead(hidden)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var weights = weights
+
+        if weights.keys.contains(where: {
+            $0.contains("gate_proj.weight") || $0.contains(".experts.gate_up_proj.weight")
+        }) {
+            return fuseGateUpWeights(weights, enabled: useFusedGateUp)
+        }
+
+        if weights.keys.contains(where: { $0.contains("gate_up_proj_scales") }) {
+            var newWeights: [String: MLXArray] = [:]
+            for (k, v) in weights {
+                if k.hasSuffix("_scales") {
+                    continue
+                } else if k.hasSuffix("_blocks") {
+                    let scaleKey = k.replacingOccurrences(of: "_blocks", with: "_scales")
+                    if let scales = weights[scaleKey] {
+                        let newV = convertMoePackedTensors(blocks: v, scales: scales)
+                        let newK = k.replacingOccurrences(of: "_blocks", with: "")
+                        newWeights[newK] = newV
+                    }
+                } else {
+                    newWeights[k] = v
+                }
+            }
+            weights = newWeights
+        }
+
+        var finalWeights: [String: MLXArray] = [:]
+        for (k, v) in weights {
+            if k.contains("gate_up_proj"), !k.contains("bias") {
+                finalWeights[
+                    k.replacingOccurrences(of: "gate_up_proj", with: "gate_proj.weight")
+                ] = contiguous(v[.ellipsis, .stride(by: 2), 0...])
+                finalWeights[
+                    k.replacingOccurrences(of: "gate_up_proj", with: "up_proj.weight")
+                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2), 0...])
+            } else if k.contains("down_proj"), !k.contains("bias") {
+                finalWeights[
+                    k.replacingOccurrences(of: "down_proj", with: "down_proj.weight")
+                ] = contiguous(v)
+            } else if k.contains("gate_up_proj_bias") {
+                finalWeights[
+                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_proj.bias")
+                ] = contiguous(v[.ellipsis, .stride(by: 2)])
+                finalWeights[
+                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "up_proj.bias")
+                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2)])
+            } else if k.contains("down_proj_bias") {
+                finalWeights[
+                    k.replacingOccurrences(of: "down_proj_bias", with: "down_proj.bias")
+                ] = contiguous(v)
+            } else {
+                finalWeights[k] = v
+            }
+        }
+
+        return fuseGateUpWeights(finalWeights, enabled: useFusedGateUp)
+    }
+
+    public func messageGenerator(tokenizer: any Tokenizer) -> any MessageGenerator {
+        GPTOSSMessageGenerator()
+    }
+
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
+        try model.layerTypes.map { layerType in
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: configuration.slidingWindow,
+                usesSlidingWindow: layerType != "full_attention")
+        }
+    }
+}
+
+extension GPTOSSModel: LoRAModel {
+    public var loraLayers: [Module] {
+        model.layers
+    }
+}
+
+// MARK: - ContinuousBatchingV2
+
+extension GPTOSSConfiguration {
+    /// Per-layer attention structure for the CBv2 engine, derived purely
+    /// from this configuration (invariant 11: model structure is data).
+    /// Every layer carries learned attention sinks (`hasSinks == true`);
+    /// backends that cannot honor sinks must refuse at engine build.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        CBv2LayerKindDerivation.gptossLayerKinds(
+            layerTypes: layerTypes,
+            numHiddenLayers: hiddenLayers,
+            slidingWindow: slidingWindow,
+            headDim: headDim,
+            numAttentionHeads: attentionHeads,
+            numKeyValueHeads: kvHeads
+        )
+    }
+}
+
+extension GPTOSSModel {
+    /// Per-layer CBv2 attention structure for this model. Derived from the
+    /// loaded trunk's resolved `layerTypes` so it is congruent with the
+    /// actual layers even when the config omits `layer_types`.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        CBv2LayerKindDerivation.gptossLayerKinds(
+            layerTypes: model.layerTypes,
+            numHiddenLayers: configuration.hiddenLayers,
+            slidingWindow: configuration.slidingWindow,
+            headDim: configuration.headDim,
+            numAttentionHeads: configuration.attentionHeads,
+            numKeyValueHeads: configuration.kvHeads
+        )
+    }
+
+    /// Build the per-layer CBv2 attending caches for this model.
+    ///
+    /// Also primes each attention block's sinks-activation Bool (one
+    /// `.item()` probe per layer, HERE at load time) so the CBv2 step loop
+    /// never performs a host readback for the sinks decision. Call this
+    /// after weights are loaded.
+    ///
+    /// The concrete layer-cache classes are owned by the CBv2 core runtime;
+    /// `makeLayerCache` is the injection point (typically wrapping a
+    /// `CBv2KVBackend`). This model file codes purely against the contract.
+    public func newCacheV2(
+        makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+            any CBv2AttendingLayerCache
+    ) rethrows -> [any CBv2AttendingLayerCache] {
+        model.prepareSinksActivation()
+        return try cbv2LayerKinds.enumerated().map { index, kind in
+            try makeLayerCache(index, kind)
+        }
+    }
+}
+
+extension GPTOSSModel: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool { true }
+}
+
+// MARK: - Chat conventions
+
+extension GPTOSSModel {
+    /// Selects the Harmony streaming path in the generation token loop.
+    ///
+    /// `.gptOSS` is not "another tool-call JSON dialect" — it means the full
+    /// Harmony framing protocol (channels, recipients, terminators). The
+    /// `ToolCallFormat` enum is the existing selection knob on
+    /// `ChatConventionsProviding`; the implementation lives in
+    /// `HarmonyFrameParser` / `HarmonyOutputRouter`.
+    ///
+    /// Developer-provided `functions.*` calls are supported. Harmony's
+    /// built-in `browser.*` and `python` tools are intentionally not exposed
+    /// or dispatched by this model integration.
+    public var toolCallFormat: ToolCallFormat? { .gptOSS }
+
+    /// Harmony reasoning is channel-framed, not delimiter-scanned. Leave nil
+    /// so the `<think>` emitter is not applied to GPT-OSS.
+    public var reasoningConfig: ReasoningConfig? { nil }
+}
