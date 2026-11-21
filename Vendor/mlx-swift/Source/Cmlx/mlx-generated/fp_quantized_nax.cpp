@@ -272,6 +272,13 @@ struct FPQuantizedNAXBlockLoader {
   // nvfp4 tensor scale, folded into the group scale as fp_dequantize does.
   // Kept in float: it is ~1e-5, so in fp16 small scales lose most bits.
   float inv_scale_enc = 1.0f;
+  // fetch's packed weights (little-endian words) and scales for store.
+  // Callers dispatch with K % 64 == 0, so a thread's n_reads bytes start on
+  // a 4-byte boundary of the uint32 weight array whenever n_reads % 4 == 0.
+  MLX_MTL_CONST bool word_reads = (n_reads % 4 == 0) && (bytes_per_pack == 1);
+  MLX_MTL_CONST short n_words = (n_reads + 3) / 4;
+  uint32_t w_words[n_words];
+  uint8_t s_regs[n_steps_per_read];
 
   FPQuantizedNAXBlockLoader(
       const device uint8_t* src_,
@@ -344,6 +351,71 @@ struct FPQuantizedNAXBlockLoader {
           }
         }
         k++;
+      }
+    }
+  }
+
+  // load_unsafe in two halves: fetch reads this thread's packed weights and
+  // scales into registers, store dequantizes them into dst + offset with
+  // load_unsafe's exact arithmetic. The device reads of the next tile then
+  // overlap the current tile's MMAs.
+  void fetch() thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_steps_per_read; i++) {
+      s_regs[i] = scales[i];
+    }
+    if constexpr (word_reads) {
+      const device uint32_t* src_words = (const device uint32_t*)src;
+      for (int q = 0; q < n_words; q++) {
+        w_words[q] = src_words[q];
+      }
+    } else {
+      for (int q = 0; q < n_words; q++) {
+        w_words[q] = 0;
+      }
+      for (int k = 0; k < n_reads; k++) {
+        w_words[k / 4] |= uint32_t(src[k * bytes_per_pack]) << (8 * (k % 4));
+      }
+    }
+  }
+
+  void store(int offset) const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    threadgroup T* d = dst + offset;
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      if constexpr (bits == 4 && group_size == 16 && !has_global_scale) {
+        // nvfp4 without a tensor scale: both codes of a byte at once. The
+        // e2m1 code goes straight into the half bits load_unsafe's
+        // fp4_e2m1 builds (sign at bit 15 instead of a negate), times
+        // 2^14 and the e4m3 scale in one float multiply. Each value has at
+        // most 6 significant bits, so every product here and in
+        // load_unsafe is exact and T gets the same value, -0 included.
+        uint8_t s_bits = s_regs[i];
+        const float scale =
+            float(half(*(thread fp8_e4m3*)(&s_bits))) * 16384.0f;
+        for (int j = 0; j < n_reads_per_scale; j++) {
+          const uint b = (w_words[k / 4] >> (8 * (k % 4))) & 0xff;
+          const ushort2 codes = ushort2(ushort(b & 0xf), ushort(b >> 4));
+          const ushort2 h = ((codes & ushort(7)) << ushort(9)) |
+              ((codes & ushort(8)) << ushort(12));
+          const float2 v = float2(as_type<half2>(h)) * scale;
+          *(threadgroup vec<T, 2>*)(d + k * pack_factor) =
+              vec<T, 2>(static_cast<T>(v.x), static_cast<T>(v.y));
+          k++;
+        }
+      } else {
+        float scale =
+            float(dequantize_scale<T, group_size>(s_regs[i])) * inv_scale_enc;
+        for (int j = 0; j < n_reads_per_scale; j++) {
+          const uint8_t b = (w_words[k / 4] >> (8 * (k % 4))) & 0xff;
+          dequantize<T, bits>(b, scale, d + k * pack_factor);
+          k++;
+        }
       }
     }
   }
@@ -453,17 +525,33 @@ METAL_FUNC void fp_qmm_t_impl(
 
   x += tm * K;
 
+  // Aligned N: two weight buffers and one barrier per K step; the next
+  // tile's packed weights are read before the current tile's MMAs and
+  // dequantized into the other buffer after them. Every product and its
+  // accumulation order are those of the one-buffer loop.
+  constexpr int tile_size = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
+      if constexpr (kAlignedN.value) {
+        loader_w.fetch();
+        loader_w.store(0);
+        loader_w.next();
+      }
+      for (int k = 0, it = 0; k < K; k += BK, it++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup Wtype* ws = Ws;
+        bool more = false;
         if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
+          more = k + BK < K;
+          if (more) {
+            loader_w.fetch();
+          }
+          ws += (it & 1) * tile_size;
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -478,7 +566,7 @@ METAL_FUNC void fp_qmm_t_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<Wtype, BK_padded, 1>(ws + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -491,7 +579,14 @@ METAL_FUNC void fp_qmm_t_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if constexpr (kAlignedN.value) {
+          if (more) {
+            loader_w.store(((it + 1) & 1) * tile_size);
+            loader_w.next();
+          }
+        } else {
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
@@ -789,7 +884,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -923,7 +1018,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<has_global_scale>(
       x,
@@ -1392,3 +1487,4 @@ template <
 }
 
 } // namespace mlx::core::metal
+#define GAUNTLET_REDRAW_3f3dda06_20261121T232646Z 1
