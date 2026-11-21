@@ -1,7 +1,9 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 // MARK: - Layer structure
 
@@ -111,20 +113,84 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                     ropeOffsets = offsets
                 }
             }
-            guard index == last else {
-                h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
-                continue
-            }
             let attended = layer.postAttentionLayerNorm.addedTo(
                 h,
-                layer.selfAttention(
-                    layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                teacherForcedAttention(
+                    layer.selfAttention, layer.inputLayerNorm(h), cache: cache[index],
                     ropeOffsets: ropeOffsets))
+            guard index == last else {
+                h = layer.postFeedforwardLayerNorm.addedTo(
+                    attended, layer.mlp(layer.preFeedforwardLayerNorm(attended)))
+                continue
+            }
             let row = attended[0..., (attended.dim(1) - 1)..., 0...]
             h = layer.postFeedforwardLayerNorm.addedTo(
                 row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
         }
         return outputLogits(model.norm(h))
+    }
+
+    static let teacherForcedSelfTest =
+        ProcessInfo.processInfo.environment["MUSE_PROMPT_FP8_SELFTEST"] == "1"
+
+    /// `numerics.project(layer, x)`, with an FP8 projection's exact rows
+    /// computed in one dispatch (`promptRowExactForward`, the same bytes per
+    /// row) instead of in pieces of 16. A row count of `16k + 1` keeps the
+    /// pieces: its last one-row piece takes the vector product.
+    private func teacherForcedProject(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        let rows = MuseGlimmerNumerics.rows(x)
+        if numerics.exactWindows, rows > MuseGlimmerNumerics.pieceRows,
+            rows % MuseGlimmerNumerics.pieceRows != 1,
+            let fp8 = layer as? ModelOptCalibratedLinear,
+            let product = fp8.promptRowExactForward(x)
+        {
+            if Self.teacherForcedSelfTest {
+                // Self-test (environment only): stop unless the bytes equal the pieces'.
+                let pieces = numerics.project(layer, x)
+                precondition(
+                    arrayEqual(product.view(dtype: .uint16), pieces.view(dtype: .uint16))
+                        .item(Bool.self),
+                    "promptRowExactForward differs from the row-exact pieces")
+            }
+            return product
+        }
+        return numerics.project(layer, x)
+    }
+
+    /// `MuseGlimmerTextAttention.callAsFunction` on a CBv2 cache, operation for
+    /// operation, with its projections through `teacherForcedProject`.
+    private func teacherForcedAttention(
+        _ attention: MuseGlimmerTextAttention, _ x: MLXArray, cache: KVCache?,
+        ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        guard let attending = cache as? any CBv2AttendingLayerCache else {
+            return attention(x, mask: .none, cache: cache, ropeOffsets: ropeOffsets)
+        }
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let (heads, kvHeads, dims) =
+            (attention.heads, attention.kvHeads, attention.headDimensions)
+        var queries = teacherForcedProject(attention.queryProj, x)
+            .reshaped(batch, length, heads, dims)
+        var keys = teacherForcedProject(attention.keyProj, x)
+            .reshaped(batch, length, kvHeads, dims)
+        var values = teacherForcedProject(attention.valueProj, x)
+            .reshaped(batch, length, kvHeads, dims)
+        queries = attention.qkNorm(queries)
+        queries = (queries.asType(.float32) * attention.qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = attention.qkNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+        if let rope = attention.rope {
+            let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: attention.scale, sinks: nil)
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        output = MuseGlimmerFusion.sigmoidGate(
+            [output, teacherForcedProject(attention.gateProj, x)])[0]
+        return teacherForcedProject(attention.outputProj, output)
     }
 }
 
