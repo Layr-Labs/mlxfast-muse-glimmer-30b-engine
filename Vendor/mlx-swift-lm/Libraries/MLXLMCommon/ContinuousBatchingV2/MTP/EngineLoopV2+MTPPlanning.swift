@@ -265,6 +265,25 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: marginalDepth, reason: "marginal_policy")
             }
         }
+        if mtp.usesFixedDepthAcceptanceWindow, mtp.planDepth > 0,
+            !eligibleRows.isEmpty
+        {
+            // Host arithmetic over acceptance already read back at the
+            // previous finalize; no device work and no extra readback.
+            let verificationLimit = mtp.maximumAutomaticDepth(
+                plannedDecodeRows: rows.count)
+            let window =
+                eligibleRows.map { rec in
+                    mtp.fixedDepthAcceptanceWindow(
+                        for: rec.id,
+                        offeredDepth: mtp.planDepth,
+                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                        verificationLimit: verificationLimit)
+                }.min() ?? mtp.planDepth
+            if window < mtp.planDepth {
+                mtp.clampPlanDepth(to: window, reason: "acceptance_window")
+            }
+        }
         if mtp.planDepth > 0 {
             let tailDepth = Self.mtpDepthWithinOutputBudget(
                 offeredDepth: mtp.planDepth,

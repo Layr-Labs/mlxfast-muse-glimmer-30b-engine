@@ -937,6 +937,46 @@ final class CBv2MTPRoundDriver {
             headStepCostRatio: cost.headStepCostRatio)
     }
 
+    /// A fixed positive depth with a request-stateful drafter under exact
+    /// acceptance: the declared depth is the ceiling and each plan's verify
+    /// window is clamped by the request's own acceptance history
+    /// (`CBv2MTPMarginalDepthPolicy.fixedWindowDepth`). Exact acceptance
+    /// keeps every emitted token the target's own, so the window changes how
+    /// many rows are verified, never which tokens are committed. Scoped to
+    /// advisory-history drafters (`historyIsAdvisory`, which implies exact
+    /// acceptance): their request state reaches neither output nor prefix
+    /// checkpoints, so other fixed-depth drafters keep their exact shapes.
+    var usesFixedDepthAcceptanceWindow: Bool {
+        guard let fixed = config.fixedDraftTokens else { return false }
+        return fixed > 0 && config.maxDraftTokens > 0
+            && usesRequestStatefulDrafter && historyIsAdvisory
+    }
+
+    private var initialRequestAcceptance: CBv2MTPRequestAcceptanceState {
+        usesFixedDepthAcceptanceWindow
+            ? CBv2MTPRequestAcceptanceState(
+                flatPrior: CBv2MTPMarginalDepthPolicy.fixedWindowFlatPrior)
+            : CBv2MTPRequestAcceptanceState()
+    }
+
+    /// The verify window for one row under a fixed declared depth; at most
+    /// `offeredDepth` and at least one draft while `offeredDepth > 0`.
+    func fixedDepthAcceptanceWindow(
+        for id: CBv2RequestID,
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int
+    ) -> Int {
+        let ceiling = min(max(offeredDepth, 0), config.maxDraftTokens)
+        guard usesFixedDepthAcceptanceWindow, ceiling > 0 else { return ceiling }
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+            offeredDepth: ceiling,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptanceProbabilities: acceptance.probabilities)
+    }
+
     func observeRequestAcceptance(
         id: CBv2RequestID,
         draftedDepth: Int,
@@ -944,8 +984,10 @@ final class CBv2MTPRoundDriver {
         rejectionObserved: Bool,
         endedByTruncation: Bool
     ) {
-        guard usesRequestStatefulDrafter, config.fixedDraftTokens == nil else { return }
-        var state = requestAcceptance[id] ?? CBv2MTPRequestAcceptanceState()
+        guard usesRequestStatefulDrafter,
+            config.fixedDraftTokens == nil || usesFixedDepthAcceptanceWindow
+        else { return }
+        var state = requestAcceptance[id] ?? initialRequestAcceptance
         state.observe(
             draftedDepth: draftedDepth,
             acceptedDepth: acceptedDepth,

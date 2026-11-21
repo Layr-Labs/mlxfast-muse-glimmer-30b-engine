@@ -128,6 +128,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     public let settings: Settings
     /// `[1, hiddenSize]`, the target's raw embedding of the mask token.
     private let maskEmbedding: MLXArray
+    /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
+    /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
+    /// than the target's row-exact verify kernel: the same E2M1 x E4M3
+    /// weights, FP32 accumulation and `weight_scale_2`, in another order.
+    /// Proposals only decide acceptance; the target verifies every token.
+    private let draftHead: ModelOptWeightOnlyNVFP4Linear?
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -163,6 +169,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             throw MuseGlimmerDFlashError.target("embedding shape")
         }
         maskEmbedding = mask.asType(model.activationDType)
+        draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         try MLX.withError { errors in
             eval(maskEmbedding)
             try errors.check()
@@ -427,7 +434,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             state: s.context)
         let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
-        let logits = target.dflashHeadProduct(rows)
+        let logits = draftHeadProduct(rows)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
@@ -493,7 +500,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
             $0[1 ..< (1 + k), 0...]
         }
-        let logits = target.dflashHeadProduct(
+        let logits = draftHeadProduct(
             rows.count == 1 ? rows[0] : concatenated(rows, axis: 0))
         guard logits.shape == [states.count * k, target.dflashVocabularySize] else {
             for s in states { s.refusal = "head" }
@@ -653,6 +660,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         s.context.append(keys: speculation.keys, values: speculation.values)
         s.memo = speculation.memo
         return true
+    }
+
+    /// The head product of draft rows `[rows, hiddenSize]`: MLX's NVFP4
+    /// product of the target's head when it is NVFP4, else the target's own.
+    private func draftHeadProduct(_ rows: MLXArray) -> MLXArray {
+        guard let draftHead, rows.dim(-1) == draftHead.inputDimensions else {
+            return target.dflashHeadProduct(rows)
+        }
+        return draftHead(rows)
     }
 
     /// The argmax of the head products, or a selection's proposals over the

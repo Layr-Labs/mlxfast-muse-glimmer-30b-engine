@@ -583,6 +583,16 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             0.85 * pow(0.98, Double($0))
         }
 
+    init() {}
+
+    /// Every position starts at `flatPrior`. The fixed-depth acceptance
+    /// window uses an optimistic prior so a request's first rounds run at
+    /// the declared depth, exactly as an unclamped fixed-depth engine does.
+    init(flatPrior: Double) {
+        let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
+        probabilities = Array(repeating: prior, count: Self.maximumDepth)
+    }
+
     /// Records positions whose target outcome was actually observed and, after
     /// a fully accepted round, transfers bounded optimism to the next position.
     /// A truncation (stop, token budget, or common-width clamp) passes
@@ -755,6 +765,39 @@ enum CBv2MTPMarginalDepthPolicy {
             depth += 1
         }
         return depth
+    }
+
+    /// Fixed-depth acceptance window. A fixed declared depth is a ceiling:
+    /// each round verifies `min(declared, window)` drafts, where the window
+    /// is the marginal rule above over the request's own acceptance history
+    /// (no wall-clock input, so the choice is deterministic for a given
+    /// accept/reject sequence). The floor of one draft keeps the history
+    /// observing: a depth-zero plan would record no acceptance and could
+    /// never reopen the window. Emitted tokens are the target's own either
+    /// way; only the number of verify rows changes.
+    static let fixedWindowFlatPrior = 0.9
+    /// One extra verify row as a fraction of a full target step. Round costs
+    /// at declared depths 3/5/7 on a request that accepts every draft give a
+    /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
+    /// conservative so estimator noise does not open windows that pay for
+    /// rejected rows.
+    static let fixedWindowHeadStepCostRatio = 0.15
+
+    static func fixedWindowDepth(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int,
+        acceptanceProbabilities: [Double]
+    ) -> Int {
+        guard offeredDepth > 0 else { return 0 }
+        let selected = selectDepth(
+            offeredDepth: offeredDepth,
+            remainingTokens: remainingTokens,
+            verificationLimit: verificationLimit,
+            acceptanceProbabilities: acceptanceProbabilities,
+            previousTargetTopTwoMargin: nil,
+            headStepCostRatio: fixedWindowHeadStepCostRatio)
+        return min(offeredDepth, max(1, selected))
     }
 
     /// A cost-confirmation probe is always at most one draft and obeys every
