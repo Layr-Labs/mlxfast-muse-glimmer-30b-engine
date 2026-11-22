@@ -993,12 +993,17 @@ final class CBv2MTPRoundDriver {
         let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
         // Read the round's draft confidence in either regime so its
         // calibration keeps learning while the declared depth runs.
-        // The window itself never depends on whether the device has already
-        // finished that speculation: that is a host/device timing race, so the
-        // same request got a different verify width on a slower host.
-        _ = availableDraftConfidence(for: id)
+        let confidence = availableDraftConfidence(for: id)
         // High-acceptance regime: always the declared depth.
         guard acceptance.inLowAcceptanceRegime else { return ceiling }
+        if let confidence {
+            return CBv2MTPMarginalDepthPolicy.fixedWindowConfidenceDepth(
+                offeredDepth: ceiling,
+                remainingTokens: remainingTokens,
+                verificationLimit: verificationLimit,
+                acceptance: acceptance,
+                confidence: confidence)
+        }
         return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,

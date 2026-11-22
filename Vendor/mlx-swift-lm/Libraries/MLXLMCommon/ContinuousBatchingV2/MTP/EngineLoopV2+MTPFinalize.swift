@@ -716,14 +716,9 @@ public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
     /// `targetHidden` `[1, depth + 1, H]` its hidden rows, both lazy.
     /// `draftsBlock`: the all-accepted outcome's next block may be drafted
     /// too (work every outcome shares is always eligible).
-    /// `draftTokens` `[1, depth]` are the verify's proposals. `anyOutcome`:
-    /// the row's accepted count is the plain prefix match of `draftTokens`
-    /// against `targetTokens` (no free span), so the drafter may build the
-    /// next block for the realized outcome on device, whatever it is.
     /// Returns the arrays to submit; empty when it does not speculate.
     func speculateNextRound(
         targetTokens: MLXArray, targetHidden: MLXArray, depth: Int, draftsBlock: Bool,
-        draftTokens: MLXArray, anyOutcome: Bool,
         requestState: any CBv2MTPRequestState) -> [MLXArray]
     /// Finalize committed `acceptedDrafts` drafts of the round and stored
     /// `carryHidden` (this object, verify row `acceptedDrafts`) as the row's
@@ -777,11 +772,9 @@ extension EngineLoopV2 {
             mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
-        let drafts = verify.acceptancePacket[0 ..< k].reshaped([1, k])
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
-            draftsBlock: draftsBlock, draftTokens: drafts,
-            anyOutcome: verify.rows[0].freeSpan == nil, requestState: state)
+            draftsBlock: draftsBlock, requestState: state)
         guard !roots.isEmpty else { return }
         do {
             try withError { fault in
