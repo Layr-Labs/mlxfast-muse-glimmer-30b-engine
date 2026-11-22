@@ -21,7 +21,7 @@ import MLXNN
 /// (register double buffer), `RG` and `CH` give the same bytes and were
 /// measured slower; benchmarks only.
 ///
-/// FP8 (routed for the MLP down projection at eight rows): the stock lane
+/// FP8 (routed for the MLP down projection at 6 to 8 rows): the stock lane
 /// chains, shuffle tree and threadgroup join, with one 4-byte weight load and
 /// one 8-byte activation load per row and step (`WV`, `AV`) and four row
 /// groups per threadgroup on the split-K run (`BM 4`). `PD` (packed decode)
@@ -493,12 +493,12 @@ public enum CBv2VerifyScales {
     // MARK: Routing
 
     /// Row groups per threadgroup for an FP8 run: four for the split-K run of
-    /// a K = 19,968 projection at eight rows (activations shared in L1),
+    /// a K = 19,968 projection at 6 to 8 rows (activations shared in L1),
     /// otherwise one. Scheduling only. Four row groups need a run of whole
-    /// 8-row blocks: the kernel's early return for rows past N must stay
-    /// uniform across a threadgroup's simdgroups.
+    /// 8-output blocks, at any row count: the kernel's early return for
+    /// outputs past N must stay uniform across a threadgroup's simdgroups.
     static func fp8RowGroups(splitsK: Bool, rows: Int, inputs: Int, runRows: Int) -> Int {
-        splitsK && rows >= 8 && inputs >= 16384 && runRows % 8 == 0 ? 4 : 1
+        splitsK && rows >= 6 && inputs >= 16384 && runRows % 8 == 0 ? 4 : 1
     }
 
     /// The exact product of `layer` for the verify rows `x` through these
@@ -527,8 +527,8 @@ public enum CBv2VerifyScales {
         }
         if let l = layer as? ModelOptCalibratedLinear {
             // Measured faster only for the MLP shapes: gate/up (vector loads) and
-            // down at eight rows (four row groups); attention keeps the stock product.
-            let mlp = l.outputDimensions >= 16384 || (inputs >= 16384 && rows >= 8)
+            // down at 6 to 8 rows (four row groups); attention keeps the stock product.
+            let mlp = l.outputDimensions >= 16384 || (inputs >= 16384 && rows >= 6)
             // Activations are read as 16-bit lanes (`as_type<vec<T, 4>>(ushort4)`).
             guard mlp, l.format == .fp8, l.execution == .graph, l.inputDimensions == inputs,
                 inputs > 64, inputs % 4 == 0, l.weightDType == x.dtype, (2 ... 8).contains(rows),

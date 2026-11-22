@@ -16,6 +16,9 @@ import MLXFast
 public enum PagedOnePassAttention {
     private static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["MUSE_PAGED_ONEPASS"] != "0"
+    /// Each state issues the K/V loads of 4 tokens before using them (same bits).
+    /// `MUSE_PAGED_ONEPASS_BLOCK=0` restores the per-token loop.
+    static let block = environment["MUSE_PAGED_ONEPASS_BLOCK"] == "0" ? 1 : 4
     /// The direct-slab decode entry (microbenchmarks, probes) takes the
     /// one-pass kernel only on request.
     static let slabEnabled = environment["MUSE_PAGED_ONEPASS_SLAB"] == "1"
@@ -173,7 +176,8 @@ public enum PagedOnePassAttention {
         \(scratch)
         const cbv2::PagedSlabAccessor<T> cache{kcache, vcache, (size_t)kvh * S * D};
         cbv2::paged_attention_onepass_impl<
-            T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP, cbv2::PagedSlabAccessor<T>>(
+            T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP, cbv2::PagedSlabAccessor<T>,
+            BLOCK>(
             q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem, out,
             threadgroup_position_in_grid, thread_position_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -193,7 +197,7 @@ public enum PagedOnePassAttention {
             const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
             const device int32_t* record =
                 records + (first + min(wanted, own - 1)) * STRIDE;
-            const cbv2::PagedSegmentAccessor<T, SEGMENTS> cache{
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
                 {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
             if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
                 fence[0] = previous[0] + 1;
@@ -201,7 +205,7 @@ public enum PagedOnePassAttention {
             \(scratch)
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
-                cbv2::PagedSegmentAccessor<T, SEGMENTS>>(
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
                 q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
                 simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -221,6 +225,7 @@ public enum PagedOnePassAttention {
         }
         return "cbv2_paged_onepass_\(kind)_\(d)_d\(headDim)_s\(pageSize)_g\(gqa)_h\(hpt)"
             + "_n\(simdgroups)_t\(partitionTokens)_p\(maxPartitions)_cap\(softcap ? 1 : 0)"
+            + "_b\(block)"
     }
 
     /// Direct-slab entry: `[B, QH, D]` in the slab dtype.
@@ -253,7 +258,7 @@ public enum PagedOnePassAttention {
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("GQA", gqa), ("HPT", hpt),
                 ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", maxPartitions),
-                ("HAS_SOFTCAP", softcap),
+                ("HAS_SOFTCAP", softcap), ("BLOCK", block),
             ],
             grid: (kvh * (gqa / hpt) * tg, b, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype], stream: stream)[0]
@@ -296,7 +301,7 @@ public enum PagedOnePassAttention {
                 ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
                 ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
                 ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride),
+                ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
             ],
             // The probe asks for the same thread count as one (tg / 2, 2, 1)
             // threadgroup: MLX accepts that shape only when the pipeline

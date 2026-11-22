@@ -250,7 +250,9 @@ extension MuseGlimmerTextModel {
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
-        return (outputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
+        return (
+            verifyOutputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
+        )
     }
 
     /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
@@ -421,14 +423,17 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
 ///   below (`CBv2VerifyScales`).
 /// - NVFP4 attention q/k/v/gate and o: 8-row tiles with whole-chunk loads
 ///   (`CBv2VerifyScales`).
-/// - FP8 attention q/k/v/gate (one cast and one product launch) and o (one
-///   launch for all eager tiles): vector loads, prefetched weight words and a
-///   packed, order-preserving shuffle tree (`CBv2SmallProjection`).
-/// - FP8 MLP down at 8 rows: vector loads and four row groups per
+/// - FP8 attention q/k/v/gate and MLP gate/up (one cast and one product
+///   launch), o and MLP down up to 5 rows (one launch for all eager tiles):
+///   vector loads, prefetched weight words and a packed, order-preserving
+///   shuffle tree (`CBv2SmallProjection`).
+/// - FP8 MLP down at 6 to 8 rows: vector loads and four row groups per
 ///   threadgroup (`CBv2VerifyScales`).
-/// Anything else (FP8 gate/up, dense layers, more than 8 rows) keeps the
-/// frontier path. `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing
-/// off. `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
+/// - NVFP4 lm_head: 8-row tiles (`CBv2VerifyScales`), then the stock
+///   multiplier and softcap.
+/// Anything else (dense layers, more than 8 rows) keeps the frontier path.
+/// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing off.
+/// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
 /// routed projection with the stock row-exact product, on the same
 /// activations, and stops the process unless every output's bits are equal.
 enum MuseGlimmerVerifyProjections {
@@ -541,18 +546,31 @@ extension MuseGlimmerTextModel {
     }
 
     /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4`
-    /// launch; FP8 pairs keep the frontier's grouped product.
+    /// launch; an FP8 pair through `CBv2SmallProjection` (one cast and one
+    /// product launch).
     func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil, let routed = CBv2VerifyNVFP4.products(layers, x) {
-            checkRouted(routed, layers, x, kind: "nvfp4.gate_up")
-            return routed
+        if verifyRows(x) != nil {
+            var routed: [MLXArray]?
+            var kind = ""
+            if let pair = CBv2VerifyNVFP4.products(layers, x) {
+                routed = pair
+                kind = "nvfp4.gate_up"
+            } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
+                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                kind = "fp8.gate_up"
+            }
+            if let routed {
+                checkRouted(routed, layers, x, kind: kind)
+                return routed
+            }
         }
         return groupedProjections(layers, x)
     }
 
     /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4` at 7
     /// and 8 rows (16-row tiles with prefetch) and `CBv2VerifyScales` below;
-    /// FP8 through `CBv2VerifyScales` at 8 rows (four row groups).
+    /// FP8 through `CBv2SmallProjection` up to 5 rows and `CBv2VerifyScales`
+    /// at 6 to 8 rows (four row groups).
     func verifyDownProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
         if let rows = verifyRows(x) {
             var routed: MLXArray?
@@ -562,8 +580,11 @@ extension MuseGlimmerTextModel {
                     rows >= 7
                     ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.down"
-            } else if layer is ModelOptCalibratedLinear, rows == 8 {
-                routed = CBv2VerifyScales.product(layer, x)
+            } else if let fp8 = layer as? ModelOptCalibratedLinear {
+                routed =
+                    rows >= 6
+                    ? CBv2VerifyScales.product(layer, x)
+                    : CBv2SmallProjection.fp8Products([fp8], x)?.first
                 kind = "fp8.down"
             }
             if let routed {
@@ -572,6 +593,20 @@ extension MuseGlimmerTextModel {
             }
         }
         return numerics.project(layer, x)
+    }
+
+    /// `outputLogits` for verify rows: an NVFP4 `lm_head` through
+    /// `CBv2VerifyScales` (8-row tiles), then the same multiplier and softcap
+    /// in the same order. Other calls run `outputLogits` itself.
+    func verifyOutputLogits(_ normedHidden: MLXArray) -> MLXArray {
+        guard verifyRows(normedHidden) != nil, lmHead is ModelOptWeightOnlyNVFP4Linear,
+            let product = CBv2VerifyScales.product(lmHead, normedHidden)
+        else { return outputLogits(normedHidden) }
+        checkRouted([product], [lmHead], normedHidden, kind: "nvfp4.lm_head")
+        var logits = product * configuration.outputMultiplier
+        let cap = configuration.finalLogitSoftcapping
+        if cap > 0 { logits = tanh(logits / cap) * cap }
+        return logits
     }
 
     /// Compiles every routed kernel (each distinct projection shape at 1 to
@@ -616,6 +651,12 @@ extension MuseGlimmerTextModel {
                 }
                 eval(outputs)
             }
+        }
+        if lmHead is ModelOptWeightOnlyNVFP4Linear, let width = inputs(lmHead) {
+            eval(
+                (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
+                    verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
+                })
         }
     }
 }
