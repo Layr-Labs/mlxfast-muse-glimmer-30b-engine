@@ -993,32 +993,17 @@ final class CBv2MTPRoundDriver {
         let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
         // Read the round's draft confidence in either regime so its
         // calibration keeps learning while the declared depth runs.
-        let confidence = availableDraftConfidence(for: id)
+        // The window itself never depends on whether the device has already
+        // finished that speculation: that is a host/device timing race, so the
+        // same request got a different verify width on a slower host.
+        _ = availableDraftConfidence(for: id)
         // High-acceptance regime: always the declared depth.
         guard acceptance.inLowAcceptanceRegime else { return ceiling }
-        if let confidence {
-            return CBv2MTPMarginalDepthPolicy.fixedWindowConfidenceDepth(
-                offeredDepth: ceiling,
-                remainingTokens: remainingTokens,
-                verificationLimit: verificationLimit,
-                acceptance: acceptance,
-                confidence: confidence)
-        }
         return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
             acceptanceProbabilities: acceptance.probabilities)
-    }
-
-    /// The acceptance ceiling's draft count for one row (see
-    /// `CBv2MTPRequestAcceptanceState.acceptanceCeilingDepth`). Same scope
-    /// as the fixed-depth acceptance window; host arithmetic over the
-    /// request's finalized rounds only.
-    func acceptanceCeilingDepth(for id: CBv2RequestID, offeredDepth: Int) -> Int {
-        guard usesFixedDepthAcceptanceWindow, offeredDepth > 0 else { return offeredDepth }
-        return (requestAcceptance[id] ?? initialRequestAcceptance)
-            .acceptanceCeilingDepth(offeredDepth: offeredDepth)
     }
 
     /// Start of a plan: forget the previous plan's draft confidences.
@@ -1060,7 +1045,6 @@ final class CBv2MTPRoundDriver {
         id: CBv2RequestID,
         draftedDepth: Int,
         acceptedDepth: Int,
-        committedTokens: Int,
         rejectionObserved: Bool,
         endedByTruncation: Bool
     ) {
@@ -1068,7 +1052,6 @@ final class CBv2MTPRoundDriver {
             config.fixedDraftTokens == nil || usesFixedDepthAcceptanceWindow
         else { return }
         var state = requestAcceptance[id] ?? initialRequestAcceptance
-        state.observeCommitted(draftedDepth: draftedDepth, committedTokens: committedTokens)
         state.observe(
             draftedDepth: draftedDepth,
             acceptedDepth: acceptedDepth,

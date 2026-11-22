@@ -614,7 +614,6 @@ extension EngineLoopV2 {
                 id: id,
                 draftedDepth: k,
                 acceptedDepth: observedAccepted,
-                committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
 

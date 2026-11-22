@@ -287,21 +287,6 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: window, reason: "acceptance_window")
             }
         }
-        if mtp.usesFixedDepthAcceptanceWindow, mtp.planDepth > 0,
-            !eligibleRows.isEmpty
-        {
-            // Acceptance ceiling: bound the draft count by the request's
-            // committed-tokens-per-round budget. Applied after the
-            // acceptance window, so the plan runs the smaller of the two.
-            // Integer arithmetic over finalized rounds; no clock, no sync.
-            let ceiling =
-                eligibleRows.map { rec in
-                    mtp.acceptanceCeilingDepth(for: rec.id, offeredDepth: mtp.planDepth)
-                }.min() ?? mtp.planDepth
-            if ceiling < mtp.planDepth {
-                mtp.clampPlanDepth(to: ceiling, reason: "acceptance_ceiling")
-            }
-        }
         if mtp.planDepth > 0 {
             let tailDepth = Self.mtpDepthWithinOutputBudget(
                 offeredDepth: mtp.planDepth,
