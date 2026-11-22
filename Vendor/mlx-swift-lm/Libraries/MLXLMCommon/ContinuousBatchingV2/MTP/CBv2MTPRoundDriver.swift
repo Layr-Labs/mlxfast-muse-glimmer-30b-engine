@@ -157,6 +157,12 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Per verify row (batch order): the prompt-lookup round, nil when
+        /// the row was not eligible. When any row carries a chain the packet
+        /// also ends with the drafter's own [B, k] proposals (the ones the
+        /// chain may have replaced), so finalize can score both sources.
+        var promptLookup: [CBv2MTPPromptLookupRound?] = []
+        var hasDrafterProposals = false
 
     }
 
@@ -326,6 +332,8 @@ final class CBv2MTPRoundDriver {
     /// Qwen acceptance is request-owned; raw nonchained wall cost is shared
     /// only within a compatible decode-row bucket.
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
+    /// Per-request prompt-lookup chooser state (`CBv2MTPPromptLookup.swift`).
+    private var promptLookupStates: [CBv2RequestID: CBv2MTPPromptLookupState] = [:]
     /// Plan-scoped: the confirmed post-verify speculation's lazy draft
     /// confidence for each row whose window this plan offered it to, kept
     /// until that round's finalize calibrates with it. Cleared every plan.
@@ -1083,6 +1091,50 @@ final class CBv2MTPRoundDriver {
         requestAcceptance[id] = state
     }
 
+    // MARK: Prompt lookup
+
+    /// The round's prompt-lookup proposal for a greedy, unconstrained row of
+    /// an advisory-history drafter, and whether the chooser prefers it over
+    /// the drafter's own tokens. nil when the row is not eligible.
+    func promptLookupRound(for rec: CBv2ScheduledRequest, depth: Int)
+        -> CBv2MTPPromptLookupRound?
+    {
+        guard CBv2MTPPromptLookupState.enabled, usesFixedDepthAcceptanceWindow, depth > 0,
+            rec.request.tokenConstraint == nil,
+            rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+        else { return nil }
+        guard let chain = CBv2MTPPromptLookupState.chain(history: rec.tokens, depth: depth)
+        else { return CBv2MTPPromptLookupRound(chain: nil, used: 0) }
+        let state = promptLookupStates[rec.id] ?? CBv2MTPPromptLookupState()
+        return CBv2MTPPromptLookupRound(
+            chain: chain, used: state.prefersLookup(chain) ? chain.tokens.count : 0)
+    }
+
+    /// Score both sources against the target's tokens after the round.
+    /// `drafter` is the drafter's own proposals for the round when the packet
+    /// carried them (a chain existed); otherwise the round's drafts were the
+    /// drafter's.
+    func observePromptLookup(
+        id: CBv2RequestID, round: CBv2MTPPromptLookupRound, targets: [Int], accepted: Int,
+        drafter: [Int32]?
+    ) {
+        var state = promptLookupStates[id] ?? CBv2MTPPromptLookupState()
+        if let chain = round.chain {
+            state.observeLookup(
+                chain: chain,
+                length: CBv2MTPPromptLookupState.countedAccepted(
+                    proposal: chain.tokens, targets: targets, accepted: accepted))
+        }
+        if let drafter {
+            state.observeDrafter(
+                length: CBv2MTPPromptLookupState.countedAccepted(
+                    proposal: drafter, targets: targets, accepted: accepted))
+        } else {
+            state.observeDrafter(length: accepted)
+        }
+        promptLookupStates[id] = state
+    }
+
     func pendingHistoryCarry(for id: CBv2RequestID) -> CBv2MTPCarry? {
         guard !targetOnlyMediaRequests.contains(id) else { return nil }
         guard let carry = carries[id], carry.needsHistoryTransition else { return nil }
@@ -1157,6 +1209,7 @@ final class CBv2MTPRoundDriver {
         releaseAssistantState(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
+        promptLookupStates.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
     }
 
@@ -1209,6 +1262,7 @@ final class CBv2MTPRoundDriver {
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
+        promptLookupStates.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
     }
 

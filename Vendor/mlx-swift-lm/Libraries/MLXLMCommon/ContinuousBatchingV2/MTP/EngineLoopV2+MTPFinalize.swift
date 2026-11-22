@@ -318,6 +318,15 @@ extension EngineLoopV2 {
             } else {
                 while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             }
+            if batchIndex < verify.promptLookup.count, let lookup = verify.promptLookup[batchIndex] {
+                // Drafter proposals ride at the packet's tail when a chain existed.
+                let drafter: [Int32]? =
+                    verify.hasDrafterProposals
+                    ? Array(host[(host.count - verify.rows.count * k + batchIndex * k)...].prefix(k))
+                    : nil
+                mtp.observePromptLookup(
+                    id: id, round: lookup, targets: targets, accepted: accepted, drafter: drafter)
+            }
             let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(

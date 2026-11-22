@@ -964,6 +964,31 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
+        // Prompt lookup: where the chooser prefers a row's n-gram chain, its
+        // tokens replace the drafter's at the chain's positions (on device,
+        // no readback). The drafter's block was drafted and its state is
+        // untouched, so later rounds see exactly what they would have.
+        var lookupRounds: [CBv2MTPPromptLookupRound?] = []
+        var drafterProposals: MLXArray?
+        if mtp.drafter is any CBv2MTPRequestStatefulDrafter, k > 0 {
+            lookupRounds = verifyRows.map { mtp.promptLookupRound(for: $0.rec, depth: k) }
+            if lookupRounds.contains(where: { $0?.chain != nil }) {
+                drafterProposals = stacked(draftSteps, axis: 1)
+                for i in 0 ..< k {
+                    var mask = [Bool](repeating: false, count: batch)
+                    var tokens = [Int32](repeating: 0, count: batch)
+                    for (row, round) in lookupRounds.enumerated() {
+                        if let round, let chain = round.chain, i < round.used {
+                            mask[row] = true
+                            tokens[row] = chain.tokens[i]
+                        }
+                    }
+                    if mask.contains(true) {
+                        draftSteps[i] = which(MLXArray(mask), MLXArray(tokens), draftSteps[i])
+                    }
+                }
+            }
+        }
         let draftIDs = stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
@@ -994,6 +1019,7 @@ extension EngineLoopV2 {
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
         }
+        if let drafterProposals { packetParts.append(drafterProposals.reshaped([-1])) }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
@@ -1009,6 +1035,8 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.promptLookup = lookupRounds
+        result.hasDrafterProposals = drafterProposals != nil
         return result
     }
 
