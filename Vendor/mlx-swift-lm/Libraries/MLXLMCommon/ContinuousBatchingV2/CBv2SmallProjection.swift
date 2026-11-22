@@ -30,8 +30,7 @@ import MLXNN
 /// of 32 (four times the threadgroups), all siblings in one dispatch.
 ///
 /// The Muse Glimmer fused verify forward routes its FP8 attention
-/// projections, MLP gate/up and MLP down up to 5 rows here
-/// (`DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ`).
+/// projections here (`DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ`).
 public enum CBv2SmallProjection {
     public static let maximumRows = 8
 

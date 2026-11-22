@@ -234,8 +234,7 @@ template <typename T> struct PagedSlabAccessor {
 
 // records: row, partition, first logical page, page count, write binding,
 // write local page, max partitions, reserved; followed by (binding, local page).
-// NODIV: the same page bound without the 64-bit division (equal for local >= 0).
-template <typename T, int N, bool NODIV = false> struct PagedSegmentAccessor {
+template <typename T, int N> struct PagedSegmentAccessor {
     const device T* buffers[N];
     const device int64_t* value_offsets;
     const device int32_t* record;
@@ -244,8 +243,7 @@ template <typename T, int N, bool NODIV = false> struct PagedSegmentAccessor {
     bool is_native_position(int) const { return false; }
     PagedKVPage<T> page(int binding, int local) const {
         if (binding < 0 || binding >= N || local < 0
-            || (NODIV ? (size_t)(local + 1) * page_elements > (size_t)value_offsets[binding]
-                      : (size_t)local >= (size_t)value_offsets[binding] / page_elements)) {
+            || (size_t)local >= (size_t)value_offsets[binding] / page_elements) {
             binding = 0; local = 0;
         }
         const device T* base = buffers[binding] + (size_t)local * page_elements;
@@ -605,11 +603,9 @@ inline void paged_attention_merge_impl(
 //       tg = (32 * NSG * MAXPART, 1, 1).
 // Threadgroup memory: q_smem[HPT * D], red_smem[MAXPART * NSG * HPT * (D + 2)],
 // part_smem[MAXPART * HPT * (D + 2)] floats.
-// BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
-// unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -677,69 +673,7 @@ inline void paged_attention_onepass_impl(
 
     float kf[EPT];
     float vf[EPT];
-    if (active && BLOCK > 1 && EPT == 4) {
-        constexpr int E4 = EPT < 4 ? EPT : 4;
-        const int first = lo + state;
-        const int count = first < hi ? (hi - first + NSG - 1) / NSG : 0;
-        int cur_lpage = -1;
-        const device T* cur_key = nullptr;
-        const device T* cur_value = nullptr;
-        for (int j0 = 0; j0 < count; j0 += BLOCK) {
-            vec<T, 4> kr[BLOCK];
-            vec<T, 4> vr[BLOCK];
-#pragma unroll
-            for (int u = 0; u < BLOCK; u++) {
-                if (j0 + u < count) {
-                    const int pos = attend_start + first + (j0 + u) * NSG;
-                    const int lpage = pos / S;
-                    const int slot = pos % S;
-                    if (lpage != cur_lpage) {
-                        const auto page = cache.read_page(table, lpage, table_len);
-                        cur_key = page.key;
-                        cur_value = page.value;
-                        cur_lpage = lpage;
-                    }
-                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
-                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
-                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
-                }
-            }
-#pragma unroll
-            for (int u = 0; u < BLOCK; u++) {
-                if (j0 + u < count) {
-#pragma unroll
-                    for (int e = 0; e < E4; e++) {
-                        kf[e] = float(kr[u][e]);
-                        vf[e] = float(vr[u][e]);
-                    }
-
-#pragma unroll
-                    for (int g = 0; g < HPT; g++) {
-                        float partial = 0.0f;
-#pragma unroll
-                        for (int e = 0; e < EPT; e++) {
-                            partial += q_smem[g * D + lane * EPT + e] * kf[e];
-                        }
-                        float qk = simd_sum(partial);
-                        if (HAS_SOFTCAP) {
-                            qk = softcap * precise::tanh(qk / softcap);
-                        }
-                        qk *= M_LOG2E_F;
-
-                        const float m_new = max(m[g], qk);
-                        const float corr = exp2(m[g] - m_new);
-                        const float p = exp2(qk - m_new);
-                        l[g] = l[g] * corr + p;
-#pragma unroll
-                        for (int e = 0; e < EPT; e++) {
-                            acc[g][e] = acc[g][e] * corr + p * vf[e];
-                        }
-                        m[g] = m_new;
-                    }
-                }
-            }
-        }
-    } else if (active) {
+    if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
             const int pos = attend_start + i;
             const int lpage = pos / S;

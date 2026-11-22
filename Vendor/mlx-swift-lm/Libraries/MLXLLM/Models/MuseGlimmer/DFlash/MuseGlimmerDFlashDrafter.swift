@@ -179,6 +179,120 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             eval(maskEmbedding)
             try errors.check()
         }
+        if Self.claimSpeculativeWarm() { warmSpeculativeRounds() }
+    }
+
+    // MARK: Load-time warm
+
+    private static let speculativeWarmLock = NSLock()
+    nonisolated(unsafe) private static var speculativeWarmClaimed = false
+
+    /// Once per process: the pipelines and libraries it compiles are process-wide.
+    private static func claimSpeculativeWarm() -> Bool {
+        speculativeWarmLock.lock()
+        defer { speculativeWarmLock.unlock() }
+        if speculativeWarmClaimed { return false }
+        speculativeWarmClaimed = true
+        return true
+    }
+
+    /// Runs the drafter half of a speculative round once for every commit
+    /// width a round can produce (1 ... 1 + maximumDraftTokens rows), on zero
+    /// operands and private context states: both commit paths, the post-verify
+    /// projection and its accepted-prefix append, block forwards over both key
+    /// alignments and with a mask, the head in both products, the proposals
+    /// and the confidence. MLX compiles a kernel at its first dispatch; without
+    /// this, widths the warm-up never reached compile inside timed rounds. The
+    /// states are released and the results dropped: no request or engine
+    /// state is read or written, and no value of any later round changes.
+    private func warmSpeculativeRounds() {
+        let c = model.configuration
+        let k = settings.maximumDraftTokens
+        let single = model.makeContextState()
+        let batched = model.makeContextState()
+        defer {
+            single.release()
+            batched.release()
+        }
+        let anchor = target.dflashTokenEmbeddings(MLXArray([Int32(c.maskTokenID)]))
+        guard anchor.size == c.hiddenSize else { return }
+        let embeddings = model.blockEmbeddings(anchor: anchor, mask: maskEmbedding)
+        let dtype = model.activationDType
+
+        func blocks(_ outputs: inout [MLXArray]) {
+            let one = model.draftBlock(embeddings: embeddings, state: single)
+            let many = model.draftBlocks(embeddings: [embeddings], states: [batched])
+            outputs.append(one)
+            outputs.append(contentsOf: many)
+            for rows in [one] + many {
+                let draftRows = rows[1 ..< (1 + k), 0...]
+                let plain = draftHeadProduct(draftRows, readout: false)
+                outputs.append(proposals(plain, selection: nil))
+                let scores = target.dflashReadout(plain).asType(.float32)
+                outputs.append(exp(scores.max(axis: -1) - scores.logSumExp(axis: -1)))
+                outputs.append(proposals(draftHeadProduct(draftRows, readout: true), selection: nil))
+            }
+        }
+
+        do {
+            try MLX.withError { errors in
+                for width in 1 ... (1 + k) {
+                    let features = MLXArray.zeros([width, c.contextWidth], dtype: dtype)
+                    var outputs: [MLXArray] = []
+                    // The post-verify projection of every verify row, and the
+                    // accepted prefixes a confirmed outcome appends.
+                    let projected = model.contextKeyValues(
+                        model.projectContext(features),
+                        segments: [(rows: 0 ..< width, position: single.nextPosition)])[0]
+                    outputs += [projected.keys, projected.values]
+                    for accepted in 1 ... width {
+                        let rows = 0 ..< accepted
+                        let probe = model.makeContextState()
+                        probe.append(
+                            keys: projected.keys[0..., 0..., rows, 0...],
+                            values: projected.values[0..., 0..., rows, 0...])
+                        outputs += probe.arrays
+                        eval(outputs)
+                        probe.release()
+                    }
+                    // A round's commit, alone and batched.
+                    model.commit(features: features, at: single.nextPosition, to: single)
+                    model.commit([.init(features: features, at: batched.nextPosition, to: batched)])
+                    blocks(&outputs)
+                    outputs += single.arrays + batched.arrays
+                    eval(outputs)
+                    try errors.check()
+                }
+                // Key lengths (held rows + block) that are and are not a
+                // multiple of the attention key tile select different kernels.
+                for _ in 0 ..< 2 {
+                    let pad = (32 - (single.count + c.blockSize) % 32) % 32
+                    let rows = pad == 0 ? 1 : pad
+                    let features = MLXArray.zeros([rows, c.contextWidth], dtype: dtype)
+                    model.commit(features: features, at: single.nextPosition, to: single)
+                    model.commit([.init(features: features, at: batched.nextPosition, to: batched)])
+                    var outputs: [MLXArray] = []
+                    blocks(&outputs)
+                    outputs += single.arrays + batched.arrays
+                    eval(outputs)
+                    try errors.check()
+                }
+                // A wrapped ring masks keys outside the window.
+                if let visible = single.visibleContext() {
+                    let count = visible.keys.dim(2)
+                    let mask = MLXArray(
+                        [Bool](repeating: true, count: c.blockSize * (count + c.blockSize)),
+                        [c.blockSize, count + c.blockSize])
+                    let rows = model.blockForward(
+                        embeddings: embeddings, at: single.nextPosition,
+                        context: (visible.keys, visible.values), mask: mask)
+                    eval(rows)
+                    try errors.check()
+                }
+            }
+        } catch {
+            // Best effort: a failed warm leaves first use where it was.
+        }
     }
 
     // MARK: Engine policy

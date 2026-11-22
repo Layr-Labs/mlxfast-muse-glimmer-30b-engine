@@ -250,9 +250,7 @@ extension MuseGlimmerTextModel {
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
-        return (
-            verifyOutputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
-        )
+        return (outputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
     }
 
     /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
@@ -301,6 +299,10 @@ extension MuseGlimmerTextModel {
         let claimed = Self.fusedVerifyWarmed.insert(ObjectIdentifier(self)).inserted
         Self.fusedVerifyWarmLock.unlock()
         guard claimed, VerifyFusedNorms.enabled, let first = model.layers.first else { return }
+        CBv2VerifyRowExactFP8.prepare(
+            model.layers.map { $0.mlp.downProj },
+            groups: model.layers.map { [$0.mlp.gateProj, $0.mlp.upProj] },
+            owner: ObjectIdentifier(self))
         let dtype = activationDType
         let width = first.inputLayerNorm.weight.dim(-1)
         guard VerifyFusedNorms.supports(width: width, rows: 1, dtype: dtype) else { return }
@@ -342,6 +344,7 @@ extension MuseGlimmerTextModel {
             }
         }
         eval(warm)
+        checkVerifyProjections(dtype: dtype)
         warmVerifyProjections(dtype: dtype)
     }
 }
@@ -423,17 +426,17 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
 ///   below (`CBv2VerifyScales`).
 /// - NVFP4 attention q/k/v/gate and o: 8-row tiles with whole-chunk loads
 ///   (`CBv2VerifyScales`).
-/// - FP8 attention q/k/v/gate and MLP gate/up (one cast and one product
-///   launch), o and MLP down up to 5 rows (one launch for all eager tiles):
-///   vector loads, prefetched weight words and a packed, order-preserving
-///   shuffle tree (`CBv2SmallProjection`).
-/// - FP8 MLP down at 6 to 8 rows: vector loads and four row groups per
+/// - FP8 attention q/k/v/gate (one cast and one product launch) and o (one
+///   launch for all eager tiles): vector loads, prefetched weight words and a
+///   packed, order-preserving shuffle tree (`CBv2SmallProjection`).
+/// - FP8 MLP down at 8 rows: vector loads and four row groups per
 ///   threadgroup (`CBv2VerifyScales`).
-/// - NVFP4 lm_head: 8-row tiles (`CBv2VerifyScales`), then the stock
-///   multiplier and softcap.
-/// Anything else (dense layers, more than 8 rows) keeps the frontier path.
-/// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing off.
-/// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
+/// Anything else (FP8 gate/up, dense layers, more than 8 rows) keeps the
+/// frontier path. Before the first window a load-time byte check compares
+/// every routed site of every layer at 1 to 8 rows with the stock product; a
+/// shape with any differing byte keeps the frontier path.
+/// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing
+/// off. `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
 /// routed projection with the stock row-exact product, on the same
 /// activations, and stops the process unless every output's bits are equal.
 enum MuseGlimmerVerifyProjections {
@@ -481,6 +484,61 @@ enum MuseGlimmerVerifyProjections {
         }
         if let report { FileHandle.standardError.write(Data(report.utf8)) }
     }
+
+    // MARK: Load-time check
+
+    /// A routed call site of a layer: attention q/k/v/gate, attention output,
+    /// MLP gate/up, MLP down.
+    enum Site: Hashable {
+        case attention, output, feedInput, down
+    }
+
+    private struct Slot: Hashable {
+        let site: Site
+        let layer: ObjectIdentifier
+    }
+
+    /// Sites the load-time check admitted, by the site's first projection.
+    nonisolated(unsafe) private static var admittedSlots = Set<Slot>()
+
+    static func admitted(_ site: Site, _ first: any UnaryLayer) -> Bool {
+        let slot = Slot(site: site, layer: ObjectIdentifier(first as AnyObject))
+        return lock.withLock { admittedSlots.contains(slot) }
+    }
+
+    static func admit(_ site: Site, _ firsts: [any UnaryLayer]) {
+        lock.withLock {
+            for first in firsts {
+                admittedSlots.insert(Slot(site: site, layer: ObjectIdentifier(first as AnyObject)))
+            }
+        }
+    }
+
+    /// `[1, rows, inputs]`: signed values over a wide exponent range, exact
+    /// zeros, negative zeros and values past the FP8 activation bound.
+    static func probe(rows: Int, inputs: Int, dtype: DType) -> MLXArray {
+        let index = MLX.arange(rows * inputs, dtype: .int32).reshaped(1, rows, inputs)
+        let phase = sin(index.asType(.float32) * 0.7548776662)
+        var values = exp(phase * 8.3177661667)
+        values = MLX.where((index % 3) .== 0, -values, values)
+        values = MLX.where((index % 97) .== 5, MLXArray(Float(0)), values)
+        values = MLX.where((index % 89) .== 7, MLXArray(-Float(0)), values)
+        values = MLX.where((index % 101) .== 11, MLXArray(Float(1e4)), values)
+        return values.asType(dtype)
+    }
+
+    /// A lazy boolean: every output has the stock output's shape, dtype and
+    /// bits (NaN payloads included).
+    static func equalBits(_ routed: [MLXArray], _ stock: [MLXArray]) -> MLXArray {
+        guard routed.count == stock.count else { return MLXArray(false) }
+        var equal = MLXArray(true)
+        for (a, b) in zip(routed, stock) {
+            guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+            let bits: DType = a.dtype.size == 4 ? .uint32 : .uint16
+            equal = equal .&& (a.view(dtype: bits) .== b.view(dtype: bits)).all()
+        }
+        return equal
+    }
 }
 
 extension MuseGlimmerTextModel {
@@ -502,161 +560,203 @@ extension MuseGlimmerTextModel {
             routed, stock, kind: kind, rows: MuseGlimmerNumerics.rows(x))
     }
 
-    /// Attention q, k, v and gate of one layer: all FP8 through
-    /// `CBv2SmallProjection`, all NVFP4 through `CBv2VerifyScales`; otherwise
-    /// the frontier's grouped or per-layer products.
-    func verifyAttentionProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil {
-            var routed: [MLXArray]?
-            var kind = ""
+    /// The routed products of `site` (nil: not routed at this shape or row
+    /// count), before the load-time check and the self-test:
+    /// - attention q, k, v and gate: all FP8 through `CBv2SmallProjection`,
+    ///   all NVFP4 through `CBv2VerifyScales`;
+    /// - attention output: FP8 through `CBv2SmallProjection` (all eager tiles
+    ///   in one launch), NVFP4 through `CBv2VerifyScales`;
+    /// - MLP gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4` launch;
+    /// - MLP down: NVFP4 through `CBv2VerifyNVFP4` at 7 and 8 rows (16-row
+    ///   tiles with prefetch) and `CBv2VerifyScales` below; FP8 through
+    ///   `CBv2VerifyScales` at 8 rows (four row groups).
+    private func routedProducts(
+        _ site: MuseGlimmerVerifyProjections.Site, _ layers: [any UnaryLayer], _ x: MLXArray,
+        rows: Int
+    ) -> (products: [MLXArray], kind: String)? {
+        switch site {
+        case .attention:
             if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
-                kind = "fp8.qkvg"
-            } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
-                kind = "nvfp4.qkvg"
+                return CBv2SmallProjection.fp8Products(fp8, x).map {
+                    (products: $0, kind: "fp8.qkvg")
+                }
             }
-            if let routed {
-                checkRouted(routed, layers, x, kind: kind)
-                return routed
+            if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
+                return CBv2VerifyScales.products(layers, x).map {
+                    (products: $0, kind: "nvfp4.qkvg")
+                }
+            }
+        case .output:
+            if let fp8 = layers[0] as? ModelOptCalibratedLinear {
+                return CBv2SmallProjection.fp8Products([fp8], x).map {
+                    (products: $0, kind: "fp8.o")
+                }
+            }
+            if layers[0] is ModelOptWeightOnlyNVFP4Linear {
+                return CBv2VerifyScales.product(layers[0], x).map {
+                    (products: [$0], kind: "nvfp4.o")
+                }
+            }
+        case .feedInput:
+            return CBv2VerifyNVFP4.products(layers, x).map { (products: $0, kind: "nvfp4.gate_up") }
+        case .down:
+            if let nv = layers[0] as? ModelOptWeightOnlyNVFP4Linear {
+                let product =
+                    rows >= 7 ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(nv, x)
+                return product.map { (products: [$0], kind: "nvfp4.down") }
+            }
+            if layers[0] is ModelOptCalibratedLinear, rows == 8 {
+                return CBv2VerifyScales.product(layers[0], x).map {
+                    (products: [$0], kind: "fp8.down")
+                }
             }
         }
-        return groupedProjections(layers, x)
+        return nil
     }
 
-    /// The attention output projection: FP8 through `CBv2SmallProjection`
-    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyScales`.
+    /// The routed products of an admitted site on exact verify rows, or nil
+    /// (the caller keeps the frontier path).
+    private func routed(
+        _ site: MuseGlimmerVerifyProjections.Site, _ layers: [any UnaryLayer], _ x: MLXArray
+    ) -> [MLXArray]? {
+        guard let rows = verifyRows(x), MuseGlimmerVerifyProjections.admitted(site, layers[0]),
+            let result = routedProducts(site, layers, x, rows: rows)
+        else { return nil }
+        checkRouted(result.products, layers, x, kind: result.kind)
+        return result.products
+    }
+
+    /// Attention q, k, v and gate of one layer; otherwise the frontier's
+    /// grouped or per-layer products.
+    func verifyAttentionProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
+        routed(.attention, layers, x) ?? groupedProjections(layers, x)
+    }
+
+    /// The attention output projection.
     func verifyOutputProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-        if verifyRows(x) != nil {
-            var routed: MLXArray?
-            var kind = ""
-            if let fp8 = layer as? ModelOptCalibratedLinear {
-                routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
-                kind = "fp8.o"
-            } else if layer is ModelOptWeightOnlyNVFP4Linear {
-                routed = CBv2VerifyScales.product(layer, x)
-                kind = "nvfp4.o"
-            }
-            if let routed {
-                checkRouted([routed], [layer], x, kind: kind)
-                return routed
-            }
-        }
-        return numerics.project(layer, x)
+        routed(.output, [layer], x)?[0] ?? numerics.project(layer, x)
     }
 
-    /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4`
-    /// launch; an FP8 pair through `CBv2SmallProjection` (one cast and one
-    /// product launch).
+    /// The feed-forward gate and up; FP8 pairs through `CBv2VerifyRowExactFP8`
+    /// (2 to 8 rows, shapes its load-time check admitted), otherwise the
+    /// frontier's grouped product.
     func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil {
-            var routed: [MLXArray]?
-            var kind = ""
-            if let pair = CBv2VerifyNVFP4.products(layers, x) {
-                routed = pair
-                kind = "nvfp4.gate_up"
-            } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
-                kind = "fp8.gate_up"
-            }
-            if let routed {
-                checkRouted(routed, layers, x, kind: kind)
-                return routed
-            }
+        if let products = routed(.feedInput, layers, x) { return products }
+        if numerics.isExact(x), let products = CBv2VerifyRowExactFP8.groupedProducts(layers, x) {
+            return products
         }
         return groupedProjections(layers, x)
     }
 
-    /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4` at 7
-    /// and 8 rows (16-row tiles with prefetch) and `CBv2VerifyScales` below;
-    /// FP8 through `CBv2SmallProjection` up to 5 rows and `CBv2VerifyScales`
-    /// at 6 to 8 rows (four row groups).
+    /// The feed-forward down projection; FP8 rows the routing leaves through
+    /// `CBv2VerifyRowExactFP8` (admitted shapes).
     func verifyDownProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-        if let rows = verifyRows(x) {
-            var routed: MLXArray?
-            var kind = ""
-            if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
-                routed =
-                    rows >= 7
-                    ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
-                kind = "nvfp4.down"
-            } else if let fp8 = layer as? ModelOptCalibratedLinear {
-                routed =
-                    rows >= 6
-                    ? CBv2VerifyScales.product(layer, x)
-                    : CBv2SmallProjection.fp8Products([fp8], x)?.first
-                kind = "fp8.down"
-            }
-            if let routed {
-                checkRouted([routed], [layer], x, kind: kind)
-                return routed
-            }
+        if let product = routed(.down, [layer], x)?[0] { return product }
+        if numerics.isExact(x), let product = CBv2VerifyRowExactFP8.product(layer, x) {
+            return product
         }
         return numerics.project(layer, x)
     }
 
-    /// `outputLogits` for verify rows: an NVFP4 `lm_head` through
-    /// `CBv2VerifyScales` (8-row tiles), then the same multiplier and softcap
-    /// in the same order. Other calls run `outputLogits` itself.
-    func verifyOutputLogits(_ normedHidden: MLXArray) -> MLXArray {
-        guard verifyRows(normedHidden) != nil, lmHead is ModelOptWeightOnlyNVFP4Linear,
-            let product = CBv2VerifyScales.product(lmHead, normedHidden)
-        else { return outputLogits(normedHidden) }
-        checkRouted([product], [lmHead], normedHidden, kind: "nvfp4.lm_head")
-        var logits = product * configuration.outputMultiplier
-        let cap = configuration.finalLogitSoftcapping
-        if cap > 0 { logits = tanh(logits / cap) * cap }
-        return logits
+    private func verifySites(_ layer: MuseGlimmerDecoderLayer)
+        -> [(MuseGlimmerVerifyProjections.Site, [any UnaryLayer])]
+    {
+        let a = layer.selfAttention
+        let mlp = layer.mlp
+        return [
+            (.attention, [a.queryProj, a.keyProj, a.valueProj, a.gateProj]),
+            (.output, [a.outputProj]),
+            (.feedInput, [mlp.gateProj, mlp.upProj]),
+            (.down, [mlp.downProj]),
+        ]
+    }
+
+    private func verifyShapeKey(_ layers: [any UnaryLayer]) -> String {
+        layers.map { layer -> String in
+            guard let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape
+            else { return "other" }
+            return "\(shape.format):\(shape.inputs)x\(shape.outputs)"
+        }.joined(separator: ",")
+    }
+
+    /// Load-time byte check, before any verify window: every routed site of
+    /// every layer at every row count (1 to 8), on a fixed probe, against
+    /// each projection's stock row-exact product (`numerics.project`). A
+    /// shape (site and projection shapes) is routed only if every comparison
+    /// of every layer with that shape matched; any other shape keeps the
+    /// frontier path for the life of the process. Once per model (from
+    /// `warmFusedVerifyKernels`); changes no weight, cache or numerics state.
+    func checkVerifyProjections(dtype: DType) {
+        guard routesVerifyProjections, numerics.exactWindows else { return }
+        var passed = [String: Bool]()
+        var firsts = [String: (site: MuseGlimmerVerifyProjections.Site, layers: [any UnaryLayer])]()
+        var compared = 0
+        for layer in model.layers {
+            var flags = [(String, MLXArray)]()
+            for (site, group) in verifySites(layer) {
+                guard
+                    let width = (group[0] as? any MuseGlimmerRowExactProjection)?.rowExactShape
+                        .inputs
+                else { continue }
+                let shape = "\(site) \(verifyShapeKey(group))"
+                for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                    let x = MuseGlimmerVerifyProjections.probe(
+                        rows: rows, inputs: width, dtype: dtype)
+                    guard let result = routedProducts(site, group, x, rows: rows) else { continue }
+                    let stock = group.map { numerics.project($0, x) }
+                    flags.append(
+                        (shape, MuseGlimmerVerifyProjections.equalBits(result.products, stock)))
+                    compared += result.products.count
+                }
+                if firsts[shape] == nil { firsts[shape] = (site, []) }
+                firsts[shape]!.layers.append(group[0])
+            }
+            eval(flags.map(\.1))
+            for (shape, flag) in flags {
+                passed[shape] = (passed[shape] ?? true) && flag.item(Bool.self)
+            }
+        }
+        var failed = [String]()
+        for (shape, ok) in passed.sorted(by: { $0.key < $1.key }) {
+            if ok, let entry = firsts[shape] {
+                MuseGlimmerVerifyProjections.admit(entry.site, entry.layers)
+            } else {
+                failed.append(shape)
+            }
+        }
+        let line =
+            "[verify-proj-check] compared \(compared) products at rows 1-8; admitted "
+            + "\(passed.count - failed.count) of \(passed.count) shapes"
+            + (failed.isEmpty ? "" : "; kept on the stock path: " + failed.joined(separator: "; "))
+            + "\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// Compiles every routed kernel (each distinct projection shape at 1 to
     /// 8 rows) on zeros, so no verify window compiles one while it is served.
-    /// Called from `warmFusedVerifyKernels` (once per model); changes no
-    /// weight, cache or numerics state.
+    /// Called from `warmFusedVerifyKernels` (once per model) after the check;
+    /// changes no weight, cache or numerics state.
     func warmVerifyProjections(dtype: DType) {
         guard routesVerifyProjections, numerics.exactWindows else { return }
-        func key(_ layers: [any UnaryLayer]) -> String {
-            layers.map { layer -> String in
-                guard let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape
-                else { return "other" }
-                return "\(shape.format):\(shape.inputs)x\(shape.outputs)"
-            }.joined(separator: ",")
-        }
-        func inputs(_ layer: any UnaryLayer) -> Int? {
-            (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape.inputs
-        }
         var seen = Set<String>()
         for layer in model.layers {
-            let a = layer.selfAttention
-            let mlp = layer.mlp
-            let sites: [(String, [any UnaryLayer])] = [
-                ("qkvg", [a.queryProj, a.keyProj, a.valueProj, a.gateProj]),
-                ("o", [a.outputProj]),
-                ("gate_up", [mlp.gateProj, mlp.upProj]),
-                ("down", [mlp.downProj]),
-            ]
-            for (site, group) in sites {
-                guard seen.insert(site + " " + key(group)).inserted,
-                    let width = inputs(group[0])
+            for (site, group) in verifySites(layer) {
+                guard seen.insert("\(site) \(verifyShapeKey(group))").inserted,
+                    let width = (group[0] as? any MuseGlimmerRowExactProjection)?.rowExactShape
+                        .inputs
                 else { continue }
                 var outputs = [MLXArray]()
                 for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                     let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                     switch site {
-                    case "qkvg": outputs += verifyAttentionProjections(group, x)
-                    case "o": outputs.append(verifyOutputProjection(group[0], x))
-                    case "gate_up": outputs += verifyFeedInputProjections(group, x)
-                    default: outputs.append(verifyDownProjection(group[0], x))
+                    case .attention: outputs += verifyAttentionProjections(group, x)
+                    case .output: outputs.append(verifyOutputProjection(group[0], x))
+                    case .feedInput: outputs += verifyFeedInputProjections(group, x)
+                    case .down: outputs.append(verifyDownProjection(group[0], x))
                     }
                 }
                 eval(outputs)
             }
-        }
-        if lmHead is ModelOptWeightOnlyNVFP4Linear, let width = inputs(lmHead) {
-            eval(
-                (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
-                    verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
-                })
         }
     }
 }
