@@ -171,33 +171,6 @@ enum PagedSegmentAttention {
         if newKeys != nil {
             precondition(k.shape == [b, kvh, d] && v.shape == k.shape)
         }
-        if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
-            plan.buckets.count == 1,
-            let heads = PagedOnePassAttention.eligible(
-                headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b)
-        {
-            let bucket = plan.buckets[0]
-            var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
-            backing.append(
-                contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
-            let result = PagedOnePassAttention.segments(
-                queries: q, backing: backing, seqinfo: seqinfo, params: params,
-                previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
-                records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
-                pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
-            if PagedOnePassAttention.checks {
-                // Self-test: the two-pass kernels on the same inputs, raw bits.
-                let reference = decode(
-                    queries: q, newKeys: nil, newValues: nil, group: group, rows: rows,
-                    sinks: nil, params: params, softcap: softcap, source: source,
-                    dispatchCache: nil, zeroFilledScratch: true)
-                PagedOnePassAttention.compare(onePass: result.out, twoPass: reference)
-                return reference
-            }
-            group.writeFence = result.fence
-            return result.out
-        }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
         let metaCount = max(8, b * qh * plan.maxPartitions * 2)

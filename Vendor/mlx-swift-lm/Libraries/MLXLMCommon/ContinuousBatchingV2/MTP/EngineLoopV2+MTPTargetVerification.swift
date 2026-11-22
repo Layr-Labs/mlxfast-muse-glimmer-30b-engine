@@ -2,9 +2,24 @@
 //
 // Target-authoritative scoring strategies for one known MTP draft chain.
 
+import Foundation
 import MLX
 
 extension EngineLoopV2 {
+    /// Layers between early submissions of a rectangular verification
+    /// forward: a paged cache that supports it `asyncEval`s the graph built
+    /// so far after every this many layers (never the last), so the device
+    /// runs the first layers while the host builds the rest. Evaluation
+    /// order only; no kernel or value changes. 0 disables it; so does
+    /// `DARKBLOOM_MTP_VERIFY_EARLY_SUBMIT_LAYERS=0`.
+    static let mtpVerifyEarlySubmitLayers: Int = {
+        let fallback = 4
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_MTP_VERIFY_EARLY_SUBMIT_LAYERS"]
+        else { return fallback }
+        return max(0, Int(raw) ?? fallback)
+    }()
 
     /// Serial mode is the chip-independent authority path: every column
     /// executes the same `[B, 1]` eager forward used by ordinary decode,
@@ -317,18 +332,25 @@ extension EngineLoopV2 {
             if hasConstraints { constraintLogits = concatenated(constraintColumns, axis: 1) }
 
         } else {
+            // Early submission joins no native root accounting and no native
+            // paged window owner, whose reads must finish construction first.
+            let earlySubmitInterval =
+                nativeShutdownState == nil && CBv2NativePagedMTPWork.current == nil
+                ? Self.mtpVerifyEarlySubmitLayers : 0
             for cache in serializingCaches {
                 cache.mtpSerializesRectangularAttention = true
                 cache.mtpBatchesRectangularAttention =
                     mtp.drafter.prefersBatchedRectangularAttention
                 cache.mtpBatchesRectangularColumnsAsRows =
                     mtp.drafter.batchesVerifyColumnsAsDecodeRows
+                cache.mtpEarlySubmitInterval = earlySubmitInterval
             }
             defer {
                 for cache in serializingCaches {
                     cache.mtpSerializesRectangularAttention = false
                     cache.mtpBatchesRectangularAttention = false
                     cache.mtpBatchesRectangularColumnsAsRows = false
+                    cache.mtpEarlySubmitInterval = 0
                 }
             }
             let tokens = concatenated(columns, axis: 1)

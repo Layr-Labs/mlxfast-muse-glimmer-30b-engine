@@ -718,19 +718,6 @@ public enum PagedAttentionKernel {
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
             partitionTokens: ptok, hasWrite: hasWrite)
-        if !hasWrite, sinks == nil, PagedOnePassAttention.enabled,
-            PagedOnePassAttention.slabEnabled,
-            let heads = PagedOnePassAttention.eligible(
-                headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: maxParts, rows: b)
-        {
-            return (
-                PagedOnePassAttention.slab(
-                    queries: q, kSlab: kSlab, vSlab: vSlab, tables: tables, seqinfo: seqinfo,
-                    params: params, softcap: softcap, pageSize: pageSize,
-                    writeFence: writeFence, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                    source: kernelSource, stream: stream), nil
-            )
-        }
         let tg = 32 * nsg
         // MLX passes arrays smaller than 8 elements in Metal's constant address
         // space; the merge implementation expects a device pointer. Keep even

@@ -614,7 +614,6 @@ extension EngineLoopV2 {
                 id: id,
                 draftedDepth: k,
                 acceptedDepth: observedAccepted,
-                committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
 
@@ -679,6 +678,14 @@ extension EngineLoopV2 {
                         carryTokenIsTarget: kept[accepted]
                             == Int(host[draftCount + batchIndex * targetWidth + accepted]),
                         requestState: state)
+                    if verify.rows.count == 1,
+                        rec.request.maxTokens - rec.generatedTokenCount > 1,
+                        mtp.launchesConfirmedOutcomeBlock(for: id)
+                    {
+                        mtpLaunchConfirmedOutcomeBlock(
+                            seedToken: kept[accepted], speculator: speculator,
+                            requestState: state)
+                    }
                 }
             }
         }
@@ -735,12 +742,24 @@ public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
     /// without a confirmed speculation. Advisory: it may size the next
     /// verify window and never changes a proposal or a committed token.
     func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray?
+    /// Right after `confirmSpeculation`, for a confirmed speculation without
+    /// a block (any outcome): build the block the next draft index 0 would
+    /// build from the carry token `seedToken`, with the same contract as
+    /// `speculateNextRound` (new wrappers only; handed out at index 0 only
+    /// when the state is still the one confirmed). Returns `[confidence,
+    /// proposals, hidden rows]`, lazy, `confidence` as in
+    /// `speculatedDraftConfidence`; empty when it does not build.
+    func draftConfirmedOutcomeBlock(seedToken: Int, requestState: any CBv2MTPRequestState)
+        -> [MLXArray]
 }
 
 extension CBv2MTPPostVerifySpeculating {
     public func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray? {
         nil
     }
+    public func draftConfirmedOutcomeBlock(
+        seedToken: Int, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] { [] }
 }
 
 extension EngineLoopV2 {
@@ -751,6 +770,37 @@ extension EngineLoopV2 {
     /// round; the shared commit work is always submitted. 0 disables the
     /// gate.
     static var mtpSpeculativeBlockMinimumFullAcceptance: Double { 0.5 }
+
+    /// Kill switch for the confirmed-outcome block launched at finalize
+    /// (`mtpLaunchConfirmedOutcomeBlock`); false restores the record path.
+    static var mtpLaunchesConfirmedOutcomeBlock: Bool { true }
+
+    /// Right after `confirmSpeculation` in a low-acceptance one-row round:
+    /// build the block the next draft index 0 would build for the confirmed
+    /// outcome and submit it with `asyncEval`, so it runs on the device while
+    /// the host finishes finalize and plans the next round. Nothing waits on
+    /// it: the plan reads its confidence only once it has completed
+    /// (`availableDraftConfidence`), and index 0 hands it out as the round's
+    /// block under `takeSpeculation`'s state checks. Never under native
+    /// completion tracking, whose root accounting this optional work would
+    /// join.
+    func mtpLaunchConfirmedOutcomeBlock(
+        seedToken: Int, speculator: any CBv2MTPPostVerifySpeculating,
+        requestState state: any CBv2MTPRequestState
+    ) {
+        guard Self.mtpLaunchesConfirmedOutcomeBlock, nativeShutdownState == nil else { return }
+        let roots = speculator.draftConfirmedOutcomeBlock(
+            seedToken: seedToken, requestState: state)
+        guard !roots.isEmpty else { return }
+        do {
+            try withError { fault in
+                asyncEval(roots)
+                try fault.check()
+            }
+        } catch {
+            speculator.dropSpeculation(requestState: state)
+        }
+    }
 
     /// Submit the drafter's next-round work behind a verify.
     /// One-row rounds only (a batched round's drafter pass has other
