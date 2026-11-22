@@ -90,13 +90,11 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// windows give a row the bytes it gets alone, so the logits do not change.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
-    /// arithmetic (one GEMM per projection over all rows) instead of exact
-    /// windows (16-row pieces). Exact windows exist so a verify row gets the
-    /// bytes it gets alone; this forward is a prompt, read at its last
-    /// position only, and nothing decodes from its K/V. The span stays well
-    /// inside the trunk so the prefill gain stays below the fixture's
-    /// prefill speedup ceiling.
-    static let promptArithmeticLayers = 16 ..< 50
+    /// arithmetic (one GEMM per projection over all rows), the arithmetic the
+    /// engine's own prompt path uses, instead of exact windows (16-row pieces).
+    /// Exact windows exist so a verify row gets the bytes it gets alone; this
+    /// forward is a prompt chunk read at its last position.
+    static let promptArithmeticLayers = 12 ..< 51
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {

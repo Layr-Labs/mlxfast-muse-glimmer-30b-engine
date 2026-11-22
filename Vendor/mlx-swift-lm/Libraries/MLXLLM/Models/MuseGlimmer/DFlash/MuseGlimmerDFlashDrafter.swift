@@ -270,6 +270,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The next block for the all-accepted outcome, when built; dropped
         /// at confirmation for any other outcome.
         var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        /// `memo` was built for the outcome the device computed from the
+        /// verify's packet (any accepted count), not only for all accepted.
+        var memoForAnyOutcome = false
         /// `[maximumDraftTokens]` float32: each block row's top-1
         /// probability under the target's readout, evaluated with the
         /// speculation (`speculatedDraftConfidence`). Set with `memo`.
@@ -575,6 +578,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Only for the served one-row batched argmax round.
     public func speculateNextRound(
         targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int, draftsBlock: Bool,
+        draftTokens: MLXArray, anyOutcome: Bool,
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let s = state(requestState)
@@ -602,6 +606,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)
+        // Any outcome: no window cut can occur for any accepted count (the
+        // newest query of the longest outcome still sees the oldest held
+        // row), so the block's mask only hides the verify rows past the
+        // realized outcome.
+        if anyOutcome, draftTokens.shape == [1, k],
+            context.count + n + context.blockSize - 1 <= window,
+            let roots = speculateDeviceOutcome(
+                &speculation, state: s, targetTokens: targetTokens, draftTokens: draftTokens,
+                ring: ring, projected: projected, depth: k)
+        {
+            return roots
+        }
         guard draftsBlock, s.lastRoundFullyAccepted else {
             s.speculation = speculation
             return [projected.keys, projected.values]
@@ -671,6 +687,107 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
     }
 
+    /// The next block for the outcome the verify realizes, whatever its
+    /// accepted count `a`, built from the verify's lazy packet with no host
+    /// read. `a` is the prefix match of the drafts against the targets (the
+    /// engine's own walk), the seed is `targets[a]`, the context is the ring
+    /// plus the `depth + 1` projected verify rows with rows past `a` masked
+    /// out, and the block is anchored at `start + a + 1` through an
+    /// array-valued RoPE offset. That is the key set, positions and seed the
+    /// normal path has after committing `a + 1` rows.
+    private func speculateDeviceOutcome(
+        _ speculation: inout Speculation, state s: State, targetTokens: MLXArray,
+        draftTokens: MLXArray, ring: [MLXArray],
+        projected: (keys: MLXArray, values: MLXArray), depth k: Int
+    ) -> [MLXArray]? {
+        let c = model.configuration
+        let context = s.context
+        let n = k + 1
+        let count = context.count
+        let block = context.blockSize
+        let total = count + n + block
+        let match = (draftTokens.asType(.int32) .== targetTokens[0..., 0 ..< k].asType(.int32))
+            .asType(.int32)
+        let accepted = cumprod(match, axis: 1).sum(axis: 1).asType(.int32)  // [1]
+        let seed = maximum(
+            takeAlong(targetTokens.asType(.int32), accepted.reshaped([1, 1]), axis: 1),
+            MLXArray(Int32(0)))
+        let anchor = target.dflashTokenEmbeddings(seed)
+        guard anchor.size == c.hiddenSize else { return nil }
+        let columns = MLXArray.arange(total, dtype: .int32)
+        let visible =
+            (columns .< (accepted + Int32(count + 1))) .|| (columns .>= Int32(count + n))
+        let mask = broadcast(visible.reshaped([1, total]), to: [block, total])
+        let position = accepted[0] + Int32(context.nextPosition + 1)
+        let keys = concatenated(
+            [ring[0][0..., 0..., 0 ..< count, 0...], projected.keys.asType(context.dtype)],
+            axis: 2)
+        let values = concatenated(
+            [ring[1][0..., 0..., 0 ..< count, 0...], projected.values.asType(context.dtype)],
+            axis: 2)
+        let hidden = blockForward(
+            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
+            position: position, context: (keys, values), mask: mask)
+        let rows = hidden[1 ..< (1 + settings.maximumDraftTokens), 0...]
+        let logits = draftHeadProduct(rows, readout: false)
+        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+            return nil
+        }
+        let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+        let scores = target.dflashReadout(logits).asType(.float32)
+        let confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
+        speculation.memo = memo
+        speculation.memoForAnyOutcome = true
+        speculation.confidence = confidence
+        s.speculation = speculation
+        return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
+    }
+
+    /// `MuseGlimmerDFlashDraftModel.blockForward` with the anchor position
+    /// an array (a scalar int32), so the block can be built before the
+    /// position is known on the host. Same operations in the same order.
+    private func blockForward(
+        embeddings: MLXArray, position: MLXArray,
+        context: (keys: MLXArray, values: MLXArray), mask: MLXArray
+    ) -> MLXArray {
+        let c = model.configuration
+        let blockRows = c.blockSize
+        let scale = 1 / Float(c.headDimensions).squareRoot()
+        func rope(_ x: MLXArray) -> MLXArray {
+            MLXFast.RoPE(
+                x, dimensions: c.headDimensions, traditional: false, base: c.ropeTheta, scale: 1,
+                offset: position)
+        }
+        var hidden = embeddings.dtype == model.activationDType
+            ? embeddings : embeddings.asType(model.activationDType)
+        hidden = hidden.reshaped([1, blockRows, c.hiddenSize])
+        for (index, layer) in model.layers.enumerated() {
+            let attention = layer.attention
+            let x = layer.inputNorm(hidden)
+            let queries = rope(
+                attention.qNorm(
+                    attention.qProj(x).reshaped([1, blockRows, c.attentionHeads, c.headDimensions])
+                        .transposed(0, 2, 1, 3)))
+            var keys = rope(
+                attention.kNorm(
+                    attention.kProj(x).reshaped([1, blockRows, c.kvHeads, c.headDimensions])
+                        .transposed(0, 2, 1, 3)))
+            var values = attention.vProj(x)
+                .reshaped([1, blockRows, c.kvHeads, c.headDimensions]).transposed(0, 2, 1, 3)
+            keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+            values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+            hidden =
+                hidden
+                + attention.oProj(
+                    attended.transposed(0, 2, 1, 3).reshaped(
+                        [1, blockRows, c.attentionHeads * c.headDimensions]))
+            hidden = hidden + layer.mlp(layer.postAttentionNorm(hidden))
+        }
+        return model.norm(hidden).reshaped([blockRows, c.hiddenSize])
+    }
+
     /// The confirmed speculation's per-row draft confidence, still lazy (the
     /// caller reads it only once it is available); nil otherwise.
     public func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray? {
@@ -699,7 +816,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         // The block assumed every draft accepted and the bonus target as the
         // seed; any other outcome keeps the commit only.
-        if accepted != speculation.depth || !carryTokenIsTarget {
+        // A device-built block (`memoForAnyOutcome`) was built for the
+        // prefix match of the packet, which is `accepted` when the engine's
+        // walk is that match; the seed is the verify's target at that row.
+        if (accepted != speculation.depth && !speculation.memoForAnyOutcome)
+            || !carryTokenIsTarget
+        {
             speculation.memo = nil
             speculation.confidence = nil
         }
