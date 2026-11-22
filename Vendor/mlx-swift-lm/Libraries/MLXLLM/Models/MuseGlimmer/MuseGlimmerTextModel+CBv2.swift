@@ -260,7 +260,6 @@ extension MuseGlimmerTextModel {
         cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
-        let n = numerics
         guard VerifyFusedQK.enabled,
             VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
         else {
@@ -282,7 +281,7 @@ extension MuseGlimmerTextModel {
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
-        return n.project(a.outputProj, output)
+        return verifyProject(a.outputProj, output)
     }
 }
 
@@ -300,6 +299,15 @@ extension MuseGlimmerTextModel {
         let claimed = Self.fusedVerifyWarmed.insert(ObjectIdentifier(self)).inserted
         Self.fusedVerifyWarmLock.unlock()
         guard claimed, VerifyFusedNorms.enabled, let first = model.layers.first else { return }
+        CBv2VerifyRowExactFP8.prepare(
+            model.layers.flatMap { layer -> [any UnaryLayer] in
+                [layer.selfAttention.outputProj, layer.mlp.downProj]
+            },
+            groups: model.layers.flatMap { layer -> [[any UnaryLayer]] in
+                let (a, m) = (layer.selfAttention, layer.mlp)
+                return [[a.queryProj, a.keyProj, a.valueProj, a.gateProj], [m.gateProj, m.upProj]]
+            },
+            owner: ObjectIdentifier(self))
         let dtype = activationDType
         let width = first.inputLayerNorm.weight.dim(-1)
         guard VerifyFusedNorms.supports(width: width, rows: 1, dtype: dtype) else { return }
@@ -351,18 +359,29 @@ extension MuseGlimmerTextModel {
 /// (`CBv2GroupedProjection`): every output element keeps its own kernel's
 /// arithmetic, so the bytes equal the separate row-exact products.
 /// `DARKBLOOM_MUSE_GLIMMER_GROUPED_VERIFY=0` turns it off; any other shape
-/// runs `numerics.project` projection by projection.
+/// runs projection by projection. FP8 groups and projections that the
+/// load-time check admitted take `CBv2VerifyRowExactFP8` (same bytes).
 extension MuseGlimmerTextModel {
     func groupedProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if numerics.isExact(x), let grouped = CBv2GroupedProjection.products(layers, x) {
-            return grouped
+        if numerics.isExact(x) {
+            if let products = CBv2VerifyRowExactFP8.groupedProducts(layers, x) { return products }
+            if let grouped = CBv2GroupedProjection.products(layers, x) { return grouped }
         }
-        return layers.map { numerics.project($0, x) }
+        return layers.map { verifyProject($0, x) }
     }
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
         let gu = groupedProjections([mlp.gateProj, mlp.upProj], x)
-        return numerics.project(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
+        return verifyProject(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
+    }
+
+    /// `numerics.project(layer, x)`, through `CBv2VerifyRowExactFP8` when it
+    /// takes the shape.
+    func verifyProject(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        if numerics.isExact(x), let product = CBv2VerifyRowExactFP8.product(layer, x) {
+            return product
+        }
+        return numerics.project(layer, x)
     }
 
     nonisolated(unsafe) private static var groupedWarmed = Set<ObjectIdentifier>()

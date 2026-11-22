@@ -400,7 +400,7 @@ public enum CBv2GroupedProjection {
             outputNames: ["out"], source: source, header: ModelOptActivationKernels.header)
     }
 
-    nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
+    nonisolated(unsafe) static let castKernels: [Int: MLXFast.MLXFastKernel] = [
         2: castKernel(segments: 2), 4: castKernel(segments: 4),
     ]
 
