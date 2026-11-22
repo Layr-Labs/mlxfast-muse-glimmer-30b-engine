@@ -610,47 +610,6 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
     }
 
-    /// Acceptance ceiling: a per-request rate limiter on committed tokens
-    /// per speculative round. The request's own running totals (rounds that
-    /// drafted, tokens those rounds committed) bound the next round's draft
-    /// count so that, even if every draft of every round is accepted, the
-    /// request commits at most
-    /// `ceilingBudgetHundredths / 100 * rounds + ceilingBurstTokens` tokens.
-    /// Inputs are accept/reject history only: integer host arithmetic, no
-    /// clock, no device state, no token values. It changes how many drafts a
-    /// round verifies, never which tokens are committed.
-    private(set) var ceilingRounds = 0
-    private(set) var ceilingCommittedTokens = 0
-    /// The budget line, one pair of constants: committed tokens after n
-    /// speculative rounds stay at or under
-    /// `ceilingBudgetHundredths / 100 * n + ceilingBurstTokens`.
-    /// It is a rounds-per-window limit: (4.75, 27) allows at most 126
-    /// tokens in 21 rounds, so a 128-token window takes at least 22 rounds
-    /// whatever the acceptance. Budget 500 with the same burst makes that
-    /// 21 rounds (at most 127 tokens in 20).
-    static let ceilingBudgetHundredths = 475
-    static let ceilingBurstTokens = 27
-    static let ceilingEnabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
-
-    /// Records one finalized speculative round for the acceptance ceiling.
-    mutating func observeCommitted(draftedDepth: Int, committedTokens: Int) {
-        guard draftedDepth > 0 else { return }
-        ceilingRounds += 1
-        ceilingCommittedTokens += max(committedTokens, 0)
-    }
-
-    /// The largest draft count k <= `offeredDepth` whose full acceptance
-    /// (k + 1 committed tokens) keeps the request on or under the budget
-    /// line after this round; at least one draft while `offeredDepth > 0`.
-    func acceptanceCeilingDepth(offeredDepth: Int) -> Int {
-        guard Self.ceilingEnabled, offeredDepth > 0 else { return max(offeredDepth, 0) }
-        let allowedAfterRound =
-            Self.ceilingBudgetHundredths * (ceilingRounds + 1) / 100 + Self.ceilingBurstTokens
-        let room = allowedAfterRound - ceilingCommittedTokens - 1
-        return min(offeredDepth, max(1, room))
-    }
-
     init() {}
 
     /// Every position starts at `flatPrior`. The fixed-depth acceptance

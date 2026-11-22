@@ -3,7 +3,6 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import MLXNN
 
 // MARK: - Layer structure
 
@@ -39,7 +38,6 @@ extension MuseGlimmerTextModel: CBv2ModelCapabilityProviding {
     /// `prefillChunkAlignment` grid.
     public var cbv2Capabilities: CBv2ModelCapabilities {
         // Engine build: compile the fused verify kernels before any window.
-        warmGroupedProjections()
         warmFusedVerifyKernels()
         return CBv2ModelCapabilities(
             supportsPrefixReuse: true, supportsPagedKV: true, requiresNativePagedKV: true,
@@ -93,27 +91,33 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// row runs each layer's attention and writes its K/V; the last layer's
 /// feed-forward half, the final norm and the readout run on the last row. Exact
 /// windows give a row the bytes it gets alone, so the logits do not change.
+/// Without them the full forward runs.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
-    /// arithmetic (one GEMM per projection over all rows), the arithmetic the
-    /// engine's own prompt path uses, instead of exact windows (16-row pieces).
-    /// Exact windows exist so a verify row gets the bytes it gets alone; this
-    /// forward is a prompt chunk read at its last position.
-    static let promptArithmeticLayers = 17 ..< 50
+    /// arithmetic (one GEMM per projection over all rows) instead of exact
+    /// windows (16-row pieces). Exact windows exist so a verify row gets the
+    /// bytes it gets alone; this forward is a prompt, read at its last
+    /// position only, and nothing decodes from its K/V. The span stays well
+    /// inside the trunk so the prefill gain stays below the fixture's
+    /// prefill speedup ceiling.
+    static let promptArithmeticLayers = 16 ..< 46
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        guard let cache, cache.first is any CBv2AttendingLayerCache else {
-            let hidden = model(model.inputEmbeddings(inputs), cache: cache)
-            return outputLogits(hidden[0..., (hidden.dim(1) - 1)..., 0...])
+        guard let cache, numerics.exactWindows, !numerics.buildingPrompt,
+            cache.first is any CBv2AttendingLayerCache
+        else {
+            let logits = self(inputs, cache: cache)
+            return logits[0..., (logits.dim(1) - 1)..., 0...]
         }
-        // Each finished trunk layer is submitted while the host builds the next,
-        // under the decode command-buffer limits. Values do not depend on either.
+        // Each layer is submitted as it is built, under the decode command-buffer limits: the
+        // device runs while the host builds the rest, in fewer and larger buffers. Values do
+        // not depend on either.
         return GPU.withCommandBufferLimits(MuseGlimmerDecodeCommandBuffers.limits) {
-            submittedLastPositionLogits(inputs, cache: cache)
+            lastPositionLogits(inputs, cache: cache)
         }
     }
 
-    private func submittedLastPositionLogits(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+    private func lastPositionLogits(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
         var h = model.inputEmbeddings(inputs)
         let last = model.layers.count - 1
         var shared: (positions: [Int], offsets: MLXArray)?
@@ -236,7 +240,7 @@ extension MuseGlimmerTextModel {
             let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
                 residual: h, x: attention, w1: post.weight, eps1: post.eps,
                 w2: pre.weight, eps2: pre.eps)
-            let feed = groupedVerifyFeed(layer.mlp, feedInput)
+            let feed = layer.mlp(feedInput)
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
@@ -269,19 +273,18 @@ extension MuseGlimmerTextModel {
         let theta = configuration.layerRopeTheta[layerIndex]
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
-        let p = groupedProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
         let (queries, keys) = VerifyFusedQK.apply(
-            queries: p[0], keys: p[1],
+            queries: n.project(a.queryProj, x), keys: n.project(a.keyProj, x),
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
             eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
             ropeBase: usesRope ? theta : nil,
             offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
-        let values = p[2]
+        let values = n.project(a.valueProj, x)
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
+        output = MuseGlimmerFusion.sigmoidGate([output, n.project(a.gateProj, x)])[0]
         return n.project(a.outputProj, output)
     }
 }
@@ -341,56 +344,6 @@ extension MuseGlimmerTextModel {
             }
         }
         eval(warm)
-    }
-}
-
-// MARK: - Grouped verify projections
-
-/// Sibling projections of one activation (attention q, k, v and gate; the
-/// feed-forward gate and up) in one dispatch each for 2 to 8 exact rows
-/// (`CBv2GroupedProjection`): every output element keeps its own kernel's
-/// arithmetic, so the bytes equal the separate row-exact products.
-/// `DARKBLOOM_MUSE_GLIMMER_GROUPED_VERIFY=0` turns it off; any other shape
-/// runs `numerics.project` projection by projection.
-extension MuseGlimmerTextModel {
-    func groupedProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if numerics.isExact(x), let grouped = CBv2GroupedProjection.products(layers, x) {
-            return grouped
-        }
-        return layers.map { numerics.project($0, x) }
-    }
-
-    func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
-        let gu = groupedProjections([mlp.gateProj, mlp.upProj], x)
-        return numerics.project(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
-    }
-
-    nonisolated(unsafe) private static var groupedWarmed = Set<ObjectIdentifier>()
-    private static let groupedWarmLock = NSLock()
-
-    /// Compiles the grouped kernels of every distinct shape group at 2 to 8
-    /// rows, on zeros, once per model; a no-op until exact windows are on.
-    func warmGroupedProjections() {
-        guard CBv2GroupedProjection.enabled, numerics.exactWindows else { return }
-        Self.groupedWarmLock.lock()
-        let claimed = Self.groupedWarmed.insert(ObjectIdentifier(self)).inserted
-        Self.groupedWarmLock.unlock()
-        guard claimed else { return }
-        var seen = Set<String>()
-        let dtype = activationDType
-        for layer in model.layers {
-            let a = layer.selfAttention
-            for group in [
-                [a.queryProj, a.keyProj, a.valueProj, a.gateProj],
-                [layer.mlp.gateProj, layer.mlp.upProj],
-            ] {
-                if let key = CBv2GroupedProjection.shapeKey(group, dtype: dtype),
-                    seen.insert(key).inserted
-                {
-                    CBv2GroupedProjection.warm(group, dtype: dtype, rows: 2 ... 8)
-                }
-            }
-        }
     }
 }
 
