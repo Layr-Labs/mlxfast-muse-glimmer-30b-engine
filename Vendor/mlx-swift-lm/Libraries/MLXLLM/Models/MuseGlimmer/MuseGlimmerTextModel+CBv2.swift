@@ -91,19 +91,33 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 /// row runs each layer's attention and writes its K/V; the last layer's
 /// feed-forward half, the final norm and the readout run on the last row. Exact
 /// windows give a row the bytes it gets alone, so the logits do not change.
+/// Without them the full forward runs.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
-    /// arithmetic (one GEMM per projection over all rows), the arithmetic the
-    /// engine's own prompt path uses, instead of exact windows (16-row pieces).
-    /// Exact windows exist so a verify row gets the bytes it gets alone; this
-    /// forward is a prompt chunk read at its last position.
-    static let promptArithmeticLayers = 12 ..< 51
+    /// arithmetic (one GEMM per projection over all rows) instead of exact
+    /// windows (16-row pieces). Exact windows exist so a verify row gets the
+    /// bytes it gets alone; this forward is a prompt, read at its last
+    /// position only, and nothing decodes from its K/V. The span stays well
+    /// inside the trunk so the prefill gain stays below the fixture's
+    /// prefill speedup ceiling.
+    static let promptArithmeticLayers = 16 ..< 46
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        guard let cache, cache.first is any CBv2AttendingLayerCache else {
-            let hidden = model(model.inputEmbeddings(inputs), cache: cache)
-            return outputLogits(hidden[0..., (hidden.dim(1) - 1)..., 0...])
+        guard let cache, numerics.exactWindows, !numerics.buildingPrompt,
+            cache.first is any CBv2AttendingLayerCache
+        else {
+            let logits = self(inputs, cache: cache)
+            return logits[0..., (logits.dim(1) - 1)..., 0...]
         }
+        // Each layer is submitted as it is built, under the decode command-buffer limits: the
+        // device runs while the host builds the rest, in fewer and larger buffers. Values do
+        // not depend on either.
+        return GPU.withCommandBufferLimits(MuseGlimmerDecodeCommandBuffers.limits) {
+            lastPositionLogits(inputs, cache: cache)
+        }
+    }
+
+    private func lastPositionLogits(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
         var h = model.inputEmbeddings(inputs)
         let last = model.layers.count - 1
         var shared: (positions: [Int], offsets: MLXArray)?
@@ -131,6 +145,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 } else {
                     h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
                 }
+                asyncEval([h])
                 continue
             }
             let attended = layer.postAttentionLayerNorm.addedTo(
