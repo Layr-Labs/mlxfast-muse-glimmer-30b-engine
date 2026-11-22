@@ -109,6 +109,8 @@ struct FPQuantizedNAXBlockLoader {
   // nvfp4 tensor scale, folded into the group scale as fp_dequantize does.
   // Kept in float: it is ~1e-5, so in fp16 small scales lose most bits.
   float inv_scale_enc = 1.0f;
+  uint8_t w_regs[n_reads];
+  uint8_t s_regs[n_steps_per_read];
 
   FPQuantizedNAXBlockLoader(
       const device uint8_t* src_,
@@ -180,6 +182,34 @@ struct FPQuantizedNAXBlockLoader {
             dst[k * pack_factor + p] = T(0);
           }
         }
+        k++;
+      }
+    }
+  }
+
+  void fetch() thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_steps_per_read; i++) {
+      s_regs[i] = scales[i];
+    }
+    for (int k = 0; k < n_reads; k++) {
+      w_regs[k] = src[k * bytes_per_pack];
+    }
+  }
+
+  void store(int offset) const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    threadgroup T* d = dst + offset;
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      float scale =
+          float(dequantize_scale<T, group_size>(s_regs[i])) * inv_scale_enc;
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize<T, bits>(w_regs[k], scale, d + k * pack_factor);
         k++;
       }
     }
@@ -290,17 +320,29 @@ METAL_FUNC void fp_qmm_t_impl(
 
   x += tm * K;
 
+  constexpr int tile_size = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
+      if constexpr (kAlignedN.value) {
+        loader_w.fetch();
+        loader_w.store(0);
+        loader_w.next();
+      }
+      for (int k = 0, it = 0; k < K; k += BK, it++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup Wtype* ws = Ws;
+        bool more = false;
         if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
+          more = k + BK < K;
+          if (more) {
+            loader_w.fetch();
+          }
+          ws += (it & 1) * tile_size;
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -315,7 +357,7 @@ METAL_FUNC void fp_qmm_t_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<Wtype, BK_padded, 1>(ws + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -328,7 +370,14 @@ METAL_FUNC void fp_qmm_t_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if constexpr (kAlignedN.value) {
+          if (more) {
+            loader_w.store(((it + 1) & 1) * tile_size);
+            loader_w.next();
+          }
+        } else {
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
@@ -626,7 +675,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -760,7 +809,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<has_global_scale>(
       x,
@@ -1128,7 +1177,47 @@ template <
   NAXTile<float, 1, TN> Dtile;
   Dtile.clear();
 
+  uint4 wn[TN][2][loads];
+  scale_bits_t sn[TN][2];
+  auto fetch = [&](int kb) {
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        const int row = 16 * t + 8 * r;
+        const device uint8_t* wt =
+            wl + row * static_cast<int64_t>(row_bytes) + kb / pack_factor;
+        const device uint8_t* st =
+            scales + row * static_cast<int64_t>(row_scales) + kb / group_size;
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          wn[t][r][l] = *(const device uint4*)(wt + 16 * l);
+        }
+        sn[t][r] = *(const device scale_bits_t*)st;
+      }
+    }
+  };
+  if (simd_gid * BK < K) {
+    fetch(simd_gid * BK);
+  }
+
   for (int k = simd_gid * BK; k < K; k += WK * BK) {
+    uint4 ws[TN][2][loads];
+    scale_bits_t ss[TN][2];
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          ws[t][r][l] = wn[t][r][l];
+        }
+        ss[t][r] = sn[t][r];
+      }
+    }
+    if (k + WK * BK < K) {
+      fetch(k + WK * BK);
+    }
     vec<T, 8> xs[2][4];
     STEEL_PRAGMA_UNROLL
     for (short r = 0; r < 2; r++) {
@@ -1138,24 +1227,6 @@ template <
             ? *(const device vec<T, 8>*)(x + r * 8 * static_cast<int64_t>(K) +
                                          k + 8 * i)
             : vec<T, 8>(0);
-      }
-    }
-    uint4 ws[TN][2][loads];
-    scale_bits_t ss[TN][2];
-    STEEL_PRAGMA_UNROLL
-    for (short t = 0; t < TN; t++) {
-      STEEL_PRAGMA_UNROLL
-      for (short r = 0; r < 2; r++) {
-        const int row = 16 * t + 8 * r;
-        const device uint8_t* wt =
-            wl + row * static_cast<int64_t>(row_bytes) + k / pack_factor;
-        const device uint8_t* st =
-            scales + row * static_cast<int64_t>(row_scales) + k / group_size;
-        STEEL_PRAGMA_UNROLL
-        for (short l = 0; l < loads; l++) {
-          ws[t][r][l] = *(const device uint4*)(wt + 16 * l);
-        }
-        ss[t][r] = *(const device scale_bits_t*)st;
       }
     }
 
