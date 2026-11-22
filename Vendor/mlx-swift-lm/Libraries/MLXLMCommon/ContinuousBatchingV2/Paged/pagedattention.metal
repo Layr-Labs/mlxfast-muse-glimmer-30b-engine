@@ -586,6 +586,208 @@ inline void paged_attention_merge_impl(
     }
 }
 
+// One-pass decode for short contexts (verify windows): pass A and pass B of
+// one (sequence, head group) in ONE threadgroup. The threadgroup holds
+// MAXPART * NSG simdgroups; simdgroup (part, state) runs exactly pass A's
+// online softmax for that partition and strided state, the partition merge
+// and the global merge then run through threadgroup memory instead of the
+// partials/meta device buffers. Every float operation of a head is the one
+// the two-pass kernels perform, in the same order, on the same float32
+// values (the device buffers were float32 too), so the output bytes are the
+// two-pass kernels' (checked by raw-bit comparison, not by this comment).
+// What changes is the schedule: no merge dispatch, and a head group of HPT
+// heads per threadgroup instead of the two-pass kernel's, so the serial
+// per-token loop is HPT heads long.
+// Requires ceil(attendLen / PTOK) <= MAXPART for every row (host-checked).
+// Grid: threads = (KVH * (GQA/HPT) * 32 * NSG * MAXPART, B, 1),
+//       tg = (32 * NSG * MAXPART, 1, 1).
+// Threadgroup memory: q_smem[HPT * D], red_smem[MAXPART * NSG * HPT * (D + 2)],
+// part_smem[MAXPART * HPT * (D + 2)] floats.
+template <
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
+    bool HAS_SOFTCAP, typename Cache>
+inline void paged_attention_onepass_impl(
+    const device T* q,
+    thread const Cache& cache,
+    const device int32_t* tables,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int maxp,
+    threadgroup float* q_smem,
+    threadgroup float* red_smem,
+    threadgroup float* part_smem,
+    device T* out,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane
+) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    constexpr int SPLITS = GQA / HPT;
+    constexpr int EPT = D / 32;
+    constexpr int TG = 32 * NSG * MAXPART;
+    constexpr int RSTRIDE = D + 2;
+
+    const int kv_head = tgpig.x / SPLITS;
+    const int hgroup = tgpig.x % SPLITS;
+    const int b = tgpig.y;
+    const int part = (int)sgitg / NSG;
+    const int state = (int)sgitg % NSG;
+    const int lin = tpitg.x;
+
+    const device int32_t* info = seqinfo + b * 8;
+    const int attend_start = info[0];
+    const int attend_len = info[1];
+    const int table_len = info[2];
+    const int parts = (attend_len + PTOK - 1) / PTOK;
+    const int lo = part * PTOK;
+    const int hi = min(attend_len, lo + PTOK);
+    const bool active = lo < attend_len;
+
+    const device int32_t* table = tables + (size_t)b * (size_t)maxp;
+    const float softcap = params[0];
+    const float scale = params[1];
+
+    const int q_head0 = kv_head * GQA + hgroup * HPT;
+    const int64_t qr = (int64_t)(kvh * GQA) * D;
+    for (int i = lin; i < HPT * D; i += TG) {
+        const int64_t offset = (int64_t)b * qr + (q_head0 + i / D) * (int64_t)D + (i % D);
+        const float value = float(q[offset]);
+        q_smem[i] = value * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m[HPT];
+    float l[HPT];
+    float acc[HPT][EPT];
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        m[g] = -FLT_MAX;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            acc[g][e] = 0.0f;
+        }
+    }
+
+    float kf[EPT];
+    float vf[EPT];
+    if (active) {
+        for (int i = lo + state; i < hi; i += NSG) {
+            const int pos = attend_start + i;
+            const int lpage = pos / S;
+            const int slot = pos % S;
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+
+#pragma unroll
+            for (int g = 0; g < HPT; g++) {
+                float partial = 0.0f;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    partial += q_smem[g * D + lane * EPT + e] * kf[e];
+                }
+                float qk = simd_sum(partial);
+                if (HAS_SOFTCAP) {
+                    qk = softcap * precise::tanh(qk / softcap);
+                }
+                qk *= M_LOG2E_F;
+
+                const float m_new = max(m[g], qk);
+                const float corr = exp2(m[g] - m_new);
+                const float p = exp2(qk - m_new);
+                l[g] = l[g] * corr + p;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    acc[g][e] = acc[g][e] * corr + p * vf[e];
+                }
+                m[g] = m_new;
+            }
+        }
+    }
+
+    // Publish this (partition, state)'s online-softmax states.
+    threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            mine[g * RSTRIDE + lane * EPT + e] = acc[g][e];
+        }
+        if (lane == 0) {
+            mine[g * RSTRIDE + D] = m[g];
+            mine[g * RSTRIDE + D + 1] = l[g];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Partition merge (pass A's tail), into threadgroup memory.
+    if (active) {
+        const threadgroup float* red = red_smem + (size_t)(part * NSG * HPT) * RSTRIDE;
+        for (int g = state; g < HPT; g += NSG) {
+            float pm = -FLT_MAX;
+            for (int s = 0; s < NSG; s++) {
+                pm = max(pm, red[(size_t)(s * HPT + g) * RSTRIDE + D]);
+            }
+            float pl = 0.0f;
+            for (int s = 0; s < NSG; s++) {
+                const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
+                const float ls = red[(size_t)(s * HPT + g) * RSTRIDE + D + 1];
+                pl += ls * exp2(ms - pm);
+            }
+            threadgroup float* prow = part_smem + (size_t)(part * HPT + g) * RSTRIDE;
+            for (int e = (int)lane; e < D; e += 32) {
+                float v = 0.0f;
+                for (int s = 0; s < NSG; s++) {
+                    const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
+                    v += red[(size_t)(s * HPT + g) * RSTRIDE + e] * exp2(ms - pm);
+                }
+                prow[e] = v;
+            }
+            if (lane == 0) {
+                prow[D] = pm;
+                prow[D + 1] = pl;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Global merge (pass B), by the partition-0 simdgroups.
+    if (part == 0) {
+        for (int g = state; g < HPT; g += NSG) {
+            float gm = -FLT_MAX;
+            for (int p = 0; p < parts; p++) {
+                gm = max(gm, part_smem[(size_t)(p * HPT + g) * RSTRIDE + D]);
+            }
+            float gl = 0.0f;
+            float gacc[EPT];
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                gacc[e] = 0.0f;
+            }
+            for (int p = 0; p < parts; p++) {
+                const threadgroup float* pp = part_smem + (size_t)(p * HPT + g) * RSTRIDE;
+                const float ms = pp[D];
+                const float ls = pp[D + 1];
+                const float w = exp2(ms - gm);
+                gl += ls * w;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    gacc[e] += pp[lane * EPT + e] * w;
+                }
+            }
+            const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                orow[lane * EPT + e] = T(gacc[e] * inv);
+            }
+        }
+    }
+}
+
 // Bulk in-place KV write (prefill chunks, prefix adoption): scatter an
 // [KVH, N, D] tile into the slabs at host-computed physical slots
 // (page * S + slot per token). Emits a chained fence value so gathers of

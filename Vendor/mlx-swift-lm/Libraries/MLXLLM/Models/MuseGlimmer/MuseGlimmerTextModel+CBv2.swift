@@ -300,6 +300,10 @@ extension MuseGlimmerTextModel {
             w2: pre.weight, eps2: pre.eps)
         warm += [norms.h, norms.y]
         let a = first.selfAttention
+        // One-pass paged verify attention: one variant per binding class.
+        PagedOnePassAttention.warm(
+            dtype: dtype, queryHeads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+            pageSize: 16, softcap: false)
         if VerifyFusedQK.enabled, VerifyFusedQK.supports(headDim: a.headDimensions, dtype: dtype) {
             let thetas = Set(configuration.layerRopeTheta)
             let rope = thetas.first { $0 != 0 }
