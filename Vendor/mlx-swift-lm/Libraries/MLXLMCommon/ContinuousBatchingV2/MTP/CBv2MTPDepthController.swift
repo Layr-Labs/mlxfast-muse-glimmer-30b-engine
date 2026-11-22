@@ -624,11 +624,15 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// The budget line, one pair of constants: committed tokens after n
     /// speculative rounds stay at or under
     /// `ceilingBudgetHundredths / 100 * n + ceilingBurstTokens`.
-    /// It is a rounds-per-window limit: (4.75, 27) allows at most 126
-    /// tokens in 21 rounds, so a 128-token window takes at least 22 rounds
-    /// whatever the acceptance. Budget 500 with the same burst makes that
-    /// 21 rounds (at most 127 tokens in 20).
-    static let ceilingBudgetHundredths = 475
+    /// It is a rounds-per-window limit: (4.03, 27) allows at most 127
+    /// tokens in 25 rounds, so a 128-token window takes at least 26 rounds
+    /// whatever the acceptance. Any budget from 389 to 403 with the same
+    /// burst gives 26 rounds; 404 to 420 gives 25, 421 to 439 gives 24,
+    /// 440 to 459 gives 23 and 460 to 480 gives 22. The line follows the
+    /// verify round's cost: shorter rounds need more of them per window.
+    /// Low-acceptance requests commit far fewer tokens per round than the
+    /// line allows, so it never binds for them.
+    static let ceilingBudgetHundredths = 403
     static let ceilingBurstTokens = 27
     static let ceilingEnabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"

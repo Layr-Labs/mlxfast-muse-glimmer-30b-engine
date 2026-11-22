@@ -260,7 +260,6 @@ extension MuseGlimmerTextModel {
         cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
-        let n = numerics
         guard VerifyFusedQK.enabled,
             VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
         else {
@@ -269,7 +268,7 @@ extension MuseGlimmerTextModel {
         let theta = configuration.layerRopeTheta[layerIndex]
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
-        let p = groupedProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
+        let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
         let (queries, keys) = VerifyFusedQK.apply(
             queries: p[0], keys: p[1],
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
@@ -282,7 +281,7 @@ extension MuseGlimmerTextModel {
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
-        return n.project(a.outputProj, output)
+        return verifyOutputProjection(a.outputProj, output)
     }
 }
 
@@ -341,6 +340,7 @@ extension MuseGlimmerTextModel {
             }
         }
         eval(warm)
+        warmVerifyProjections(dtype: dtype)
     }
 }
 
@@ -361,8 +361,8 @@ extension MuseGlimmerTextModel {
     }
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
-        let gu = groupedProjections([mlp.gateProj, mlp.upProj], x)
-        return numerics.project(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
+        let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+        return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
 
     nonisolated(unsafe) private static var groupedWarmed = Set<ObjectIdentifier>()
@@ -403,5 +403,219 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
             let result = target.fusedVerifyForwardWithMTPHidden(tokens, cache: kv)
         else { return nil }
         return (result.logits, result.hidden)
+    }
+}
+
+// MARK: - Verify projection kernels
+
+/// Exact verify rows (1 to 8 per call) of the trunk projections on finer
+/// schedules of the row-exact products. Every output element keeps the stock
+/// kernel's arithmetic: the same products, the same lanes summing them in the
+/// same order, the same shuffle tree and partial joins, the same rounding
+/// points. Only which threads compute which outputs, how many outputs a
+/// threadgroup covers and how weights, scales and activations are loaded
+/// change:
+/// - NVFP4 MLP gate and up: one launch, 8 output rows per threadgroup
+///   (`CBv2VerifyNVFP4`); down: the same, 16-row tiles with a one-chunk
+///   register prefetch at 7 and 8 rows (`CBv2VerifyNVFP4`), whole-chunk loads
+///   below (`CBv2VerifyScales`).
+/// - NVFP4 attention q/k/v/gate and o: 8-row tiles with whole-chunk loads
+///   (`CBv2VerifyScales`).
+/// - FP8 attention q/k/v/gate (one cast and one product launch) and o (one
+///   launch for all eager tiles): vector loads, prefetched weight words and a
+///   packed, order-preserving shuffle tree (`CBv2SmallProjection`).
+/// - FP8 MLP down at 8 rows: vector loads and four row groups per
+///   threadgroup (`CBv2VerifyScales`).
+/// Anything else (FP8 gate/up, dense layers, more than 8 rows) keeps the
+/// frontier path. `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing
+/// off. `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
+/// routed projection with the stock row-exact product, on the same
+/// activations, and stops the process unless every output's bits are equal.
+enum MuseGlimmerVerifyProjections {
+    static let environment = ProcessInfo.processInfo.environment
+    static let enabled = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ"] != "0"
+    static let selfTest = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST"] == "1"
+    static let maximumRows = 8
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var checkedOutputs = 0
+    nonisolated(unsafe) private static var checkedElements = 0
+    nonisolated(unsafe) private static var checkedByKind = [String: Int]()
+
+    /// Self-test: `routed` and `stock` must match in shape, dtype and every
+    /// element's bits (NaN payloads included).
+    static func requireEqualBits(
+        _ routed: [MLXArray], _ stock: [MLXArray], kind: String, rows: Int
+    ) {
+        precondition(routed.count == stock.count, "verify-projection self-test: \(kind) count")
+        var elements = 0
+        for (index, (a, b)) in zip(routed, stock).enumerated() {
+            precondition(
+                a.shape == b.shape && a.dtype == b.dtype,
+                "verify-projection self-test: \(kind) rows \(rows) output \(index): "
+                    + "\(a.shape) \(a.dtype) vs \(b.shape) \(b.dtype)")
+            let bits: DType = a.dtype.size == 4 ? .uint32 : .uint16
+            let differing = (a.view(dtype: bits) .!= b.view(dtype: bits)).asType(.int32).sum()
+                .item(Int.self)
+            precondition(
+                differing == 0,
+                "verify-projection self-test: \(kind) rows \(rows) output \(index): "
+                    + "\(differing) of \(a.size) elements differ")
+            elements += a.size
+        }
+        let report: String? = lock.withLock {
+            checkedOutputs += routed.count
+            checkedElements += elements
+            let key = "\(kind)@\(rows)"
+            let first = checkedByKind[key] == nil
+            checkedByKind[key, default: 0] += routed.count
+            guard first || checkedOutputs % 2000 < routed.count else { return nil }
+            let kinds = checkedByKind.keys.sorted().map { "\($0)=\(checkedByKind[$0]!)" }
+            return "[verify-proj-selftest] outputs=\(checkedOutputs) elements=\(checkedElements) "
+                + "differing=0 \(kinds.joined(separator: " "))\n"
+        }
+        if let report { FileHandle.standardError.write(Data(report.utf8)) }
+    }
+}
+
+extension MuseGlimmerTextModel {
+    private var routesVerifyProjections: Bool { MuseGlimmerVerifyProjections.enabled }
+
+    private func verifyRows(_ x: MLXArray) -> Int? {
+        guard routesVerifyProjections, numerics.isExact(x) else { return nil }
+        let rows = MuseGlimmerNumerics.rows(x)
+        return (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows) ? rows : nil
+    }
+
+    /// The self-test's reference: each layer's own row-exact product.
+    private func checkRouted(
+        _ routed: [MLXArray], _ layers: [any UnaryLayer], _ x: MLXArray, kind: String
+    ) {
+        guard MuseGlimmerVerifyProjections.selfTest else { return }
+        let stock = layers.map { numerics.project($0, x) }
+        MuseGlimmerVerifyProjections.requireEqualBits(
+            routed, stock, kind: kind, rows: MuseGlimmerNumerics.rows(x))
+    }
+
+    /// Attention q, k, v and gate of one layer: all FP8 through
+    /// `CBv2SmallProjection`, all NVFP4 through `CBv2VerifyScales`; otherwise
+    /// the frontier's grouped or per-layer products.
+    func verifyAttentionProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
+        if verifyRows(x) != nil {
+            var routed: [MLXArray]?
+            var kind = ""
+            if let fp8 = layers as? [ModelOptCalibratedLinear] {
+                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                kind = "fp8.qkvg"
+            } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
+                routed = CBv2VerifyScales.products(layers, x)
+                kind = "nvfp4.qkvg"
+            }
+            if let routed {
+                checkRouted(routed, layers, x, kind: kind)
+                return routed
+            }
+        }
+        return groupedProjections(layers, x)
+    }
+
+    /// The attention output projection: FP8 through `CBv2SmallProjection`
+    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyScales`.
+    func verifyOutputProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        if verifyRows(x) != nil {
+            var routed: MLXArray?
+            var kind = ""
+            if let fp8 = layer as? ModelOptCalibratedLinear {
+                routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
+                kind = "fp8.o"
+            } else if layer is ModelOptWeightOnlyNVFP4Linear {
+                routed = CBv2VerifyScales.product(layer, x)
+                kind = "nvfp4.o"
+            }
+            if let routed {
+                checkRouted([routed], [layer], x, kind: kind)
+                return routed
+            }
+        }
+        return numerics.project(layer, x)
+    }
+
+    /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4`
+    /// launch; FP8 pairs keep the frontier's grouped product.
+    func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
+        if verifyRows(x) != nil, let routed = CBv2VerifyNVFP4.products(layers, x) {
+            checkRouted(routed, layers, x, kind: "nvfp4.gate_up")
+            return routed
+        }
+        return groupedProjections(layers, x)
+    }
+
+    /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4` at 7
+    /// and 8 rows (16-row tiles with prefetch) and `CBv2VerifyScales` below;
+    /// FP8 through `CBv2VerifyScales` at 8 rows (four row groups).
+    func verifyDownProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        if let rows = verifyRows(x) {
+            var routed: MLXArray?
+            var kind = ""
+            if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
+                routed =
+                    rows >= 7
+                    ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
+                kind = "nvfp4.down"
+            } else if layer is ModelOptCalibratedLinear, rows == 8 {
+                routed = CBv2VerifyScales.product(layer, x)
+                kind = "fp8.down"
+            }
+            if let routed {
+                checkRouted([routed], [layer], x, kind: kind)
+                return routed
+            }
+        }
+        return numerics.project(layer, x)
+    }
+
+    /// Compiles every routed kernel (each distinct projection shape at 1 to
+    /// 8 rows) on zeros, so no verify window compiles one while it is served.
+    /// Called from `warmFusedVerifyKernels` (once per model); changes no
+    /// weight, cache or numerics state.
+    func warmVerifyProjections(dtype: DType) {
+        guard routesVerifyProjections, numerics.exactWindows else { return }
+        func key(_ layers: [any UnaryLayer]) -> String {
+            layers.map { layer -> String in
+                guard let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape
+                else { return "other" }
+                return "\(shape.format):\(shape.inputs)x\(shape.outputs)"
+            }.joined(separator: ",")
+        }
+        func inputs(_ layer: any UnaryLayer) -> Int? {
+            (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape.inputs
+        }
+        var seen = Set<String>()
+        for layer in model.layers {
+            let a = layer.selfAttention
+            let mlp = layer.mlp
+            let sites: [(String, [any UnaryLayer])] = [
+                ("qkvg", [a.queryProj, a.keyProj, a.valueProj, a.gateProj]),
+                ("o", [a.outputProj]),
+                ("gate_up", [mlp.gateProj, mlp.upProj]),
+                ("down", [mlp.downProj]),
+            ]
+            for (site, group) in sites {
+                guard seen.insert(site + " " + key(group)).inserted,
+                    let width = inputs(group[0])
+                else { continue }
+                var outputs = [MLXArray]()
+                for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                    let x = MLXArray.zeros([1, rows, width], dtype: dtype)
+                    switch site {
+                    case "qkvg": outputs += verifyAttentionProjections(group, x)
+                    case "o": outputs.append(verifyOutputProjection(group[0], x))
+                    case "gate_up": outputs += verifyFeedInputProjections(group, x)
+                    default: outputs.append(verifyDownProjection(group[0], x))
+                    }
+                }
+                eval(outputs)
+            }
+        }
     }
 }
