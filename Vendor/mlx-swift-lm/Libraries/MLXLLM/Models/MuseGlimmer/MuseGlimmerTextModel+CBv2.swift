@@ -1,7 +1,9 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 // MARK: - Layer structure
 
@@ -111,20 +113,109 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                     ropeOffsets = offsets
                 }
             }
-            guard index == last else {
-                h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
-                continue
-            }
             let attended = layer.postAttentionLayerNorm.addedTo(
                 h,
-                layer.selfAttention(
-                    layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                teacherForcedAttention(
+                    layer.selfAttention, layer.inputLayerNorm(h), cache: cache[index],
                     ropeOffsets: ropeOffsets))
+            guard index == last else {
+                h = layer.postFeedforwardLayerNorm.addedTo(
+                    attended, teacherForcedMLP(layer.mlp, layer.preFeedforwardLayerNorm(attended)))
+                continue
+            }
             let row = attended[0..., (attended.dim(1) - 1)..., 0...]
             h = layer.postFeedforwardLayerNorm.addedTo(
                 row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
         }
         return outputLogits(model.norm(h))
+    }
+
+    /// Self-test switch (environment only) for both prompt products below.
+    static let teacherForcedSelfTest =
+        ProcessInfo.processInfo.environment["MUSE_PROMPT_FP8_SELFTEST"] == "1"
+
+    /// `MuseGlimmerTextMLP.callAsFunction`, operation for operation, with its
+    /// projections through `teacherForcedProject`.
+    private func teacherForcedMLP(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
+        teacherForcedProject(
+            mlp.downProj,
+            compiledSiluProduct(
+                teacherForcedProject(mlp.gateProj, x), teacherForcedProject(mlp.upProj, x)))
+    }
+
+    /// `numerics.project(layer, x)`, with an FP8 projection's exact rows
+    /// computed in one dispatch (`promptRowExactForward`, the same bytes per
+    /// row) instead of in pieces of 16. A row count of `16k + 1` keeps the
+    /// pieces: its last one-row piece takes the vector product.
+    private func teacherForcedProject(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
+        let rows = MuseGlimmerNumerics.rows(x)
+        if numerics.exactWindows, rows > MuseGlimmerNumerics.pieceRows,
+            rows % MuseGlimmerNumerics.pieceRows != 1,
+            let fp8 = layer as? ModelOptCalibratedLinear,
+            let product = fp8.promptRowExactForward(x)
+        {
+            if Self.teacherForcedSelfTest {
+                // Self-test (environment only): stop unless the bytes equal the pieces'.
+                let pieces = numerics.project(layer, x)
+                precondition(
+                    arrayEqual(product.view(dtype: .uint16), pieces.view(dtype: .uint16))
+                        .item(Bool.self),
+                    "promptRowExactForward differs from the row-exact pieces")
+            }
+            return product
+        }
+        // NVFP4 pieces all run the matrix kernel (no scalar rows), so any row
+        // count above 16 takes the one-dispatch product.
+        if numerics.isExact(x), rows > MuseGlimmerNumerics.pieceRows,
+            let nvfp4 = layer as? ModelOptWeightOnlyNVFP4Linear,
+            let product = nvfp4.promptRowExactForward(x)
+        {
+            if Self.teacherForcedSelfTest {
+                let pieces = numerics.project(layer, x)
+                precondition(
+                    arrayEqual(product.view(dtype: .uint16), pieces.view(dtype: .uint16))
+                        .item(Bool.self),
+                    "NVFP4 promptRowExactForward differs from the row-exact pieces")
+            }
+            return product
+        }
+        return numerics.project(layer, x)
+    }
+
+    /// `MuseGlimmerTextAttention.callAsFunction` on a CBv2 cache, operation for
+    /// operation, with its projections through `teacherForcedProject`.
+    private func teacherForcedAttention(
+        _ attention: MuseGlimmerTextAttention, _ x: MLXArray, cache: KVCache?,
+        ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        guard let attending = cache as? any CBv2AttendingLayerCache else {
+            return attention(x, mask: .none, cache: cache, ropeOffsets: ropeOffsets)
+        }
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let (heads, kvHeads, dims) =
+            (attention.heads, attention.kvHeads, attention.headDimensions)
+        var queries = teacherForcedProject(attention.queryProj, x)
+            .reshaped(batch, length, heads, dims)
+        var keys = teacherForcedProject(attention.keyProj, x)
+            .reshaped(batch, length, kvHeads, dims)
+        var values = teacherForcedProject(attention.valueProj, x)
+            .reshaped(batch, length, kvHeads, dims)
+        queries = attention.qkNorm(queries)
+        queries = (queries.asType(.float32) * attention.qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = attention.qkNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+        if let rope = attention.rope {
+            let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: attention.scale, sinks: nil)
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        output = MuseGlimmerFusion.sigmoidGate(
+            [output, teacherForcedProject(attention.gateProj, x)])[0]
+        return teacherForcedProject(attention.outputProj, output)
     }
 }
 
@@ -155,5 +246,115 @@ extension MuseGlimmerCBv2Adapter: CBv2ResidentParametersProviding {
     public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(target) }
     public func residentParameterArrays() -> [MLXArray] {
         target.parameters().flattened().map(\.1)
+    }
+}
+
+// MARK: - Fused verify forward
+
+/// The exact verify forward with each block-norm boundary in one dispatch:
+/// `postAttention` add-norm with the following `preFeedforward` norm, and
+/// `postFeedforward` add-norm with the next layer's `input` norm. Every other
+/// operation is the tower's own. Bytes equal `forwardWithMTPHidden`; the
+/// kernel reproduces MLX's row reduction below 32 rows
+/// (`VerifyFusedNorms`). `DARKBLOOM_VERIFY_FUSED_NORMS=0` turns it off.
+extension MuseGlimmerTextModel {
+    func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
+        -> (logits: MLXArray, hidden: MLXArray)?
+    {
+        guard VerifyFusedNorms.enabled, !mtpHiddenLayerIDs.isEmpty,
+            cache.count == model.layers.count,
+            cache.allSatisfy({ $0 is any CBv2AttendingLayerCache })
+        else { return nil }
+        var h = model.inputEmbeddings(tokens)
+        let rows = MuseGlimmerNumerics.rows(h)
+        guard numerics.isExact(h),
+            VerifyFusedNorms.supports(width: h.dim(-1), rows: rows, dtype: h.dtype)
+        else { return nil }
+
+        let layers = model.layers
+        let capture = mtpHiddenLayerIDs
+        var captured = [Int: MLXArray]()
+        var shared: (positions: [Int], offsets: MLXArray)?
+        var layerInput = layers[0].inputLayerNorm(h)
+        for (index, layer) in layers.enumerated() {
+            var ropeOffsets: MLXArray?
+            if layer.selfAttention.rope != nil,
+                let attending = cache[index] as? any CBv2AttendingLayerCache
+            {
+                let positions = attending.rows.map(\.absoluteOffset)
+                if let shared, shared.positions == positions {
+                    ropeOffsets = shared.offsets
+                } else {
+                    let offsets = attending.positionOffsets + 0
+                    shared = (positions, offsets)
+                    ropeOffsets = offsets
+                }
+            }
+            let attention = fusedVerifyAttention(
+                layer.selfAttention, layerIndex: index, layerInput,
+                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
+            let post = layer.postAttentionLayerNorm
+            let pre = layer.preFeedforwardLayerNorm
+            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
+                residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                w2: pre.weight, eps2: pre.eps)
+            let feed = layer.mlp(feedInput)
+            if index + 1 < layers.count {
+                let postFF = layer.postFeedforwardLayerNorm
+                let next = layers[index + 1].inputLayerNorm
+                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                    w2: next.weight, eps2: next.eps)
+            } else {
+                h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
+            }
+            if capture.contains(index) { captured[index] = h }
+        }
+        let parts = capture.map { captured[$0]! }
+        let normed = model.norm(h)
+        return (outputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
+    }
+
+    /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
+    /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
+    func fusedVerifyAttention(
+        _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let n = numerics
+        guard VerifyFusedQK.enabled,
+            VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
+        else {
+            return a(x, mask: .none, cache: attending as? KVCache, ropeOffsets: ropeOffsets)
+        }
+        let theta = configuration.layerRopeTheta[layerIndex]
+        let usesRope = a.rope != nil
+        precondition(usesRope == (theta != 0))
+        let (queries, keys) = VerifyFusedQK.apply(
+            queries: n.project(a.queryProj, x), keys: n.project(a.keyProj, x),
+            heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+            eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
+            ropeBase: usesRope ? theta : nil,
+            offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
+        let values = n.project(a.valueProj, x)
+            .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        output = MuseGlimmerFusion.sigmoidGate([output, n.project(a.gateProj, x)])[0]
+        return n.project(a.outputProj, output)
+    }
+}
+
+extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
+    public func fusedVerifyForwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count,
+            let result = target.fusedVerifyForwardWithMTPHidden(tokens, cache: kv)
+        else { return nil }
+        return (result.logits, result.hidden)
     }
 }
