@@ -179,6 +179,69 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             eval(maskEmbedding)
             try errors.check()
         }
+        // Load-time scratch round (outside every timed window: the drafter is
+        // built once, when the runner loads, before the worker serves).
+        if Self.scratchRoundWarmEnabled, Self.claimScratchRoundWarm() {
+            warmScratchRounds()
+        }
+    }
+
+    // MARK: Load-time scratch warm
+
+    /// Kill switch for the load-time scratch rounds.
+    static let scratchRoundWarmEnabled = true
+    private static let scratchRoundWarmLock = NSLock()
+    nonisolated(unsafe) private static var scratchRoundWarmClaimed = false
+
+    /// One claim per process: the pipelines it compiles are process-wide.
+    private static func claimScratchRoundWarm() -> Bool {
+        scratchRoundWarmLock.lock()
+        defer { scratchRoundWarmLock.unlock() }
+        if scratchRoundWarmClaimed { return false }
+        scratchRoundWarmClaimed = true
+        return true
+    }
+
+    /// The drafter half of a speculative round, on a PRIVATE context state
+    /// with input-independent operands, for every commit width a round can
+    /// produce (1 ... 1 + maximumDraftTokens rows): context projection and
+    /// K/V, the block forward (single and batched entry), the draft head in
+    /// both its products, and the argmax. Its only effect that outlives it is
+    /// first use (Metal pipeline state, kernel libraries): the scratch state
+    /// is released, no request or engine state is read or written, and the
+    /// results are discarded. Without it those first uses fall in the first
+    /// timed speculative rounds, because the harness warm runs only the
+    /// plain stepper.
+    private func warmScratchRounds() {
+        let c = model.configuration
+        let scratch = model.makeContextState()
+        defer { scratch.release() }
+        let anchor = target.dflashTokenEmbeddings(MLXArray([Int32(c.maskTokenID)]))
+        guard anchor.size == c.hiddenSize else { return }
+        let embeddings = model.blockEmbeddings(anchor: anchor, mask: maskEmbedding)
+        let depth = settings.maximumDraftTokens
+        do {
+            try MLX.withError { errors in
+                for width in 1 ... (1 + depth) {
+                    let features = MLXArray.zeros(
+                        [width, c.contextWidth], dtype: model.activationDType)
+                    model.commit(features: features, at: scratch.nextPosition, to: scratch)
+                    let block = model.draftBlock(embeddings: embeddings, state: scratch)
+                    let batched = model.draftBlocks(embeddings: [embeddings], states: [scratch])
+                    var outputs = [block]
+                    outputs.append(contentsOf: batched)
+                    for rows in [block, batched.first].compactMap({ $0 }) {
+                        let draftRows = rows[1 ..< (1 + depth), 0...]
+                        outputs.append(argMax(draftHeadProduct(draftRows, readout: false), axis: -1))
+                        outputs.append(argMax(draftHeadProduct(draftRows, readout: true), axis: -1))
+                    }
+                    eval(outputs)
+                    try errors.check()
+                }
+            }
+        } catch {
+            // Best effort: a failed warm leaves first use where it was.
+        }
     }
 
     // MARK: Engine policy
@@ -955,5 +1018,17 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ],
             hostBytes: c.blockSize * (c.slidingWindow + c.blockSize),
             ownerWorking: owner)
+    }
+}
+
+// MARK: - Parameter residency
+
+/// The drafter's own parameters (about 2 GiB of quantized weights), keyed by
+/// its draft model, so `CBv2ParameterResidency.prepare` keeps them resident
+/// like the target's. Memory placement only; no value changes.
+extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(model) }
+    public func residentParameterArrays() -> [MLXArray] {
+        model.parameters().flattened().map(\.1)
     }
 }

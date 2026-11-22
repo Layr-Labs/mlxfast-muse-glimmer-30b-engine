@@ -175,6 +175,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// slab the bytes a fused-write step reads from its inputs. Rounds it
     /// cannot take fall back to the column loop.
     package var mtpBatchesRectangularColumnsAsRows = false
+    /// Layers between early submissions of a rectangular verification
+    /// forward (`submitVerifyPrefixEarly`); 0 is off. Set and cleared by the
+    /// engine's verification scope with the flags above.
+    package var mtpEarlySubmitInterval = 0
+    /// Early submissions issued (test hook).
+    public private(set) var mtpEarlySubmissions = 0
     /// Rounds attended as decode rows (test hook).
     public private(set) var mtpColumnsAsRowsCalls = 0
     /// Diagnosis (`DARKBLOOM_PAGED_ENGINE_TRACE=1`): segment dispatch plan
@@ -682,7 +688,30 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
         advancePositionOffsets(by: l)
-        return finishAttentionCall(output)
+        let attended = finishAttentionCall(output)
+        submitVerifyPrefixEarly(attended)
+        return attended
+    }
+
+    /// Inside a rectangular verification forward, every
+    /// `mtpEarlySubmitInterval` layers (never at the last layer), hands the
+    /// device the graph built so far: every earlier layer and this layer's
+    /// attention, whose K/V writes it reads through the group's write fence.
+    /// The host then builds the remaining layers while the device runs these.
+    /// Evaluation order only: the same kernels run on the same inputs, so no
+    /// value changes. A submission error faults the round like a refused write.
+    private func submitVerifyPrefixEarly(_ attended: MLXArray) {
+        let interval = mtpEarlySubmitInterval
+        guard interval > 0, mtpSerializesRectangularAttention,
+            (layerIndex + 1) % interval == 0, layerIndex + 1 < pool.layerDTypes.count,
+            !pool.writeValidation.isFaulted
+        else { return }
+        do {
+            try withError { asyncEval(attended) }
+            mtpEarlySubmissions += 1
+        } catch {
+            pool.writeValidation.record(error)
+        }
     }
 
     /// Whether `writePromptKVWithoutAttention` may stand in for this layer's

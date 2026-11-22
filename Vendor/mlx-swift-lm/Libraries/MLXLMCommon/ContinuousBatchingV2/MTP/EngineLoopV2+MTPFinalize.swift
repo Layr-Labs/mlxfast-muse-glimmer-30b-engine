@@ -2,8 +2,39 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
+
+/// Polled host readback of an MTP round's scheduled results.
+///
+/// `asArray` on an array still in flight blocks in MLX's event wait, and the
+/// host thread then wakes some time after the GPU signals. Every array this
+/// polls was handed to `asyncEval` at launch (`EngineLoopV2+MTPExecution`),
+/// so its completion event is already armed: spinning on the non-blocking
+/// availability check returns as soon as it is signalled. The readback that
+/// follows is the same `asArray` of the same bytes, so values are unchanged.
+/// A bounded spin falls through to the ordinary blocking read.
+enum CBv2MTPPolledReadback {
+    /// Kill switch: `false` restores the plain blocking readback.
+    static let enabled = true
+    /// Spin bound before the blocking read takes over.
+    static let spinBudgetNanoseconds: UInt64 = 100_000_000
+
+    static func awaitAvailable(_ array: MLXArray?) {
+        guard enabled, let array else { return }
+        var available = false
+        guard _mlx_array_is_available(&available, array.ctx) == 0, !available else { return }
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ spinBudgetNanoseconds
+        var spins: UInt32 = 0
+        while true {
+            available = false
+            guard _mlx_array_is_available(&available, array.ctx) == 0, !available else { return }
+            spins &+= 1
+            if spins & 63 == 0, DispatchTime.now().uptimeNanoseconds >= deadline { return }
+        }
+    }
+}
 
 extension EngineLoopV2 {
     /// Runs before ordinary token finalization and any deferred request frees.
@@ -138,6 +169,7 @@ extension EngineLoopV2 {
             var seedPolicyTopTwo: [Float]?
             guard
                 completedNativeReadback({
+                    CBv2MTPPolledReadback.awaitAvailable(round.seedPolicyTopTwoValues)
                     seedPolicyTopTwo = round.seedPolicyTopTwoValues?.asArray(Float.self)
                 })
             else { return }
@@ -168,6 +200,7 @@ extension EngineLoopV2 {
         // first token; its last prompt hidden row is that token's carry.
         // Prefill carries never run under native completion tracking.
         if !round.prefillCarries.isEmpty {
+            CBv2MTPPolledReadback.awaitAvailable(round.prefillCarryTopTwoValues)
             let prefillTopTwo = round.prefillCarryTopTwoValues?.asArray(Float.self)
             if prefillTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (index, carry) in round.prefillCarries.enumerated() {
@@ -209,6 +242,7 @@ extension EngineLoopV2 {
         }
         guard
             completedNativeReadback({
+                CBv2MTPPolledReadback.awaitAvailable(verify.acceptancePacket)
                 host = verify.acceptancePacket.asArray(Int32.self)
                 CBv2CoreInstrumentation.recordHostSync()
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
