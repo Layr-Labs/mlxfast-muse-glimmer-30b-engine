@@ -380,7 +380,9 @@ extension EngineLoopV2 {
                 }
             } else {
                 output = try checkedModelForward(phase: .mtpVerification) {
-                    mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                    (mtp.model as? any CBv2VerifyWindowForwarding)?.forwardVerifyWindow(
+                        tokens: tokens, caches: caches)
+                        ?? mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
                 }
             }
             if let nativePagedWork, let windowWork {
