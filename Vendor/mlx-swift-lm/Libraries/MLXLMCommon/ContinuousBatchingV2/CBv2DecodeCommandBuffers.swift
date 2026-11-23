@@ -10,12 +10,15 @@ public protocol CBv2DecodeCommandBufferLimitsProviding: AnyObject {
     var decodeCommandBufferLimits: GPU.CommandBufferLimits? { get }
     /// Limits for speculative (MTP) rounds whose rows are all decode or
     /// verification rows (at most `EngineLoopV2.speculativeCommandBufferRowTokens`
-    /// tokens); rounds that carry a prompt chunk keep MLX's defaults.
+    /// tokens); rounds that carry a prompt chunk take `prefillCommandBufferLimits`.
     var speculativeCommandBufferLimits: GPU.CommandBufferLimits? { get }
+    /// Limits for steps that include a prompt chunk. Defaults to nil (MLX defaults).
+    var prefillCommandBufferLimits: GPU.CommandBufferLimits? { get }
 }
 
 extension CBv2DecodeCommandBufferLimitsProviding {
     public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? { nil }
+    public var prefillCommandBufferLimits: GPU.CommandBufferLimits? { nil }
 }
 
 extension EngineLoopV2 {
@@ -23,9 +26,9 @@ extension EngineLoopV2 {
     static let speculativeCommandBufferRowTokens = 8
 
     /// Runs one step's graph construction and evaluation with the model's
-    /// decode command-buffer limits when `plan` is a plain decode step, or its
+    /// decode command-buffer limits when `plan` is a plain decode step, its
     /// speculative limits when `plan` is a speculative round of decode and
-    /// verification rows.
+    /// verification rows, or its prefill limits when `plan` carries a prompt chunk.
     func withDecodeCommandBuffers<R>(
         _ plan: CBv2StepPlan, speculative: Bool = false, _ body: () throws -> R
     ) rethrows -> R {
@@ -37,11 +40,12 @@ extension EngineLoopV2 {
             limits =
                 plan.assignments.allSatisfy({
                     $0.numTokens <= Self.speculativeCommandBufferRowTokens
-                }) ? provider.speculativeCommandBufferLimits : nil
+                })
+                ? provider.speculativeCommandBufferLimits : provider.prefillCommandBufferLimits
         } else {
             limits =
                 plan.assignments.allSatisfy({ $0.numTokens == 1 })
-                ? provider.decodeCommandBufferLimits : nil
+                ? provider.decodeCommandBufferLimits : provider.prefillCommandBufferLimits
         }
         guard let limits else { return try body() }
         return try GPU.withCommandBufferLimits(limits, body)

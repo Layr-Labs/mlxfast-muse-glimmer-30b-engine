@@ -64,6 +64,9 @@ extension MuseGlimmerCBv2Adapter {
     public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
         MuseGlimmerDecodeCommandBuffers.limits
     }
+    public var prefillCommandBufferLimits: GPU.CommandBufferLimits? {
+        GPU.CommandBufferLimits(operations: 60, megabytes: 1 << 20)
+    }
 }
 
 // MARK: - Prompt output
@@ -99,7 +102,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// engine's own prompt path uses, instead of exact windows (16-row pieces).
     /// Exact windows exist so a verify row gets the bytes it gets alone; this
     /// forward is a prompt chunk read at its last position.
-    static let promptArithmeticLayers = 17 ..< 50
+    static let promptArithmeticLayers = 16 ..< 50
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
@@ -595,16 +598,51 @@ extension MuseGlimmerTextModel {
         return numerics.project(layer, x)
     }
 
+    private static let readoutKernel = MLXFast.metalKernel(
+        name: "muse_glimmer_verify_logit_readout",
+        inputNames: ["x", "params"],
+        outputNames: ["y"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint n4 = uint(N4_);
+            if (idx >= n4) { return; }
+            const bfloat16_t mult = bfloat16_t(params[0]);
+            const bfloat16_t cap = bfloat16_t(params[1]);
+            const device vec<bfloat16_t, 4>* src = (const device vec<bfloat16_t, 4>*)x;
+            device vec<bfloat16_t, 4>* dst = (device vec<bfloat16_t, 4>*)y;
+            const vec<bfloat16_t, 4> v = src[idx];
+            vec<bfloat16_t, 4> o;
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+              const bfloat16_t s = v[i] * mult;
+              const bfloat16_t q = s / cap;
+              const bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
+              o[i] = t * cap;
+            }
+            dst[idx] = o;
+            """)
+
     /// `outputLogits` for verify rows: an NVFP4 `lm_head` through
     /// `CBv2VerifyScales` (8-row tiles), then the same multiplier and softcap
-    /// in the same order. Other calls run `outputLogits` itself.
+    /// fused into one vectorized pass. Other calls run `outputLogits` itself.
     func verifyOutputLogits(_ normedHidden: MLXArray) -> MLXArray {
         guard verifyRows(normedHidden) != nil, lmHead is ModelOptWeightOnlyNVFP4Linear,
             let product = CBv2VerifyScales.product(lmHead, normedHidden)
         else { return outputLogits(normedHidden) }
         checkRouted([product], [lmHead], normedHidden, kind: "nvfp4.lm_head")
-        var logits = product * configuration.outputMultiplier
         let cap = configuration.finalLogitSoftcapping
+        if cap > 0, product.dtype == .bfloat16, product.size % 4 == 0 {
+            let n4 = product.size / 4
+            let tg = 256
+            let gridX = ((n4 + tg - 1) / tg) * tg
+            let params = MLXArray([configuration.outputMultiplier, cap])
+            return Self.readoutKernel(
+                [product, params],
+                template: [("N4_", n4)],
+                grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [product.shape], outputDTypes: [product.dtype])[0]
+        }
+        var logits = product * configuration.outputMultiplier
         if cap > 0 { logits = tanh(logits / cap) * cap }
         return logits
     }

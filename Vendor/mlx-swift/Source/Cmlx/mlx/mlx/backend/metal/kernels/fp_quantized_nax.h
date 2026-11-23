@@ -136,8 +136,109 @@ struct FPQuantizedNAXBlockLoader {
     }
   }
 
+  void fetch_nvfp4(thread uint2* q_buf, thread uint8_t* s_buf) const thread {
+    if constexpr (n_steps_per_read == 2) {
+      const uint4 q4 = *(const device uint4*)src;
+      q_buf[0] = q4.xy;
+      q_buf[1] = q4.zw;
+      const uchar2 s2 = *(const device uchar2*)scales;
+      s_buf[0] = s2.x;
+      s_buf[1] = s2.y;
+    } else {
+      const device uint2* src_u2 = (const device uint2*)src;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        q_buf[i] = src_u2[i];
+        s_buf[i] = scales[i];
+      }
+    }
+  }
+
+  void store_nvfp4(
+      threadgroup T* ws_base,
+      const thread uint2* q_buf,
+      const thread uint8_t* s_buf) const thread {
+    threadgroup vec<T, 8>* dst_v8 =
+        (threadgroup vec<T, 8>*)(ws_base + bi * dst_ld + bj * pack_factor);
+    for (int i = 0; i < n_steps_per_read; i++) {
+      const half scale = dequantize_scale<half, 16>(s_buf[i]);
+      const uint2 q = q_buf[i];
+      {
+        const uint lo0 = (q.x & 0x000f) | ((q.x & 0x00f0) << 12);
+        const uint hi0 = ((q.x >> 8) & 0x000f) | ((q.x & 0xf000) << 4);
+        half2 a0 = (as_type<half2>(
+                        ((lo0 & 0x00070007) << 9) |
+                        ((lo0 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        half2 b0 = (as_type<half2>(
+                        ((hi0 & 0x00070007) << 9) |
+                        ((hi0 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+
+        const uint qx1 = q.x >> 16;
+        const uint lo1 = (qx1 & 0x000f) | ((qx1 & 0x00f0) << 12);
+        const uint hi1 = ((qx1 >> 8) & 0x000f) | ((qx1 & 0xf000) << 4);
+        half2 a1 = (as_type<half2>(
+                        ((lo1 & 0x00070007) << 9) |
+                        ((lo1 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        half2 b1 = (as_type<half2>(
+                        ((hi1 & 0x00070007) << 9) |
+                        ((hi1 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        dst_v8[2 * i + 0] = vec<T, 8>(
+            T(a0.x), T(a0.y), T(b0.x), T(b0.y), T(a1.x), T(a1.y), T(b1.x),
+            T(b1.y));
+      }
+      {
+        const uint lo2 = (q.y & 0x000f) | ((q.y & 0x00f0) << 12);
+        const uint hi2 = ((q.y >> 8) & 0x000f) | ((q.y & 0xf000) << 4);
+        half2 a2 = (as_type<half2>(
+                        ((lo2 & 0x00070007) << 9) |
+                        ((lo2 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        half2 b2 = (as_type<half2>(
+                        ((hi2 & 0x00070007) << 9) |
+                        ((hi2 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+
+        const uint qy1 = q.y >> 16;
+        const uint lo3 = (qy1 & 0x000f) | ((qy1 & 0x00f0) << 12);
+        const uint hi3 = ((qy1 >> 8) & 0x000f) | ((qy1 & 0xf000) << 4);
+        half2 a3 = (as_type<half2>(
+                        ((lo3 & 0x00070007) << 9) |
+                        ((lo3 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        half2 b3 = (as_type<half2>(
+                        ((hi3 & 0x00070007) << 9) |
+                        ((hi3 & 0x00080008) << 12)) *
+                    half2(16384.0h)) *
+            scale;
+        dst_v8[2 * i + 1] = vec<T, 8>(
+            T(a2.x), T(a2.y), T(b2.x), T(b2.y), T(a3.x), T(a3.y), T(b3.x),
+            T(b3.y));
+      }
+    }
+  }
+
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if constexpr (
+        bits == 4 && group_size == 16 && !has_global_scale &&
+        n_reads_per_scale == 8) {
+      uint2 q_buf[n_steps_per_read];
+      uint8_t s_buf[n_steps_per_read];
+      fetch_nvfp4(q_buf, s_buf);
+      store_nvfp4(dst - (bi * dst_ld + bj * pack_factor), q_buf, s_buf);
       return;
     }
 
@@ -208,7 +309,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    typename Wtype = bfloat>
+    typename Wtype = bfloat,
+    const bool double_buffer_ws = false>
 METAL_FUNC void fp_qmm_t_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -292,43 +394,140 @@ METAL_FUNC void fp_qmm_t_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
+      if constexpr (
+          kAlignedN.value && bits == 4 && group_size == 16 &&
+          !has_global_scale && loader_w_t::n_reads_per_scale == 8 &&
+          loader_w_t::BCOLS_PACKED * BN >= WM * WN * SIMD_SIZE) {
+        constexpr int ws_tile_size = BN * BK_padded;
+        uint2 q_buf[loader_w_t::n_steps_per_read];
+        uint8_t s_buf[loader_w_t::n_steps_per_read];
+        loader_w.fetch_nvfp4(q_buf, s_buf);
+        loader_w.next();
+        if constexpr (double_buffer_ws) {
+          loader_w.store_nvfp4(Ws, q_buf, s_buf);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          int stage = 0;
+          for (int k = 0; k < K; k += BK) {
+            if (k + BK < K) {
+              loader_w.fetch_nvfp4(q_buf, s_buf);
+              loader_w.next();
+            }
+
+            threadgroup Wtype* Ws_cur = Ws + stage * ws_tile_size;
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              Btile.template load<Wtype, BK_padded, 1>(
+                  Ws_cur + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
+            }
+
+            if (k + BK < K) {
+              loader_w.store_nvfp4(
+                  Ws + (1 - stage) * ws_tile_size, q_buf, s_buf);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              stage = 1 - stage;
+            }
+
+            x += BK;
+          }
         } else {
-          loader_w.load_safe(short2(BK, tgp_bn));
+          for (int k = 0; k < K; k += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.store_nvfp4(Ws, q_buf, s_buf);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (k + BK < K) {
+              loader_w.fetch_nvfp4(q_buf, s_buf);
+              loader_w.next();
+            }
+
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(x + kk1, K);
+              } else {
+                Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+              }
+
+              Btile.template load<Wtype, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+
+              (void)compiler_barrier;
+            }
+
+            x += BK;
+          }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<Wtype, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            loader_w.load_safe(short2(BK, tgp_bn));
           }
 
-          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<Wtype, TN, TK> Btile;
 
-          (void)compiler_barrier;
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          loader_w.next();
         }
-
-        x += BK;
-        loader_w.next();
       }
 
       // Store results to device memory
@@ -374,6 +573,21 @@ METAL_FUNC vec<Wtype, 4> dequantize_fp_x4(uint q, uint8_t s) {
         Wtype(float(b.x) * scale),
         Wtype(float(b.y) * scale));
   }
+}
+
+template <typename Wtype>
+METAL_FUNC vec<Wtype, 4> dequantize_fp4_x4_scaled(uint q, half scale) {
+  const uint lo = (q & 0x000f) | ((q & 0x00f0) << 12);
+  const uint hi = ((q >> 8) & 0x000f) | ((q & 0xf000) << 4);
+  half2 a = (as_type<half2>(
+                 ((lo & 0x00070007) << 9) | ((lo & 0x00080008) << 12)) *
+             half2(16384.0h)) *
+      scale;
+  half2 b = (as_type<half2>(
+                 ((hi & 0x00070007) << 9) | ((hi & 0x00080008) << 12)) *
+             half2(16384.0h)) *
+      scale;
+  return vec<Wtype, 4>(Wtype(a.x), Wtype(a.y), Wtype(b.x), Wtype(b.y));
 }
 
 template <
@@ -625,8 +839,11 @@ template <
   (void)lid;
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
+  constexpr bool kDoubleBuf =
+      (bits == 4 && group_size == 16 && !has_global_scale &&
+       sizeof(Wtype) == 2);
 
-  threadgroup Wtype Ws[BN * BK_padded];
+  threadgroup Wtype Ws[(kDoubleBuf ? 2 : 1) * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -655,7 +872,8 @@ template <
       BN,
       WM,
       WN,
-      Wtype>(
+      Wtype,
+      kDoubleBuf>(
       w, scales, global_scale, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1128,6 +1346,175 @@ template <
   NAXTile<float, 1, TN> Dtile;
   Dtile.clear();
 
+  if constexpr (bits == 4 && group_size == 16) {
+    if (M <= 8) {
+      const bool x_row0 = fm < M;
+      uint4 ws_cur[TN][2];
+      ushort ss_cur[TN][2];
+      const int k0 = simd_gid * BK;
+      if (k0 < K) {
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            const int row = 16 * t + 8 * r;
+            ws_cur[t][r] = *(const device uint4*)(
+                wl + row * static_cast<int64_t>(row_bytes) + k0 / 2);
+            ss_cur[t][r] = *(const device ushort*)(
+                scales + row * static_cast<int64_t>(row_scales) + k0 / 16);
+          }
+        }
+      }
+
+      for (int k = k0; k < K; k += WK * BK) {
+        vec<T, 8> xs0[4];
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 4; i++) {
+          xs0[i] = x_row0 ? *(const device vec<T, 8>*)(x + k + 8 * i)
+                          : vec<T, 8>(0);
+        }
+
+        uint4 ws_next[TN][2];
+        ushort ss_next[TN][2];
+        const int kn = k + WK * BK;
+        if (kn < K) {
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            STEEL_PRAGMA_UNROLL
+            for (short r = 0; r < 2; r++) {
+              const int row = 16 * t + 8 * r;
+              ws_next[t][r] = *(const device uint4*)(
+                  wl + row * static_cast<int64_t>(row_bytes) + kn / 2);
+              ss_next[t][r] = *(const device ushort*)(
+                  scales + row * static_cast<int64_t>(row_scales) + kn / 16);
+            }
+          }
+        }
+
+        half sc0[TN][2];
+        half sc1[TN][2];
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            sc0[t][r] = dequantize_scale<half, 16>(uint8_t(ss_cur[t][r]));
+            sc1[t][r] = dequantize_scale<half, 16>(uint8_t(ss_cur[t][r] >> 8));
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (short f = 0; f < TK; f++) {
+          typename Frag::template dtype_frag_t<T> a;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 4; j++) {
+            a[j] = xs0[f / 2][4 * (f % 2) + j];
+            a[4 + j] = T(0);
+          }
+          typename Frag::template dtype_frag_t<Wtype> b[TN];
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            STEEL_PRAGMA_UNROLL
+            for (short r = 0; r < 2; r++) {
+              const uint q = ws_cur[t][r][f / 2] >> (16 * (f % 2));
+              const half sc = (f < 4) ? sc0[t][r] : sc1[t][r];
+              const vec<Wtype, 4> v = dequantize_fp4_x4_scaled<Wtype>(q, sc);
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < 4; j++) {
+                b[t][4 * r + j] = v[j];
+              }
+            }
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t += 2) {
+            Frag::mma(
+                Dtile.frag_at(0, t),
+                Dtile.frag_at(0, t + 1),
+                a,
+                metal::bool_constant<false>{},
+                b[t],
+                b[t + 1],
+                metal::bool_constant<true>{});
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            ws_cur[t][r] = ws_next[t][r];
+            ss_cur[t][r] = ss_next[t][r];
+          }
+        }
+      }
+    } else {
+      for (int k = simd_gid * BK; k < K; k += WK * BK) {
+        vec<T, 8> xs[2][4];
+        STEEL_PRAGMA_UNROLL
+        for (short r = 0; r < 2; r++) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 4; i++) {
+            xs[r][i] = x_rows[r]
+                ? *(const device vec<T, 8>*)(
+                      x + r * 8 * static_cast<int64_t>(K) + k + 8 * i)
+                : vec<T, 8>(0);
+          }
+        }
+        uint4 ws[TN][2];
+        ushort ss[TN][2];
+        half sc0[TN][2];
+        half sc1[TN][2];
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            const int row = 16 * t + 8 * r;
+            ws[t][r] = *(const device uint4*)(
+                wl + row * static_cast<int64_t>(row_bytes) + k / 2);
+            ss[t][r] = *(const device ushort*)(
+                scales + row * static_cast<int64_t>(row_scales) + k / 16);
+            sc0[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r]));
+            sc1[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r] >> 8));
+          }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short f = 0; f < TK; f++) {
+          typename Frag::template dtype_frag_t<T> a;
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) {
+              a[4 * r + j] = xs[r][f / 2][4 * (f % 2) + j];
+            }
+          }
+          typename Frag::template dtype_frag_t<Wtype> b[TN];
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            STEEL_PRAGMA_UNROLL
+            for (short r = 0; r < 2; r++) {
+              const uint q = ws[t][r][f / 2] >> (16 * (f % 2));
+              const half sc = (f < 4) ? sc0[t][r] : sc1[t][r];
+              const vec<Wtype, 4> v = dequantize_fp4_x4_scaled<Wtype>(q, sc);
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < 4; j++) {
+                b[t][4 * r + j] = v[j];
+              }
+            }
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t += 2) {
+            Frag::mma(
+                Dtile.frag_at(0, t),
+                Dtile.frag_at(0, t + 1),
+                a,
+                metal::bool_constant<false>{},
+                b[t],
+                b[t + 1],
+                metal::bool_constant<true>{});
+          }
+        }
+      }
+    }
+  } else {
   for (int k = simd_gid * BK; k < K; k += WK * BK) {
     vec<T, 8> xs[2][4];
     STEEL_PRAGMA_UNROLL
@@ -1204,6 +1591,7 @@ template <
             metal::bool_constant<true>{});
       }
     }
+  }
   }
 
   threadgroup float Ps[(WK - 1) * 16 * BN];

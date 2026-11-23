@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// What the drafter reads from its target. The drafter has no embedding
 /// table and no output head of its own.
@@ -175,8 +176,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
+        Self.requantize8BitLayers(model)
         try MLX.withError { errors in
-            eval(maskEmbedding)
+            var warm = [maskEmbedding]
+            if let textTarget = target as? MuseGlimmerTextModel,
+                model.activationDType == .bfloat16
+            {
+                let (t, conf) = Self.fusedArgMaxAndConfidence(
+                    MLXArray.zeros([1, target.dflashVocabularySize], dtype: .bfloat16),
+                    outputMultiplier: textTarget.configuration.outputMultiplier,
+                    softcap: textTarget.configuration.finalLogitSoftcapping)
+                warm += [t, conf]
+            }
+            eval(warm)
             try errors.check()
         }
     }
@@ -459,10 +471,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         let anchor = target.dflashTokenEmbeddings(tokens.asType(.int32))
         guard anchor.size == c.hiddenSize else { return "embedding" }
-        let block = model.draftBlock(
+        let visible = s.context.visibleContext()
+        let rows = fastDraftBlockRows(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
-            state: s.context)
-        let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
+            at: s.context.nextPosition,
+            context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
+            draftCount: settings.maximumDraftTokens)
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -526,8 +540,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let states = started.map(\.state).filter { $0.refusal == nil }
         guard !states.isEmpty else { return }
         let k = settings.maximumDraftTokens
-        let rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
-            $0[1 ..< (1 + k), 0...]
+        let rows: [MLXArray]
+        if states.count == 1 {
+            let ctx = states[0].context
+            let visible = ctx.visibleContext()
+            rows = [
+                fastDraftBlockRows(
+                    embeddings: blocks[0], at: ctx.nextPosition,
+                    context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
+                    draftCount: k)
+            ]
+        } else {
+            rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
+                $0[1 ..< (1 + k), 0...]
+            }
         }
         let logits = draftHeadProduct(
             rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
@@ -607,39 +633,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return [projected.keys, projected.values]
         }
 
-        // context.append on new wrappers. Slot zero holds a position
-        // congruent to the ring's base position modulo the window: the
-        // first held one before the ring wraps, the base lap's slot zero
-        // after (`heldPositions`).
-        let slotZero = context.heldPositions[0]
-        func slot(_ position: Int) -> Int { ((position - slotZero) % window + window) % window }
-        let keys = ring[0].sharingArray()
-        let values = ring[1].sharingArray()
-        var written = 0
-        while written < n {
-            let at = slot(start + written)
-            let run = min(n - written, window - at)
-            let source = written ..< (written + run)
-            keys[0..., 0..., at ..< (at + run), 0...] =
-                projected.keys[0..., 0..., source, 0...].asType(context.dtype)
-            values[0..., 0..., at ..< (at + run), 0...] =
-                projected.values[0..., 0..., source, 0...].asType(context.dtype)
-            written += run
-        }
         let next = start + n
         let first = max(context.firstPosition, next - window)
         let count = next - first
-        // visibleContext of the appended ring.
-        let held: [Int]
-        if count == window {
-            let oldest = slot(first)
-            held = (0 ..< window).map { first + ($0 - oldest + window) % window }
-        } else {
-            held = Array(first ..< next)
-        }
-        let mask = MuseGlimmerDFlashContextState.visibility(
-            anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
-        ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
 
         // startRound's block and memo from the bonus target as the seed.
         let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
@@ -648,23 +644,86 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.speculation = speculation
             return [projected.keys, projected.values]
         }
-        let block = model.blockForward(
-            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
-            context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
-            mask: mask)
-        let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
+        let rows: MLXArray
+        if context.count + n <= window {
+            // Fast path: ring has not wrapped yet — concatenate existing slice
+            // and projected rows instead of copying the entire 40 MB ring.
+            let existingCount = context.count
+            let ctxKeys = concatenated([
+                ring[0][0..., 0..., 0 ..< existingCount, 0...],
+                projected.keys.asType(context.dtype),
+            ], axis: 2)
+            let ctxValues = concatenated([
+                ring[1][0..., 0..., 0 ..< existingCount, 0...],
+                projected.values.asType(context.dtype),
+            ], axis: 2)
+            let held = Array(first ..< next)
+            let mask = MuseGlimmerDFlashContextState.visibility(
+                anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
+            ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
+            rows = fastDraftBlockRows(
+                embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+                context: (ctxKeys, ctxValues), mask: mask,
+                draftCount: settings.maximumDraftTokens)
+        } else {
+            // context.append on new wrappers. Slot zero holds a position
+            // congruent to the ring's base position modulo the window: the
+            // first held one before the ring wraps, the base lap's slot zero
+            // after (`heldPositions`).
+            let slotZero = context.heldPositions[0]
+            func slot(_ position: Int) -> Int { ((position - slotZero) % window + window) % window }
+            let keys = ring[0].sharingArray()
+            let values = ring[1].sharingArray()
+            var written = 0
+            while written < n {
+                let at = slot(start + written)
+                let run = min(n - written, window - at)
+                let source = written ..< (written + run)
+                keys[0..., 0..., at ..< (at + run), 0...] =
+                    projected.keys[0..., 0..., source, 0...].asType(context.dtype)
+                values[0..., 0..., at ..< (at + run), 0...] =
+                    projected.values[0..., 0..., source, 0...].asType(context.dtype)
+                written += run
+            }
+            // visibleContext of the appended ring.
+            let held: [Int]
+            if count == window {
+                let oldest = slot(first)
+                held = (0 ..< window).map { first + ($0 - oldest + window) % window }
+            } else {
+                held = Array(first ..< next)
+            }
+            let mask = MuseGlimmerDFlashContextState.visibility(
+                anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
+            ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
+            rows = fastDraftBlockRows(
+                embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+                context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
+                mask: mask, draftCount: settings.maximumDraftTokens)
+        }
         // startRound's head: the speculated memo must equal the normal one.
         let logits = draftHeadProduct(rows, readout: false)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             s.speculation = speculation
             return [projected.keys, projected.values]
         }
-        let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
-        // Per-row top-1 probability of the proposal, softmax over the
-        // target's readout scale: exp(max - logsumexp). Advisory only: it
-        // sizes the next verify window and never changes a proposal.
-        let scores = target.dflashReadout(logits).asType(.float32)
-        let confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
+        let memo: (tokens: MLXArray, hidden: MLXArray)
+        let confidence: MLXArray
+        if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
+            let (tokens, conf) = Self.fusedArgMaxAndConfidence(
+                logits,
+                outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+            memo = (tokens: tokens, hidden: rows)
+            confidence = conf
+        } else {
+            memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+            // Per-row top-1 probability of the proposal, softmax over the
+            // target's readout scale: exp(max - logsumexp). Advisory only: it
+            // sizes the next verify window and never changes a proposal.
+            let scores = target.dflashReadout(logits).asType(.float32)
+            confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
+        }
         speculation.memo = memo
         speculation.confidence = confidence
         s.speculation = speculation
@@ -759,6 +818,281 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return target.dflashHeadProduct(rows)
         }
         return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
+    }
+
+    private static let requantLock = NSLock()
+    nonisolated(unsafe) private static var requantizedModels = Set<ObjectIdentifier>()
+
+    /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
+    /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
+    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
+    /// Permitted by the track contract (drafter only proposes tokens; the
+    /// pinned target verifies every emitted token).
+    private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
+        let key = ObjectIdentifier(model)
+        requantLock.lock()
+        let claimed = requantizedModels.insert(key).inserted
+        requantLock.unlock()
+        guard claimed else { return }
+
+        let updates = model.leafModules().compactMapValues { m -> Module? in
+            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+                return nil
+            }
+            let dense = MLX.dequantized(
+                ql.weight, scales: ql.scales, biases: ql.biases,
+                groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
+            let replacement = QuantizedLinear(
+                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+            if let biases = replacement.biases {
+                eval(replacement.weight, replacement.scales, biases)
+            } else {
+                eval(replacement.weight, replacement.scales)
+            }
+            return replacement
+        }
+        model.update(modules: updates)
+    }
+
+    /// One block forward returning only the `draftCount` active draft rows
+    /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
+    /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
+    /// K/V on all `blockSize` rows so attention sees the full block, then
+    /// slices queries, attention, O-proj, MLP and final norm to only the
+    /// `draftCount` active rows (7 instead of 16), cutting final-layer work
+    /// in half with mathematically identical proposals.
+    private func fastDraftBlockRows(
+        embeddings: MLXArray, at position: Int,
+        context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
+        draftCount: Int
+    ) -> MLXArray {
+        let c = model.configuration
+        let block = c.blockSize
+        let scale = 1 / Float(c.headDimensions).squareRoot()
+        let act = embeddings.dtype == model.activationDType
+            ? embeddings : embeddings.asType(model.activationDType)
+        var hidden = act.reshaped([1, block, c.hiddenSize])
+        let lastIndex = model.layers.count - 1
+        for (index, layer) in model.layers.enumerated() {
+            let attention = layer.attention
+            let x = layer.inputNorm(hidden)
+            var keys = MLXFast.RoPE(
+                attention.kNorm(
+                    attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
+                        .transposed(0, 2, 1, 3)),
+                dimensions: c.headDimensions, traditional: false,
+                base: c.ropeTheta, scale: 1, offset: position)
+            var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
+                .transposed(0, 2, 1, 3)
+            if let context {
+                keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+            }
+            if index == lastIndex {
+                let active = 1 ..< (1 + draftCount)
+                let xActive = x[0..., active, 0...]
+                let queries = MLXFast.RoPE(
+                    attention.qNorm(
+                        attention.qProj(xActive).reshaped([
+                            1, draftCount, c.attentionHeads, c.headDimensions,
+                        ]).transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position + 1)
+                let activeMask = mask.map { $0[active, 0...] }
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
+                var h = hidden[0..., active, 0...]
+                    + attention.oProj(
+                        attended.transposed(0, 2, 1, 3).reshaped([
+                            1, draftCount, c.attentionHeads * c.headDimensions,
+                        ]))
+                let mx = layer.postAttentionNorm(h)
+                h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                return model.norm(h).reshaped([draftCount, c.hiddenSize])
+            }
+            let queries = MLXFast.RoPE(
+                attention.qNorm(
+                    attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
+                        .transposed(0, 2, 1, 3)),
+                dimensions: c.headDimensions, traditional: false,
+                base: c.ropeTheta, scale: 1, offset: position)
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+            hidden =
+                hidden
+                + attention.oProj(
+                    attended.transposed(0, 2, 1, 3).reshaped([
+                        1, block, c.attentionHeads * c.headDimensions,
+                    ]))
+            let mx = layer.postAttentionNorm(hidden)
+            hidden =
+                hidden
+                + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+        }
+        return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
+    }
+
+    /// Fused 2-stage split-V argmax + softcapped-readout top-1 probability.
+    /// Replaces 9 separate dispatches (~50 MB traffic) over `[M, V]` logits
+    /// with one read of `logits` (2.8 MB) and a 64-way partial reduction.
+    private static let argMaxConfStage1 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_s1",
+        inputNames: ["logits", "params"],
+        outputNames: ["p_raw", "p_idx", "p_sc", "p_sum"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            constexpr int chunk_size = (V + CHUNKS - 1) / CHUNKS;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+
+            const int start = int(chunk) * chunk_size;
+            const int end = min(V, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + size_t(row) * size_t(V);
+            const bfloat16_t b_mult = bfloat16_t(params[0]);
+            const bfloat16_t b_cap = bfloat16_t(params[1]);
+            const bool has_cap = params[1] > 0.0f;
+
+            float best_raw = -INFINITY;
+            int best_idx = V;
+            float best_sc = -INFINITY;
+            float sum_exp = 0.0f;
+            for (int i = start + int(lid); i < end; i += 256) {
+              const bfloat16_t raw_bf = row_ptr[i];
+              const float raw_f = float(raw_bf);
+              if (raw_f > best_raw || (raw_f == best_raw && i < best_idx)) {
+                best_raw = raw_f;
+                best_idx = i;
+              }
+              bfloat16_t s_bf = raw_bf * b_mult;
+              if (has_cap) {
+                s_bf = bfloat16_t(metal::precise::tanh(float(s_bf / b_cap))) * b_cap;
+              }
+              const float sc = float(s_bf);
+              if (sc > best_sc) {
+                sum_exp = (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sc) + 1.0f) : 1.0f;
+                best_sc = sc;
+              } else {
+                sum_exp += metal::exp(sc - best_sc);
+              }
+            }
+
+            const float sg_raw = simd_max(best_raw);
+            const int sg_idx = simd_min((best_raw == sg_raw) ? best_idx : V);
+            const float sg_sc = simd_max(best_sc);
+            const float sg_sum = simd_sum(
+                (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sg_sc)) : 0.0f);
+
+            threadgroup float sh_raw[8];
+            threadgroup int sh_idx[8];
+            threadgroup float sh_sc[8];
+            threadgroup float sh_sum[8];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw;
+              sh_idx[sg] = sg_idx;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float v_raw = (lane < 8) ? sh_raw[lane] : -INFINITY;
+              const int v_idx = (lane < 8) ? sh_idx[lane] : V;
+              const float v_sc = (lane < 8) ? sh_sc[lane] : -INFINITY;
+              const float v_sum = (lane < 8) ? sh_sum[lane] : 0.0f;
+
+              const float tg_raw = simd_max(v_raw);
+              const int tg_idx = simd_min((v_raw == tg_raw) ? v_idx : V);
+              const float tg_sc = simd_max(v_sc);
+              const float tg_sum = simd_sum(
+                  (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - tg_sc)) : 0.0f);
+
+              if (lane == 0) {
+                const uint out_i = row * uint(CHUNKS) + chunk;
+                p_raw[out_i] = tg_raw;
+                p_idx[out_i] = tg_idx;
+                p_sc[out_i] = tg_sc;
+                p_sum[out_i] = tg_sum;
+              }
+            }
+            """)
+
+    private static let argMaxConfStage2 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_s2",
+        inputNames: ["p_raw", "p_idx", "p_sc", "p_sum"],
+        outputNames: ["tokens", "confidence"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint idx = row * uint(CHUNKS) + lid;
+
+            const float v_raw = p_raw[idx];
+            const int v_idx = p_idx[idx];
+            const float v_sc = p_sc[idx];
+            const float v_sum = p_sum[idx];
+
+            const float sg_raw = simd_max(v_raw);
+            const int sg_idx = simd_min((v_raw == sg_raw) ? v_idx : V);
+            const float sg_sc = simd_max(v_sc);
+            const float sg_sum = simd_sum(
+                (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - sg_sc)) : 0.0f);
+
+            threadgroup float sh_raw[2];
+            threadgroup int sh_idx[2];
+            threadgroup float sh_sc[2];
+            threadgroup float sh_sum[2];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw;
+              sh_idx[sg] = sg_idx;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float f_raw = (lane < 2) ? sh_raw[lane] : -INFINITY;
+              const int f_idx = (lane < 2) ? sh_idx[lane] : V;
+              const float f_sc = (lane < 2) ? sh_sc[lane] : -INFINITY;
+              const float f_sum = (lane < 2) ? sh_sum[lane] : 0.0f;
+
+              const float row_raw = simd_max(f_raw);
+              const int row_idx = simd_min((f_raw == row_raw) ? f_idx : V);
+              const float row_sc = simd_max(f_sc);
+              const float row_sum = simd_sum(
+                  (f_sum > 0.0f) ? (f_sum * metal::exp(f_sc - row_sc)) : 0.0f);
+
+              if (lane == 0) {
+                tokens[row] = row_idx;
+                confidence[row] = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+              }
+            }
+            """)
+
+    private static func fusedArgMaxAndConfidence(
+        _ logits: MLXArray, outputMultiplier: Float, softcap: Float
+    ) -> (tokens: MLXArray, confidence: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let params = MLXArray([outputMultiplier, softcap])
+        let partials = argMaxConfStage1(
+            [logits, params],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks], [rows, chunks]],
+            outputDTypes: [.float32, .int32, .float32, .float32])
+        let out = argMaxConfStage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows]],
+            outputDTypes: [.int32, .float32])
+        return (out[0], out[1])
     }
 
     /// The argmax of the head products, or a selection's proposals over the
