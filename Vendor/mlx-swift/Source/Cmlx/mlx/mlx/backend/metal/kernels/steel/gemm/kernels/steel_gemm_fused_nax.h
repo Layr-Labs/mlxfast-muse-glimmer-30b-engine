@@ -167,6 +167,10 @@ template <
   const short sgp_sn = short(sgp_sn_int);
   const bool is_unaligned_sn = align_N ? false : (sgp_sn != SN);
 
+  if ((!align_M && sgp_sm <= 0) || (!align_N && sgp_sn <= 0)) {
+    return;
+  }
+
   A += transpose_a ? tm : (tm * params->lda);
   B += transpose_b ? (tn * params->ldb) : tn;
   D += tm * params->ldd + tn;

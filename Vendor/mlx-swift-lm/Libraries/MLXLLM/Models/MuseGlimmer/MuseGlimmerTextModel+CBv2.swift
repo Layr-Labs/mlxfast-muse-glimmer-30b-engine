@@ -62,7 +62,10 @@ extension MuseGlimmerTextModel: CBv2ModelCapabilityProviding {
 /// partitioning.
 extension MuseGlimmerCBv2Adapter {
     public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
-        MuseGlimmerDecodeCommandBuffers.limits
+        GPU.CommandBufferLimits(operations: 200, megabytes: 1 << 20)
+    }
+    public var prefillCommandBufferLimits: GPU.CommandBufferLimits? {
+        GPU.CommandBufferLimits(operations: 60, megabytes: 1 << 20)
     }
 }
 

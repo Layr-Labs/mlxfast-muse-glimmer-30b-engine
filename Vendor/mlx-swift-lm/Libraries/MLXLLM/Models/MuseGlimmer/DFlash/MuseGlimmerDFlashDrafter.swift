@@ -607,39 +607,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return [projected.keys, projected.values]
         }
 
-        // context.append on new wrappers. Slot zero holds a position
-        // congruent to the ring's base position modulo the window: the
-        // first held one before the ring wraps, the base lap's slot zero
-        // after (`heldPositions`).
-        let slotZero = context.heldPositions[0]
-        func slot(_ position: Int) -> Int { ((position - slotZero) % window + window) % window }
-        let keys = ring[0].sharingArray()
-        let values = ring[1].sharingArray()
-        var written = 0
-        while written < n {
-            let at = slot(start + written)
-            let run = min(n - written, window - at)
-            let source = written ..< (written + run)
-            keys[0..., 0..., at ..< (at + run), 0...] =
-                projected.keys[0..., 0..., source, 0...].asType(context.dtype)
-            values[0..., 0..., at ..< (at + run), 0...] =
-                projected.values[0..., 0..., source, 0...].asType(context.dtype)
-            written += run
-        }
         let next = start + n
         let first = max(context.firstPosition, next - window)
         let count = next - first
-        // visibleContext of the appended ring.
-        let held: [Int]
-        if count == window {
-            let oldest = slot(first)
-            held = (0 ..< window).map { first + ($0 - oldest + window) % window }
-        } else {
-            held = Array(first ..< next)
-        }
-        let mask = MuseGlimmerDFlashContextState.visibility(
-            anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
-        ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
 
         // startRound's block and memo from the bonus target as the seed.
         let seed = maximum(targetTokens[0 ..< 1, k ..< n].asType(.int32), MLXArray(Int32(0)))
@@ -648,10 +618,63 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.speculation = speculation
             return [projected.keys, projected.values]
         }
-        let block = model.blockForward(
-            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
-            context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
-            mask: mask)
+        let block: MLXArray
+        if context.count + n <= window {
+            // Fast path: ring has not wrapped yet — concatenate existing slice
+            // and projected rows instead of copying the entire 40 MB ring.
+            let existingCount = context.count
+            let ctxKeys = concatenated([
+                ring[0][0..., 0..., 0 ..< existingCount, 0...],
+                projected.keys.asType(context.dtype),
+            ], axis: 2)
+            let ctxValues = concatenated([
+                ring[1][0..., 0..., 0 ..< existingCount, 0...],
+                projected.values.asType(context.dtype),
+            ], axis: 2)
+            let held = Array(first ..< next)
+            let mask = MuseGlimmerDFlashContextState.visibility(
+                anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
+            ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
+            block = model.blockForward(
+                embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+                context: (ctxKeys, ctxValues),
+                mask: mask)
+        } else {
+            // context.append on new wrappers. Slot zero holds a position
+            // congruent to the ring's base position modulo the window: the
+            // first held one before the ring wraps, the base lap's slot zero
+            // after (`heldPositions`).
+            let slotZero = context.heldPositions[0]
+            func slot(_ position: Int) -> Int { ((position - slotZero) % window + window) % window }
+            let keys = ring[0].sharingArray()
+            let values = ring[1].sharingArray()
+            var written = 0
+            while written < n {
+                let at = slot(start + written)
+                let run = min(n - written, window - at)
+                let source = written ..< (written + run)
+                keys[0..., 0..., at ..< (at + run), 0...] =
+                    projected.keys[0..., 0..., source, 0...].asType(context.dtype)
+                values[0..., 0..., at ..< (at + run), 0...] =
+                    projected.values[0..., 0..., source, 0...].asType(context.dtype)
+                written += run
+            }
+            // visibleContext of the appended ring.
+            let held: [Int]
+            if count == window {
+                let oldest = slot(first)
+                held = (0 ..< window).map { first + ($0 - oldest + window) % window }
+            } else {
+                held = Array(first ..< next)
+            }
+            let mask = MuseGlimmerDFlashContextState.visibility(
+                anchor: next, blockSize: context.blockSize, window: window, contextPositions: held
+            ).map { MLXArray($0, [context.blockSize, count + context.blockSize]) }
+            block = model.blockForward(
+                embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+                context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
+                mask: mask)
+        }
         let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
         // startRound's head: the speculated memo must equal the normal one.
         let logits = draftHeadProduct(rows, readout: false)
@@ -955,5 +978,14 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ],
             hostBytes: c.blockSize * (c.slidingWindow + c.blockSize),
             ownerWorking: owner)
+    }
+}
+
+// MARK: - Parameter residency
+
+extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(model) }
+    public func residentParameterArrays() -> [MLXArray] {
+        model.parameters().flattened().map(\.1) + [maskEmbedding]
     }
 }
