@@ -827,9 +827,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
     /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
-    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
-    /// Permitted by the track contract (drafter only proposes tokens; the
-    /// pinned target verifies every emitted token).
+    /// `groupSize: 32` (~335 MB), and the 5-bit `groupSize: 64` MLP
+    /// projections to 4-bit at the same group size (5.5 to 4.5 bits per
+    /// weight: the largest share of the drafter's bytes, read once per
+    /// block). Permitted by the track contract (drafter only proposes
+    /// tokens; the pinned target verifies every emitted token).
     private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
         let key = ObjectIdentifier(model)
         requantLock.lock()
@@ -838,14 +840,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard claimed else { return }
 
         let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+            guard let ql = m as? QuantizedLinear, ql.mode == .affine,
+                ql.bits == 8 || (ql.bits == 5 && ql.groupSize == 64)
+            else {
                 return nil
             }
             let dense = MLX.dequantized(
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
             let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+                weight: dense, bias: ql.bias, groupSize: ql.bits == 8 ? 32 : 64, bits: 4,
+                mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {
