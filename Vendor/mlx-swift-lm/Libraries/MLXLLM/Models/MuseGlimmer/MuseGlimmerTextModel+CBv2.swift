@@ -217,6 +217,8 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        // The q/k launch per (RoPE base, shape) for this forward only.
+        let qk = VerifyFusedQK.Prepared()
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -233,7 +235,8 @@ extension MuseGlimmerTextModel {
             }
             let attention = fusedVerifyAttention(
                 layer.selfAttention, layerIndex: index, layerInput,
-                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
+                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets,
+                qk: qk)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
             let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
@@ -284,7 +287,8 @@ extension MuseGlimmerTextModel {
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
     func fusedVerifyAttention(
         _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
-        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?,
+        qk: VerifyFusedQK.Prepared? = nil
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         guard VerifyFusedQK.enabled,
@@ -296,7 +300,7 @@ extension MuseGlimmerTextModel {
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
         let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
-        let (queries, keys) = VerifyFusedQK.apply(
+        let (queries, keys) = (qk ?? VerifyFusedQK.Prepared())(
             queries: p[0], keys: p[1],
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
             eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,

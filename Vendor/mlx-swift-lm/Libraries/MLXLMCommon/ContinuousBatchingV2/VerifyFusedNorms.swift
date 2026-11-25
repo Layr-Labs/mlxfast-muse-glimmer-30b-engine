@@ -289,19 +289,86 @@ public enum VerifyFusedQK {
         eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float = 1,
         offsets: MLXArray?
     ) -> (queries: MLXArray, keys: MLXArray) {
-        let (b, l) = (queries.dim(0), queries.dim(1))
-        let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) }
-            ?? MLXArray.zeros([1], type: Int32.self)
-        let params = MLXArray([eps, queryScale, log2(ropeBase ?? 1), ropeScale])
-        let out = kernel(
-            [queries, keys, offs, params],
-            template: [
-                ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
-                ("ROPE_", ropeBase != nil), ("OFFB_", offs.size == 1 ? 0 : 1),
-            ],
-            grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
-            outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
-            outputDTypes: [queries.dtype, keys.dtype])
-        return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+        Prepared()(
+            queries: queries, keys: keys, heads: heads, kvHeads: kvHeads, headDim: headDim,
+            eps: eps, queryScale: queryScale, ropeBase: ropeBase, ropeScale: ropeScale,
+            offsets: offsets)
+    }
+
+    /// `apply` with its launch memoized for one verify forward. Every
+    /// argument that shapes the launch or its scalar tensor is the memo key
+    /// (shapes, dtypes, head counts, the offset binding and the exact bits of
+    /// the four FP32 parameters), so a hit binds what `apply` would build for
+    /// that call and a miss builds it. The 52 layers of one forward share the
+    /// activation shape, the q/k norm epsilon and the query scale, and split
+    /// into two RoPE bases (sliding and NoPE): two launches and two scalar
+    /// tensors instead of 52, and one zero offset tensor instead of one per
+    /// NoPE layer. The Metal source, its inputs and outputs are `apply`'s.
+    /// Not thread-safe: one per forward.
+    public final class Prepared {
+        private struct Key: Hashable {
+            let batch: Int
+            let length: Int
+            let heads: Int
+            let kvHeads: Int
+            let headDim: Int
+            let queryDType: DType
+            let keyDType: DType
+            let rope: Bool
+            let offsetsPerRow: Bool
+            let paramBits: [UInt32]
+        }
+
+        private var launches: [Key: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)] =
+            [:]
+        private var zeroOffsets: MLXArray?
+
+        public init() {}
+
+        /// Launch configurations built so far (tests).
+        public var preparedCount: Int { launches.count }
+
+        public func callAsFunction(
+            queries: MLXArray, keys: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
+            eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float = 1,
+            offsets: MLXArray?
+        ) -> (queries: MLXArray, keys: MLXArray) {
+            let (b, l) = (queries.dim(0), queries.dim(1))
+            let offs: MLXArray
+            if let offsets {
+                offs = offsets.dtype == .int32 ? offsets : offsets.asType(.int32)
+            } else if let zeroOffsets {
+                offs = zeroOffsets
+            } else {
+                let made = MLXArray.zeros([1], type: Int32.self)
+                zeroOffsets = made
+                offs = made
+            }
+            let values: [Float] = [eps, queryScale, log2(ropeBase ?? 1), ropeScale]
+            let key = Key(
+                batch: b, length: l, heads: heads, kvHeads: kvHeads, headDim: headDim,
+                queryDType: queries.dtype, keyDType: keys.dtype, rope: ropeBase != nil,
+                offsetsPerRow: offs.size != 1, paramBits: values.map(\.bitPattern))
+            let entry: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)
+            if let hit = launches[key] {
+                entry = hit
+            } else {
+                let made = (
+                    launch: kernel.prepare(
+                        template: [
+                            ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
+                            ("ROPE_", key.rope), ("OFFB_", key.offsetsPerRow ? 1 : 0),
+                        ],
+                        grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
+                        outputDTypes: [queries.dtype, keys.dtype]),
+                    params: MLXArray(values)
+                )
+                launches[key] = made
+                entry = made
+            }
+            let out = entry.launch([queries, keys, offs, entry.params])
+            return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+        }
     }
 }
