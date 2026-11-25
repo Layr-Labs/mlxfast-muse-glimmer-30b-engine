@@ -663,7 +663,11 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     init(flatPrior: Double) {
         let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
         probabilities = Array(repeating: prior, count: Self.maximumDepth)
+        // Start just above the low-acceptance threshold: one poorly accepted
+        // round moves a hard request to short windows, instead of three.
+        roundAcceptanceFraction = Self.initialRoundAcceptanceFraction
     }
+    static let initialRoundAcceptanceFraction = 0.80
 
     /// Records positions whose target outcome was actually observed and, after
     /// a fully accepted round, transfers bounded optimism to the next position.
