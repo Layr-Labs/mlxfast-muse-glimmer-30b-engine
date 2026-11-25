@@ -332,9 +332,13 @@ public enum CBv2SmallProjection {
 
     /// Rows per thread: 2, as the stock schedule (4 measured 1.7x slower at
     /// eight rows: registers).
-    static func rowsPerThread(rows: Int, split: Bool) -> Int {
+    static func rowsPerThread(rows: Int, split: Bool, inputs: Int = 0) -> Int {
         if let o = rowsPerThreadOverride { return split ? o.split : o.flat }
-        return 2
+        // Long K-split rows (MLP down, K = 19,968) at 2 to 5 rows carry at most
+        // 20 chains per lane: four rows per thread put twice the weight bytes in
+        // flight (M4 micro: 1.2x to 1.9x faster at 2 to 4 rows; 6 to 8 rows
+        // never reach this kernel). Same chains, same bytes.
+        return split && inputs >= 16384 && rows <= 5 ? 4 : 2
     }
 
     /// Two codes per bit operation in the weight decode, with the exact
@@ -346,8 +350,8 @@ public enum CBv2SmallProjection {
     /// Weight words loaded ahead, in iterations: none for K-split tiles
     /// (deeper measured slower: registers), 4 (up to 4 rows) or 2 for the
     /// BN = 1 rows (o projection: 32 iterations per lane).
-    static func prefetchDepth(rows: Int, split: Bool) -> Int {
-        split ? 1 : (rows <= 4 ? 4 : 2)
+    static func prefetchDepth(rows: Int, split: Bool, inputs: Int = 0) -> Int {
+        split ? (inputs >= 16384 && rows >= 3 && rows <= 5 ? 2 : 1) : (rows <= 4 ? 4 : 2)
     }
 
     /// Activation rows outermost in the inner loop (same chains).
@@ -396,14 +400,16 @@ public enum CBv2SmallProjection {
             arrays += [layer.weight, layer.graphConstants!.outputScale]
             for run in fp8Runs(layer) {
                 let tm = min(
-                    rowsPerThread(rows: rows, split: run.split), run.rows.count, max(1, 32 / rows))
+                    rowsPerThread(rows: rows, split: run.split, inputs: inputs), run.rows.count,
+                    max(1, 32 / rows))
                 segments.append(
                     FP8Segment(
                         weight: i, row0: run.rows.lowerBound, rows: run.rows.count,
                         input: layers.count == 1 ? 0 : i, output: i,
                         column0: run.rows.lowerBound, outputWidth: layer.outputDimensions,
                         split: run.split, tm: tm,
-                        prefetch: prefetchOverride ?? prefetchDepth(rows: rows, split: run.split)))
+                        prefetch: prefetchOverride
+                            ?? prefetchDepth(rows: rows, split: run.split, inputs: inputs)))
             }
         }
         arrays.append(cast)
