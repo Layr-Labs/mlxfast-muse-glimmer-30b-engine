@@ -176,7 +176,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
-        Self.requantize8BitLayers(model)
+        Self.requantizeDrafter(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -825,35 +825,45 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private static let requantLock = NSLock()
     nonisolated(unsafe) private static var requantizedModels = Set<ObjectIdentifier>()
 
-    /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
-    /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
-    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
+    /// Re-quantizes the drafter in memory on load. The pinned 8-bit attention
+    /// and encoder projections become 4-bit/group-32, and every pinned 5-bit
+    /// MLP projection becomes 3-bit/group-64.
     /// Permitted by the track contract (drafter only proposes tokens; the
     /// pinned target verifies every emitted token).
-    private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
+    private static func requantizeDrafter(_ model: MuseGlimmerDFlashDraftModel) {
         let key = ObjectIdentifier(model)
         requantLock.lock()
         let claimed = requantizedModels.insert(key).inserted
         requantLock.unlock()
         guard claimed else { return }
 
-        let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+        let updates = model.leafModules().flattened().compactMap { path, m -> (String, Module)? in
+            guard let ql = m as? QuantizedLinear, ql.mode == .affine else {
+                return nil
+            }
+            let geometry: (groupSize: Int, bits: Int)
+            switch ql.bits {
+            case 8:
+                geometry = (32, 4)
+            case 5 where path.contains(".mlp."):
+                geometry = (64, 3)
+            default:
                 return nil
             }
             let dense = MLX.dequantized(
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
             let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+                weight: dense, bias: ql.bias, groupSize: geometry.groupSize,
+                bits: geometry.bits, mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {
                 eval(replacement.weight, replacement.scales)
             }
-            return replacement
+            return (path, replacement)
         }
-        model.update(modules: updates)
+        model.update(modules: ModuleChildren.unflattened(updates))
     }
 
     /// One block forward returning only the `draftCount` active draft rows
