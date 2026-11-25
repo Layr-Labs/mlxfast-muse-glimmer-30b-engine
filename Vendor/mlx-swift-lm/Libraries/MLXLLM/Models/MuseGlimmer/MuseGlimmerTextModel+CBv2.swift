@@ -304,10 +304,11 @@ extension MuseGlimmerTextModel {
             offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
-        var output = attending.updateAndAttend(
+        let attended = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
-        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
+        let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions).transposed(0, 2, 1, 3)
+        let output = MuseGlimmerFusion.sigmoidGate([attended, gate])[0]
+            .transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         return verifyOutputProjection(a.outputProj, output)
     }
 }
