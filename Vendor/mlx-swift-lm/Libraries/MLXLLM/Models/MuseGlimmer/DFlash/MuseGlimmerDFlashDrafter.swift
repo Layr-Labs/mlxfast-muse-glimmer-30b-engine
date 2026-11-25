@@ -825,11 +825,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private static let requantLock = NSLock()
     nonisolated(unsafe) private static var requantizedModels = Set<ObjectIdentifier>()
 
-    /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
-    /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
-    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
-    /// Permitted by the track contract (drafter only proposes tokens; the
-    /// pinned target verifies every emitted token).
+    /// Re-quantizes the drafter's linear projections in memory on load:
+    /// 8-bit attention and encoder projections (`encoder.fc` and
+    /// `self_attn.{q,k,v,o}_proj`, ~597 MB) to 4-bit `groupSize: 32`
+    /// (~335 MB), and 5-bit `groupSize: 64` MLP projections to 3-bit
+    /// `groupSize: 64` (5.5 to 3.5 bits per weight, ~36% fewer MLP bytes per
+    /// drafted block). Permitted by the track contract (drafter only proposes
+    /// tokens; the pinned target verifies every emitted token).
     private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
         let key = ObjectIdentifier(model)
         requantLock.lock()
@@ -838,14 +840,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard claimed else { return }
 
         let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+            guard let ql = m as? QuantizedLinear, ql.mode == .affine,
+                ql.bits == 8 || (ql.bits == 5 && ql.groupSize == 64)
+            else {
                 return nil
             }
+            let targetBits = ql.bits == 8 ? 4 : 3
+            let targetGroupSize = ql.bits == 8 ? 32 : 64
             let dense = MLX.dequantized(
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
             let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+                weight: dense, bias: ql.bias, groupSize: targetGroupSize, bits: targetBits,
+                mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {

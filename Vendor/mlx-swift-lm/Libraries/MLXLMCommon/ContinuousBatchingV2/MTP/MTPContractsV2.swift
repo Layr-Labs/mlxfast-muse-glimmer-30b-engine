@@ -167,6 +167,16 @@ public protocol CBv2MTPPrefillSteppableModel: CBv2MTPSteppableModel {
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
+/// Optional fused attention-only prefill refinement returning the exact same
+/// `(logits, lastHidden)` contract as `CBv2MTPPrefillSteppableModel`, or nil
+/// to fall back to `forwardWithHiddenForPrefill`.
+public protocol CBv2FusedMTPPrefillForwarding: CBv2MTPPrefillSteppableModel {
+    func fusedForwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)?
+}
+
 /// Engine-facing recurrent hidden-capture refinement. A recurrent MTP target
 /// is only activated when this seam and request-owned recurrent state are both
 /// present, so no call can silently fall through to the stateless forward.

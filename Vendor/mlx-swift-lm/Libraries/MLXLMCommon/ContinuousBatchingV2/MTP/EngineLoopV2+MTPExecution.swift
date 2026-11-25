@@ -568,6 +568,12 @@ extension EngineLoopV2 {
             } else if mtp.tracksPersistentHistory {
                 let prefill = mtp.model as? any CBv2MTPPrefillSteppableModel
                 let forward = try checkedModelForward(phase: .prefill) {
+                    if let fused = mtp.model as? any CBv2FusedMTPPrefillForwarding,
+                        let result = fused.fusedForwardWithHiddenForPrefill(
+                            tokens: inputs, caches: caches, requirement: requirement)
+                    {
+                        return result
+                    }
                     if let prefill {
                         return prefill.forwardWithHiddenForPrefill(
                             tokens: inputs, caches: caches, requirement: requirement)
