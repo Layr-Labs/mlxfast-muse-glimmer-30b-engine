@@ -269,6 +269,196 @@ public enum CBv2VerifyScales {
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
+    private static let nvfp4GroupedHelper = """
+
+        template <typename T, int V, int K, int N, bool SCALED>
+        inline void cb_sc_nvfp4_tile(
+            const device uint32_t* w, const device uint8_t* scales, const device T* x,
+            float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr int BN = 8;
+            constexpr short TN = 1;
+            constexpr short TM = (V + 7) / 8;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            static_assert(K % BK == 0, "whole chunks only");
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * BN;
+
+            const device T* xr[TM][2];
+            float2 C[TN][TM];
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+                }
+                C[0][mt] = float2(0);
+            }
+            const int row = min(y_col + fm, N - 1);
+            const device uint* wl = (const device uint*)(
+                (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+            const device uint8_t* sl = scales + size_t(row) * row_scales + fn / 4;
+
+            uint qa[4];
+            uint sa[2];
+            float4 xa[4][TM][2];
+            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    qa[block] = wl[b / 8];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xa[block][mt][j] = mo_wo_load4(xr[mt][j] + b);
+                        }
+                    }
+                }
+                sa[0] = uint(sl[k / 16]) | (uint(sl[k / 16 + 2]) << 16);
+                sa[1] = uint(sl[k / 16 + 4]) | (uint(sl[k / 16 + 6]) << 16);
+                half2 hs[2];
+                hs[0] = cb_sc_e4m3x2(sa[0]);
+                hs[1] = cb_sc_e4m3x2(sa[1]);
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const half s = hs[block / 2][block % 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(xa[block][mt][0][i], xa[block][mt][1][i]);
+                        }
+                        const float2 a = mo_wo_pair(qa[block], i, s);
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            mo_wo_mma(C[0][mt], a, bf[mt]);
+                        }
+                    }
+                }
+            }
+
+            constexpr int tile_elems = TN * TM * 2;
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        p[(mt * 2 + j) * 32] = C[0][mt][j];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            C[0][mt][j] += p[(mt * 2 + j) * 32];
+                        }
+                    }
+                }
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        if (8 * mt + fn + j < V) {
+                            device T* yr = y + size_t(8 * mt + fn + j) * N;
+                            const int out = y_col + fm;
+                            if (out < N) {
+                                yr[out] = mo_wo_result<T>(C[0][mt][j], SCALED, tensor_scale0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+    private static func nvfp4GroupedKernel(segments: Int) -> MLXFast.MLXFastKernel {
+        var inputs = [String](), outputs = [String]()
+        var body = """
+            constexpr int TILE_ELEMS = ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+
+            """
+        var offset = "0"
+        for i in 0 ..< segments {
+            inputs += ["w\(i)", "sc\(i)", "ts\(i)"]
+            outputs.append("y\(i)")
+            let tiles = "((N\(i) + 7) / 8)"
+            body += """
+                \(i == 0 ? "" : "else ")if (tg < \(offset) + \(tiles)) {
+                    cb_sc_nvfp4_tile<T, V, K, N\(i), true>(
+                        w\(i), sc\(i), x, ts\(i)[0], y\(i), tg - (\(offset)), sg, sl, partials);
+                }
+
+                """
+            offset += " + \(tiles)"
+        }
+        inputs.append("x")
+        return MLXFast.metalKernel(
+            name: "cbv2_verify_scales_nvfp4_grouped_\(segments)", inputNames: inputs,
+            outputNames: outputs, source: body,
+            header: nvfp4Header + nvfp4GroupedHelper)
+    }
+
+    nonisolated(unsafe) private static let nvfp4GroupedKernels: [Int: MLXFast.MLXFastKernel] = [
+        2: nvfp4GroupedKernel(segments: 2), 4: nvfp4GroupedKernel(segments: 4),
+    ]
+
+    public static func nvfp4Products(
+        _ layers: [ModelOptWeightOnlyNVFP4Linear], _ x: MLXArray
+    ) -> [MLXArray]? {
+        guard let kernel = nvfp4GroupedKernels[layers.count] else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        guard rows > ModelOptWeightOnlyNVFP4RowExact.scalarRows,
+            ModelOptWeightOnlyNVFP4RowExact.supports(rows: rows, inputs: inputs, dtype: x.dtype)
+        else { return nil }
+        var arrays = [MLXArray]()
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs),
+        ]
+        var shapes = [[Int]]()
+        var totalTiles = 0
+        for (i, l) in layers.enumerated() {
+            guard l.inputDimensions == inputs,
+                nvfp4Supports(
+                    rows: rows, inputs: inputs, outputs: l.outputDimensions, dtype: x.dtype),
+                l.weight.dtype == .uint32, l.weight.shape == [l.outputDimensions, inputs / 8],
+                l.weightScale.dtype == .uint8,
+                l.weightScale.shape == [l.outputDimensions, inputs / 16],
+                l.weightScale2.dtype == .float32, l.weightScale2.size == 1
+            else { return nil }
+            let outputs = l.outputDimensions
+            arrays += [l.weight, l.weightScale, l.weightScale2.reshaped(1)]
+            template.append(("N\(i)", outputs))
+            shapes.append([rows, outputs])
+            totalTiles += (outputs + 7) / 8
+        }
+        arrays.append(x.reshaped(rows, inputs))
+        let results = kernel(
+            arrays, template: template,
+            grid: (32, 8 * totalTiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: layers.count))
+        let lead = Array(x.shape.dropLast())
+        return zip(results, layers).map { $0.reshaped(lead + [$1.outputDimensions]) }
+    }
+
     // MARK: FP8
 
     private static let fp8Source = """

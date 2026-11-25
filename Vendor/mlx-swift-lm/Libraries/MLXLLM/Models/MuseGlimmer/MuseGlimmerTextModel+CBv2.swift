@@ -557,8 +557,8 @@ extension MuseGlimmerTextModel {
             if let fp8 = layers as? [ModelOptCalibratedLinear] {
                 routed = CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
-            } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
+            } else if let nv = layers as? [ModelOptWeightOnlyNVFP4Linear] {
+                routed = CBv2VerifyScales.nvfp4Products(nv, x)
                 kind = "nvfp4.qkvg"
             }
             if let routed {
