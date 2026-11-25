@@ -240,20 +240,23 @@ extension MuseGlimmerTextModel {
                 residual: h, x: attention, w1: post.weight, eps1: post.eps,
                 w2: pre.weight, eps2: pre.eps)
             let feed = groupedVerifyFeed(layer.mlp, feedInput)
+            let postFF = layer.postFeedforwardLayerNorm
             if index + 1 < layers.count {
-                let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
                 (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
                     residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
                     w2: next.weight, eps2: next.eps)
+                if capture.contains(index) { captured[index] = h }
             } else {
-                h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
+                let finalNorm = model.norm
+                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                    w2: finalNorm.weight, eps2: finalNorm.eps)
+                if capture.contains(index) { captured[index] = h }
             }
-            if capture.contains(index) { captured[index] = h }
         }
         let parts = capture.map { captured[$0]! }
-        let normed = model.norm(h)
-        return (normed, parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
+        return (layerInput, parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
     }
     func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
         -> (logits: MLXArray, hidden: MLXArray)?
