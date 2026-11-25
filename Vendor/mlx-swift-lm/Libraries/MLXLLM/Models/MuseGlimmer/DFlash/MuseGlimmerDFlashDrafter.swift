@@ -140,6 +140,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    private let fusedGateUp: [QuantizedLinear?]
+    private let fusedKV: [QuantizedLinear?]
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -177,6 +179,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
+        fusedGateUp = model.layers.map { layer in
+            Self.fuseQuantizedPair(layer.mlp.gate, layer.mlp.up)
+        }
+        fusedKV = model.layers.map { layer in
+            Self.fuseQuantizedPair(layer.attention.kProj, layer.attention.vProj)
+        }
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -856,6 +864,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    private static func fuseQuantizedPair(_ a: Linear, _ b: Linear) -> QuantizedLinear? {
+        guard let qa = a as? QuantizedLinear, let qb = b as? QuantizedLinear,
+            qa.bits == qb.bits, qa.groupSize == qb.groupSize, qa.mode == qb.mode,
+            qa.bias == nil, qb.bias == nil, qa.globalScale == nil, qb.globalScale == nil,
+            (qa.biases == nil) == (qb.biases == nil)
+        else { return nil }
+        let w = concatenated([qa.weight, qb.weight], axis: 0)
+        let s = concatenated([qa.scales, qb.scales], axis: 0)
+        let bi: MLXArray? =
+            if let ba = qa.biases, let bb = qb.biases {
+                concatenated([ba, bb], axis: 0)
+            } else {
+                nil
+            }
+        if let bi {
+            eval(w, s, bi)
+        } else {
+            eval(w, s)
+        }
+        return QuantizedLinear(
+            weight: w, bias: nil, scales: s, biases: bi,
+            groupSize: qa.groupSize, bits: qa.bits, mode: qa.mode)
+    }
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -878,14 +910,31 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)
-            var keys = MLXFast.RoPE(
-                attention.kNorm(
-                    attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
-            var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                .transposed(0, 2, 1, 3)
+            var keys: MLXArray
+            var values: MLXArray
+            if let kvProj = fusedKV[index] {
+                let kv = kvProj(x)
+                let kvDim = c.kvHeads * c.headDimensions
+                keys = MLXFast.RoPE(
+                    attention.kNorm(
+                        kv[0..., 0..., 0 ..< kvDim]
+                            .reshaped([1, block, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                values = kv[0..., 0..., kvDim...]
+                    .reshaped([1, block, c.kvHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3)
+            } else {
+                keys = MLXFast.RoPE(
+                    attention.kNorm(
+                        attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3)
+            }
             if let context {
                 keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
                 values = concatenated([context.values[index ..< index + 1], values], axis: 2)
@@ -909,7 +958,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             1, draftCount, c.attentionHeads * c.headDimensions,
                         ]))
                 let mx = layer.postAttentionNorm(h)
-                h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                let mlpAct: MLXArray
+                if let gu = fusedGateUp[index] {
+                    let gateUp = gu(mx)
+                    let inter = c.intermediateSize
+                    mlpAct = compiledSiluProduct(
+                        gateUp[0..., 0..., 0 ..< inter], gateUp[0..., 0..., inter...])
+                } else {
+                    mlpAct = compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx))
+                }
+                h = h + layer.mlp.down(mlpAct)
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
             let queries = MLXFast.RoPE(
@@ -927,9 +985,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         1, block, c.attentionHeads * c.headDimensions,
                     ]))
             let mx = layer.postAttentionNorm(hidden)
-            hidden =
-                hidden
-                + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+            let mlpAct: MLXArray
+            if let gu = fusedGateUp[index] {
+                let gateUp = gu(mx)
+                let inter = c.intermediateSize
+                mlpAct = compiledSiluProduct(
+                    gateUp[0..., 0..., 0 ..< inter], gateUp[0..., 0..., inter...])
+            } else {
+                mlpAct = compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx))
+            }
+            hidden = hidden + layer.mlp.down(mlpAct)
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
