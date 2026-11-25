@@ -911,7 +911,12 @@ enum CBv2MTPMarginalDepthPolicy {
     /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
     /// conservative so estimator noise does not open windows that pay for
     /// rejected rows.
-    static let fixedWindowHeadStepCostRatio = 0.15
+    /// Re-measured on the current frontier: about 1.16 ms per added verify
+    /// row on a ~46 ms serial step (0.025), and about 1.5% of a round per
+    /// added row on the ranked box (our 7e67e048). 0.04 keeps a margin.
+    /// `CBV2_WINDOW_ROW_COST` overrides it.
+    static let fixedWindowHeadStepCostRatio: Double =
+        ProcessInfo.processInfo.environment["CBV2_WINDOW_ROW_COST"].flatMap { Double($0) } ?? 0.04
 
     static func fixedWindowDepth(
         offeredDepth: Int,
