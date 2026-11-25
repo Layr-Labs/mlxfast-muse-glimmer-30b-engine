@@ -214,6 +214,7 @@ extension EngineLoopV2 {
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
             })
         else { return }
+        engineWorkInterval.hostWorkBegan()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.acceptance.readback", seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
