@@ -1482,3 +1482,22 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ownerWorking: owner)
     }
 }
+
+// MARK: - Parameter residency
+
+/// The drafter's own buffers (pinned and re-quantized layers, the
+/// low-acceptance MLP copies) in a residency set beside the target's; the
+/// draft head is the target's and already registered. Memory placement only.
+extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
+    public var residentParameterKey: ObjectIdentifier { ObjectIdentifier(model) }
+    public func residentParameterArrays() -> [MLXArray] {
+        var arrays = model.parameters().flattened().map(\.1)
+        for low in lowMLP {
+            for linear in [low.gate, low.up, low.down] {
+                arrays += [linear.weight, linear.scales]
+                if let biases = linear.biases { arrays.append(biases) }
+            }
+        }
+        return arrays + [maskEmbedding]
+    }
+}
