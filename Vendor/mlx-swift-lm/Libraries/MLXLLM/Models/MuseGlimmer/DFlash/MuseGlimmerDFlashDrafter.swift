@@ -134,6 +134,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     public let settings: Settings
     /// `[1, hiddenSize]`, the target's raw embedding of the mask token.
     private let maskEmbedding: MLXArray
+    /// Low-acceptance rounds' MLP: 3-bit group-32 copies of each layer's pinned 5-bit
+    /// gate, up and down (`CBV2_DRAFTER_LOW_MLP_BITS`, 5 disables). Empty
+    /// when disabled or when a projection is not the pinned affine form.
+    private let lowMLP: [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
     /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
     /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
     /// than the target's row-exact verify kernel: the same E2M1 x E4M3
@@ -177,6 +181,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
+        lowMLP = Self.lowAcceptanceMLP(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -822,6 +827,55 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
     }
 
+    /// Layer `index`'s MLP: the 3-bit group-32 copy while a low-acceptance round
+    /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
+    private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
+        if CBv2DraftRegime.lowAcceptance, index < lowMLP.count {
+            let low = lowMLP[index]
+            return low.down(compiledSiluProduct(low.gate(x), low.up(x)))
+        }
+        return mlp.down(compiledSiluProduct(mlp.gate(x), mlp.up(x)))
+    }
+
+    private static func lowAcceptanceMLP(_ model: MuseGlimmerDFlashDraftModel)
+        -> [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
+    {
+        let bits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_LOW_MLP_BITS"]
+            .flatMap { Int($0) }.map { min(max($0, 2), 5) } ?? 3
+        guard bits < 5 else { return [] }
+        func low(_ linear: Linear) -> QuantizedLinear? {
+            guard let ql = linear as? QuantizedLinear, ql.mode == .affine, ql.bits > bits else {
+                return nil
+            }
+            let dense = MLX.dequantized(
+                ql.weight, scales: ql.scales, biases: ql.biases,
+                groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
+            let copy = QuantizedLinear(
+                weight: dense, bias: ql.bias, groupSize: 32, bits: bits, mode: .affine)
+            eval([copy.weight, copy.scales] + (copy.biases.map { [$0] } ?? []))
+            return copy
+        }
+        var copies: [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)] = []
+        for layer in model.layers {
+            guard let gate = low(layer.mlp.gate), let up = low(layer.mlp.up),
+                let down = low(layer.mlp.down)
+            else { return [] }
+            copies.append((gate, up, down))
+        }
+        // Compile the copies' kernels at load for the block's row counts
+        // (16 rows; 7 active rows in the last layer), not in a timed round.
+        if let first = copies.first {
+            let width = model.configuration.hiddenSize
+            var warm = [MLXArray]()
+            for rows in [model.configuration.blockSize, 7] {
+                let x = MLXArray.zeros([1, rows, width], dtype: model.activationDType)
+                warm.append(first.down(compiledSiluProduct(first.gate(x), first.up(x))))
+            }
+            eval(warm)
+        }
+        return copies
+    }
+
     private static let requantLock = NSLock()
     nonisolated(unsafe) private static var requantizedModels = Set<ObjectIdentifier>()
 
@@ -909,7 +963,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             1, draftCount, c.attentionHeads * c.headDimensions,
                         ]))
                 let mx = layer.postAttentionNorm(h)
-                h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                h = h + draftMLP(index, layer.mlp, mx)
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
             let queries = MLXFast.RoPE(
@@ -929,7 +983,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             let mx = layer.postAttentionNorm(hidden)
             hidden =
                 hidden
-                + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                + draftMLP(index, layer.mlp, mx)
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
