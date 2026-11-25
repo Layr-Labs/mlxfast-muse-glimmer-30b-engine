@@ -306,8 +306,14 @@ extension MuseGlimmerTextModel {
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
-        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
+        // Gate the `[B, L, H, D]` view of the attention output directly: the
+        // elementwise kernel reads it strided and writes contiguous rows, so
+        // the merge to `[B, L, H * D]` is free. Reshaping the transposed view
+        // first materializes a copy per layer (one more dispatch and a full
+        // read and write of the output). Same elements, same expression.
+        let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+        output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
+            .reshaped(batch, length, -1)
         return verifyOutputProjection(a.outputProj, output)
     }
 }
