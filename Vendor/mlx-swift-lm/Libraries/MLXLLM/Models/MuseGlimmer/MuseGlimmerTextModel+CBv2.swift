@@ -460,7 +460,8 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
 ///   (`CBv2VerifyNVFP4`); down: the same, 16-row tiles with a one-chunk
 ///   register prefetch at 7 and 8 rows (`CBv2VerifyNVFP4`), whole-chunk loads
 ///   below (`CBv2VerifyScales`).
-/// - NVFP4 attention q/k/v/gate and o: 8-row tiles with whole-chunk loads
+/// - NVFP4 attention q/k/v/gate: one launch, one segment per projection
+///   (`CBv2VerifyNVFP4`); o: 8-row tiles with whole-chunk loads
 ///   (`CBv2VerifyScales`).
 /// - FP8 attention q/k/v/gate and MLP gate/up (one cast and one product
 ///   launch), o and MLP down up to 5 rows (one launch for all eager tiles):
@@ -552,7 +553,11 @@ extension MuseGlimmerTextModel {
                 routed = CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
+                // One launch for the whole group (the MLP gate/up tile, one
+                // segment per projection); the per-projection launches when
+                // the group is not taken. Both are the row-exact product.
+                routed = CBv2VerifyNVFP4.products(layers, x)
+                    ?? CBv2VerifyScales.products(layers, x)
                 kind = "nvfp4.qkvg"
             }
             if let routed {
