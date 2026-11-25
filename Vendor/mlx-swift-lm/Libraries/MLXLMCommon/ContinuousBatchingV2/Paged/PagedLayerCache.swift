@@ -685,6 +685,112 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return finishAttentionCall(output)
     }
 
+    public func updateAndAttendGatedVerify(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        gate: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        guard sinks == nil, mtpSerializesRectangularAttention, mtpBatchesRectangularColumnsAsRows,
+            !usesGatheredNativeDecode, pool.groupKey(forLayer: layerIndex).quantization == nil,
+            kind.sharesKVWithLayer == nil,
+            PagedOnePassAttention.enabled, !segmentDecodeReference,
+            !PagedOnePassAttention.checks
+        else { return nil }
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex)
+        else { return nil }
+        let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+        guard b == pagedRows.count,
+            (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !pagedRows.isEmpty,
+            !pool.usesStepOwnedAttention, !pool.writeValidation.isFaulted,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            boundSpanContext == nil, attentionMetadata == nil, attentionPacket == nil,
+            keys.dim(0) == b, keys.dim(2) == l, values.shape == keys.shape,
+            gate.shape == [b, l, qh * d],
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: l, layerIndex: layerIndex),
+            validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: nil)
+        else { return nil }
+        let group = pool.group(pagedRows[0].groupKey)
+        let kvh = group.key.kvHeads
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil,
+            keys.dtype == group.dtype, values.dtype == group.dtype,
+            d == group.key.headDim, qh % kvh == 0,
+            pagedRows.allSatisfy({ row in
+                row.groupKey == pagedRows[0].groupKey && !row.isReleased
+                    && row.absoluteOffset >= row.frozenHighWater
+                    && row.absoluteOffset + l <= row.maxLength
+                    && (row.windowSize == nil
+                        || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
+            })
+        else { return nil }
+        let gqa = qh / kvh
+        guard let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa) else {
+            return nil
+        }
+        let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
+        let splits = gqa / hpt
+        let maxAttend = pagedRows.map { row in
+            let end = row.absoluteOffset + l
+            if let w = row.windowSize { return min(end, w) }
+            return end
+        }.max() ?? 0
+        let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
+            PagedAttentionKernel.partitionTokensForDispatch(
+                maxAttendLength: maxAttend, batch: b * l, kvHeads: kvh,
+                headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
+        let maxPartitions = max(1, (maxAttend + ptok - 1) / ptok)
+        guard PagedOnePassAttention.eligible(
+            headDim: d, gqa: gqa, simdgroups: nsg, partitions: maxPartitions, rows: b * l) != nil
+        else { return nil }
+        guard let segmentLayout = group.segmentLayout else { return nil }
+        let segmentCount = Set(pagedRows.flatMap { row in
+            row.table.map { segmentLayout.segmentIndex(page: $0) }
+        }).count
+        guard segmentCount <= PagedSegmentDispatchPlan.maximumBindings else { return nil }
+        guard beginAttentionWork(queries: queries, rows: pagedRows) else { return nil }
+        defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        for (index, row) in pagedRows.enumerated() {
+            row.write(keys: keys[index], values: values[index])
+        }
+        guard !pool.writeValidation.isFaulted else {
+            advancePositionOffsets(by: l)
+            return finishAttentionCall(faultOutput(queries)).transposed(0, 2, 1, 3).reshaped(b, l, -1)
+        }
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(b * l)
+        for row in pagedRows {
+            for t in 0 ..< l {
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        }
+        let result = PagedSegmentAttention.decode(
+            queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
+            newKeys: nil, newValues: nil, group: group, rows: descriptors,
+            sinks: nil, params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: pool.segmentSeqinfo,
+            mergeScratch: columnsAsRowsScratch,
+            gate: gate.reshaped(b * l, qh, d))
+        mtpColumnsAsRowsCalls += 1
+        let merged = result.reshaped(b, l, qh * d)
+        let output = merged.dtype == queries.dtype ? merged : merged.asType(queries.dtype)
+        advancePositionOffsets(by: l)
+        return finishAttentionCall(output)
+    }
+
     /// Whether `writePromptKVWithoutAttention` may stand in for this layer's
     /// prompt-chunk `updateAndAttend`: plain native K/V whose attention call
     /// carries nothing beyond the write and the offset advance — no quantized

@@ -134,7 +134,13 @@ public enum PagedOnePassAttention {
                 valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
                 kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                 partitionTokens: ptok, softcap: softcap, source: source)
-            outputs += [result.fence, result.out]
+            let gated = segments(
+                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                seqinfo: seqinfo, params: params, previous: previous,
+                valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                partitionTokens: ptok, softcap: softcap, source: source, gate: q)
+            outputs += [result.fence, result.out, gated.fence, gated.out]
         }
         eval(outputs)
     }
@@ -185,8 +191,9 @@ public enum PagedOnePassAttention {
 
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
-    private static func segmentBody(bindings: Int) -> String {
+    private static func segmentBody(bindings: Int, gated: Bool) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        let gateArg = gated ? ", gate" : ", (const device T*)nullptr"
         return """
             const int row = threadgroup_position_in_grid.y;
             int first = 0;
@@ -205,10 +212,10 @@ public enum PagedOnePassAttention {
             \(scratch)
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
-                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, HAS_GATE>(
                 q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
-                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup\(gateArg));
             """
     }
 
@@ -270,38 +277,47 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, gate: MLXArray? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
         let bindings = backing.count
+        let hasGate = gate != nil
         let kernelName =
             name(
-                "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
-                gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                "segments\(bindings)_kvh\(kvHeads)\(hasGate ? "_gated" : "")", dtype: dtype,
+                headDim: d, pageSize: pageSize, gqa: gqa, hpt: hpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap)
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
                 FileHandle.standardError.write(Data("[onepass] new kernel \(kernelName)\n".utf8))
             }
+            let inputNames =
+                ["q"] + (0 ..< bindings).map { "segment\($0)" }
+                + ["seqinfo", "params", "previous", "value_offsets", "records"]
+                + (hasGate ? ["gate"] : [])
             let made = MLXFast.metalKernel(
                 name: kernelName,
-                inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
-                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
-                outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
+                inputNames: inputNames,
+                outputNames: ["fence", "out"],
+                source: segmentBody(bindings: bindings, gated: hasGate),
                 header: source, ensureRowContiguous: true)
             kernels[kernelName] = made
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
+        let inputs =
+            [queries] + backing + [seqinfo, params, previous, valueOffsets, records]
+            + (gate.map { [$0] } ?? [])
         let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
+            inputs,
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
                 ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
                 ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
                 ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                ("HAS_GATE", hasGate),
             ],
             // The probe asks for the same thread count as one (tg / 2, 2, 1)
             // threadgroup: MLX accepts that shape only when the pipeline

@@ -130,7 +130,8 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        gate: MLXArray? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -180,12 +181,13 @@ enum PagedSegmentAttention {
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
             backing.append(
                 contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
+            let gateInput: MLXArray? = gate.map { $0.dtype == dtype ? $0 : $0.asType(dtype) }
             let result = PagedOnePassAttention.segments(
                 queries: q, backing: backing, seqinfo: seqinfo, params: params,
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, gate: gateInput)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
@@ -268,11 +270,15 @@ enum PagedSegmentAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
-        return mergeKernel(key: mergeKey, source: source)(
+        var out = mergeKernel(key: mergeKey, source: source)(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+        if let gate {
+            out = out * sigmoid(gate.dtype == dtype ? gate : gate.asType(dtype))
+        }
+        return out
     }
 }
 
