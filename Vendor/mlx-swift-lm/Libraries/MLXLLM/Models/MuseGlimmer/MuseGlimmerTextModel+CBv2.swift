@@ -217,6 +217,10 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        // Both boundaries pair a post-sublayer norm with a pre-sublayer norm.
+        // The tower config fixes their epsilons; each call binds its own weights.
+        let addNormNorm = VerifyFusedNorms.PreparedAddNormNorm(
+            like: h, eps1: configuration.postNormEps, eps2: configuration.rmsNormEps)
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -236,16 +240,14 @@ extension MuseGlimmerTextModel {
                 cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
-            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
-                residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                w2: pre.weight, eps2: pre.eps)
+            let (mid, feedInput) = addNormNorm(
+                residual: h, x: attention, w1: post.weight, w2: pre.weight)
             let feed = groupedVerifyFeed(layer.mlp, feedInput)
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
-                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
-                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                    w2: next.weight, eps2: next.eps)
+                (h, layerInput) = addNormNorm(
+                    residual: mid, x: feed, w1: postFF.weight, w2: next.weight)
             } else {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
@@ -306,8 +308,14 @@ extension MuseGlimmerTextModel {
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
-        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        output = MuseGlimmerFusion.sigmoidGate([output, p[3]])[0]
+        // Gate the `[B, L, H, D]` view of the attention output directly: the
+        // elementwise kernel reads it strided and writes contiguous rows, so
+        // the merge to `[B, L, H * D]` is free. Reshaping the transposed view
+        // first materializes a copy per layer (one more dispatch and a full
+        // read and write of the output). Same elements, same expression.
+        let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+        output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
+            .reshaped(batch, length, -1)
         return verifyOutputProjection(a.outputProj, output)
     }
 }

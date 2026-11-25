@@ -211,9 +211,43 @@ package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXAr
     return (outputs[0], outputs[1])
 }
 
+// The rounded readout is a scalar function of a BF16 bit pattern and two model
+// parameters. Build its full image on the GPU when one call can amortize it.
+private let cbv2ReadoutHeader = """
+    inline bfloat16_t cbv2_readout_scalar(bfloat16_t raw, float multiplier, float softcap) {
+        const bfloat16_t mult = bfloat16_t(multiplier);
+        const bfloat16_t cap = bfloat16_t(softcap);
+        bfloat16_t s = raw * mult;
+        if (softcap > 0.0f) {
+            bfloat16_t q = s / cap;
+            bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
+            s = t * cap;
+        }
+        return s;
+    }
+
+    template <bool UseTable, typename T>
+    inline float cbv2_readout_value(bfloat16_t raw, const device T* transform) {
+        if constexpr (UseTable) {
+            return float(transform[as_type<ushort>(raw)]);
+        } else {
+            return float(cbv2_readout_scalar(raw, transform[0], transform[1]));
+        }
+    }
+    """
+
+private let cbv2ReadoutTableKernel = MLXFast.metalKernel(
+    name: "cbv2_readout_bf16_table",
+    inputNames: ["params"], outputNames: ["table"],
+    source: """
+        const uint bits = thread_position_in_grid.x;
+        table[bits] = cbv2_readout_scalar(as_type<bfloat16_t>(ushort(bits)), params[0], params[1]);
+        """,
+    header: cbv2ReadoutHeader)
+
 private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
     name: "cbv2_fused_readout_top2_s1",
-    inputNames: ["raw_logits", "params"],
+    inputNames: ["raw_logits", "transform"],
     outputNames: ["partial_ids", "partial_values", "partial_nf"],
     source: """
         constexpr uint CHUNKS = 64;
@@ -225,10 +259,6 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         const uint start = chunk * chunk_size;
         const uint end = min(vocab, start + chunk_size);
 
-        const bfloat16_t mult = bfloat16_t(params[0]);
-        const bfloat16_t cap = bfloat16_t(params[1]);
-        const bool has_cap = params[1] > 0.0f;
-
         const device bfloat16_t* row_ptr = raw_logits + ulong(row) * ulong(vocab);
         darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
         uint local_nf = 0u;
@@ -237,13 +267,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         const uint end4 = end & ~3u;
         if (lid == 0) {
             for (uint i = start; i < min(start4, end); i++) {
-                bfloat16_t s = row_ptr[i] * mult;
-                if (has_cap) {
-                    bfloat16_t q = s / cap;
-                    bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                    s = t * cap;
-                }
-                float fv = float(s);
+                float fv = cbv2_readout_value<USE_TABLE_>(row_ptr[i], transform);
                 if (!isfinite(fv)) { local_nf = 1u; }
                 darkbloom_qwen35_mtp_top2_insert(local, fv, i);
             }
@@ -257,13 +281,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
                 const uint base_i = start4 + (j << 2);
                 #pragma unroll
                 for (uint k = 0; k < 4; k++) {
-                    bfloat16_t s = v[k] * mult;
-                    if (has_cap) {
-                        bfloat16_t q = s / cap;
-                        bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                        s = t * cap;
-                    }
-                    float fv = float(s);
+                    float fv = cbv2_readout_value<USE_TABLE_>(v[k], transform);
                     if (!isfinite(fv)) { local_nf = 1u; }
                     darkbloom_qwen35_mtp_top2_insert(local, fv, base_i + k);
                 }
@@ -272,13 +290,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         if (lid == 0) {
             const uint tail_start = max(start4, end4);
             for (uint i = tail_start; i < end; i++) {
-                bfloat16_t s = row_ptr[i] * mult;
-                if (has_cap) {
-                    bfloat16_t q = s / cap;
-                    bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                    s = t * cap;
-                }
-                float fv = float(s);
+                float fv = cbv2_readout_value<USE_TABLE_>(row_ptr[i], transform);
                 if (!isfinite(fv)) { local_nf = 1u; }
                 darkbloom_qwen35_mtp_top2_insert(local, fv, i);
             }
@@ -323,7 +335,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
             partial_nf[row * CHUNKS + chunk] = int(nf_scratch[0]);
         }
     """,
-    header: cbv2TopTwoHeader
+    header: cbv2TopTwoHeader + "\n" + cbv2ReadoutHeader
 )
 
 private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
@@ -385,10 +397,20 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
     precondition(rows > 0 && vocab >= 2)
     let chunks = 64
     let params = MLXArray([outputMultiplier, softcap])
+    let tableSize = 1 << 16
+    let useTable = softcap > 0 && rawProduct.size >= 2 * tableSize
+    let transform: MLXArray
+    if useTable {
+        transform = cbv2ReadoutTableKernel(
+            [params], grid: (tableSize, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tableSize]], outputDTypes: [.bfloat16])[0]
+    } else {
+        transform = params
+    }
     let flat = rawProduct.reshaped([rows, vocab])
     let partials = cbv2FusedReadoutTopTwoStage1(
-        [flat, params],
-        template: [("V_", vocab)],
+        [flat, transform],
+        template: [("V_", vocab), ("USE_TABLE_", useTable)],
         grid: (256 * chunks, rows, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],

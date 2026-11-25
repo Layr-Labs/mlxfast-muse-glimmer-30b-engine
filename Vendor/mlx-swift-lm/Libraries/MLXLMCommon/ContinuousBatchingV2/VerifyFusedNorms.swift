@@ -170,22 +170,36 @@ public enum VerifyFusedNorms {
         outputNames: ["h", "y"],
         source: source, header: header)
 
-    /// `(residual + centeredRMSNorm(x, w1, eps1), centeredRMSNorm(that, w2, eps2))`.
-    /// `residual` and `x` are `[..., width]` BF16 with fewer than 32 rows.
+    /// Reusable within a forward whose layers share the activation shape and norm epsilons.
+    public struct PreparedAddNormNorm {
+        private let launch: MLXFast.MLXFastKernel.Launch
+        private let params: MLXArray
+
+        public init(like x: MLXArray, eps1: Float, eps2: Float) {
+            let width = x.dim(-1)
+            let rows = x.size / width
+            let tg = threadgroupSize(width: width)
+            let blocks = width / (tg * readsPerThread)
+            params = MLXArray([Float(1.0 / Double(width)), eps1, eps2])
+            launch = kernel.prepare(
+                template: [("D_", width), ("BLOCKS_", blocks)],
+                grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
+        }
+
+        public func callAsFunction(residual: MLXArray, x: MLXArray, w1: MLXArray, w2: MLXArray)
+            -> (h: MLXArray, y: MLXArray)
+        {
+            let out = launch([residual, x, w1, w2, params])
+            return (out[0], out[1])
+        }
+    }
+
     public static func fusedAddNormNorm(
         residual: MLXArray, x: MLXArray, w1: MLXArray, eps1: Float, w2: MLXArray, eps2: Float
     ) -> (h: MLXArray, y: MLXArray) {
-        let width = x.dim(-1)
-        let rows = x.size / width
-        let tg = threadgroupSize(width: width)
-        let blocks = width / (tg * readsPerThread)
-        let params = MLXArray([Float(1.0 / Double(width)), eps1, eps2])
-        let out = kernel(
-            [residual, x, w1, w2, params],
-            template: [("D_", width), ("BLOCKS_", blocks)],
-            grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
-        return (out[0], out[1])
+        PreparedAddNormNorm(like: x, eps1: eps1, eps2: eps2)(
+            residual: residual, x: x, w1: w1, w2: w2)
     }
 }
 
