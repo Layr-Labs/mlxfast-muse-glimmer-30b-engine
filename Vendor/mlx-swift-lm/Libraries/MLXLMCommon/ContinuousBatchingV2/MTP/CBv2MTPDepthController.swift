@@ -911,7 +911,7 @@ enum CBv2MTPMarginalDepthPolicy {
     /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
     /// conservative so estimator noise does not open windows that pay for
     /// rejected rows.
-    static let fixedWindowHeadStepCostRatio = 0.15
+    static let fixedWindowHeadStepCostRatio = 0.065
 
     static func fixedWindowDepth(
         offeredDepth: Int,
