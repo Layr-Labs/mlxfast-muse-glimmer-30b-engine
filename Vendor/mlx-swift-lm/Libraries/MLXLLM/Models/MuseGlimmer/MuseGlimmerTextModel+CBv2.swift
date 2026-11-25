@@ -409,6 +409,19 @@ extension MuseGlimmerTextModel {
     }
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
+        if verifyRows(x) != nil,
+            let activated = CBv2VerifyNVFP4.siluGateUpProduct(
+                gate: mlp.gateProj, up: mlp.upProj, x)
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let stock = compiledSiluProduct(
+                    numerics.project(mlp.gateProj, x), numerics.project(mlp.upProj, x))
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [activated], [stock], kind: "nvfp4.silu_gate_up",
+                    rows: MuseGlimmerNumerics.rows(x))
+            }
+            return verifyDownProjection(mlp.downProj, activated)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
@@ -740,7 +753,14 @@ extension MuseGlimmerTextModel {
                     switch site {
                     case "qkvg": outputs += verifyAttentionProjections(group, x)
                     case "o": outputs.append(verifyOutputProjection(group[0], x))
-                    case "gate_up": outputs += verifyFeedInputProjections(group, x)
+                    case "gate_up":
+                        if let activated = CBv2VerifyNVFP4.siluGateUpProduct(
+                            gate: group[0], up: group[1], x)
+                        {
+                            outputs.append(activated)
+                        } else {
+                            outputs += verifyFeedInputProjections(group, x)
+                        }
                     default: outputs.append(verifyDownProjection(group[0], x))
                     }
                 }

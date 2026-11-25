@@ -12,13 +12,17 @@ enum PagedSegmentTransfers {
         const int token = records[r * 3];
         const int page = records[r * 3 + 1];
         const int slot = records[r * 3 + 2];
-        const int n = keys_shape[1];
         if (page > 0) {
-            const size_t source = ((size_t)h * n + token) * D + d;
+            // Verify hands us [head, token, dim] views of token-major projections.
+            // Read the views directly instead of staging two head-major copies.
+            const int64_t k = int64_t(h) * keys_strides[0]
+                + int64_t(token) * keys_strides[1] + int64_t(d) * keys_strides[2];
+            const int64_t v = int64_t(h) * values_strides[0]
+                + int64_t(token) * values_strides[1] + int64_t(d) * values_strides[2];
             const size_t target = (((size_t)page * H + h) * S + slot) * D + d;
             device T* destination = storage;
-            destination[target] = keys[source];
-            destination[VBASE + target] = values[source];
+            destination[target] = keys[k];
+            destination[VBASE + target] = values[v];
         }
         if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
         """
@@ -74,7 +78,7 @@ enum PagedSegmentTransfers {
                     : (reading
                         ? PagedQuantizedTransfers.readBody : PagedQuantizedTransfers.writeBody),
                 header: quantization == nil ? "" : PagedQuantizedMetal.header,
-                ensureRowContiguous: quantization == nil,
+                ensureRowContiguous: reading && quantization == nil,
                 mutableInputs: [reading ? "output" : "storage"])
             kernels[key] = made
             return made

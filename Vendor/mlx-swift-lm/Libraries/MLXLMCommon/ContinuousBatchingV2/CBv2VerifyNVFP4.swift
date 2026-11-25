@@ -222,6 +222,168 @@ public enum CBv2VerifyNVFP4 {
         }
         """
 
+    static let siluGateUpTileHelper = """
+
+        template <typename T>
+        inline T cbv2_vn_silu_product(T g, T u) {
+            // Match unary_ops.h::Sigmoid without narrowing the positive branch's
+            // reciprocal before the subtraction. The graph rounds at each
+            // primitive's T return: sigmoid, then its two multiplies.
+            const auto y = 1 / (1 + metal::precise::exp(metal::abs(g)));
+            const T sig = (g < 0) ? y : 1 - y;
+            const T silu = g * sig;
+            return silu * u;
+        }
+
+        template <typename T, int V, int K, int N, int TN>
+        inline void cbv2_vn_silu_gate_up_tile(
+            const device uint32_t* wg, const device uint8_t* scg, float tsg,
+            const device uint32_t* wu, const device uint8_t* scu, float tsu,
+            const device T* x, device T* y, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr short TM = (V + 7) / 8;
+            constexpr int ROWS = 8 * TN;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            static_assert(K % BK == 0, "whole chunks only");
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * ROWS;
+
+            const device T* xr[TM][2];
+            float2 Cg[TN][TM];
+            float2 Cu[TN][TM];
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+                }
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    Cg[t][mt] = float2(0);
+                    Cu[t][mt] = float2(0);
+                }
+            }
+            const device uint* wlg[TN];
+            const device uint8_t* slg[TN];
+            const device uint* wlu[TN];
+            const device uint8_t* slu[TN];
+            MO_WO_UNROLL
+            for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wlg[t] = (const device uint*)(
+                    (const device uint8_t*)wg + size_t(row) * row_bytes + 2 * fn);
+                slg[t] = scg + size_t(row) * row_scales + fn / 4;
+                wlu[t] = (const device uint*)(
+                    (const device uint8_t*)wu + size_t(row) * row_bytes + 2 * fn);
+                slu[t] = scu + size_t(row) * row_scales + fn / 4;
+            }
+
+            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    ushort4 xv[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                    uint qg[TN];
+                    half sg_h[TN];
+                    uint qu[TN];
+                    half su_h[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        qg[t] = wlg[t][b / 8];
+                        sg_h[t] = mo_wo_e4m3(slg[t][b / 16]);
+                        qu[t] = wlu[t][b / 8];
+                        su_h[t] = mo_wo_e4m3(slu[t][b / 16]);
+                    }
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(
+                                float(as_type<bfloat>(xv[mt][0][i])),
+                                float(as_type<bfloat>(xv[mt][1][i])));
+                        }
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            const float2 ag = mo_wo_pair(qg[t], i, sg_h[t]);
+                            const float2 au = mo_wo_pair(qu[t], i, su_h[t]);
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                mo_wo_mma(Cg[t][mt], ag, bf[mt]);
+                                mo_wo_mma(Cu[t][mt], au, bf[mt]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            constexpr int tile_elems = TN * TM * 2;
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * (2 * tile_elems) * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            const int slot = (t * TM + mt) * 2 + j;
+                            p[slot * 32] = Cg[t][mt][j];
+                            p[(tile_elems + slot) * 32] = Cu[t][mt][j];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * (2 * tile_elems) * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                const int slot = (t * TM + mt) * 2 + j;
+                                Cg[t][mt][j] += p[slot * 32];
+                                Cu[t][mt][j] += p[(tile_elems + slot) * 32];
+                            }
+                        }
+                    }
+                }
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        if (8 * mt + fn + j < V) {
+                            device T* yr = y + size_t(8 * mt + fn + j) * N;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const int out = y_col + fm + 8 * t;
+                                if (out < N) {
+                                    const T g_val = mo_wo_result<T>(Cg[t][mt][j], true, tsg);
+                                    const T u_val = mo_wo_result<T>(Cu[t][mt][j], true, tsu);
+                                    yr[out] = cbv2_vn_silu_product<T>(g_val, u_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
     /// Segment `i` takes tiles `[sum of tiles before, + ceil(N_i / (8 * TN)))`
     /// of the grid's y axis.
     private static func kernel(segments: Int) -> MLXFast.MLXFastKernel {
@@ -258,6 +420,24 @@ public enum CBv2VerifyNVFP4 {
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
         1: kernel(segments: 1), 2: kernel(segments: 2),
     ]
+
+    nonisolated(unsafe) private static let siluGateUpKernel: MLXFast.MLXFastKernel = {
+        let body = """
+            constexpr int TILE_ELEMS = TN * ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * 2 * TILE_ELEMS * 32];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+            cbv2_vn_silu_gate_up_tile<T, V, K, N0, TN>(
+                w0, sc0, ts0[0], w1, sc1, ts1[0], x, y0, tg, sg, sl, partials);
+            """
+        return MLXFast.metalKernel(
+            name: "cbv2_verify_nvfp4_row_exact_silu_gate_up",
+            inputNames: ["w0", "sc0", "ts0", "w1", "sc1", "ts1", "x"],
+            outputNames: ["y0"],
+            source: body,
+            header: ModelOptWeightOnlyNVFP4RowExact.header + siluGateUpTileHelper)
+    }()
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
@@ -351,6 +531,44 @@ public enum CBv2VerifyNVFP4 {
             outputShapes: shapes, outputDTypes: [x.dtype, x.dtype])
         let lead = Array(x.shape.dropLast())
         return zip(results, nv).map { $0.reshaped(lead + [$1.weight.dim(0)]) }
+    }
+
+    public static func siluGateUpProduct(
+        gate: any UnaryLayer, up: any UnaryLayer, _ x: MLXArray
+    ) -> MLXArray? {
+        guard let gLayer = gate as? ModelOptWeightOnlyNVFP4Linear,
+            let uLayer = up as? ModelOptWeightOnlyNVFP4Linear
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        let outputs = gLayer.weight.dim(0)
+        guard outputs == uLayer.weight.dim(0),
+            gLayer.inputDimensions == inputs,
+            uLayer.inputDimensions == inputs,
+            supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            takes(weight: gLayer.weight, blockScales: gLayer.weightScale,
+                tensorScale: gLayer.weightScale2, inputs: inputs),
+            takes(weight: uLayer.weight, blockScales: uLayer.weightScale,
+                tensorScale: uLayer.weightScale2, inputs: inputs)
+        else { return nil }
+        let g = geometry(rows: rows, inputs: inputs)
+        guard g.prefetch == 0 else { return nil }
+        let tile = 8 * g.fragments
+        let tiles = (outputs + tile - 1) / tile
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("N0", outputs),
+        ]
+        let result = siluGateUpKernel(
+            [
+                gLayer.weight, gLayer.weightScale, gLayer.weightScale2.reshaped(1),
+                uLayer.weight, uLayer.weightScale, uLayer.weightScale2.reshaped(1),
+                x.reshaped(rows, inputs),
+            ],
+            template: template,
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
+        return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
     /// Compiles the kernels for rows 1 to 8 of these MLP layers (gate and up
