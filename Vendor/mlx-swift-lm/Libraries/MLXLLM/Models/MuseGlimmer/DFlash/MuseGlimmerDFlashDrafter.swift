@@ -478,7 +478,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: settings.maximumDraftTokens)
+            draftCount: settings.maximumDraftTokens, rampSubmission: Self.rampsSubmission)
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -866,7 +866,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        draftCount: Int, rampSubmission: Bool = false
     ) -> MLXArray {
         let c = model.configuration
         let block = c.blockSize
@@ -930,9 +930,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             hidden =
                 hidden
                 + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+            if rampSubmission, index == 0 {
+                // Submit the round's first layer (with the context commit and
+                // block embedding before it) as its own command buffer, so the
+                // GPU starts the drafter while the rest of the block and the
+                // head are still being built and encoded. Same operations,
+                // same kernels: only the command-buffer partition moves.
+                asyncEval(hidden)
+            }
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
+
+    /// `MUSE_CRIT=0` (or `MUSE_CRIT_DRAFT=0`) restores one submission for the
+    /// whole drafter round (block and head); otherwise layer 0 is submitted
+    /// first (see `fastDraftBlockRows`). Read once.
+    static let rampsSubmission: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return env["MUSE_CRIT"] != "0" && env["MUSE_CRIT_DRAFT"] != "0"
+    }()
 
     /// Fused 2-stage split-V argmax + softcapped-readout top-1 probability.
     /// Replaces 9 separate dispatches (~50 MB traffic) over `[M, V]` logits

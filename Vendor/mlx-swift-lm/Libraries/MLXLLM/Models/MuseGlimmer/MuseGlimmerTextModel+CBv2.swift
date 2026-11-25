@@ -250,11 +250,31 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
+            if index + 1 == Self.verifyRampLayers {
+                // Submit the first layers while the others' graph is still
+                // being built: the GPU starts the verify as soon as the
+                // drafter ends instead of waiting for the whole build and the
+                // first buffer's encode, and runs these layers while the host
+                // builds the rest. Same operations and kernels; only the
+                // command-buffer partition moves.
+                asyncEval(h, layerInput)
+            }
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
         return (normed, parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
     }
+
+    /// How many leading verify layers are submitted as their own command
+    /// buffers during the build: `MUSE_CRIT_VLAYERS` (default 9). `0`, or
+    /// `MUSE_CRIT=0`, restores one verify submission after the whole graph is
+    /// built. Read once.
+    static let verifyRampLayers: Int = {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MUSE_CRIT"] != "0" else { return 0 }
+        return max(0, env["MUSE_CRIT_VLAYERS"].flatMap { Int($0) } ?? 9)
+    }()
+
     func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
         -> (logits: MLXArray, hidden: MLXArray)?
     {
@@ -470,6 +490,8 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
 ///   threadgroup (`CBv2VerifyScales`).
 /// - NVFP4 lm_head: 8-row tiles (`CBv2VerifyScales`), then the stock
 ///   multiplier and softcap.
+/// - NVFP4 MLP gate/up and down at 1 to 3 rows, o at 1 and 2 rows: scalar
+///   fused multiply-add chains, 32-row tiles (`CBv2VerifyRows`).
 /// Anything else (dense layers, more than 8 rows) keeps the frontier path.
 /// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ=0` turns the routing off.
 /// `DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST=1` also computes every
@@ -480,6 +502,9 @@ enum MuseGlimmerVerifyProjections {
     static let enabled = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ"] != "0"
     static let selfTest = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST"] == "1"
     static let maximumRows = 8
+    /// Most rows `CBv2VerifyRows` takes per site (the 8-row tiles win above).
+    static let scalarRowsFeed = 3
+    static let scalarRowsOutput = 2
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var checkedOutputs = 0
@@ -564,14 +589,20 @@ extension MuseGlimmerTextModel {
     }
 
     /// The attention output projection: FP8 through `CBv2SmallProjection`
-    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyScales`.
+    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyRows` at 1
+    /// and 2 rows and `CBv2VerifyScales` above.
     func verifyOutputProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-        if verifyRows(x) != nil {
+        if let rows = verifyRows(x) {
             var routed: MLXArray?
             var kind = ""
             if let fp8 = layer as? ModelOptCalibratedLinear {
                 routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
                 kind = "fp8.o"
+            } else if rows <= MuseGlimmerVerifyProjections.scalarRowsOutput,
+                let scalar = CBv2VerifyRows.products([layer], x)?.first
+            {
+                routed = scalar
+                kind = "nvfp4.o.vrow"
             } else if layer is ModelOptWeightOnlyNVFP4Linear {
                 routed = CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.o"
@@ -584,14 +615,19 @@ extension MuseGlimmerTextModel {
         return numerics.project(layer, x)
     }
 
-    /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4`
-    /// launch; an FP8 pair through `CBv2SmallProjection` (one cast and one
-    /// product launch).
+    /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyRows`
+    /// launch at 1 to 3 rows, one `CBv2VerifyNVFP4` launch above; an FP8
+    /// pair through `CBv2SmallProjection` (one cast and one product launch).
     func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil {
+        if let rows = verifyRows(x) {
             var routed: [MLXArray]?
             var kind = ""
-            if let pair = CBv2VerifyNVFP4.products(layers, x) {
+            if layers.count == 2, rows <= MuseGlimmerVerifyProjections.scalarRowsFeed,
+                let pair = CBv2VerifyRows.products(layers, x)
+            {
+                routed = pair
+                kind = "nvfp4.gate_up.vrow"
+            } else if let pair = CBv2VerifyNVFP4.products(layers, x) {
                 routed = pair
                 kind = "nvfp4.gate_up"
             } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
@@ -606,15 +642,21 @@ extension MuseGlimmerTextModel {
         return groupedProjections(layers, x)
     }
 
-    /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4` at 7
-    /// and 8 rows (16-row tiles with prefetch) and `CBv2VerifyScales` below;
+    /// The feed-forward down projection: NVFP4 through `CBv2VerifyRows` at 1
+    /// to 3 rows, `CBv2VerifyNVFP4` at 7 and 8 (16-row tiles with prefetch)
+    /// and `CBv2VerifyScales` between;
     /// FP8 through `CBv2SmallProjection` up to 5 rows and `CBv2VerifyScales`
     /// at 6 to 8 rows (four row groups).
     func verifyDownProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
         if let rows = verifyRows(x) {
             var routed: MLXArray?
             var kind = ""
-            if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
+            if rows <= MuseGlimmerVerifyProjections.scalarRowsFeed,
+                let scalar = CBv2VerifyRows.products([layer], x)?.first
+            {
+                routed = scalar
+                kind = "nvfp4.down.vrow"
+            } else if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
                 routed =
                     rows >= 7
                     ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
