@@ -103,6 +103,10 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Exact windows exist so a verify row gets the bytes it gets alone; this
     /// forward is a prompt chunk read at its last position.
     static let promptArithmeticLayers = 16 ..< 50
+    /// Layers whose attention half (not the MLP) takes the prompt arithmetic:
+    /// a finer step than a whole layer, so the timed prefill lands closer to
+    /// its 2.0 ceiling without crossing it.
+    static let promptAttentionLayers: Set<Int> = [14, 15]
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
@@ -141,6 +145,17 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                     h = numerics.prompt {
                         layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
                     }
+                } else if Self.promptAttentionLayers.contains(index) {
+                    let x = h
+                    let attended = numerics.prompt {
+                        layer.postAttentionLayerNorm.addedTo(
+                            x,
+                            layer.selfAttention(
+                                layer.inputLayerNorm(x), mask: .none, cache: cache[index],
+                                ropeOffsets: ropeOffsets))
+                    }
+                    h = layer.postFeedforwardLayerNorm.addedTo(
+                        attended, layer.mlp(layer.preFeedforwardLayerNorm(attended)))
                 } else {
                     h = layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
                 }
