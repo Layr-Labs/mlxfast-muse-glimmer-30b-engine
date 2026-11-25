@@ -609,7 +609,7 @@ inline void paged_attention_merge_impl(
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool HAS_GATE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -625,7 +625,8 @@ inline void paged_attention_onepass_impl(
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
-    uint lane
+    uint lane,
+    const device T* gate = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -845,10 +846,19 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t row_off = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + row_off;
+            const device T* grow = HAS_GATE ? (gate + row_off) : nullptr;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                T val = T(gacc[e] * inv);
+                if (HAS_GATE) {
+                    const float gx = float(grow[lane * EPT + e]);
+                    const float gy = 1.0f / (1.0f + metal::precise::exp(metal::abs(gx)));
+                    const T gs = T((gx < 0.0f) ? gy : (1.0f - gy));
+                    val = val * gs;
+                }
+                orow[lane * EPT + e] = val;
             }
         }
     }

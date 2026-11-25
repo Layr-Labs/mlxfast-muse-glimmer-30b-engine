@@ -140,6 +140,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    private struct LowAccMLP {
+        let gate: Module
+        let up: Module
+        let down: Module
+    }
+    private let lowAccMLPs: [LowAccMLP]
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -177,6 +183,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
+        lowAccMLPs = Self.build3BitMLPs(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -259,6 +266,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var speculation: Speculation?
         /// The last finalized round accepted every draft.
         var lastRoundFullyAccepted = false
+        var hasFinalizedRound = false
 
         init(owner: ObjectIdentifier, context: MuseGlimmerDFlashContextState) {
             self.owner = owner
@@ -478,7 +486,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: settings.maximumDraftTokens)
+            draftCount: settings.maximumDraftTokens,
+            useLowAccMLP: s.hasFinalizedRound && !s.lastRoundFullyAccepted)
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -550,7 +559,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 fastDraftBlockRows(
                     embeddings: blocks[0], at: ctx.nextPosition,
                     context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-                    draftCount: k)
+                    draftCount: k,
+                    useLowAccMLP: states[0].hasFinalizedRound && !states[0].lastRoundFullyAccepted)
             ]
         } else {
             rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
@@ -856,6 +866,32 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    private static func build3BitMLPs(_ model: MuseGlimmerDFlashDraftModel) -> [LowAccMLP] {
+        var toEval: [MLXArray] = []
+        let copies: [LowAccMLP] = model.layers.map { layer in
+            func requant3(_ module: Module) -> Module {
+                guard let ql = module as? QuantizedLinear, ql.bits > 3, ql.mode == .affine else {
+                    return module
+                }
+                let dense = MLX.dequantized(
+                    ql.weight, scales: ql.scales, biases: ql.biases,
+                    groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
+                let q3 = QuantizedLinear(
+                    weight: dense, bias: ql.bias, groupSize: 32, bits: 3, mode: .affine)
+                toEval.append(q3.weight)
+                toEval.append(q3.scales)
+                if let biases = q3.biases { toEval.append(biases) }
+                return q3
+            }
+            return LowAccMLP(
+                gate: requant3(layer.mlp.gate),
+                up: requant3(layer.mlp.up),
+                down: requant3(layer.mlp.down))
+        }
+        if !toEval.isEmpty { eval(toEval) }
+        return copies
+    }
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -866,7 +902,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        draftCount: Int, useLowAccMLP: Bool = false
     ) -> MLXArray {
         let c = model.configuration
         let block = c.blockSize
@@ -909,7 +945,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             1, draftCount, c.attentionHeads * c.headDimensions,
                         ]))
                 let mx = layer.postAttentionNorm(h)
-                h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                let mlpOut: MLXArray
+                if useLowAccMLP, index < lowAccMLPs.count,
+                    let gate = lowAccMLPs[index].gate as? UnaryLayer,
+                    let up = lowAccMLPs[index].up as? UnaryLayer,
+                    let down = lowAccMLPs[index].down as? UnaryLayer
+                {
+                    mlpOut = down(compiledSiluProduct(gate(mx), up(mx)))
+                } else {
+                    mlpOut = layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+                }
+                h = h + mlpOut
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
             let queries = MLXFast.RoPE(
@@ -927,9 +973,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         1, block, c.attentionHeads * c.headDimensions,
                     ]))
             let mx = layer.postAttentionNorm(hidden)
-            hidden =
-                hidden
-                + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+            let mlpOut: MLXArray
+            if useLowAccMLP, index < lowAccMLPs.count,
+                let gate = lowAccMLPs[index].gate as? UnaryLayer,
+                let up = lowAccMLPs[index].up as? UnaryLayer,
+                let down = lowAccMLPs[index].down as? UnaryLayer
+            {
+                mlpOut = down(compiledSiluProduct(gate(mx), up(mx)))
+            } else {
+                mlpOut = layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+            }
+            hidden = hidden + mlpOut
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
@@ -1290,6 +1344,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         s.awaitsCarry = true
         s.committedInputCount += rows
+        s.hasFinalizedRound = true
         s.lastRoundFullyAccepted = rows == s.stagedInputCount
         // Keep the speculation for this outcome: the pending rows exactly
         // this round's first `rows` verify rows (none when `rows` is 0).
