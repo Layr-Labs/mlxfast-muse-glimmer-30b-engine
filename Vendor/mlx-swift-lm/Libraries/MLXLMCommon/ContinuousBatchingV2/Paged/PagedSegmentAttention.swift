@@ -130,7 +130,8 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        holes: Bool = false
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -185,7 +186,7 @@ enum PagedSegmentAttention {
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, holes: holes)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
@@ -198,6 +199,8 @@ enum PagedSegmentAttention {
             group.writeFence = result.fence
             return result.out
         }
+        // Only the one-pass kernel has a draft-tree variant.
+        if holes { CBv2VerifyTree.failed = true }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
         let metaCount = max(8, b * qh * plan.maxPartitions * 2)
