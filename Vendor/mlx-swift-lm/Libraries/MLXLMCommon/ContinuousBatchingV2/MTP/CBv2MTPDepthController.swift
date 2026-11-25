@@ -583,6 +583,15 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             0.85 * pow(0.98, Double($0))
         }
 
+    /// The fixed-depth window's own per-position estimates: a more
+    /// pessimistic start than `probabilities`, which keep gating the
+    /// post-verify speculation exactly as before.
+    private(set) var windowProbabilities: [Double] =
+        (0 ..< CBv2MTPRequestAcceptanceState.maximumDepth).map {
+            0.85 * pow(0.98, Double($0))
+        }
+    static let windowFlatPrior = 0.7
+
     /// Draft-confidence calibration: per position, the mean logit of the
     /// drafter's top-1 probability over rounds whose target outcome at that
     /// position was observed, and how many such rounds there were. Only
@@ -663,6 +672,8 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     init(flatPrior: Double) {
         let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
         probabilities = Array(repeating: prior, count: Self.maximumDepth)
+        windowProbabilities = Array(
+            repeating: min(prior, Self.windowFlatPrior), count: Self.maximumDepth)
     }
 
     /// Records positions whose target outcome was actually observed and, after
@@ -681,6 +692,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
 
         for position in 0 ..< accepted {
             probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+            windowProbabilities[position] += Self.alpha * (1.0 - windowProbabilities[position])
         }
         // Regime signal: only rounds whose outcome was fully observed (a
         // rejection, or every draft accepted) count; a truncation does not.
@@ -694,6 +706,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
+            windowProbabilities[accepted] += Self.alpha * (0.0 - windowProbabilities[accepted])
         } else if !rejectionObserved, !endedByTruncation,
             drafted > 0, accepted == drafted, drafted < Self.maximumDepth,
             probabilities[drafted] < 0.95
@@ -701,6 +714,9 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             // A fully accepted round is bounded evidence that the hot chain
             // may profitably extend one position farther.
             probabilities[drafted] += Self.alpha * (0.95 - probabilities[drafted])
+            if windowProbabilities[drafted] < 0.95 {
+                windowProbabilities[drafted] += Self.alpha * (0.95 - windowProbabilities[drafted])
+            }
         }
     }
 
@@ -911,7 +927,7 @@ enum CBv2MTPMarginalDepthPolicy {
     /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
     /// conservative so estimator noise does not open windows that pay for
     /// rejected rows.
-    static let fixedWindowHeadStepCostRatio = 0.15
+    static let fixedWindowHeadStepCostRatio = 0.065
 
     static func fixedWindowDepth(
         offeredDepth: Int,
