@@ -182,11 +182,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             if let textTarget = target as? MuseGlimmerTextModel,
                 model.activationDType == .bfloat16
             {
+                let dummyLogits = MLXArray.zeros(
+                    [1, target.dflashVocabularySize], dtype: .bfloat16)
                 let (t, conf) = Self.fusedArgMaxAndConfidence(
-                    MLXArray.zeros([1, target.dflashVocabularySize], dtype: .bfloat16),
+                    dummyLogits,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
-                warm += [t, conf]
+                warm += [t, conf, Self.fastArgMax(dummyLogits)]
             }
             eval(warm)
             try errors.check()
@@ -1095,6 +1097,139 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return (out[0], out[1])
     }
 
+    private static let fastArgMaxStage1 = MLXFast.metalKernel(
+        name: "dflash_fast_argmax_s1",
+        inputNames: ["logits"],
+        outputNames: ["p_val", "p_idx"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint chunk_size = (vocab + CHUNKS - 1) / CHUNKS;
+            const uint start = chunk * chunk_size;
+            const uint end = min(vocab, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + ulong(row) * ulong(vocab);
+
+            float best_val = -INFINITY;
+            int best_idx = int(vocab);
+            const uint start4 = (start + 3u) & ~3u;
+            const uint end4 = end & ~3u;
+            if (lid == 0) {
+              for (uint i = start; i < min(start4, end); i++) {
+                const float v = float(row_ptr[i]);
+                if (v > best_val || (v == best_val && int(i) < best_idx)) {
+                  best_val = v;
+                  best_idx = int(i);
+                }
+              }
+            }
+            if (end4 > start4) {
+              const device vec<bfloat16_t, 4>* src4 =
+                  (const device vec<bfloat16_t, 4>*)(row_ptr + start4);
+              const uint count4 = (end4 - start4) >> 2;
+              for (uint j = lid; j < count4; j += 256u) {
+                const vec<bfloat16_t, 4> vv = src4[j];
+                const uint base_i = start4 + (j << 2);
+                #pragma unroll
+                for (uint k = 0; k < 4; k++) {
+                  const float v = float(vv[k]);
+                  const int idx = int(base_i + k);
+                  if (v > best_val || (v == best_val && idx < best_idx)) {
+                    best_val = v;
+                    best_idx = idx;
+                  }
+                }
+              }
+            }
+            if (lid == 0) {
+              const uint tail_start = max(start4, end4);
+              for (uint i = tail_start; i < end; i++) {
+                const float v = float(row_ptr[i]);
+                if (v > best_val || (v == best_val && int(i) < best_idx)) {
+                  best_val = v;
+                  best_idx = int(i);
+                }
+              }
+            }
+
+            const float sg_val = simd_max(best_val);
+            const int sg_idx = simd_min((best_val == sg_val) ? best_idx : int(vocab));
+            threadgroup float sh_val[8];
+            threadgroup int sh_idx[8];
+            if (lane == 0) {
+              sh_val[sg] = sg_val;
+              sh_idx[sg] = sg_idx;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float v = (lane < 8) ? sh_val[lane] : -INFINITY;
+              const int idx = (lane < 8) ? sh_idx[lane] : int(vocab);
+              const float tg_val = simd_max(v);
+              const int tg_idx = simd_min((v == tg_val) ? idx : int(vocab));
+              if (lane == 0) {
+                const uint out_i = row * CHUNKS + chunk;
+                p_val[out_i] = tg_val;
+                p_idx[out_i] = tg_idx;
+              }
+            }
+            """)
+
+    private static let fastArgMaxStage2 = MLXFast.metalKernel(
+        name: "dflash_fast_argmax_s2",
+        inputNames: ["p_val", "p_idx"],
+        outputNames: ["tokens"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint idx = row * CHUNKS + lid;
+            const float v = p_val[idx];
+            const int id = p_idx[idx];
+            const float sg_val = simd_max(v);
+            const int sg_idx = simd_min((v == sg_val) ? id : int(vocab));
+            threadgroup float sh_val[2];
+            threadgroup int sh_idx[2];
+            if (lane == 0) {
+              sh_val[sg] = sg_val;
+              sh_idx[sg] = sg_idx;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float fv = (lane < 2) ? sh_val[lane] : -INFINITY;
+              const int fid = (lane < 2) ? sh_idx[lane] : int(vocab);
+              const float rv = simd_max(fv);
+              const int rid = simd_min((fv == rv) ? fid : int(vocab));
+              if (lane == 0) {
+                tokens[row] = rid;
+              }
+            }
+            """)
+
+    private static func fastArgMax(_ logits: MLXArray) -> MLXArray {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let partials = fastArgMaxStage1(
+            [logits],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks], [rows, chunks]],
+            outputDTypes: [.float32, .int32])
+        return fastArgMaxStage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows]],
+            outputDTypes: [.int32])[0]
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
     /// target's readout of them when it gives one per row.
     private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
@@ -1103,9 +1238,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         {
             return coupled.asType(.int32)
         }
+        if logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 {
+            return Self.fastArgMax(logits)
+        }
         return argMax(logits, axis: -1).asType(.int32)
     }
-
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
         else { return [] }

@@ -336,7 +336,12 @@ extension EngineLoopV2 {
             // attention owner; its reads must finish construction before sealing.
             let nativePagedWork = CBv2NativePagedMTPWork.current
             let windowWork = try nativePagedWork?.prepareWindow()
-            let output: (logits: MLXArray, lastHidden: MLXArray)
+            var scoredOutput:
+                (
+                    topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray,
+                    lastHidden: MLXArray
+                )?
+            var output: (logits: MLXArray, lastHidden: MLXArray)?
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
                 // window; the model stages [1+k, ...] captured stacks per
@@ -379,57 +384,81 @@ extension EngineLoopV2 {
                     recurrent[row.rec.id] = [evaluation]
                 }
             } else {
-                output = try checkedModelForward(phase: .mtpVerification) {
-                    (mtp.model as? any CBv2FusedVerifyForwarding)?.fusedVerifyForwardWithHidden(
-                        tokens: tokens, caches: caches)
-                        ?? mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                if !hasConstraints, !useTargetPrefix, spanSampler == nil,
+                    logitDiagnostic == nil,
+                    mtp.usesRequestStatefulDrafter,
+                    (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize == nil,
+                    let fusedReadout = mtp.model as? any CBv2FusedVerifyReadoutForwarding
+                {
+                    scoredOutput = try checkedModelForward(phase: .mtpVerification) {
+                        fusedReadout.fusedVerifyForwardScoredWithHidden(
+                            tokens: tokens, caches: caches)
+                    }
+                }
+                if scoredOutput == nil {
+                    output = try checkedModelForward(phase: .mtpVerification) {
+                        (mtp.model as? any CBv2FusedVerifyForwarding)?
+                            .fusedVerifyForwardWithHidden(tokens: tokens, caches: caches)
+                            ?? mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                    }
                 }
             }
             if let nativePagedWork, let windowWork {
                 try nativePagedWork.closeWindow(windowWork)
             }
-            if hasConstraints { constraintLogits = output.logits }
-            // Flag the model's logits before a host sampler sees them.
-            nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
-            if mtp.usesRequestStatefulDrafter {
-                guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
-                    preconditionFailure(
-                        "CBv2 request-stateful rectangular MTP target lacks top-two provider")
+            if let scored = scoredOutput {
+                nonFinite = scored.nonFinite
+                if mtp.config.fixedDraftTokens == nil {
+                    policyTopTwo = (scored.topTwoIDs, scored.topTwoValues)
                 }
-                let batch = output.logits.dim(0)
-                let width = output.logits.dim(1)
-                let vocabulary = output.logits.dim(2)
-                let flat = output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo = provider.cbv2MTPTopTwo(flat)
-                policyTopTwo = (
-                    topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32)
-                )
-            }
-            if useTargetPrefix || spanSampler != nil {
-                let drafts: MLXArray? =
-                    typicalDelta != nil
-                    ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
-                let scored = scoreColumns(output.logits, columnOffset: 0, drafts: drafts)
-                scores = scored.scores
-                accept = scored.accept
-            } else if let policyTopTwo {
-                scores = policyTopTwo.ids[0..., 0..., 0]
+                scores = scored.topTwoIDs[0..., 0..., 0]
+                hidden = scored.lastHidden
             } else {
-                scores = argMax(output.logits, axis: -1).asType(.int32)
-            }
-            captureDiagnostics(
-                output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
-            hidden = output.lastHidden
-            // Draft-head shortlist (rectangular only; the serial oracle stays
-            // byte-identical to the shipped path): each verify position's
-            // target top-K ids feed the NEXT round's shortlisted draft, and
-            // the captured probability mass rides the acceptance packet so
-            // finalize can gate coverage without an extra host sync.
-            if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
-                .draftShortlistSize
-            {
-                shortlist = Self.mtpDraftShortlist(logits: output.logits, size: size)
+                let output = output!
+                if hasConstraints { constraintLogits = output.logits }
+                // Flag the model's logits before a host sampler sees them.
+                nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
+                if mtp.usesRequestStatefulDrafter {
+                    guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
+                        preconditionFailure(
+                            "CBv2 request-stateful rectangular MTP target lacks top-two provider")
+                    }
+                    let batch = output.logits.dim(0)
+                    let width = output.logits.dim(1)
+                    let vocabulary = output.logits.dim(2)
+                    let flat = output.logits.reshaped([1, batch * width, vocabulary])
+                    let topTwo = provider.cbv2MTPTopTwo(flat)
+                    policyTopTwo = (
+                        topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
+                        topTwo.values.reshaped([batch, width, 2]).asType(.float32)
+                    )
+                }
+                if useTargetPrefix || spanSampler != nil {
+                    let drafts: MLXArray? =
+                        typicalDelta != nil
+                        ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
+                    let scored = scoreColumns(output.logits, columnOffset: 0, drafts: drafts)
+                    scores = scored.scores
+                    accept = scored.accept
+                } else if let policyTopTwo {
+                    scores = policyTopTwo.ids[0..., 0..., 0]
+                } else {
+                    scores = argMax(output.logits, axis: -1).asType(.int32)
+                }
+                captureDiagnostics(
+                    output.logits, columnOffset: 0, phase: "rectangular_verify",
+                    topTwo: policyTopTwo)
+                hidden = output.lastHidden
+                // Draft-head shortlist (rectangular only; the serial oracle stays
+                // byte-identical to the shipped path): each verify position's
+                // target top-K ids feed the NEXT round's shortlisted draft, and
+                // the captured probability mass rides the acceptance packet so
+                // finalize can gate coverage without an extra host sync.
+                if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
+                    .draftShortlistSize
+                {
+                    shortlist = Self.mtpDraftShortlist(logits: output.logits, size: size)
+                }
             }
         }
 

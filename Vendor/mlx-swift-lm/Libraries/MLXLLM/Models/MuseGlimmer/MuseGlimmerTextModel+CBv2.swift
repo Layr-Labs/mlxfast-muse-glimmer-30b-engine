@@ -199,8 +199,8 @@ extension MuseGlimmerCBv2Adapter: CBv2ResidentParametersProviding {
 /// kernel reproduces MLX's row reduction below 32 rows
 /// (`VerifyFusedNorms`). `DARKBLOOM_VERIFY_FUSED_NORMS=0` turns it off.
 extension MuseGlimmerTextModel {
-    func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
-        -> (logits: MLXArray, hidden: MLXArray)?
+    private func fusedVerifyTrunk(_ tokens: MLXArray, cache: [KVCache])
+        -> (normed: MLXArray, hidden: MLXArray)?
     {
         guard VerifyFusedNorms.enabled, !mtpHiddenLayerIDs.isEmpty,
             cache.count == model.layers.count,
@@ -253,11 +253,33 @@ extension MuseGlimmerTextModel {
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
-        return (
-            verifyOutputLogits(normed), parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
-        )
+        return (normed, parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
+    }
+    func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
+        -> (logits: MLXArray, hidden: MLXArray)?
+    {
+        guard let trunk = fusedVerifyTrunk(tokens, cache: cache) else { return nil }
+        return (verifyOutputLogits(trunk.normed), trunk.hidden)
     }
 
+    func fusedVerifyForwardScoredWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
+        -> (
+            topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, hidden: MLXArray
+        )?
+    {
+        guard lmHead is ModelOptWeightOnlyNVFP4Linear,
+            let trunk = fusedVerifyTrunk(tokens, cache: cache),
+            verifyRows(trunk.normed) != nil,
+            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            product.ndim == 3, product.dtype == .bfloat16
+        else { return nil }
+        checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
+        let scored = cbv2FusedReadoutTopTwoAndNonFinite(
+            product,
+            outputMultiplier: configuration.outputMultiplier,
+            softcap: configuration.finalLogitSoftcapping)
+        return (scored.ids, scored.values, scored.nonFinite, trunk.hidden)
+    }
     /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
     func fusedVerifyAttention(
@@ -408,6 +430,20 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
             let result = target.fusedVerifyForwardWithMTPHidden(tokens, cache: kv)
         else { return nil }
         return (result.logits, result.hidden)
+    }
+}
+
+extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
+    public func fusedVerifyForwardScoredWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (
+        topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
+    )? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count,
+            let result = target.fusedVerifyForwardScoredWithMTPHidden(tokens, cache: kv)
+        else { return nil }
+        return (result.topTwoIDs, result.topTwoValues, result.nonFinite, result.hidden)
     }
 }
 
@@ -695,6 +731,11 @@ extension MuseGlimmerTextModel {
                 (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
                     verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
                 })
+            let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
+                MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+            eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
         }
     }
 }
