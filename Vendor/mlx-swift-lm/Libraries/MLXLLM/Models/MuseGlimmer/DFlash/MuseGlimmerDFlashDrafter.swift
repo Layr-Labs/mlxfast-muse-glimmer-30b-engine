@@ -837,15 +837,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         requantLock.unlock()
         guard claimed else { return }
 
+        // The 5-bit MLP projections (~1.37 GB, most of the drafter's bytes)
+        // go to `mlpBits` at group 64 (`CBV2_DRAFTER_MLP_BITS`, 5 keeps them).
+        let mlpBits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_MLP_BITS"]
+            .flatMap { Int($0) }.map { min(max($0, 3), 5) } ?? 3
+        // The 8-bit attention and encoder projections go to `attentionBits`
+        // (`CBV2_DRAFTER_ATTN_BITS`: 4 is the record's group-32 form, 3 at group 64).
+        let attentionBits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_ATTN_BITS"]
+            .flatMap { Int($0) }.map { min(max($0, 3), 4) } ?? 3
         let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+            guard let ql = m as? QuantizedLinear, ql.mode == .affine,
+                ql.bits == 8 || (ql.bits == 5 && mlpBits < 5)
+            else {
                 return nil
             }
             let dense = MLX.dequantized(
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
-            let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+            let replacement =
+                ql.bits == 8
+                ? QuantizedLinear(
+                    weight: dense, bias: ql.bias, groupSize: attentionBits < 4 ? 64 : 32,
+                    bits: attentionBits, mode: .affine)
+                : QuantizedLinear(
+                    weight: dense, bias: ql.bias, groupSize: 64, bits: mlpBits, mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {
