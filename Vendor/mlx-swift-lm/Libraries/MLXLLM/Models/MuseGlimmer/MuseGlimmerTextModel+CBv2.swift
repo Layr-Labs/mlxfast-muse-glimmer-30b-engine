@@ -75,12 +75,123 @@ extension MuseGlimmerCBv2Adapter {
 /// vocabulary projection of rows nothing reads is left out. It keeps MLX's
 /// arithmetic with exact windows on too.
 extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
+    private static let fusedPrefillEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_PREFILL"] != "0"
+
+    /// Attention for a prompt chunk using the tower's own Q/K norm, query scale,
+    /// RoPE, and paged `updateAndAttend`, with the attention output gated before
+    /// merging heads (`[B, L, H, D]`) so the strided transpose is never copied.
+    private func fusedPrefillAttention(
+        _ a: MuseGlimmerTextAttention, _ x: MLXArray,
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let n = numerics
+        var queries = n.project(a.queryProj, x).reshaped(batch, length, a.heads, a.headDimensions)
+        var keys = n.project(a.keyProj, x).reshaped(batch, length, a.kvHeads, a.headDimensions)
+        let values = n.project(a.valueProj, x)
+            .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+
+        queries = a.qkNorm(queries)
+        queries = (queries.asType(.float32) * a.qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = a.qkNorm(keys).transposed(0, 2, 1, 3)
+
+        if let rope = a.rope {
+            let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+        let attended = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
+        let gate = n.project(a.gateProj, x).reshaped(batch, length, a.heads, a.headDimensions)
+        let gated = MuseGlimmerFusion.sigmoidGate([attended.transposed(0, 2, 1, 3), gate])[0]
+            .reshaped(batch, length, -1)
+        return n.project(a.outputProj, gated)
+    }
+
+    /// Shared prompt-chunk forward for both `cbv2Prefill` and
+    /// `CBv2FusedMTPPrefillForwarding`. Keeps MLX's prompt arithmetic on every
+    /// projection and norm, eliminates the 52 per-layer attention-output
+    /// transpose copies, skips the unused final-layer MLP on `.evaluationOnly`
+    /// chunks (after writing layer 51's KV cache), and runs `model.norm` only on
+    /// the frontier row for `.lastPositionLogits`.
+    func fusedPrefillForward(
+        inputEmbeddings: MLXArray, cache: [KVCache]?, capture: [Int],
+        requirement: CBv2PrefillRequirement
+    ) -> (output: MLXArray, captured: MLXArray?)? {
+        guard Self.fusedPrefillEnabled, let cache,
+            cache.count == model.layers.count,
+            cache.allSatisfy({ $0 is any CBv2AttendingLayerCache })
+        else { return nil }
+        let length = inputEmbeddings.dim(1)
+        guard length > 0 else { return nil }
+        return numerics.prompt {
+            var h = inputEmbeddings
+            var captured = [Int: MLXArray]()
+            var shared: (positions: [Int], offsets: MLXArray)?
+            let last = model.layers.count - 1
+            for (index, layer) in model.layers.enumerated() {
+                let attending = cache[index] as! any CBv2AttendingLayerCache
+                var ropeOffsets: MLXArray?
+                if layer.selfAttention.rope != nil {
+                    let positions = attending.rows.map(\.absoluteOffset)
+                    if let shared, shared.positions == positions {
+                        ropeOffsets = shared.offsets
+                    } else {
+                        let offsets = attending.positionOffsets + 0
+                        shared = (positions, offsets)
+                        ropeOffsets = offsets
+                    }
+                }
+                let attnOut = fusedPrefillAttention(
+                    layer.selfAttention, layer.inputLayerNorm(h),
+                    cache: attending, ropeOffsets: ropeOffsets)
+                if index == last, requirement == .evaluationOnly, !capture.contains(last) {
+                    let capturedHidden: MLXArray?
+                    if capture.isEmpty {
+                        capturedHidden = nil
+                    } else {
+                        let parts = capture.map { captured[$0]! }
+                        capturedHidden =
+                            parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
+                    }
+                    return (attnOut[0..., -1, 0 ..< 1], capturedHidden)
+                }
+                let mid = layer.postAttentionLayerNorm.addedTo(h, attnOut)
+                h = layer.postFeedforwardLayerNorm.addedTo(
+                    mid, layer.mlp(layer.preFeedforwardLayerNorm(mid)))
+                if capture.contains(index) { captured[index] = h }
+            }
+            let capturedHidden: MLXArray?
+            if capture.isEmpty {
+                capturedHidden = nil
+            } else {
+                let parts = capture.map { captured[$0]! }
+                capturedHidden = parts.count == 1 ? parts[0] : concatenated(parts, axis: -1)
+            }
+            switch requirement {
+            case .evaluationOnly:
+                return (h[0..., -1, 0 ..< 1], capturedHidden)
+            case .lastPositionLogits:
+                let lastRow = model.norm(h[0..., (length - 1) ..< length, 0...])[0..., 0, 0...]
+                return (outputLogits(lastRow), capturedHidden)
+            }
+        }
+    }
+
     public func cbv2Prefill(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
-        numerics.prompt {
-            let hidden = model(inputEmbedding ?? model.inputEmbeddings(inputs), cache: cache)
+        let emb = inputEmbedding ?? model.inputEmbeddings(inputs)
+        if let fused = fusedPrefillForward(
+            inputEmbeddings: emb, cache: cache, capture: [], requirement: requirement)
+        {
+            return fused.output
+        }
+        return numerics.prompt {
+            let hidden = model(emb, cache: cache)
             switch requirement {
             case .evaluationOnly: return hidden[0..., -1, 0 ..< 1]
             case .lastPositionLogits: return outputLogits(hidden[0..., -1, 0...])
@@ -269,8 +380,17 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        if !MuseGlimmerVerifyProjections.selfTest,
+            let fused = CBv2VerifyScales.verifiedFusedNVFP4ReadoutTopTwoAndNonFinite(
+                lmHead, trunk.normed,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+        {
+            return (fused.ids, fused.values, fused.nonFinite, trunk.hidden)
+        }
+        guard let product = CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -304,6 +424,13 @@ extension MuseGlimmerTextModel {
             offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+        if let gatedCache = attending as? any CBv2GatedAttendingLayerCache,
+            let gated = gatedCache.updateAndAttendGated(
+                queries: queries, keys: keys, values: values,
+                gate: p[3], scale: a.scale, sinks: nil)
+        {
+            return verifyOutputProjection(a.outputProj, gated)
+        }
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         // Gate the `[B, L, H, D]` view of the attention output directly: the
@@ -436,6 +563,22 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
             let result = target.fusedVerifyForwardWithMTPHidden(tokens, cache: kv)
         else { return nil }
         return (result.logits, result.hidden)
+    }
+}
+
+extension MuseGlimmerCBv2Adapter: CBv2FusedMTPPrefillForwarding {
+    public func fusedForwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count, !target.mtpHiddenLayerIDs.isEmpty,
+            let result = target.fusedPrefillForward(
+                inputEmbeddings: target.model.inputEmbeddings(tokens),
+                cache: kv, capture: target.mtpHiddenLayerIDs, requirement: requirement),
+            let hidden = result.captured
+        else { return nil }
+        return (result.output, hidden)
     }
 }
 
@@ -742,6 +885,11 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            CBv2VerifyScales.verifyAndWarmLMHeadReadout(
+                lmHead, width: width, dtype: dtype,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping,
+                rows: 1 ... MuseGlimmerVerifyProjections.maximumRows)
         }
     }
 }
