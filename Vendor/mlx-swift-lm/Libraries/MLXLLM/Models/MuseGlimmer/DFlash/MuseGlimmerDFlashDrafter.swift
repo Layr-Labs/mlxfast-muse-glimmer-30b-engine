@@ -830,7 +830,14 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
     /// Permitted by the track contract (drafter only proposes tokens; the
     /// pinned target verifies every emitted token).
+    /// `CBV2_DRAFTER_REQUANT=1` re-quantizes the 8-bit projections to 4-bit
+    /// on load. Off by default: the drafter's proposals are precision-
+    /// sensitive on low-acceptance prompts, so it keeps its pinned 8-bit.
+    static let requantizes8BitLayers =
+        ProcessInfo.processInfo.environment["CBV2_DRAFTER_REQUANT"] == "1"
+
     private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
+        guard requantizes8BitLayers else { return }
         let key = ObjectIdentifier(model)
         requantLock.lock()
         let claimed = requantizedModels.insert(key).inserted
