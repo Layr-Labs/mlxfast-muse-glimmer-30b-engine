@@ -525,6 +525,13 @@ enum MuseGlimmerVerifyProjections {
 extension MuseGlimmerTextModel {
     private var routesVerifyProjections: Bool { MuseGlimmerVerifyProjections.enabled }
 
+    /// Low-acceptance windows' FP8 products on simdgroup matrices (not
+    /// row-exact; never under the bitwise self-test).
+    private func matrixFP8(_ layers: [ModelOptCalibratedLinear], _ x: MLXArray) -> [MLXArray]? {
+        guard !MuseGlimmerVerifyProjections.selfTest else { return nil }
+        return CBv2SmallProjection.fp8MatrixProducts(layers, x)
+    }
+
     private func verifyRows(_ x: MLXArray) -> Int? {
         guard routesVerifyProjections, numerics.isExact(x) else { return nil }
         let rows = MuseGlimmerNumerics.rows(x)
@@ -549,7 +556,7 @@ extension MuseGlimmerTextModel {
             var routed: [MLXArray]?
             var kind = ""
             if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                routed = matrixFP8(fp8, x) ?? CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
                 routed = CBv2VerifyScales.products(layers, x)
@@ -570,7 +577,9 @@ extension MuseGlimmerTextModel {
             var routed: MLXArray?
             var kind = ""
             if let fp8 = layer as? ModelOptCalibratedLinear {
-                routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
+                routed =
+                    matrixFP8([fp8], x)?.first
+                    ?? CBv2SmallProjection.fp8Products([fp8], x)?.first
                 kind = "fp8.o"
             } else if layer is ModelOptWeightOnlyNVFP4Linear {
                 routed = CBv2VerifyScales.product(layer, x)
@@ -595,7 +604,7 @@ extension MuseGlimmerTextModel {
                 routed = pair
                 kind = "nvfp4.gate_up"
             } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                routed = matrixFP8(fp8, x) ?? CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.gate_up"
             }
             if let routed {
@@ -621,9 +630,10 @@ extension MuseGlimmerTextModel {
                 kind = "nvfp4.down"
             } else if let fp8 = layer as? ModelOptCalibratedLinear {
                 routed =
-                    rows >= 6
-                    ? CBv2VerifyScales.product(layer, x)
-                    : CBv2SmallProjection.fp8Products([fp8], x)?.first
+                    matrixFP8([fp8], x)?.first
+                    ?? (rows >= 6
+                        ? CBv2VerifyScales.product(layer, x)
+                        : CBv2SmallProjection.fp8Products([fp8], x)?.first)
                 kind = "fp8.down"
             }
             if let routed {
@@ -714,6 +724,10 @@ extension MuseGlimmerTextModel {
                     let width = inputs(group[0])
                 else { continue }
                 var outputs = [MLXArray]()
+                // Both the record's products and the low-acceptance matrix ones.
+                for matrix in [false, true] {
+                CBv2SmallProjection.fp8MatrixRounds = matrix
+                defer { CBv2SmallProjection.fp8MatrixRounds = false }
                 for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                     let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                     switch site {
@@ -722,6 +736,7 @@ extension MuseGlimmerTextModel {
                     case "gate_up": outputs += verifyFeedInputProjections(group, x)
                     default: outputs.append(verifyDownProjection(group[0], x))
                     }
+                }
                 }
                 eval(outputs)
             }

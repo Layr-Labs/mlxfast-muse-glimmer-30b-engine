@@ -979,6 +979,10 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        // Low-acceptance windows take the FP8 matrix products.
+        CBv2SmallProjection.fp8MatrixRounds =
+            batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
+        defer { CBv2SmallProjection.fp8MatrixRounds = false }
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)

@@ -787,3 +787,199 @@ public enum CBv2SmallProjection {
         }
     }
 }
+
+// MARK: FP8 matrix products for low-acceptance verify windows
+
+/// FP8 verify projections on simdgroup matrices: eight output rows, eight
+/// activation rows and eight inputs per multiply-accumulate, every weight
+/// read once for up to 8 rows. The stock row-exact products run one fused
+/// multiply-add chain per row, so their cost grows with the window's rows;
+/// these do not. They keep the products' operands (the FP8 activation cast,
+/// `T(decode(w) * scale)` weights, float32 sums, one rounding to `T`) but
+/// not the row-exact order of the sums, so a row's last bits can differ
+/// from the one-row step's. The window's tokens are the argmax of its rows
+/// (contract section 11.5); only low-acceptance rounds take them.
+extension CBv2SmallProjection {
+    static let fp8MatrixEnabled =
+        ProcessInfo.processInfo.environment["CBV2_FP8_MMA"] != "0"
+    /// Set by the engine while a low-acceptance verify window is built.
+    nonisolated(unsafe) public static var fp8MatrixRounds = false
+
+    static let fp8MatrixHelper = """
+
+        #include <metal_simdgroup_matrix>
+        #define CBV2_F8M_UNROLL _Pragma("clang loop unroll(full)")
+        typedef metal::simdgroup_matrix<float, 8, 8> cbv2_f8m_matrix;
+
+        inline void cbv2_f8m_mma(thread float2& C, float2 A, float2 B) {
+            cbv2_f8m_matrix D_mat, A_mat, B_mat, C_mat;
+            reinterpret_cast<thread float2&>(A_mat.thread_elements()) = A;
+            reinterpret_cast<thread float2&>(B_mat.thread_elements()) = B;
+            reinterpret_cast<thread float2&>(C_mat.thread_elements()) = C;
+            simdgroup_multiply_accumulate(D_mat, A_mat, B_mat, C_mat);
+            C = reinterpret_cast<thread float2&>(D_mat.thread_elements());
+        }
+
+        // One 32-output tile of y = x . W^T over all K: eight simdgroups take
+        // the 128-input chunks q with q % 8 == simdgroup, then join.
+        template <typename T, int V, int K, int N>
+        inline void cbv2_f8m_tile(
+            const device uint8_t* w, float wscale, const device T* x, device T* y,
+            int tile, uint simd_gid, uint simd_lid, threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr short TN = 4;
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * 32;
+            const float nanv = metal::numeric_limits<float>::quiet_NaN();
+            const device T* xr[2];
+            CBV2_F8M_UNROLL for (short j = 0; j < 2; j++) {
+                xr[j] = x + size_t(min(fn + j, V - 1)) * K + 4 * fm;
+            }
+            float2 C[TN];
+            CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) { C[t] = float2(0); }
+            const device uint8_t* wl[TN];
+            CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wl[t] = w + size_t(row) * K + 4 * fn;
+            }
+            for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                CBV2_F8M_UNROLL for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    float4 xv[2];
+                    CBV2_F8M_UNROLL for (short j = 0; j < 2; j++) {
+                        xv[j] = float4(*(const device vec<T, 4>*)(xr[j] + b));
+                    }
+                    uint2 q[TN];
+                    CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                        q[t] = *(const device uint2*)(wl[t] + b);
+                    }
+                    CBV2_F8M_UNROLL for (short i = 0; i < 4; i++) {
+                        const float2 bf = float2(xv[0][i], xv[1][i]);
+                        CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                            const uint c0 = (q[t].x >> (8 * i)) & 255u;
+                            const uint c1 = (q[t].y >> (8 * i)) & 255u;
+                            const float d0 = (c0 & 0x7F) == 0x7F ? nanv : modelopt_e4m3_value(uint8_t(c0));
+                            const float d1 = (c1 & 0x7F) == 0x7F ? nanv : modelopt_e4m3_value(uint8_t(c1));
+                            cbv2_f8m_mma(
+                                C[t], float2(float(T(d0 * wscale)), float(T(d1 * wscale))), bf);
+                        }
+                    }
+                }
+            }
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * TN * 2 * 32 + simd_lid;
+                CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                    CBV2_F8M_UNROLL for (short j = 0; j < 2; j++) { p[(t * 2 + j) * 32] = C[t][j]; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * TN * 2 * 32 + simd_lid;
+                    CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                        CBV2_F8M_UNROLL for (short j = 0; j < 2; j++) { C[t][j] += p[(t * 2 + j) * 32]; }
+                    }
+                }
+                CBV2_F8M_UNROLL for (short j = 0; j < 2; j++) {
+                    if (fn + j < V) {
+                        device T* yr = y + size_t(fn + j) * N;
+                        CBV2_F8M_UNROLL for (short t = 0; t < TN; t++) {
+                            const int out = y_col + fm + 8 * t;
+                            if (out < N) { yr[out] = static_cast<T>(C[t][j]); }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+    private static func fp8MatrixKernel(layers: Int) -> MLXFast.MLXFastKernel {
+        var body = """
+            threadgroup float partials[7 * 4 * 2 * 32];
+            int g = int(threadgroup_position_in_grid.y);
+
+            """
+        for i in 0 ..< layers {
+            let tiles = "((N\(i) + 31) / 32)"
+            let xOffset = layers == 1 ? "0" : "\(i) * V * K"
+            body += """
+                if (g < \(tiles)) {
+                    cbv2_f8m_tile<T, V, K, N\(i)>(
+                        w\(i), s\(i)[0], x + \(xOffset), y\(i), g,
+                        simdgroup_index_in_threadgroup, thread_index_in_simdgroup, partials);
+                    return;
+                }
+                g -= \(tiles);
+
+                """
+        }
+        return MLXFast.metalKernel(
+            name: "cbv2_fp8_matrix_\(layers)",
+            inputNames: (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" } + ["x"],
+            outputNames: (0 ..< layers).map { "y\($0)" },
+            source: body, header: ModelOptActivationKernels.header + fp8MatrixHelper)
+    }
+
+    nonisolated(unsafe) private static let fp8MatrixKernels: [Int: MLXFast.MLXFastKernel] = [
+        1: fp8MatrixKernel(layers: 1), 2: fp8MatrixKernel(layers: 2),
+        4: fp8MatrixKernel(layers: 4),
+    ]
+
+    /// FP8 sibling projections of one activation (`x`: `[..., K]`, 2 to 8
+    /// rows) on simdgroup matrices; nil unless `fp8MatrixRounds` is set and
+    /// every layer is one this path takes (then the caller's route runs).
+    public static func fp8MatrixProducts(_ layers: [ModelOptCalibratedLinear], _ x: MLXArray)
+        -> [MLXArray]?
+    {
+        guard fp8MatrixEnabled, fp8MatrixRounds, let kernel = fp8MatrixKernels[layers.count]
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0, inputs % 128 == 0, x.dtype == .bfloat16 || x.dtype == .float16
+        else { return nil }
+        let rows = x.size / inputs
+        guard (2 ... maximumRows).contains(rows),
+            layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: x.dtype) })
+        else { return nil }
+        let flat = x.reshaped(rows, inputs)
+        let cast: MLXArray
+        if layers.count == 1 {
+            guard case .fp8(let mu, let bound) = layers[0].graphConstants!.storage else {
+                return nil
+            }
+            cast = ModelOptActivationKernels.fp8(flat, multipliers: mu, overflowBound: bound)
+        } else {
+            guard let castKernel = castKernels[layers.count] else { return nil }
+            var castInputs: [MLXArray] = [flat]
+            for layer in layers {
+                guard case .fp8(let mu, let bound) = layer.graphConstants!.storage else {
+                    return nil
+                }
+                castInputs += [mu, bound]
+            }
+            let total = layers.count * rows * inputs
+            cast = castKernel(
+                castInputs, template: [("T", x.dtype), ("COUNT", rows * inputs)],
+                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
+                outputShapes: [[total]], outputDTypes: [x.dtype])[0]
+        }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs),
+        ]
+        var tiles = 0
+        for (i, layer) in layers.enumerated() {
+            template.append(("N\(i)", layer.outputDimensions))
+            tiles += (layer.outputDimensions + 31) / 32
+        }
+        let outputs = kernel(
+            layers.map(\.weight) + layers.map { $0.graphConstants!.outputScale } + [cast],
+            template: template,
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: layers.map { [rows, $0.outputDimensions] },
+            outputDTypes: Array(repeating: x.dtype, count: layers.count))
+        let lead = Array(x.shape.dropLast())
+        return zip(outputs, layers).map { $0.reshaped(lead + [$1.outputDimensions]) }
+    }
+}

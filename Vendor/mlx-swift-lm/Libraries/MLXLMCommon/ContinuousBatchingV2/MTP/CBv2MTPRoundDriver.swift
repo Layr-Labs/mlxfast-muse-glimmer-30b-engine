@@ -664,6 +664,13 @@ final class CBv2MTPRoundDriver {
         seedMarks.insert(id)
     }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
+
+    /// Whether the fixed-depth window currently treats `id` as a
+    /// low-acceptance request.
+    func inLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
+        usesFixedDepthAcceptanceWindow
+            && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
+    }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
     func forceSynchronizedSeed() {
