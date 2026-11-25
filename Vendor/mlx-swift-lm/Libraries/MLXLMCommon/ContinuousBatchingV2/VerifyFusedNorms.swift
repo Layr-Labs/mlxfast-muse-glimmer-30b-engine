@@ -250,7 +250,8 @@ public enum VerifyFusedQK {
           const uint half_dims = D_ / 2;
           bool low = lane < 16;
           int batch_offset = offsets[b * OFFB_];
-          float L = scale * static_cast<float>(l + batch_offset);
+          int row_position = ROWPOS_ ? rowpos[l] : int(l);
+          float L = scale * static_cast<float>(row_position + batch_offset);
           for (int i = 0; i < 4; i++) {
             float other = simd_shuffle_xor(v[i], ushort(16));
             uint px = (low ? lane : lane - 16) * 4 + i;
@@ -274,9 +275,31 @@ public enum VerifyFusedQK {
 
     static let kernel = MLXFast.metalKernel(
         name: "verify_qk_norm_rope",
-        inputNames: ["q", "k", "offsets", "params"],
+        inputNames: ["q", "k", "offsets", "params", "rowpos"],
         outputNames: ["qo", "ko"],
         source: source)
+
+    /// Identity row positions per window width (unused unless `ROWPOS_`).
+    nonisolated(unsafe) private static var identityRows: [Int: MLXArray] = [:]
+    nonisolated(unsafe) private static var treeRows: [CBv2VerifyTreeLayout: MLXArray] = [:]
+    private static let rowsLock = NSLock()
+
+    /// Row positions of the window being built: a draft tree's leaf columns
+    /// take their logical depth; every other window is the identity.
+    static func rowPositions(rows l: Int) -> (array: MLXArray, explicit: Bool) {
+        rowsLock.lock()
+        defer { rowsLock.unlock() }
+        if let tree = CBv2VerifyTree.active(columns: l) {
+            if let cached = treeRows[tree] { return (cached, true) }
+            let made = MLXArray(CBv2VerifyTree.rowOffsets(tree))
+            treeRows[tree] = made
+            return (made, true)
+        }
+        if let cached = identityRows[l] { return (cached, false) }
+        let made = MLXArray((0 ..< max(l, 1)).map { Int32($0) })
+        identityRows[l] = made
+        return (made, false)
+    }
 
     public static func supports(headDim: Int, dtype: DType) -> Bool {
         headDim == 128 && dtype == .bfloat16
@@ -293,11 +316,14 @@ public enum VerifyFusedQK {
         let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) }
             ?? MLXArray.zeros([1], type: Int32.self)
         let params = MLXArray([eps, queryScale, log2(ropeBase ?? 1), ropeScale])
+        let rows = rowPositions(rows: l)
+        if rows.explicit && ropeBase != nil { CBv2VerifyTree.rowPositionCalls += 1 }
         let out = kernel(
-            [queries, keys, offs, params],
+            [queries, keys, offs, params, rows.array],
             template: [
                 ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
                 ("ROPE_", ropeBase != nil), ("OFFB_", offs.size == 1 ? 0 : 1),
+                ("ROWPOS_", rows.explicit && ropeBase != nil),
             ],
             grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],

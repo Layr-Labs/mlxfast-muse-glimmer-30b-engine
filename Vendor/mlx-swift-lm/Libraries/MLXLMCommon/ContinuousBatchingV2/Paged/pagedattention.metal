@@ -395,6 +395,7 @@ inline void paged_attention_part_cached_impl(
     for (int i = lo + (int)sgitg; i < hi; i += NSG) {
         const int absolute_position = attend_start + i;
         if (uses_visible_range && (absolute_position < info[3] || absolute_position >= info[4])) continue;
+        if (absolute_position >= info[6] && absolute_position < info[7]) continue;
         if (allowed_mask != nullptr && !allowed_mask[int64_t(qi) * mask_query_stride + int64_t(i) * mask_key_stride]) continue;
         if (HAS_WRITE && i == attend_len - 1) {
             // The newest position: read the step's tile from the INPUTS,
@@ -644,6 +645,9 @@ inline void paged_attention_onepass_impl(
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+    // Draft-tree leaf rows skip [hole_lo, hole_hi); empty for every other row.
+    const int hole_lo = info[6];
+    const int hole_hi = info[7];
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
     const int hi = min(attend_len, lo + PTOK);
@@ -706,7 +710,8 @@ inline void paged_attention_onepass_impl(
             }
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
-                if (j0 + u < count) {
+                const int upos = attend_start + first + (j0 + u) * NSG;
+                if (j0 + u < count && !(upos >= hole_lo && upos < hole_hi)) {
 #pragma unroll
                     for (int e = 0; e < E4; e++) {
                         kf[e] = float(kr[u][e]);
@@ -742,6 +747,7 @@ inline void paged_attention_onepass_impl(
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
             const int pos = attend_start + i;
+            if (pos >= hole_lo && pos < hole_hi) continue;
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);

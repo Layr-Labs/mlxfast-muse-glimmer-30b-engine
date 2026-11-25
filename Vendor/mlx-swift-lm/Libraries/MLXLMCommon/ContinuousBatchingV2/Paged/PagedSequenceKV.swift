@@ -543,6 +543,34 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         writtenHighWater = max(writtenHighWater, absoluteOffset)
     }
 
+    /// Whether `copyToken` can run on this row: plain native K/V, no
+    /// step-owned tickets.
+    var canCopyToken: Bool {
+        !released && !pool.usesStepOwnedAttention && groupKey.quantization == nil
+            && !groupKey.isAsymmetric
+    }
+
+    /// Copies the K/V of position `source` onto position `destination`, both
+    /// written and inside the current frontier (a tree round's leaf row onto
+    /// the committed position after the accepted chain). One gather and one
+    /// in-place write dispatch; the cursor does not move.
+    func copyToken(from source: Int, to destination: Int) {
+        guard canCopyToken, source != destination else { return }
+        precondition(
+            source >= baseOffset && source < absoluteOffset && destination >= baseOffset
+                && destination < absoluteOffset,
+            "[PagedSequenceKV] token copy outside the written range")
+        let (keys, values) = gatherRange(start: source, count: 1)
+        let s = pool.config.pageSize
+        let lp = destination / s
+        let index = ringPages.map { lp % $0 } ?? lp
+        precondition(index < table.count, "[PagedSequenceKV] token copy past the page table")
+        let slot = table[index] * Int32(s) + Int32(destination % s)
+        pool.writeTokens(
+            group: groupKey, slots: [slot], keys: keys.squeezed(axis: 0),
+            values: values.squeezed(axis: 0))
+    }
+
     /// Reserve the destination for ONE decode token and advance the
     /// frontier WITHOUT touching storage — the paged decode kernel writes
     /// the tile in place (fused write, see PagedAttentionKernel.decode).

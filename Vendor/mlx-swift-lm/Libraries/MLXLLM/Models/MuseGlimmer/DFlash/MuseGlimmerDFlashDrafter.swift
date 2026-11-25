@@ -57,7 +57,7 @@ extension MuseGlimmerDFlashTarget {
 /// in that round's pass.
 public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPPostVerifySpeculating,
-    @unchecked Sendable
+    CBv2MTPTreeDrafter, @unchecked Sendable
 {
     /// `startRound` builds the complete block and every later `draftStep`
     /// merely exposes a memo slice.  The proposal token roots the block and
@@ -189,6 +189,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                // Second choices (draft trees): the same graph a round builds.
+                let rows = Self.alternativeRows
+                let blockLogits = MLXArray.zeros(
+                    [rows, target.dflashVocabularySize], dtype: .bfloat16)
+                let ids = arange(target.dflashVocabularySize, dtype: .int32)
+                    .reshaped([1, target.dflashVocabularySize])
+                let isBest = equal(
+                    ids, MLXArray.zeros([rows], type: Int32.self).reshaped([rows, 1]))
+                warm.append(
+                    Self.fastArgMax(
+                        which(isBest, MLXArray(-Float.infinity).asType(.bfloat16), blockLogits)))
             }
             eval(warm)
             try errors.check()
@@ -240,6 +251,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// This round's proposals `[maximumDraftTokens]` and their hidden
         /// rows `[maximumDraftTokens, hiddenSize]`.
         var memo: (tokens: MLXArray, hidden: MLXArray)?
+        /// The head products and proposals of the memo's first rows, for
+        /// second choices (draft trees); computed only when asked.
+        var alternativeSource: (logits: MLXArray, best: MLXArray)?
+        var alternatives: MLXArray?
         /// This round's coupled-proposal rule; nil proposes the argmax.
         var selection: CBv2MTPProposalSelection?
         /// `startRounds` already drafted this round's block.
@@ -284,6 +299,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The next block for the all-accepted outcome, when built; dropped
         /// at confirmation for any other outcome.
         var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        var alternativeSource: (logits: MLXArray, best: MLXArray)? = nil
         /// `[maximumDraftTokens]` float32: each block row's top-1
         /// probability under the target's readout, evaluated with the
         /// speculation (`speculatedDraftConfidence`). Set with `memo`.
@@ -484,6 +500,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return "head"
         }
         s.memo = (proposals(logits, selection: s.selection), rows)
+        s.alternativeSource = Self.alternativeSource(logits, best: s.memo!.tokens)
         return nil
     }
 
@@ -565,10 +582,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return
         }
         for (index, s) in states.enumerated() {
-            s.memo = (
-                proposals(logits[(index * k) ..< ((index + 1) * k), 0...], selection: s.selection),
-                rows[index]
-            )
+            let block = logits[(index * k) ..< ((index + 1) * k), 0...]
+            s.memo = (proposals(block, selection: s.selection), rows[index])
+            s.alternativeSource = Self.alternativeSource(block, best: s.memo!.tokens)
             s.prestarted = true
         }
     }
@@ -727,6 +743,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
         }
         speculation.memo = memo
+        speculation.alternativeSource = Self.alternativeSource(logits, best: memo.tokens)
         speculation.confidence = confidence
         s.speculation = speculation
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
@@ -806,6 +823,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         guard let memo else { return .committed }
         s.memo = memo
+        s.alternativeSource = speculation.alternativeSource
         return .drafted
     }
 
@@ -1230,6 +1248,40 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputDTypes: [.int32])[0]
     }
 
+    /// Block rows that keep a second choice (draft-tree leaf depths).
+    static let alternativeRows = 3
+
+    private static func alternativeSource(_ logits: MLXArray, best: MLXArray)
+        -> (logits: MLXArray, best: MLXArray)?
+    {
+        guard CBv2VerifyTree.enabled, logits.ndim == 2, logits.dtype == .bfloat16,
+            logits.dim(1) >= 256, best.ndim == 1, best.dim(0) == logits.dim(0)
+        else { return nil }
+        let n = min(alternativeRows, logits.dim(0))
+        return (logits[0 ..< n, 0...], best[0 ..< n])
+    }
+
+    /// The second-ranked head product at block position `index`: the argmax
+    /// with the proposal's own id excluded (any tie order; it only drafts).
+    public func alternativeDraft(index: Int, requestState: any CBv2MTPRequestState)
+        -> MLXArray?
+    {
+        let s = state(requestState)
+        guard s.refusal == nil, s.selection == nil, let source = s.alternativeSource,
+            index >= 0, index < source.logits.dim(0)
+        else { return nil }
+        if s.alternatives == nil {
+            let n = source.logits.dim(0)
+            let vocabulary = source.logits.dim(1)
+            let ids = arange(vocabulary, dtype: .int32).reshaped([1, vocabulary])
+            let isBest = equal(ids, source.best.asType(.int32).reshaped([n, 1]))
+            let masked = which(
+                isBest, MLXArray(-Float.infinity).asType(.bfloat16), source.logits)
+            s.alternatives = Self.fastArgMax(masked)
+        }
+        return s.alternatives![index ..< (index + 1)]
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
     /// target's readout of them when it gives one per row.
     private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
@@ -1312,6 +1364,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private func clearRound(_ s: State) {
         s.memo = nil
+        s.alternativeSource = nil
+        s.alternatives = nil
         s.selection = nil
         s.prestarted = false
         s.stagedInputCount = 0

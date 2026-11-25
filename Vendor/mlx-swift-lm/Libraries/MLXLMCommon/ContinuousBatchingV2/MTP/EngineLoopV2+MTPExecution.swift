@@ -858,6 +858,11 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        // A draft tree: one row, a chain plus the drafter's second choices.
+        let tree = batch == 1 ? mtp.treeMark(for: verifyRows[0].rec.id) : nil
+        let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+        var treeLeavesBuilt = tree != nil && treeDrafter != nil
+        if let tree { precondition(tree.drafts == k, "CBv2 MTP: tree width != round depth") }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -900,11 +905,23 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
                     }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
+                    let result: (tokens: MLXArray, hidden: MLXArray)
+                    if let tree, draftIndex >= tree.chain {
+                        // Leaf column: the second choice at the leaf's depth.
+                        let alternative = treeDrafter?.alternativeDraft(
+                            index: tree.leafDepths[draftIndex - tree.chain] - 1,
+                            requestState: requestState)
+                        if alternative == nil { treeLeavesBuilt = false }
+                        result = (
+                            alternative?.asType(.int32) ?? MLXArray([Int32(0)]), currentHidden[index]
+                        )
+                    } else {
+                        result = stateful.draftStep(
+                            tokens: currentTokens[index],
+                            hidden: currentHidden[index],
+                            shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                            requestState: requestState)
+                    }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
@@ -979,8 +996,24 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        CBv2VerifyTree.begin(treeLeavesBuilt ? tree : nil)
+        var treeHonored = false
+        let target: (
+            scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
+            shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+            policyTopTwo: (ids: MLXArray, values: MLXArray)?,
+            cacheInnerState: [MLXArray],
+            diagnostics: [CBv2LogitDiagnosticPacket],
+            recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+        )
+        do {
+            target = try mtpBuildTargetVerification(
+                columns: targetColumns, rows: verifyRows, driver: mtp)
+            treeHonored = CBv2VerifyTree.end()
+        } catch {
+            _ = CBv2VerifyTree.end()
+            throw error
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -1009,6 +1042,8 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.tree = tree
+        result.treeLeavesValid = tree != nil && treeHonored
         return result
     }
 
