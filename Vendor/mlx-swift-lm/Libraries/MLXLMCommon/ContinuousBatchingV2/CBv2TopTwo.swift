@@ -7,7 +7,7 @@ import MLX
 // Metal entry-point names remain stable so extraction preserves pipeline identity.
 /// Shared exact ordering for the two-stage candidate-only top-2 reduction:
 /// value descending, token id ascending on exact ties, and NaNs last.
-private let cbv2TopTwoHeader = """
+let cbv2TopTwoHeader = """
     struct darkbloom_qwen35_mtp_top2_state {
         float first_value;
         float second_value;
@@ -397,6 +397,83 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
         partials,
         grid: (chunks, rows, 1),
         threadGroup: (chunks, 1, 1),
+        outputShapes: [[rows, 2], [rows, 2], [rows]],
+        outputDTypes: [.int32, .float32, .int32])
+    return (
+        outputs[0].reshaped([batch, width, 2]),
+        outputs[1].reshaped([batch, width, 2]),
+        outputs[2].reshaped([batch, width])
+    )
+}
+
+private let cbv2FusedReadoutTopTwoStage2Chunks = MLXFast.metalKernel(
+    name: "cbv2_fused_readout_top2_s2_chunks",
+    inputNames: ["partial_ids", "partial_values", "partial_nf"],
+    outputNames: ["top_ids", "top_values", "non_finite"],
+    source: """
+        constexpr uint CHUNKS = uint(CHUNKS_);
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.y;
+
+        darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+        uint nf = 0u;
+        for (uint c = lid; c < CHUNKS; c += 256u) {
+            const uint base = (row * CHUNKS + c) * 2;
+            darkbloom_qwen35_mtp_top2_insert(
+                local, partial_values[base], uint(partial_ids[base]));
+            darkbloom_qwen35_mtp_top2_insert(
+                local, partial_values[base + 1], uint(partial_ids[base + 1]));
+            nf |= uint(partial_nf[row * CHUNKS + c]);
+        }
+
+        threadgroup darkbloom_qwen35_mtp_top2_state scratch[256];
+        threadgroup uint nf_scratch[256];
+        scratch[lid] = local;
+        nf_scratch[lid] = nf;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                darkbloom_qwen35_mtp_top2_state merged = scratch[lid];
+                darkbloom_qwen35_mtp_top2_state other = scratch[lid + stride];
+                if (other.count > 0) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                scratch[lid] = merged;
+                nf_scratch[lid] |= nf_scratch[lid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lid == 0) {
+            const uint output_base = row * 2;
+            top_ids[output_base] = int(scratch[0].first_id);
+            top_ids[output_base + 1] = int(scratch[0].second_id);
+            top_values[output_base] = scratch[0].first_value;
+            top_values[output_base + 1] = scratch[0].second_value;
+            non_finite[row] = nf_scratch[0] != 0u ? 1 : 0;
+        }
+    """,
+    header: cbv2TopTwoHeader
+)
+
+/// Finalizes chunked fused readout top-2 and non-finite partials into
+/// `[batch, width, 2]` IDs/values and `[batch, width]` non-finite flags.
+func cbv2FusedReadoutTopTwoFinalizeChunks(
+    partialIDs: MLXArray, partialValues: MLXArray, partialNF: MLXArray,
+    batch: Int, width: Int, chunks: Int
+) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
+    let rows = batch * width
+    let outputs = cbv2FusedReadoutTopTwoStage2Chunks(
+        [partialIDs, partialValues, partialNF],
+        template: [("CHUNKS_", chunks)],
+        grid: (256, rows, 1),
+        threadGroup: (256, 1, 1),
         outputShapes: [[rows, 2], [rows, 2], [rows]],
         outputDTypes: [.int32, .float32, .int32])
     return (
