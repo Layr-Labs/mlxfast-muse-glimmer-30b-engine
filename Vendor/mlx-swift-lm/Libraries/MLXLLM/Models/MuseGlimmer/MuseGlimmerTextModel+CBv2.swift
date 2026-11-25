@@ -217,6 +217,10 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        // Both boundaries pair a post-sublayer norm with a pre-sublayer norm.
+        // The tower config fixes their epsilons; each call binds its own weights.
+        let addNormNorm = VerifyFusedNorms.PreparedAddNormNorm(
+            like: h, eps1: configuration.postNormEps, eps2: configuration.rmsNormEps)
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -236,16 +240,14 @@ extension MuseGlimmerTextModel {
                 cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
-            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
-                residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                w2: pre.weight, eps2: pre.eps)
+            let (mid, feedInput) = addNormNorm(
+                residual: h, x: attention, w1: post.weight, w2: pre.weight)
             let feed = groupedVerifyFeed(layer.mlp, feedInput)
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
-                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
-                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                    w2: next.weight, eps2: next.eps)
+                (h, layerInput) = addNormNorm(
+                    residual: mid, x: feed, w1: postFF.weight, w2: next.weight)
             } else {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
