@@ -80,7 +80,16 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
         numerics.prompt {
-            let hidden = model(inputEmbedding ?? model.inputEmbeddings(inputs), cache: cache)
+            let embeddings = inputEmbedding ?? model.inputEmbeddings(inputs)
+            if let fused = fusedPrefillResidual(embeddings, cache: cache, capture: []) {
+                switch requirement {
+                case .evaluationOnly:
+                    return fused.hidden[0..., -1, 0 ..< 1]
+                case .lastPositionLogits:
+                    return outputLogits(model.norm(fused.hidden[0..., -1, 0...]))
+                }
+            }
+            let hidden = model(embeddings, cache: cache)
             switch requirement {
             case .evaluationOnly: return hidden[0..., -1, 0 ..< 1]
             case .lastPositionLogits: return outputLogits(hidden[0..., -1, 0...])
@@ -88,6 +97,115 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
         }
     }
     // Packed prefill keeps the protocol's fail-closed default.
+
+    /// Fused prefill trunk for both plain prefill and MTP hidden-capture
+    /// prefill: keeps every projection, norm, attention and MLP operation in
+    /// `numerics.prompt` while fusing Q/K norm + FP32 query scale + RoPE into
+    /// one head-major kernel (`VerifyFusedQK.applyHeadMajor`, 0-ULP verified
+    /// with stock fallback) and applying the attention output gate before
+    /// merging heads so no `[B, L, H, D]` transpose copy is materialized.
+    private func fusedPrefillResidual(
+        _ embeddings: MLXArray, cache: [KVCache]?, capture: [Int]
+    ) -> (hidden: MLXArray, captured: [MLXArray])? {
+        guard let cache, cache.count == model.layers.count,
+            cache.allSatisfy({ $0 is any CBv2AttendingLayerCache })
+        else { return nil }
+        var h = embeddings
+        var captured = [Int: MLXArray]()
+        var shared: (positions: [Int], offsets: MLXArray)?
+        for (index, layer) in model.layers.enumerated() {
+            let attending = cache[index] as! any CBv2AttendingLayerCache
+            var ropeOffsets: MLXArray?
+            if layer.selfAttention.rope != nil {
+                let positions = attending.rows.map(\.absoluteOffset)
+                if let shared, shared.positions == positions {
+                    ropeOffsets = shared.offsets
+                } else {
+                    let offsets = attending.positionOffsets + 0
+                    shared = (positions, offsets)
+                    ropeOffsets = offsets
+                }
+            }
+            let attn = fusedPrefillAttention(
+                layer.selfAttention, layerIndex: index, layer.inputLayerNorm(h),
+                cache: attending, ropeOffsets: ropeOffsets)
+            let mid = layer.postAttentionLayerNorm.addedTo(h, attn)
+            h = layer.postFeedforwardLayerNorm.addedTo(
+                mid, layer.mlp(layer.preFeedforwardLayerNorm(mid)))
+            if capture.contains(index) { captured[index] = h }
+        }
+        return (h, capture.map { captured[$0]! })
+    }
+
+    private func fusedPrefillAttention(
+        _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let n = numerics
+        let qRaw = n.project(a.queryProj, x)
+        let kRaw = n.project(a.keyProj, x)
+        let vRaw = n.project(a.valueProj, x)
+        let gRaw = n.project(a.gateProj, x)
+        let queries: MLXArray
+        let keys: MLXArray
+        let theta = configuration.layerRopeTheta[layerIndex]
+        let usesRope = a.rope != nil
+        if VerifyFusedQK.prefillEnabled,
+            VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
+        {
+            precondition(usesRope == (theta != 0))
+            let qk = VerifyFusedQK.applyHeadMajor(
+                queries: qRaw, keys: kRaw,
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
+                ropeBase: usesRope ? theta : nil,
+                offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
+            queries = qk.queries
+            keys = qk.keys
+        } else {
+            var q = a.qkNorm(qRaw.reshaped(batch, length, a.heads, a.headDimensions))
+            q = (q.asType(.float32) * a.qkScaleFactor).asType(q.dtype).transposed(0, 2, 1, 3)
+            var k = a.qkNorm(kRaw.reshaped(batch, length, a.kvHeads, a.headDimensions))
+                .transposed(0, 2, 1, 3)
+            if let rope = a.rope {
+                let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+                q = rope(q, offset: offsets)
+                k = rope(k, offset: offsets)
+            }
+            queries = q
+            keys = k
+        }
+        let values = vRaw
+            .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
+        let gate = gRaw.reshaped(batch, length, a.heads, a.headDimensions)
+        output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
+            .reshaped(batch, length, -1)
+        return n.project(a.outputProj, output)
+    }
+
+    func fusedPrefillWithMTPHidden(
+        _ tokens: MLXArray, cache: [KVCache]?, requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, hidden: MLXArray)? {
+        guard !mtpHiddenLayerIDs.isEmpty else { return nil }
+        return numerics.prompt {
+            guard
+                let fused = fusedPrefillResidual(
+                    model.inputEmbeddings(tokens), cache: cache, capture: mtpHiddenLayerIDs)
+            else { return nil }
+            let captured =
+                fused.captured.count == 1
+                ? fused.captured[0] : concatenated(fused.captured, axis: -1)
+            switch requirement {
+            case .evaluationOnly:
+                return (fused.hidden[0..., -1, 0 ..< 1], captured)
+            case .lastPositionLogits:
+                return (outputLogits(model.norm(fused.hidden[0..., -1, 0...])), captured)
+            }
+        }
+    }
 }
 
 // MARK: - Teacher-forced readout
@@ -269,8 +387,17 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        if MuseGlimmerVerifyProjections.fusedLMReadout, !MuseGlimmerVerifyProjections.selfTest,
+            let scored = CBv2VerifyScales.verifiedFusedNVFP4ReadoutTopTwoAndNonFinite(
+                lmHead, trunk.normed,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+        {
+            return (scored.ids, scored.values, scored.nonFinite, trunk.hidden)
+        }
+        guard let product = CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -371,6 +498,24 @@ extension MuseGlimmerTextModel {
                     }
                 }
             }
+            if VerifyFusedQK.verifyPrefillParity(
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                eps: a.qkNorm.eps, queryScale: a.qkScaleFactor, ropeBase: rope, dtype: dtype)
+            {
+                let prefillLen = 512
+                let q512 = MLXArray.zeros(
+                    [1, prefillLen, a.heads * a.headDimensions], dtype: dtype)
+                let k512 = MLXArray.zeros(
+                    [1, prefillLen, a.kvHeads * a.headDimensions], dtype: dtype)
+                for base in bases {
+                    let out = VerifyFusedQK.applyHeadMajor(
+                        queries: q512, keys: k512, heads: a.heads, kvHeads: a.kvHeads,
+                        headDim: a.headDimensions, eps: a.qkNorm.eps,
+                        queryScale: a.qkScaleFactor, ropeBase: base,
+                        offsets: base == nil ? nil : MLXArray.zeros([1], type: Int32.self))
+                    warm += [out.queries, out.keys]
+                }
+            }
         }
         eval(warm)
         warmVerifyProjections(dtype: dtype)
@@ -394,6 +539,17 @@ extension MuseGlimmerTextModel {
     }
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
+        if MuseGlimmerVerifyProjections.fusedSilu, verifyRows(x) != nil,
+            let fused = CBv2VerifyNVFP4.verifiedSiluProduct([mlp.gateProj, mlp.upProj], x)
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let stock = compiledSiluProduct(
+                    numerics.project(mlp.gateProj, x), numerics.project(mlp.upProj, x))
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [fused], [stock], kind: "nvfp4.gate_up_silu", rows: MuseGlimmerNumerics.rows(x))
+            }
+            return verifyDownProjection(mlp.downProj, fused)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
@@ -434,6 +590,19 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
         let kv = caches.compactMap { $0 as? KVCache }
         guard kv.count == caches.count,
             let result = target.fusedVerifyForwardWithMTPHidden(tokens, cache: kv)
+        else { return nil }
+        return (result.logits, result.hidden)
+    }
+}
+
+extension MuseGlimmerCBv2Adapter: CBv2FusedMTPPrefillForwarding {
+    public func fusedForwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count,
+            let result = target.fusedPrefillWithMTPHidden(
+                tokens, cache: kv, requirement: requirement)
         else { return nil }
         return (result.logits, result.hidden)
     }
@@ -485,6 +654,12 @@ enum MuseGlimmerVerifyProjections {
     static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ"] != "0"
     static let selfTest = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST"] == "1"
+    /// Single-pass NVFP4 gate/up + SiLU product with one-time runtime 0-ULP
+    /// parity verification and automatic stock fallback on any mismatch.
+    static let fusedSilu = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_SILU"] != "0"
+    /// Fused NVFP4 lm_head + readout + top-2 + non-finite check with one-time
+    /// runtime 0-ULP parity verification and automatic stock fallback.
+    static let fusedLMReadout = environment["DARKBLOOM_MUSE_GLIMMER_FUSED_LM_READOUT"] != "0"
     static let maximumRows = 8
 
     private static let lock = NSLock()
@@ -730,6 +905,9 @@ extension MuseGlimmerTextModel {
                     }
                 }
                 eval(outputs)
+                if site == "gate_up", MuseGlimmerVerifyProjections.fusedSilu {
+                    CBv2VerifyNVFP4.verifyAndWarmSilu(gateUp: group, dtype: dtype)
+                }
             }
         }
         if lmHead is ModelOptWeightOnlyNVFP4Linear, let width = inputs(lmHead) {
@@ -742,6 +920,12 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            if MuseGlimmerVerifyProjections.fusedLMReadout {
+                CBv2VerifyScales.verifyAndWarmLMHeadReadout(
+                    lmHead, width: width, dtype: dtype,
+                    outputMultiplier: configuration.outputMultiplier,
+                    softcap: configuration.finalLogitSoftcapping)
+            }
         }
     }
 }

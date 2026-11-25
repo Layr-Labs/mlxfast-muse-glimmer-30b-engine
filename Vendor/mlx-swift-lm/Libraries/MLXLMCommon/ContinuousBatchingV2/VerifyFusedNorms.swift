@@ -203,6 +203,78 @@ public enum VerifyFusedQK {
     public static let enabled: Bool =
         ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_FUSED_QK"] != "0"
 
+    /// `DARKBLOOM_PREFILL_FUSED_QK=0` disables head-major fused Q/K in prefill.
+    public static let prefillEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_QK"] != "0"
+
+    private static let prefillParityLock = NSLock()
+    nonisolated(unsafe) private static var prefillParityPassed: Bool?
+
+    public static var prefillEnabled: Bool {
+        guard enabled, prefillEnvEnabled else { return false }
+        return prefillParityLock.withLock { prefillParityPassed ?? true }
+    }
+
+    /// One-time 0-ULP bit-equality check of `applyHeadMajor` against the stock
+    /// `rmsNorm` + FP32 scale + `RoPE` chain for both rotary and NoPE modes.
+    /// If any bit differs, disables `applyHeadMajor` in prefill automatically.
+    public static func verifyPrefillParity(
+        heads: Int, kvHeads: Int, headDim: Int, eps: Float, queryScale: Float,
+        ropeBase: Float?, dtype: DType
+    ) -> Bool {
+        guard enabled, prefillEnvEnabled, supports(headDim: headDim, dtype: dtype) else {
+            return false
+        }
+        let len = 8
+        let qVals = (0 ..< (len * heads * headDim)).map { idx -> Float in
+            Float(((idx * 7) % 31) - 15) * 0.125
+        }
+        let kVals = (0 ..< (len * kvHeads * headDim)).map { idx -> Float in
+            Float(((idx * 11) % 29) - 14) * 0.125
+        }
+        let qRaw = MLXArray(qVals, [1, len, heads * headDim]).asType(dtype)
+        let kRaw = MLXArray(kVals, [1, len, kvHeads * headDim]).asType(dtype)
+        let bases: [Float?] = ropeBase != nil ? [ropeBase, nil] : [nil]
+        for base in bases {
+            let offsetCases: [Int32] = base != nil ? [0, 17] : [0]
+            for offVal in offsetCases {
+                let offs = MLXArray([offVal])
+                let fused = applyHeadMajor(
+                    queries: qRaw, keys: kRaw, heads: heads, kvHeads: kvHeads, headDim: headDim,
+                    eps: eps, queryScale: queryScale, ropeBase: base,
+                    offsets: base != nil ? offs : nil)
+                var refQ = MLXFast.rmsNorm(
+                    qRaw.reshaped(1, len, heads, headDim), weight: MLXArray.mlxNone, eps: eps)
+                refQ = (refQ.asType(.float32) * queryScale).asType(dtype).transposed(0, 2, 1, 3)
+                var refK = MLXFast.rmsNorm(
+                    kRaw.reshaped(1, len, kvHeads, headDim), weight: MLXArray.mlxNone, eps: eps
+                ).transposed(0, 2, 1, 3)
+                if let base {
+                    refQ = MLXFast.RoPE(
+                        refQ, dimensions: headDim, traditional: false, base: base, scale: 1.0,
+                        offset: offs)
+                    refK = MLXFast.RoPE(
+                        refK, dimensions: headDim, traditional: false, base: base, scale: 1.0,
+                        offset: offs)
+                }
+                let diffQ = (
+                    contiguous(fused.queries).view(dtype: .uint16)
+                        .!= contiguous(refQ).view(dtype: .uint16)
+                ).asType(.int32).sum().item(Int.self)
+                let diffK = (
+                    contiguous(fused.keys).view(dtype: .uint16)
+                        .!= contiguous(refK).view(dtype: .uint16)
+                ).asType(.int32).sum().item(Int.self)
+                if diffQ != 0 || diffK != 0 {
+                    prefillParityLock.withLock { prefillParityPassed = false }
+                    return false
+                }
+            }
+        }
+        prefillParityLock.withLock { prefillParityPassed = true }
+        return true
+    }
+
     static let source = """
         uint lane = thread_position_in_threadgroup.x;
         uint g = threadgroup_position_in_grid.y;
@@ -215,9 +287,13 @@ public enum VerifyFusedQK {
         const device bfloat16_t* src = isq
             ? q + size_t(tok) * H_ * D_ + size_t(head) * D_
             : k + size_t(tok) * KVH_ * D_ + size_t(head - H_) * D_;
-        device bfloat16_t* dst = isq
-            ? qo + size_t(tok) * H_ * D_ + size_t(head) * D_
-            : ko + size_t(tok) * KVH_ * D_ + size_t(head - H_) * D_;
+        device bfloat16_t* dst = HEAD_MAJOR_
+            ? (isq
+                ? qo + (size_t(b) * H_ + size_t(head)) * L_ * D_ + size_t(l) * D_
+                : ko + (size_t(b) * KVH_ + size_t(head - H_)) * L_ * D_ + size_t(l) * D_)
+            : (isq
+                ? qo + size_t(tok) * H_ * D_ + size_t(head) * D_
+                : ko + size_t(tok) * KVH_ * D_ + size_t(head - H_) * D_);
         const float eps = params[0];
         const float qscale = params[1];
         const float base = params[2];
@@ -298,10 +374,36 @@ public enum VerifyFusedQK {
             template: [
                 ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
                 ("ROPE_", ropeBase != nil), ("OFFB_", offs.size == 1 ? 0 : 1),
+                ("HEAD_MAJOR_", false),
             ],
             grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
             outputDTypes: [queries.dtype, keys.dtype])
         return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+    }
+
+    /// Same arithmetic as `apply`, writing directly to contiguous head-major
+    /// `[B, H, L, D]` and `[B, KVH, L, D]` outputs so prefill attention needs
+    /// no transpose copy.
+    public static func applyHeadMajor(
+        queries: MLXArray, keys: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
+        eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float = 1,
+        offsets: MLXArray?
+    ) -> (queries: MLXArray, keys: MLXArray) {
+        let (b, l) = (queries.dim(0), queries.dim(1))
+        let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) }
+            ?? MLXArray.zeros([1], type: Int32.self)
+        let params = MLXArray([eps, queryScale, log2(ropeBase ?? 1), ropeScale])
+        let out = kernel(
+            [queries, keys, offs, params],
+            template: [
+                ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
+                ("ROPE_", ropeBase != nil), ("OFFB_", offs.size == 1 ? 0 : 1),
+                ("HEAD_MAJOR_", true),
+            ],
+            grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
+            outputShapes: [[b, heads, l, headDim], [b, kvHeads, l, headDim]],
+            outputDTypes: [queries.dtype, keys.dtype])
+        return (out[0], out[1])
     }
 }
