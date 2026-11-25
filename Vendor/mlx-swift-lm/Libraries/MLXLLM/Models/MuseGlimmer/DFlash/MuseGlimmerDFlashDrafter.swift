@@ -140,6 +140,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    private struct FusedLayerProjections {
+        let qkv: QuantizedLinear?
+        let qOut: Int
+        let kOut: Int
+        let kv: QuantizedLinear?
+        let gateUp: QuantizedLinear?
+        let gateOut: Int
+    }
+    private let fusedLayers: [FusedLayerProjections]
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -177,8 +186,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
+        let builtFused = Self.buildFusedProjections(model)
+        self.fusedLayers = builtFused
         try MLX.withError { errors in
             var warm = [maskEmbedding]
+            for fused in builtFused {
+                for ql in [fused.qkv, fused.kv, fused.gateUp].compactMap({ $0 }) {
+                    warm.append(ql.weight)
+                    warm.append(ql.scales)
+                    if let biases = ql.biases { warm.append(biases) }
+                    if let bias = ql.bias { warm.append(bias) }
+                }
+            }
             if let textTarget = target as? MuseGlimmerTextModel,
                 model.activationDType == .bfloat16
             {
@@ -189,6 +208,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                let dummyX = MLXArray.zeros([1, c.blockSize, c.hiddenSize], dtype: .bfloat16)
+                if let firstLayer = model.layers.first {
+                    let (dh, dy) = Self.drafterAddRMSNorm(
+                        residual: dummyX, x: dummyX, weight: firstLayer.postAttentionNorm.weight,
+                        eps: firstLayer.postAttentionNorm.eps)
+                    warm += [dh, dy]
+                    let dummyQKV = MLXArray.zeros(
+                        [1, c.blockSize, (c.attentionHeads + 2 * c.kvHeads) * c.headDimensions],
+                        dtype: .bfloat16)
+                    let (dq, dk, dv) = Self.drafterQKVNormRoPE(
+                        qkv: dummyQKV,
+                        qWeight: firstLayer.attention.qNorm.weight,
+                        kWeight: firstLayer.attention.kNorm.weight,
+                        heads: c.attentionHeads, kvHeads: c.kvHeads, headDim: c.headDimensions,
+                        eps: firstLayer.attention.qNorm.eps, ropeBase: c.ropeTheta,
+                        offset: 0)
+                    warm += [dq, dk, dv]
+                }
             }
             eval(warm)
             try errors.check()
@@ -825,11 +862,6 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private static let requantLock = NSLock()
     nonisolated(unsafe) private static var requantizedModels = Set<ObjectIdentifier>()
 
-    /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
-    /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
-    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
-    /// Permitted by the track contract (drafter only proposes tokens; the
-    /// pinned target verifies every emitted token).
     private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
         let key = ObjectIdentifier(model)
         requantLock.lock()
@@ -838,7 +870,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard claimed else { return }
 
         let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+            guard let ql = m as? QuantizedLinear,
+                (ql.bits == 8 || ql.bits == 5), ql.mode == .affine
+            else {
                 return nil
             }
             let dense = MLX.dequantized(
@@ -856,13 +890,189 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    private static func fuseQuantizedLinears(_ linears: [Linear]) -> QuantizedLinear? {
+        let qls = linears.compactMap { $0 as? QuantizedLinear }
+        guard qls.count == linears.count, let first = qls.first else { return nil }
+        let hasBiases = first.biases != nil
+        let hasBias = first.bias != nil
+        guard qls.allSatisfy({
+            $0.bits == first.bits && $0.groupSize == first.groupSize && $0.mode == first.mode
+                && ($0.biases != nil) == hasBiases && ($0.bias != nil) == hasBias
+                && $0.globalScale == nil && $0.weight.dim(1) == first.weight.dim(1)
+        }) else { return nil }
+        let weight = concatenated(qls.map(\.weight), axis: 0)
+        let scales = concatenated(qls.map(\.scales), axis: 0)
+        let biases = hasBiases ? concatenated(qls.compactMap(\.biases), axis: 0) : nil
+        let bias = hasBias ? concatenated(qls.compactMap(\.bias), axis: 0) : nil
+        return QuantizedLinear(
+            weight: weight, bias: bias, scales: scales, biases: biases,
+            groupSize: first.groupSize, bits: first.bits, mode: first.mode)
+    }
+
+    private static func buildFusedProjections(
+        _ model: MuseGlimmerDFlashDraftModel
+    ) -> [FusedLayerProjections] {
+        let c = model.configuration
+        let qOut = c.attentionHeads * c.headDimensions
+        let kOut = c.kvHeads * c.headDimensions
+        let gateOut = c.intermediateSize
+        let lastIndex = model.layers.count - 1
+        return model.layers.enumerated().map { index, layer in
+            let attn = layer.attention
+            let qkv: QuantizedLinear? = index < lastIndex
+                ? fuseQuantizedLinears([attn.qProj, attn.kProj, attn.vProj]) : nil
+            let kv: QuantizedLinear? = index == lastIndex
+                ? fuseQuantizedLinears([attn.kProj, attn.vProj]) : nil
+            let gateUp = fuseQuantizedLinears([layer.mlp.gate, layer.mlp.up])
+            return FusedLayerProjections(
+                qkv: qkv, qOut: qOut, kOut: kOut, kv: kv, gateUp: gateUp, gateOut: gateOut)
+        }
+    }
+
+    private static let drafterAddRMSNormKernel = MLXFast.metalKernel(
+        name: "dflash_add_rmsnorm",
+        inputNames: ["residual", "x", "weight", "params"],
+        outputNames: ["h", "y"],
+        source: """
+            constexpr int D = D_;
+            constexpr int TG = 256;
+            threadgroup float shared[8];
+            threadgroup float bcast[1];
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            const float inv = params[0];
+            const float eps = params[1];
+
+            const device bfloat16_t* rr = residual + size_t(row) * D;
+            const device bfloat16_t* xr = x + size_t(row) * D;
+            device bfloat16_t* hr = h + size_t(row) * D;
+            device bfloat16_t* yr = y + size_t(row) * D;
+
+            float sum_sq = 0.0f;
+            for (int i = int(lid); i < D; i += TG) {
+              bfloat16_t hb = rr[i] + xr[i];
+              hr[i] = hb;
+              float f = float(hb);
+              sum_sq += f * f;
+            }
+            sum_sq = simd_sum(sum_sq);
+            if (lane == 0) { shared[sg] = sum_sq; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              float v = (lane < 8) ? shared[lane] : 0.0f;
+              v = simd_sum(v);
+              if (lane == 0) { bcast[0] = metal::precise::rsqrt(v * inv + eps); }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float r = bcast[0];
+            for (int i = int(lid); i < D; i += TG) {
+              float f = float(hr[i]);
+              yr[i] = bfloat16_t(f * r * float(weight[i]));
+            }
+            """)
+
+    private static func drafterAddRMSNorm(
+        residual: MLXArray, x: MLXArray, weight: MLXArray, eps: Float
+    ) -> (h: MLXArray, y: MLXArray) {
+        let width = x.dim(-1)
+        let rows = x.size / width
+        let params = MLXArray([Float(1.0 / Double(width)), eps])
+        let out = drafterAddRMSNormKernel(
+            [residual, x, weight, params],
+            template: [("D_", width)],
+            grid: (256, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
+        return (out[0], out[1])
+    }
+
+    private static let drafterQKVNormRoPEKernel = MLXFast.metalKernel(
+        name: "dflash_qkv_norm_rope",
+        inputNames: ["qkv", "qw", "kw", "params"],
+        outputNames: ["qo", "ko", "vo"],
+        source: """
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint g = threadgroup_position_in_grid.y;
+            constexpr int HQ = H_;
+            constexpr int HK = KVH_;
+            constexpr int HT = HQ + 2 * HK;
+            constexpr int STRIDE = HT * D_;
+            const int head = int(g) % HT;
+            const int l = int(g) / HT;
+            const device bfloat16_t* row_ptr = qkv + size_t(l) * size_t(STRIDE);
+            if (head >= HQ + HK) {
+              const int vh = head - HQ - HK;
+              const device bfloat16_t* src = row_ptr + size_t(HQ + HK + vh) * D_ + lane * 4;
+              device bfloat16_t* dst = vo + size_t(l) * HK * D_ + size_t(vh) * D_ + lane * 4;
+              for (int i = 0; i < 4; i++) {
+                dst[i] = src[i];
+              }
+              return;
+            }
+            const bool isq = head < HQ;
+            const device bfloat16_t* src = row_ptr + size_t(head) * D_ + lane * 4;
+            const device bfloat16_t* w = isq ? qw : kw;
+            device bfloat16_t* dst = (isq
+                ? qo + size_t(l) * HQ * D_ + size_t(head) * D_
+                : ko + size_t(l) * HK * D_ + size_t(head - HQ) * D_) + lane * 4;
+            const float eps = params[0];
+            const float log2_base = params[1];
+            const float offset = params[2];
+
+            float tx[4];
+            float acc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+              tx[i] = float(src[i]);
+              acc += tx[i] * tx[i];
+            }
+            acc = simd_sum(acc);
+            const float inv = metal::precise::rsqrt(acc / float(D_) + eps);
+            float v[4];
+            for (int i = 0; i < 4; i++) {
+              v[i] = float(bfloat16_t(tx[i] * inv * float(w[lane * 4 + i])));
+            }
+            constexpr uint half_dims = D_ / 2;
+            const bool low = lane < 16;
+            const float L = offset + float(l);
+            for (int i = 0; i < 4; i++) {
+              const float other = simd_shuffle_xor(v[i], ushort(16));
+              const uint px = (low ? lane : lane - 16) * 4 + i;
+              const float d = float(px) / float(half_dims);
+              const float inv_freq = metal::exp2(-d * log2_base);
+              const float theta = L * inv_freq;
+              const float c = metal::fast::cos(theta);
+              const float s = metal::fast::sin(theta);
+              const float x1 = low ? v[i] : other;
+              const float x2 = low ? other : v[i];
+              const float rx1 = x1 * c - x2 * s;
+              const float rx2 = x1 * s + x2 * c;
+              dst[i] = bfloat16_t(low ? rx1 : rx2);
+            }
+            """)
+
+    private static func drafterQKVNormRoPE(
+        qkv: MLXArray, qWeight: MLXArray, kWeight: MLXArray,
+        heads: Int, kvHeads: Int, headDim: Int, eps: Float, ropeBase: Float, offset: Int
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
+        let l = qkv.dim(1)
+        let params = MLXArray([eps, log2(ropeBase), Float(offset)])
+        let out = drafterQKVNormRoPEKernel(
+            [qkv, qWeight, kWeight, params],
+            template: [("H_", heads), ("KVH_", kvHeads), ("D_", headDim)],
+            grid: (32, l * (heads + 2 * kvHeads), 1), threadGroup: (32, 1, 1),
+            outputShapes: [
+                [1, l, heads, headDim], [1, l, kvHeads, headDim], [1, l, kvHeads, headDim],
+            ],
+            outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype])
+        return (
+            out[0].transposed(0, 2, 1, 3),
+            out[1].transposed(0, 2, 1, 3),
+            out[2].transposed(0, 2, 1, 3)
+        )
+    }
+
     /// One block forward returning only the `draftCount` active draft rows
-    /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
-    /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
-    /// K/V on all `blockSize` rows so attention sees the full block, then
-    /// slices queries, attention, O-proj, MLP and final norm to only the
-    /// `draftCount` active rows (7 instead of 16), cutting final-layer work
-    /// in half with mathematically identical proposals.
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
@@ -875,25 +1085,45 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ? embeddings : embeddings.asType(model.activationDType)
         var hidden = act.reshaped([1, block, c.hiddenSize])
         let lastIndex = model.layers.count - 1
+        let useFusedNorms = model.activationDType == .bfloat16
+        let useFusedQK = useFusedNorms && c.headDimensions == 128
+        var x = model.layers[0].inputNorm(hidden)
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
-            let x = layer.inputNorm(hidden)
-            var keys = MLXFast.RoPE(
-                attention.kNorm(
-                    attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
-            var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                .transposed(0, 2, 1, 3)
-            if let context {
-                keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
-                values = concatenated([context.values[index ..< index + 1], values], axis: 2)
-            }
-            if index == lastIndex {
+            let fused = index < fusedLayers.count ? fusedLayers[index] : nil
+            let isLast = index == lastIndex
+
+            var queries: MLXArray
+            var keys: MLXArray
+            var values: MLXArray
+
+            if isLast {
+                let rawK: MLXArray
+                let rawV: MLXArray
+                if let kvProj = fused?.kv {
+                    let kv = kvProj(x)
+                    let kOut = fused!.kOut
+                    rawK = kv[0..., 0..., 0 ..< kOut]
+                    rawV = kv[0..., 0..., kOut...]
+                } else {
+                    rawK = attention.kProj(x)
+                    rawV = attention.vProj(x)
+                }
+                keys = MLXFast.RoPE(
+                    attention.kNorm(
+                        rawK.reshaped([1, block, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                values = rawV.reshaped([1, block, c.kvHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3)
+                if let context {
+                    keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                    values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+                }
                 let active = 1 ..< (1 + draftCount)
                 let xActive = x[0..., active, 0...]
-                let queries = MLXFast.RoPE(
+                queries = MLXFast.RoPE(
                     attention.qNorm(
                         attention.qProj(xActive).reshaped([
                             1, draftCount, c.attentionHeads, c.headDimensions,
@@ -903,33 +1133,112 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 let activeMask = mask.map { $0[active, 0...] }
                 let attended = MLXFast.scaledDotProductAttention(
                     queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
-                var h = hidden[0..., active, 0...]
-                    + attention.oProj(
-                        attended.transposed(0, 2, 1, 3).reshaped([
-                            1, draftCount, c.attentionHeads * c.headDimensions,
-                        ]))
-                let mx = layer.postAttentionNorm(h)
-                h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
-                return model.norm(h).reshaped([draftCount, c.hiddenSize])
+                let oOut = attention.oProj(
+                    attended.transposed(0, 2, 1, 3).reshaped([
+                        1, draftCount, c.attentionHeads * c.headDimensions,
+                    ]))
+                let h: MLXArray
+                let mx: MLXArray
+                if useFusedNorms {
+                    (h, mx) = Self.drafterAddRMSNorm(
+                        residual: hidden[0..., active, 0...], x: oOut,
+                        weight: layer.postAttentionNorm.weight, eps: layer.postAttentionNorm.eps)
+                } else {
+                    h = hidden[0..., active, 0...] + oOut
+                    mx = layer.postAttentionNorm(h)
+                }
+                let mlpAct: MLXArray
+                if let guProj = fused?.gateUp {
+                    let gu = guProj(mx)
+                    let gOut = fused!.gateOut
+                    mlpAct = compiledSiluProduct(gu[0..., 0..., 0 ..< gOut], gu[0..., 0..., gOut...])
+                } else {
+                    mlpAct = compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx))
+                }
+                let downOut = layer.mlp.down(mlpAct)
+                if useFusedNorms {
+                    let (_, normed) = Self.drafterAddRMSNorm(
+                        residual: h, x: downOut, weight: model.norm.weight, eps: model.norm.eps)
+                    return normed.reshaped([draftCount, c.hiddenSize])
+                }
+                return model.norm(h + downOut).reshaped([draftCount, c.hiddenSize])
             }
-            let queries = MLXFast.RoPE(
-                attention.qNorm(
-                    attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+
+            if let qkvProj = fused?.qkv, useFusedQK {
+                let qkv = qkvProj(x)
+                (queries, keys, values) = Self.drafterQKVNormRoPE(
+                    qkv: qkv,
+                    qWeight: attention.qNorm.weight, kWeight: attention.kNorm.weight,
+                    heads: c.attentionHeads, kvHeads: c.kvHeads, headDim: c.headDimensions,
+                    eps: attention.qNorm.eps, ropeBase: c.ropeTheta, offset: position)
+            } else {
+                let rawQ: MLXArray
+                let rawK: MLXArray
+                let rawV: MLXArray
+                if let qkvProj = fused?.qkv {
+                    let qkv = qkvProj(x)
+                    let qOut = fused!.qOut
+                    let kEnd = qOut + fused!.kOut
+                    rawQ = qkv[0..., 0..., 0 ..< qOut]
+                    rawK = qkv[0..., 0..., qOut ..< kEnd]
+                    rawV = qkv[0..., 0..., kEnd...]
+                } else {
+                    rawQ = attention.qProj(x)
+                    rawK = attention.kProj(x)
+                    rawV = attention.vProj(x)
+                }
+                queries = MLXFast.RoPE(
+                    attention.qNorm(
+                        rawQ.reshaped([1, block, c.attentionHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                keys = MLXFast.RoPE(
+                    attention.kNorm(
+                        rawK.reshaped([1, block, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                values = rawV.reshaped([1, block, c.kvHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3)
+            }
+            if let context {
+                keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+            }
             let attended = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-            hidden =
-                hidden
-                + attention.oProj(
-                    attended.transposed(0, 2, 1, 3).reshaped([
-                        1, block, c.attentionHeads * c.headDimensions,
-                    ]))
-            let mx = layer.postAttentionNorm(hidden)
-            hidden =
-                hidden
-                + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
+            let oOut = attention.oProj(
+                attended.transposed(0, 2, 1, 3).reshaped([
+                    1, block, c.attentionHeads * c.headDimensions,
+                ]))
+            let mx: MLXArray
+            if useFusedNorms {
+                (hidden, mx) = Self.drafterAddRMSNorm(
+                    residual: hidden, x: oOut,
+                    weight: layer.postAttentionNorm.weight, eps: layer.postAttentionNorm.eps)
+            } else {
+                hidden = hidden + oOut
+                mx = layer.postAttentionNorm(hidden)
+            }
+            let mlpAct: MLXArray
+            if let guProj = fused?.gateUp {
+                let gu = guProj(mx)
+                let gOut = fused!.gateOut
+                mlpAct = compiledSiluProduct(gu[0..., 0..., 0 ..< gOut], gu[0..., 0..., gOut...])
+            } else {
+                mlpAct = compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx))
+            }
+            let downOut = layer.mlp.down(mlpAct)
+            let nextLayer = model.layers[index + 1]
+            if useFusedNorms {
+                (hidden, x) = Self.drafterAddRMSNorm(
+                    residual: hidden, x: downOut,
+                    weight: nextLayer.inputNorm.weight, eps: nextLayer.inputNorm.eps)
+            } else {
+                hidden = hidden + downOut
+                x = nextLayer.inputNorm(hidden)
+            }
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }

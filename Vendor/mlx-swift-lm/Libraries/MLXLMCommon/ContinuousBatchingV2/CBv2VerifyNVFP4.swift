@@ -256,7 +256,7 @@ public enum CBv2VerifyNVFP4 {
     }
 
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
-        1: kernel(segments: 1), 2: kernel(segments: 2),
+        1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
@@ -312,11 +312,10 @@ public enum CBv2VerifyNVFP4 {
         product(x, weight: layer.weight, blockScales: layer.weightScale, tensorScale: layer.weightScale2)
     }
 
-    /// The products of two sibling NVFP4 layers of one input (MLP gate and
-    /// up), one launch, each equal to its layer's own row-exact product; nil
-    /// when the pair is not taken.
     public static func products(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
-        guard layers.count == 2, let nv = layers as? [ModelOptWeightOnlyNVFP4Linear] else {
+        guard let k = kernels[layers.count], layers.count >= 2,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear]
+        else {
             return nil
         }
         let inputs = x.dim(-1)
@@ -346,9 +345,9 @@ public enum CBv2VerifyNVFP4 {
             tiles += (outputs + tile - 1) / tile
         }
         arrays.append(x.reshaped(rows, inputs))
-        let results = kernels[2]!(
+        let results = k(
             arrays, template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: shapes, outputDTypes: [x.dtype, x.dtype])
+            outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: nv.count))
         let lead = Array(x.shape.dropLast())
         return zip(results, nv).map { $0.reshaped(lead + [$1.weight.dim(0)]) }
     }
