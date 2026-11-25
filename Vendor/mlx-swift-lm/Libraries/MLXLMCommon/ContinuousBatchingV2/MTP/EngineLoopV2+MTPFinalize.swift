@@ -248,6 +248,18 @@ extension EngineLoopV2 {
             var naturalEmitted: Int
             var constraintFailure: String? = nil
             var nonFiniteAfterPrefix = false
+            /// Tree rounds: drafts the chain accepted, and the first column
+            /// of the branch committed after them with its accepted length
+            /// (nil: none).
+            var chainAccepted: Int? = nil
+            var branchColumn: Int? = nil
+            var branchAccepted = 0
+
+            /// Verify column of committed row `v` (seed row 0).
+            func column(row v: Int) -> Int {
+                guard let start = branchColumn, let a = chainAccepted, v > a else { return v }
+                return start + (v - a - 1)
+            }
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -315,10 +327,48 @@ extension EngineLoopV2 {
                 while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
                     accepted += 1
                 }
-            } else {
+            } else if verify.tree == nil {
                 while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             }
-            let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
+            var committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
+            var rowTargets = targets
+            var chainAccepted: Int?
+            var branchColumn: Int?
+            var branchAccepted = 0
+            if let tree = verify.tree, metadata.freeSpan == nil, acceptBase == nil {
+                // The chain's accepted prefix and the target's token after
+                // it; then, when that token opens the branch at its depth,
+                // the branch's matching prefix and the target after it.
+                var a = 0
+                while a < tree.chain, targets[a] == drafts[a] { a += 1 }
+                chainAccepted = a
+                accepted = a
+                committed = Array(drafts[0 ..< a]) + [targets[a]]
+                rowTargets = Array(targets[0 ... a])
+                if a < tree.chain, verify.treeLeavesValid,
+                    let branch = tree.branch(depth: a + 1),
+                    metadata.storageRows.allSatisfy({
+                        ($0 as? PagedSequenceKV)?.canCopyToken == true
+                    })
+                {
+                    let start = tree.branchStart(branch)
+                    var e = 0
+                    while e < tree.branchLengths[branch],
+                        drafts[start + e - 1] == (e == 0 ? targets[a] : targets[start + e - 1])
+                    {
+                        e += 1
+                    }
+                    if e > 0 {
+                        committed =
+                            Array(drafts[0 ..< a]) + (0 ..< e).map { drafts[start + $0 - 1] }
+                            + [targets[start + e - 1]]
+                        rowTargets = Array(targets[0 ... a]) + (0 ..< e).map { targets[start + $0] }
+                        accepted = a + e
+                        branchColumn = start
+                        branchAccepted = e
+                    }
+                }
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
@@ -331,7 +381,7 @@ extension EngineLoopV2 {
             // A position this row would commit was decided by non-finite
             // target logits: commit nothing and fail the request exactly like
             // any other finalize-time verify failure.
-            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+            if rowTargets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
                 nonFiniteVerifyFailures += 1
                 step.discard.insert(id)
                 releaseDiscarded(metadata)
@@ -344,10 +394,13 @@ extension EngineLoopV2 {
                     batchIndex: batchIndex,
                     metadata: metadata,
                     rec: rec,
-                    targets: targets,
+                    targets: rowTargets,
                     committed: committed,
                     accepted: accepted,
-                    naturalEmitted: naturalEmitted))
+                    naturalEmitted: naturalEmitted,
+                    chainAccepted: chainAccepted,
+                    branchColumn: branchColumn,
+                    branchAccepted: branchAccepted))
         }
 
         if let logits = verify.constraintLogits {
@@ -531,6 +584,19 @@ extension EngineLoopV2 {
                     }
                 }
             }
+            // Tree: the committed branch rows' K/V move to the positions
+            // after the chain's accepted prefix (all inside this round's
+            // writes); rows past `confirmed` are rolled back anyway.
+            if let start = outcome.branchColumn, let a = outcome.chainAccepted {
+                let rows = min(outcome.branchAccepted, confirmed - a - 1)
+                if rows > 0 {
+                    for sequence in metadata.storageRows {
+                        guard let paged = sequence as? PagedSequenceKV else { continue }
+                        let base = paged.absoluteOffset - (1 + k)
+                        paged.copyTokens(from: base + start, to: base + a + 1, count: rows)
+                    }
+                }
+            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -543,16 +609,39 @@ extension EngineLoopV2 {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
+                let committedDraftTokens: MLXArray
+                let committedTargetHidden: MLXArray
+                if outcome.branchColumn != nil,
+                    committedDraftCount > (outcome.chainAccepted ?? committedDraftCount)
+                {
+                    // Draft i is verify column `column(row: i + 1)`; target
+                    // hidden row v is verify row `column(row: v)`.
+                    let draftColumns = (0 ..< committedDraftCount).map {
+                        Int32(outcome.column(row: $0 + 1) - 1)
+                    }
+                    let hiddenRows = (0 ..< committedDraftCount).map {
+                        Int32(outcome.column(row: $0))
+                    }
+                    committedDraftTokens = take(
+                        verify.draftIDs[batchIndex ..< batchIndex + 1], MLXArray(draftColumns),
+                        axis: 1)
+                    committedTargetHidden = take(
+                        verify.lastHidden[batchIndex ..< batchIndex + 1], MLXArray(hiddenRows),
+                        axis: 1)
+                } else {
+                    committedDraftTokens = verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount]
+                    committedTargetHidden = verify.lastHidden[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount,
+                        0...]
+                }
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
-                    committedTargetHidden: verify.lastHidden[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount,
-                        0...])
+                    committedDraftTokens: committedDraftTokens,
+                    committedTargetHidden: committedTargetHidden)
             }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
@@ -588,11 +677,12 @@ extension EngineLoopV2 {
                 }
             }
 
-            let observedAccepted = min(accepted, confirmed)
+            let observedAccepted = min(outcome.chainAccepted ?? accepted, confirmed)
+            let observedDrafted = verify.tree?.chain ?? k
             // Per-request timing: this verify row confirmed at the step's
             // readback-done instant (already read by `finalize`).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
-            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            rec.recordMTPRound(drafted: observedDrafted, accepted: observedAccepted)
             if confirmed > 0 {
                 rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
                 step.forwardShapes?.confirmTokens(
@@ -603,16 +693,17 @@ extension EngineLoopV2 {
             }
             // engine-local: per-round audit record (benchmark free-run audit)
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                drafted: observedDrafted, accepted: observedAccepted, emitted: confirmed,
                 audit: CBv2MTPRoundAuditRecord(
-                    requestID: id.raw, drafted: k,
-                    accepted: accepted, committed: confirmed))
-            let rejectionObserved = accepted < k && confirmed > accepted
+                    requestID: id.raw, drafted: observedDrafted,
+                    accepted: observedAccepted, committed: confirmed))
+            let rejectionObserved =
+                observedAccepted < observedDrafted && confirmed > observedAccepted
             let acceptanceTruncated =
-                !rejectionObserved && confirmed <= accepted && confirmed < k
+                !rejectionObserved && confirmed <= observedAccepted && confirmed < observedDrafted
             mtp.observeRequestAcceptance(
                 id: id,
-                draftedDepth: k,
+                draftedDepth: observedDrafted,
                 acceptedDepth: observedAccepted,
                 committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
@@ -633,8 +724,10 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+                var hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
                     targetOutputIndex: confirmed - 1, draftDepth: k)
+                // Tree: a committed branch row is the carry.
+                hiddenColumn = outcome.column(row: hiddenColumn)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears
@@ -669,7 +762,8 @@ extension EngineLoopV2 {
                 // drafter keeps it only for this carry object; its all-accepted
                 // block also needs the carry token to be the verify's own
                 // bonus target.
-                if confirmed == accepted + 1, committedDraftCount == accepted,
+                if outcome.branchColumn == nil,
+                    confirmed == accepted + 1, committedDraftCount == accepted,
                     hiddenColumn == accepted, accepted <= k,
                     let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
                     let state = metadata.assistantState
@@ -718,9 +812,11 @@ public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
     /// `draftsBlock`: the all-accepted outcome's next block may be drafted
     /// too (work every outcome shares is always eligible).
     /// Returns the arrays to submit; empty when it does not speculate.
+    /// `draftTokens` `[1, depth]`, when given: draft the next block for the
+    /// outcome this verify decides (accept count read on the device).
     func speculateNextRound(
         targetTokens: MLXArray, targetHidden: MLXArray, depth: Int, draftsBlock: Bool,
-        requestState: any CBv2MTPRequestState) -> [MLXArray]
+        draftTokens: MLXArray?, requestState: any CBv2MTPRequestState) -> [MLXArray]
     /// Finalize committed `acceptedDrafts` drafts of the round and stored
     /// `carryHidden` (this object, verify row `acceptedDrafts`) as the row's
     /// carry; `carryTokenIsTarget` when its token is the verify's own target
@@ -751,6 +847,9 @@ extension EngineLoopV2 {
     /// round; the shared commit work is always submitted. 0 disables the
     /// gate.
     static var mtpSpeculativeBlockMinimumFullAcceptance: Double { 0.5 }
+    /// `CBV2_MTP_OUTCOME_SPEC=0` keeps the all-accepted-only block speculation.
+    static let mtpOutcomeSpeculation =
+        ProcessInfo.processInfo.environment["CBV2_MTP_OUTCOME_SPEC"] != "0"
 
     /// Submit the drafter's next-round work behind a verify.
     /// One-row rounds only (a batched round's drafter pass has other
@@ -766,16 +865,27 @@ extension EngineLoopV2 {
             let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
             let state = verify.rows[0].assistantState
         else { return }
-        let k = verify.k
-        // Packet: [1, k] drafts, then [1, k + 1] targets.
-        let targets = verify.acceptancePacket[k ..< (2 * k + 1)].reshaped([1, k + 1])
+        let width = verify.k
+        // A tree round speculates its chain only (columns 0 ... chain).
+        let k = verify.tree?.chain ?? width
+        // Packet: [1, width] drafts, then [1, width + 1] targets.
+        let targets = verify.acceptancePacket[width ..< (width + k + 1)].reshaped([1, k + 1])
+        let hidden =
+            verify.tree == nil ? verify.lastHidden : verify.lastHidden[0..., 0 ..< (k + 1), 0...]
+        let id = verify.rows[0].id
         let draftsBlock =
-            mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
+            mtp.predictedFullAcceptance(for: id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        // Low-acceptance rounds rarely accept everything: draft the block of
+        // the outcome the verify decides instead.
+        let draftTokens: MLXArray? =
+            Self.mtpOutcomeSpeculation && mtp.inLowAcceptanceRegime(id)
+            ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
+        if verify.tree != nil, draftTokens == nil { return }
         let roots = speculator.speculateNextRound(
-            targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
-            draftsBlock: draftsBlock, requestState: state)
+            targetTokens: targets, targetHidden: hidden, depth: k,
+            draftsBlock: draftsBlock, draftTokens: draftTokens, requestState: state)
         guard !roots.isEmpty else { return }
         do {
             try withError { fault in

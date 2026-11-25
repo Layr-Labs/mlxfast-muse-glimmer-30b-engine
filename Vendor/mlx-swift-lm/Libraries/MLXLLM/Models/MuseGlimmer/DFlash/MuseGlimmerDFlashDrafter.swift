@@ -57,7 +57,7 @@ extension MuseGlimmerDFlashTarget {
 /// in that round's pass.
 public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPPostVerifySpeculating,
-    @unchecked Sendable
+    CBv2MTPTreeDrafter, @unchecked Sendable
 {
     /// `startRound` builds the complete block and every later `draftStep`
     /// merely exposes a memo slice.  The proposal token roots the block and
@@ -189,6 +189,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                // Second choices (draft trees): the same graph a round builds.
+                let rows = Self.alternativeRows
+                let blockLogits = MLXArray.zeros(
+                    [rows, target.dflashVocabularySize], dtype: .bfloat16)
+                let ids = arange(target.dflashVocabularySize, dtype: .int32)
+                    .reshaped([1, target.dflashVocabularySize])
+                let isBest = equal(
+                    ids, MLXArray.zeros([rows], type: Int32.self).reshaped([rows, 1]))
+                warm.append(
+                    Self.fastArgMax(
+                        which(isBest, MLXArray(-Float.infinity).asType(.bfloat16), blockLogits)))
             }
             eval(warm)
             try errors.check()
@@ -240,6 +251,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// This round's proposals `[maximumDraftTokens]` and their hidden
         /// rows `[maximumDraftTokens, hiddenSize]`.
         var memo: (tokens: MLXArray, hidden: MLXArray)?
+        /// The head products and proposals of the memo's first rows, for
+        /// second choices (draft trees); computed only when asked.
+        var alternativeSource: (logits: MLXArray, best: MLXArray)?
+        var alternatives: MLXArray?
         /// This round's coupled-proposal rule; nil proposes the argmax.
         var selection: CBv2MTPProposalSelection?
         /// `startRounds` already drafted this round's block.
@@ -284,6 +299,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The next block for the all-accepted outcome, when built; dropped
         /// at confirmation for any other outcome.
         var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        var alternativeSource: (logits: MLXArray, best: MLXArray)? = nil
+        /// The block was drafted for the outcome the verify itself decided
+        /// (its accept count read on the device), not for all-accepted.
+        var deviceOutcome = false
         /// `[maximumDraftTokens]` float32: each block row's top-1
         /// probability under the target's readout, evaluated with the
         /// speculation (`speculatedDraftConfidence`). Set with `memo`.
@@ -484,6 +503,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return "head"
         }
         s.memo = (proposals(logits, selection: s.selection), rows)
+        s.alternativeSource = Self.alternativeSource(logits, best: s.memo!.tokens)
         return nil
     }
 
@@ -565,10 +585,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return
         }
         for (index, s) in states.enumerated() {
-            s.memo = (
-                proposals(logits[(index * k) ..< ((index + 1) * k), 0...], selection: s.selection),
-                rows[index]
-            )
+            let block = logits[(index * k) ..< ((index + 1) * k), 0...]
+            s.memo = (proposals(block, selection: s.selection), rows[index])
+            s.alternativeSource = Self.alternativeSource(block, best: s.memo!.tokens)
             s.prestarted = true
         }
     }
@@ -603,7 +622,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Only for the served one-row batched argmax round.
     public func speculateNextRound(
         targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int, draftsBlock: Bool,
-        requestState: any CBv2MTPRequestState
+        draftTokens: MLXArray?, requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let s = state(requestState)
         s.speculation = nil
@@ -630,6 +649,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)
+        if let draftTokens, draftTokens.shape == [1, k], context.count + n <= window {
+            return speculateOutcomeBlock(
+                s, speculation: speculation, targetTokens: targetTokens,
+                draftTokens: draftTokens, depth: k, start: start, projected: projected)
+        }
         guard draftsBlock, s.lastRoundFullyAccepted else {
             s.speculation = speculation
             return [projected.keys, projected.values]
@@ -727,7 +751,91 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
         }
         speculation.memo = memo
+        speculation.alternativeSource = Self.alternativeSource(logits, best: memo.tokens)
         speculation.confidence = confidence
+        s.speculation = speculation
+        return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
+    }
+
+    /// The next block for the outcome this verify decides: its accept count
+    /// `a` (leading drafts equal to the targets) is read on the device, the
+    /// seed is the target at row `a`, the block sits at `start + a + 1`, and
+    /// the projected verify rows past `a` are masked out of its context. The
+    /// ring has not wrapped (`context.count + depth + 1 <= window`), so the
+    /// context is the held ring plus the projected rows.
+    private func speculateOutcomeBlock(
+        _ s: State, speculation inProgress: Speculation, targetTokens: MLXArray,
+        draftTokens: MLXArray, depth k: Int, start: Int,
+        projected: (keys: MLXArray, values: MLXArray)
+    ) -> [MLXArray] {
+        var speculation = inProgress
+        let c = model.configuration
+        let context = s.context
+        let n = k + 1
+        let ring = context.arrays
+        let existingCount = context.count
+        let block = context.blockSize
+        let targets = targetTokens.asType(.int32)
+        let match = equal(draftTokens.asType(.int32), targets[0..., 0 ..< k]).asType(.int32)
+        let accepted = cumprod(match, axis: 1).sum()
+        let seed = maximum(
+            takeAlong(targets, accepted.reshaped([1, 1]), axis: 1), MLXArray(Int32(0)))
+        let anchor = target.dflashTokenEmbeddings(seed)
+        guard anchor.size == c.hiddenSize else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
+        let ctxKeys = concatenated([
+            ring[0][0..., 0..., 0 ..< existingCount, 0...],
+            projected.keys.asType(context.dtype),
+        ], axis: 2)
+        let ctxValues = concatenated([
+            ring[1][0..., 0..., 0 ..< existingCount, 0...],
+            projected.values.asType(context.dtype),
+        ], axis: 2)
+        // Host visibility of the all-accepted layout, then the rows past `a`.
+        let next = start + n
+        let first = max(context.firstPosition, next - context.window)
+        let count = next - first
+        let hostMask = MuseGlimmerDFlashContextState.visibility(
+            anchor: next, blockSize: block, window: context.window,
+            contextPositions: Array(first ..< next)
+        ).map { MLXArray($0, [block, count + block]) }
+        let projectedVisible = lessEqual(MLXArray(Array(Int32(0) ..< Int32(n))), accepted)
+        let columns = concatenated([
+            MLXArray.ones([count - n], type: Bool.self), projectedVisible,
+            MLXArray.ones([block], type: Bool.self),
+        ], axis: 0)
+        let outcomeMask = broadcast(columns.reshaped([1, count + block]), to: [block, count + block])
+        let mask = hostMask.map { logicalAnd($0, outcomeMask) } ?? outcomeMask
+        let position = MLXArray(Int32(start + 1)) + accepted
+        let rows = fastDraftBlockRows(
+            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+            context: (ctxKeys, ctxValues), mask: mask,
+            draftCount: settings.maximumDraftTokens, devicePosition: position)
+        let logits = draftHeadProduct(rows, readout: false)
+        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
+        let memo: (tokens: MLXArray, hidden: MLXArray)
+        let confidence: MLXArray
+        if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
+            let (tokens, conf) = Self.fusedArgMaxAndConfidence(
+                logits,
+                outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+            memo = (tokens: tokens, hidden: rows)
+            confidence = conf
+        } else {
+            memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+            let scores = target.dflashReadout(logits).asType(.float32)
+            confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
+        }
+        speculation.memo = memo
+        speculation.alternativeSource = Self.alternativeSource(logits, best: memo.tokens)
+        speculation.confidence = confidence
+        speculation.deviceOutcome = true
         s.speculation = speculation
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
     }
@@ -760,7 +868,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         // The block assumed every draft accepted and the bonus target as the
         // seed; any other outcome keeps the commit only.
-        if accepted != speculation.depth || !carryTokenIsTarget {
+        if (!speculation.deviceOutcome && accepted != speculation.depth) || !carryTokenIsTarget {
             speculation.memo = nil
             speculation.confidence = nil
         }
@@ -806,6 +914,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         guard let memo else { return .committed }
         s.memo = memo
+        s.alternativeSource = speculation.alternativeSource
         return .drafted
     }
 
@@ -866,8 +975,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        draftCount: Int, devicePosition: MLXArray? = nil
     ) -> MLXArray {
+        func rope(_ x: MLXArray, _ shift: Int) -> MLXArray {
+            if let devicePosition {
+                return MLXFast.RoPE(
+                    x, dimensions: model.configuration.headDimensions, traditional: false,
+                    base: model.configuration.ropeTheta, scale: 1,
+                    offset: shift == 0 ? devicePosition : devicePosition + Int32(shift))
+            }
+            return MLXFast.RoPE(
+                x, dimensions: model.configuration.headDimensions, traditional: false,
+                base: model.configuration.ropeTheta, scale: 1, offset: position + shift)
+        }
         let c = model.configuration
         let block = c.blockSize
         let scale = 1 / Float(c.headDimensions).squareRoot()
@@ -878,12 +998,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)
-            var keys = MLXFast.RoPE(
+            var keys = rope(
                 attention.kNorm(
                     attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+                        .transposed(0, 2, 1, 3)), 0)
             var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
                 .transposed(0, 2, 1, 3)
             if let context {
@@ -893,13 +1011,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             if index == lastIndex {
                 let active = 1 ..< (1 + draftCount)
                 let xActive = x[0..., active, 0...]
-                let queries = MLXFast.RoPE(
+                let queries = rope(
                     attention.qNorm(
                         attention.qProj(xActive).reshaped([
                             1, draftCount, c.attentionHeads, c.headDimensions,
-                        ]).transposed(0, 2, 1, 3)),
-                    dimensions: c.headDimensions, traditional: false,
-                    base: c.ropeTheta, scale: 1, offset: position + 1)
+                        ]).transposed(0, 2, 1, 3)), 1)
                 let activeMask = mask.map { $0[active, 0...] }
                 let attended = MLXFast.scaledDotProductAttention(
                     queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
@@ -912,12 +1028,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 h = h + layer.mlp.down(compiledSiluProduct(layer.mlp.gate(mx), layer.mlp.up(mx)))
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
-            let queries = MLXFast.RoPE(
+            let queries = rope(
                 attention.qNorm(
                     attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+                        .transposed(0, 2, 1, 3)), 0)
             let attended = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
             hidden =
@@ -1230,6 +1344,47 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputDTypes: [.int32])[0]
     }
 
+    /// Block rows that keep a second choice (draft-tree leaf depths).
+    static let alternativeRows = 3
+
+    private static func alternativeSource(_ logits: MLXArray, best: MLXArray)
+        -> (logits: MLXArray, best: MLXArray)?
+    {
+        guard CBv2VerifyTree.enabled, logits.ndim == 2, logits.dtype == .bfloat16,
+            logits.dim(1) >= 256, best.ndim == 1, best.dim(0) == logits.dim(0)
+        else { return nil }
+        let n = min(alternativeRows, logits.dim(0))
+        return (logits[0 ..< n, 0...], best[0 ..< n])
+    }
+
+    /// The second-ranked head product at block position `index`: the argmax
+    /// with the proposal's own id excluded (any tie order; it only drafts).
+    public func alternativeDraft(index: Int, requestState: any CBv2MTPRequestState)
+        -> MLXArray?
+    {
+        let s = state(requestState)
+        guard s.refusal == nil, s.selection == nil, let source = s.alternativeSource,
+            index >= 0, index < source.logits.dim(0)
+        else { return nil }
+        if s.alternatives == nil {
+            let n = source.logits.dim(0)
+            let vocabulary = source.logits.dim(1)
+            let ids = arange(vocabulary, dtype: .int32).reshaped([1, vocabulary])
+            let isBest = equal(ids, source.best.asType(.int32).reshaped([n, 1]))
+            let masked = which(
+                isBest, MLXArray(-Float.infinity).asType(.bfloat16), source.logits)
+            s.alternatives = Self.fastArgMax(masked)
+        }
+        return s.alternatives![index ..< (index + 1)]
+    }
+
+    public func proposalDraft(index: Int, requestState: any CBv2MTPRequestState) -> MLXArray? {
+        let s = state(requestState)
+        guard s.refusal == nil, let memo = s.memo, index >= 0, index < memo.tokens.dim(0)
+        else { return nil }
+        return memo.tokens[index ..< (index + 1)]
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
     /// target's readout of them when it gives one per row.
     private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
@@ -1312,6 +1467,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private func clearRound(_ s: State) {
         s.memo = nil
+        s.alternativeSource = nil
+        s.alternatives = nil
         s.selection = nil
         s.prestarted = false
         s.stagedInputCount = 0
