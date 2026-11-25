@@ -664,6 +664,13 @@ final class CBv2MTPRoundDriver {
         seedMarks.insert(id)
     }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
+
+    /// Whether the fixed-depth window currently treats `id` as a
+    /// low-acceptance request.
+    func inLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
+        usesFixedDepthAcceptanceWindow
+            && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
+    }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
     func forceSynchronizedSeed() {
@@ -1473,4 +1480,10 @@ enum CBv2MTPHiddenIndex {
         precondition(targetOutputIndex >= 0 && targetOutputIndex <= draftDepth)
         return targetOutputIndex
     }
+}
+
+/// Set by the engine while a low-acceptance round's drafts are built, so a
+/// drafter can draft those rounds more cheaply. Never read for target work.
+public enum CBv2DraftRegime {
+    nonisolated(unsafe) public static var lowAcceptance = false
 }
