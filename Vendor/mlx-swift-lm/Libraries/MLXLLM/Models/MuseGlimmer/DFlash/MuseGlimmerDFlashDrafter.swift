@@ -141,6 +141,29 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
 
+    /// Head rows the argmax proposals are taken over: the first
+    /// `proposalVocabulary` token ids of `draftHead` (the full vocabulary
+    /// without an NVFP4 head). A prefix of the head's rows is a contiguous
+    /// view of the same codes and block scales, so the product reads only
+    /// those rows. A proposal whose argmax lies past the prefix is a
+    /// different proposal, which the target then rejects or accepts as for
+    /// any other; the emitted tokens are the target's either way. Readout
+    /// (coupled selection) products always cover the full vocabulary.
+    /// `DARKBLOOM_DFLASH_PROPOSAL_VOCAB=0` keeps the full vocabulary.
+    private let proposalVocabulary: Int
+
+    static let defaultProposalVocabulary = 65536
+
+    static func proposalVocabulary(vocabulary: Int, hasHead: Bool) -> Int {
+        guard hasHead else { return vocabulary }
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROPOSAL_VOCAB"]
+        let requested = raw.flatMap { Int($0) } ?? defaultProposalVocabulary
+        guard requested >= 256, requested % 32 == 0, requested < vocabulary else {
+            return vocabulary
+        }
+        return requested
+    }
+
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
         settings: Settings = Settings()
@@ -176,19 +199,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
+        proposalVocabulary = Self.proposalVocabulary(
+            vocabulary: target.dflashVocabularySize, hasHead: draftHead != nil)
         Self.requantize8BitLayers(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
                 model.activationDType == .bfloat16
             {
-                let dummyLogits = MLXArray.zeros(
-                    [1, target.dflashVocabularySize], dtype: .bfloat16)
-                let (t, conf) = Self.fusedArgMaxAndConfidence(
-                    dummyLogits,
-                    outputMultiplier: textTarget.configuration.outputMultiplier,
-                    softcap: textTarget.configuration.finalLogitSoftcapping)
-                warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                for width in Set([target.dflashVocabularySize, proposalVocabulary]) {
+                    let dummyLogits = MLXArray.zeros([1, width], dtype: .bfloat16)
+                    let (t, conf) = Self.fusedArgMaxAndConfidence(
+                        dummyLogits,
+                        outputMultiplier: textTarget.configuration.outputMultiplier,
+                        softcap: textTarget.configuration.finalLogitSoftcapping)
+                    warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                }
             }
             eval(warm)
             try errors.check()
@@ -479,8 +505,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
             draftCount: settings.maximumDraftTokens)
-        let logits = draftHeadProduct(rows, readout: s.selection != nil)
-        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+        let readout = s.selection != nil
+        let logits = draftHeadProduct(rows, readout: readout)
+        guard logits.shape == [settings.maximumDraftTokens, headWidth(readout: readout)] else {
             return "head"
         }
         s.memo = (proposals(logits, selection: s.selection), rows)
@@ -557,10 +584,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 $0[1 ..< (1 + k), 0...]
             }
         }
+        let readout = states.contains { $0.selection != nil }
         let logits = draftHeadProduct(
-            rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
-            readout: states.contains { $0.selection != nil })
-        guard logits.shape == [states.count * k, target.dflashVocabularySize] else {
+            rows.count == 1 ? rows[0] : concatenated(rows, axis: 0), readout: readout)
+        guard logits.shape == [states.count * k, headWidth(readout: readout)] else {
             for s in states { s.refusal = "head" }
             return
         }
@@ -705,7 +732,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         // startRound's head: the speculated memo must equal the normal one.
         let logits = draftHeadProduct(rows, readout: false)
-        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+        guard logits.shape == [settings.maximumDraftTokens, headWidth(readout: false)] else {
             s.speculation = speculation
             return [projected.keys, projected.values]
         }
@@ -819,7 +846,23 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let draftHead, rows.dim(-1) == draftHead.inputDimensions else {
             return target.dflashHeadProduct(rows)
         }
-        return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
+        if readout { return draftHead(rows) }
+        guard proposalVocabulary < draftHead.outputDimensions else {
+            return draftHead.unscaledProduct(rows)
+        }
+        let prefix = 0 ..< proposalVocabulary
+        return quantizedMM(
+            rows, draftHead.weight[prefix], scales: draftHead.weightScale[prefix], biases: nil,
+            transpose: true, groupSize: ModelOptWeightOnlyNVFP4Layout.blockSize, bits: 4,
+            mode: .nvfp4)
+    }
+
+    /// Columns `draftHeadProduct` returns.
+    private func headWidth(readout: Bool) -> Int {
+        guard !readout, let draftHead, proposalVocabulary < draftHead.outputDimensions else {
+            return target.dflashVocabularySize
+        }
+        return proposalVocabulary
     }
 
     private static let requantLock = NSLock()
