@@ -182,6 +182,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
+        contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -194,6 +195,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+            }
+            if let epilogue = contextKeyEpilogue {
+                let key = MLXArray.zeros([1, c.kvHeads * c.headDimensions], dtype: .bfloat16)
+                warm.append(epilogue.apply(Array(repeating: key, count: 5), rows: 1, position: 0))
             }
             eval(warm)
             try errors.check()
@@ -586,6 +591,122 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         settings.batchesRequests && !settings.couplesSampledProposals
     }
 
+    private let contextKeyEpilogue: ContextKeyEpilogue?
+
+    private static let contextKeysKernel = MLXFast.metalKernel(
+        name: "dflash_context_keys",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "w0", "w1", "w2", "w3", "w4", "dims", "params",
+        ],
+        outputNames: ["keys"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = threadgroup_position_in_grid.y;
+            const uint rows = uint(dims[0]);
+            const uint row = group % rows;
+            const uint head = (group / rows) % HEADS_;
+            const uint layer = group / (rows * HEADS_);
+            const device bfloat16_t* src;
+            const device bfloat16_t* weight;
+            switch (layer) {
+                case 0: src = k0; weight = w0; break;
+                case 1: src = k1; weight = w1; break;
+                case 2: src = k2; weight = w2; break;
+                case 3: src = k3; weight = w3; break;
+                default: src = k4; weight = w4; break;
+            }
+            src += (size_t(row) * HEADS_ + head) * 128 + lane * 4;
+            weight += lane * 4;
+            device bfloat16_t* dst = keys + size_t(group) * 128 + lane * 4;
+
+            // Match rms_single_row: four adjacent channels per lane, then two SIMD sums.
+            float x[4];
+            float sum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = src[i];
+                sum += x[i] * x[i];
+            }
+            sum = simd_sum(sum);
+            sum = simd_sum(lane == 0 ? sum : 0.0f);
+            const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
+            const bool low = lane < 16;
+            const float pos = float(dims[1] + int(row));
+            for (uint i = 0; i < 4; ++i) {
+                const bfloat16_t norm = weight[i] * static_cast<bfloat16_t>(x[i] * inv);
+                const float v = static_cast<float>(norm);
+                const float other = simd_shuffle_xor(v, ushort(16));
+                const float d = float((lane % 16) * 4 + i) / 64.0f;
+                const float theta = pos * metal::exp2(-d * params[1]);
+                const float c = metal::fast::cos(theta);
+                const float s = metal::fast::sin(theta);
+                const float x1 = low ? v : other;
+                const float x2 = low ? other : v;
+                dst[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+            }
+            """)
+
+    private struct ContextKeyEpilogue {
+        let kvHeads: Int
+        let weights: [MLXArray]
+        let coefficients: MLXArray
+
+        init?(_ model: MuseGlimmerDFlashDraftModel) {
+            let c = model.configuration
+            guard model.layers.count == 5, c.headDimensions == 128,
+                model.activationDType == .bfloat16, Device.defaultDevice().deviceType == .gpu
+            else { return nil }
+            var weights: [MLXArray] = []
+            weights.reserveCapacity(5)
+            for layer in model.layers {
+                let norm = layer.attention.kNorm
+                guard norm.weight.dtype == .bfloat16, norm.weight.shape == [128],
+                    norm.eps == c.rmsNormEps
+                else { return nil }
+                weights.append(norm.weight)
+            }
+            self.kvHeads = c.kvHeads
+            self.weights = weights
+            self.coefficients = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+        }
+
+        func apply(_ projections: [MLXArray], rows: Int, position: Int) -> MLXArray {
+            var inputs = projections
+            inputs.reserveCapacity(12)
+            inputs.append(contentsOf: weights)
+            inputs.append(MLXArray([Int32(rows), Int32(position)]))
+            inputs.append(coefficients)
+            return MuseGlimmerDFlashDrafter.contextKeysKernel(
+                inputs, template: [("HEADS_", kvHeads)],
+                grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
+        }
+    }
+
+    private func speculativeContextKeyValues(
+        _ context: MLXArray, at position: Int
+    ) -> (keys: MLXArray, values: MLXArray) {
+        let c = model.configuration
+        let rows = context.dim(0)
+        guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
+            position >= 0, position <= Int(Int32.max) - rows
+        else { return model.contextKeyValues(context, at: position) }
+        let shape = [1, rows, c.kvHeads, c.headDimensions]
+        var keys: [MLXArray] = []
+        var values: [MLXArray] = []
+        keys.reserveCapacity(model.layers.count)
+        values.reserveCapacity(model.layers.count)
+        for layer in model.layers {
+            keys.append(layer.attention.kProj(context))
+            values.append(layer.attention.vProj(context).reshaped(shape).transposed(0, 2, 1, 3))
+        }
+        guard keys.allSatisfy({ $0.dtype == .bfloat16 }) else {
+            return model.contextKeyValues(context, at: position)
+        }
+        return (
+            epilogue.apply(keys, rows: rows, position: position),
+            concatenated(values, axis: 0))
+    }
+
     /// Builds the next round's index-0 work from the verify's lazy rows,
     /// behind the submitted verify, before the acceptance count is known.
     ///
@@ -629,9 +750,14 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // all-accepted outcome's entry is all of them.
         let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
-        let projected = model.contextKeyValues(
-            model.projectContext(features),
-            segments: [(rows: 0 ..< n, position: start)])[0]
+        // The single-dispatch context-key epilogue in low-acceptance rounds;
+        // the stock context projection otherwise.
+        let projected =
+            CBv2DraftRegime.lowAcceptanceSpeculation
+            ? speculativeContextKeyValues(model.projectContext(features), at: start)
+            : model.contextKeyValues(
+                model.projectContext(features),
+                segments: [(rows: 0 ..< n, position: start)])[0]
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)

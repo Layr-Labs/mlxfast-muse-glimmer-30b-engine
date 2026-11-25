@@ -1010,7 +1010,7 @@ final class CBv2MTPRoundDriver {
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
-            acceptanceProbabilities: acceptance.probabilities)
+            acceptanceProbabilities: acceptance.windowProbabilities)
     }
 
     /// The acceptance ceiling's draft count for one row (see
@@ -1486,4 +1486,7 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Set by the engine while a low-acceptance request's post-verify
+    /// speculation is built. Never read for target work.
+    nonisolated(unsafe) public static var lowAcceptanceSpeculation = false
 }
