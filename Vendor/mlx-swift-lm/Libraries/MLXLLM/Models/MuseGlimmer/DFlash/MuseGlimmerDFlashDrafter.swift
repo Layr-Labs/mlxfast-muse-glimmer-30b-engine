@@ -483,8 +483,55 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
-        s.memo = (proposals(logits, selection: s.selection), rows)
+        let first = proposals(logits, selection: s.selection)
+        if Self.refinesBlock, s.selection == nil,
+            let refined = refinedProposals(
+                first, anchor: anchor, at: s.context.nextPosition, visible: visible)
+        {
+            s.memo = refined
+            return nil
+        }
+        s.memo = (first, rows)
         return nil
+    }
+
+    /// `CBV2_DFLASH_REFINE=0` drafts each block in one pass.
+    static let refinesBlock =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_REFINE"] != "0"
+
+    /// A second denoising pass of the same block: the first pass's proposals
+    /// replace the mask rows of positions 1 ... k, the block runs again over
+    /// the same context, and positions 2 ... k take the second pass's argmax
+    /// (each now sees the proposals before it). Position 1 keeps the first
+    /// pass's proposal: it was already conditioned on the anchor and context
+    /// alone. Proposals only; the target verifies every one.
+    private func refinedProposals(
+        _ first: MLXArray, anchor: MLXArray, at position: Int,
+        visible: (keys: MLXArray, values: MLXArray, mask: MLXArray?)?
+    ) -> (tokens: MLXArray, hidden: MLXArray)? {
+        let c = model.configuration
+        let k = settings.maximumDraftTokens
+        guard k >= 2, first.shape == [k], c.blockSize > k + 1 else { return nil }
+        let dtype = model.activationDType
+        let filled = target.dflashTokenEmbeddings(first.asType(.int32).reshaped([1, k]))
+        guard filled.size == k * c.hiddenSize else { return nil }
+        let embeddings = concatenated(
+            [
+                anchor.reshaped([1, c.hiddenSize]).asType(dtype),
+                filled.reshaped([k, c.hiddenSize]).asType(dtype),
+                broadcast(
+                    maskEmbedding.reshaped([1, c.hiddenSize]),
+                    to: [c.blockSize - 1 - k, c.hiddenSize]
+                ).asType(dtype),
+            ], axis: 0)
+        let rows = fastDraftBlockRows(
+            embeddings: embeddings, at: position,
+            context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
+            draftCount: k)
+        let logits = draftHeadProduct(rows, readout: false)
+        guard logits.shape == [k, target.dflashVocabularySize] else { return nil }
+        let second = proposals(logits, selection: nil)
+        return (concatenated([first[0 ..< 1], second[1 ..< k]], axis: 0), rows)
     }
 
     /// A round's commit before its block: the pending rows and the carry row
@@ -837,15 +884,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         requantLock.unlock()
         guard claimed else { return }
 
+        // The 5-bit MLP projections (~1.37 GB, most of the drafter's bytes)
+        // go to `mlpBits` at group 64 (`CBV2_DRAFTER_MLP_BITS`, 5 keeps them).
+        let mlpBits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_MLP_BITS"]
+            .flatMap { Int($0) }.map { min(max($0, 3), 5) } ?? 3
+        // The 8-bit attention and encoder projections go to `attentionBits`
+        // (`CBV2_DRAFTER_ATTN_BITS`: 4 is the record's group-32 form, 3 at group 64).
+        let attentionBits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_ATTN_BITS"]
+            .flatMap { Int($0) }.map { min(max($0, 3), 4) } ?? 3
         let updates = model.leafModules().compactMapValues { m -> Module? in
-            guard let ql = m as? QuantizedLinear, ql.bits == 8, ql.mode == .affine else {
+            guard let ql = m as? QuantizedLinear, ql.mode == .affine,
+                ql.bits == 8 || (ql.bits == 5 && mlpBits < 5)
+            else {
                 return nil
             }
             let dense = MLX.dequantized(
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
-            let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+            let replacement =
+                ql.bits == 8
+                ? QuantizedLinear(
+                    weight: dense, bias: ql.bias, groupSize: attentionBits < 4 ? 64 : 32,
+                    bits: attentionBits, mode: .affine)
+                : QuantizedLinear(
+                    weight: dense, bias: ql.bias, groupSize: 64, bits: mlpBits, mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {
