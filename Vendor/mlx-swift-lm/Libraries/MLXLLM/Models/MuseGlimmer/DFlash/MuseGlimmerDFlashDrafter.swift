@@ -827,7 +827,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     /// Re-quantizes the drafter's 8-bit linear projections (`encoder.fc` and
     /// `self_attn.{q,k,v,o}_proj`, ~597 MB) in memory on load to 4-bit
-    /// `groupSize: 32` (~335 MB), leaving the 5-bit MLP weights untouched.
+    /// `groupSize: 64` (~300 MB), leaving the 5-bit MLP weights untouched.
     /// Permitted by the track contract (drafter only proposes tokens; the
     /// pinned target verifies every emitted token).
     private static func requantize8BitLayers(_ model: MuseGlimmerDFlashDraftModel) {
@@ -845,7 +845,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 ql.weight, scales: ql.scales, biases: ql.biases,
                 groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode)
             let replacement = QuantizedLinear(
-                weight: dense, bias: ql.bias, groupSize: 32, bits: 4, mode: .affine)
+                weight: dense, bias: ql.bias, groupSize: 64, bits: 4, mode: .affine)
             if let biases = replacement.biases {
                 eval(replacement.weight, replacement.scales, biases)
             } else {
