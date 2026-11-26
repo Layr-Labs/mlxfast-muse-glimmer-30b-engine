@@ -222,6 +222,345 @@ public enum CBv2VerifyNVFP4 {
         }
         """
 
+    /// `cbv2_vn_tile` with its output written to threadgroup memory `[V][8 * TN]`,
+    /// preserving the exact stock `TN = 1` K-loop and register footprint.
+    static let tileHelperTG = """
+
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED>
+        inline void cbv2_vn_tile_tg(
+            const device uint32_t* w, const device uint8_t* scales, const device T* x,
+            float tensor_scale0, threadgroup T* y, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr short TM = (V + 7) / 8;
+            constexpr int ROWS = 8 * TN;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            static_assert(K % BK == 0, "whole chunks only");
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * ROWS;
+
+            const device T* xr[TM][2];
+            float2 C[TN][TM];
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+                }
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    C[t][mt] = float2(0);
+                }
+            }
+            const device uint* wl[TN];
+            const device uint8_t* sl[TN];
+            MO_WO_UNROLL
+            for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wl[t] = (const device uint*)(
+                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = scales + size_t(row) * row_scales + fn / 4;
+            }
+
+            uint qb[4][TN];
+            uint sb[4][TN];
+            if (PF == 1 && int(simd_gid) * BK < K) {
+                const int k0 = simd_gid * BK;
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k0 + 32 * block;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        qb[block][t] = wl[t][b / 8];
+                        sb[block][t] = sl[t][b / 16];
+                    }
+                }
+            }
+            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                const int kn = k + WK * BK;
+                const bool more = kn < K;
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    ushort4 xv[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                    uint q[TN];
+                    half s[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if (PF == 1) {
+                            q[t] = qb[block][t];
+                            s[t] = mo_wo_e4m3(sb[block][t]);
+                        } else {
+                            q[t] = wl[t][b / 8];
+                            s[t] = mo_wo_e4m3(sl[t][b / 16]);
+                        }
+                    }
+                    if (PF == 1 && more) {
+                        const int bn = kn + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            qb[block][t] = wl[t][bn / 8];
+                            sb[block][t] = sl[t][bn / 16];
+                        }
+                    }
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(
+                                float(as_type<bfloat>(xv[mt][0][i])),
+                                float(as_type<bfloat>(xv[mt][1][i])));
+                        }
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            const float2 a = mo_wo_pair(q[t], i, s[t]);
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                mo_wo_mma(C[t][mt], a, bf[mt]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            constexpr int tile_elems = TN * TM * 2;
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            p[((t * TM + mt) * 2 + j) * 32] = C[t][mt][j];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                C[t][mt][j] += p[((t * TM + mt) * 2 + j) * 32];
+                            }
+                        }
+                    }
+                }
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        if (8 * mt + fn + j < V) {
+                            threadgroup T* yr = y + size_t(8 * mt + fn + j) * ROWS;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const int out = y_col + fm + 8 * t;
+                                if (out < N) {
+                                    yr[fm + 8 * t] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        template <typename T>
+        inline T cbv2_vn_sigmoid(T x) {
+            const float xf = float(x);
+            const T y = T(1.0f) / (T(1.0f) + T(metal::precise::exp(metal::fabs(xf))));
+            return (xf < 0.0f) ? y : (T(1.0f) - y);
+        }
+
+        template <typename T>
+        inline T cbv2_vn_silu_product(T g, T u) {
+            const T s = cbv2_vn_sigmoid(g);
+            const T m = g * s;
+            return m * u;
+        }
+
+        // Second sequential pass (`up` projection) with fused `silu(gate_tile) * up`
+        // directly in `simd_gid == 0` before the single global store (zero `up_tile`,
+        // zero extra barrier, exact stock `TN = 1` K-loop register footprint).
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED>
+        inline void cbv2_vn_tile_up_silu(
+            const device uint32_t* w, const device uint8_t* scales, const device T* x,
+            float tensor_scale0, const threadgroup T* gate_tile, device T* y, int tile,
+            uint simd_gid, uint simd_lid, threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr short TM = (V + 7) / 8;
+            constexpr int ROWS = 8 * TN;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            static_assert(K % BK == 0, "whole chunks only");
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * ROWS;
+
+            const device T* xr[TM][2];
+            float2 C[TN][TM];
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+                }
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    C[t][mt] = float2(0);
+                }
+            }
+            const device uint* wl[TN];
+            const device uint8_t* sl[TN];
+            MO_WO_UNROLL
+            for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wl[t] = (const device uint*)(
+                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = scales + size_t(row) * row_scales + fn / 4;
+            }
+
+            uint qb[4][TN];
+            uint sb[4][TN];
+            if (PF == 1 && int(simd_gid) * BK < K) {
+                const int k0 = simd_gid * BK;
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k0 + 32 * block;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        qb[block][t] = wl[t][b / 8];
+                        sb[block][t] = sl[t][b / 16];
+                    }
+                }
+            }
+            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                const int kn = k + WK * BK;
+                const bool more = kn < K;
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    ushort4 xv[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                    uint q[TN];
+                    half s[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if (PF == 1) {
+                            q[t] = qb[block][t];
+                            s[t] = mo_wo_e4m3(sb[block][t]);
+                        } else {
+                            q[t] = wl[t][b / 8];
+                            s[t] = mo_wo_e4m3(sl[t][b / 16]);
+                        }
+                    }
+                    if (PF == 1 && more) {
+                        const int bn = kn + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            qb[block][t] = wl[t][bn / 8];
+                            sb[block][t] = sl[t][bn / 16];
+                        }
+                    }
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(
+                                float(as_type<bfloat>(xv[mt][0][i])),
+                                float(as_type<bfloat>(xv[mt][1][i])));
+                        }
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            const float2 a = mo_wo_pair(q[t], i, s[t]);
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                mo_wo_mma(C[t][mt], a, bf[mt]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            constexpr int tile_elems = TN * TM * 2;
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            p[((t * TM + mt) * 2 + j) * 32] = C[t][mt][j];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                C[t][mt][j] += p[((t * TM + mt) * 2 + j) * 32];
+                            }
+                        }
+                    }
+                }
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        const int row = 8 * mt + fn + j;
+                        if (row < V) {
+                            device T* yr = y + size_t(row) * N;
+                            const threadgroup T* gr = gate_tile + size_t(row) * ROWS;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const int out = y_col + fm + 8 * t;
+                                if (out < N) {
+                                    const T u_val = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    yr[out] = cbv2_vn_silu_product<T>(gr[fm + 8 * t], u_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
     /// Segment `i` takes tiles `[sum of tiles before, + ceil(N_i / (8 * TN)))`
     /// of the grid's y axis.
     private static func kernel(segments: Int) -> MLXFast.MLXFastKernel {
@@ -371,5 +710,149 @@ public enum CBv2VerifyNVFP4 {
             }
         }
         if !outs.isEmpty { eval(outs) }
+    }
+
+    // MARK: Sequential TN=1 Fused gate/up + SiLU product
+
+    private static let siluEnvEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_SILU"] != "0"
+
+    /// Maximum verify rows routed through fused sequential `TN = 1` gate/up+SiLU.
+    /// Defaults to 5 so short low-acceptance windows (`L = 2...5`) eliminate
+    /// intermediate MLP gate/up buffers and `compiledSiluProduct` dispatches
+    /// without altering the full-window (`L = 6...8`) verify schedule.
+    public static let maxSiluRows: Int = {
+        if let raw = ProcessInfo.processInfo.environment["MUSE_VERIFY_NVFP4_SILU_MAX_ROWS"],
+            let value = Int(raw)
+        {
+            return min(max(value, 2), maximumRows)
+        }
+        return min(5, maximumRows)
+    }()
+
+    private static let siluKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_gate_up_silu_seq",
+        inputNames: ["w0", "sc0", "ts0", "w1", "sc1", "ts1", "x"],
+        outputNames: ["y"],
+        source: """
+            constexpr int TILE_ELEMS = TN * ((V + 7) / 8) * 2;
+            constexpr int COLS = 8 * TN;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            threadgroup T gate_tile[V * COLS];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+            cbv2_vn_tile_tg<T, V, K, N0, TN, PF, SCALED>(
+                w0, sc0, x, ts0[0], gate_tile, tg, sg, sl, partials);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            cbv2_vn_tile_up_silu<T, V, K, N0, TN, PF, SCALED>(
+                w1, sc1, x, ts1[0], gate_tile, y, tg, sg, sl, partials);
+            """,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + tileHelperTG)
+
+    private struct SiluParityKey: Hashable {
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+    }
+
+    private static let siluParityLock = NSLock()
+    nonisolated(unsafe) private static var siluParityVerdict = [SiluParityKey: Bool]()
+
+    /// Computes `silu(gate(x)) * up(x)` in one sequential `TN = 1` launch
+    /// without materializing `gate` or `up` to global memory.
+    public static func siluProduct(_ layers: [any UnaryLayer], _ x: MLXArray) -> MLXArray? {
+        guard siluEnvEnabled, layers.count == 2,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear],
+            nv[0].outputDimensions == nv[1].outputDimensions
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        guard (2 ... maxSiluRows).contains(rows),
+            supports(rows: rows, inputs: inputs, dtype: x.dtype)
+        else { return nil }
+        for layer in nv {
+            guard layer.inputDimensions == inputs,
+                takes(weight: layer.weight, blockScales: layer.weightScale,
+                    tensorScale: layer.weightScale2, inputs: inputs)
+            else { return nil }
+        }
+        let outputs = nv[0].outputDimensions
+        let g = geometry(rows: rows, inputs: inputs)
+        let tile = 8 * g.fragments
+        let tiles = (outputs + tile - 1) / tile
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments),
+            ("PF", g.prefetch), ("SCALED", true), ("N0", outputs),
+        ]
+        let result = siluKernel(
+            [
+                nv[0].weight, nv[0].weightScale, nv[0].weightScale2.reshaped(1),
+                nv[1].weight, nv[1].weightScale, nv[1].weightScale2.reshaped(1),
+                x.reshaped(rows, inputs),
+            ],
+            template: template,
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
+        return result.reshaped(Array(x.shape.dropLast()) + [outputs])
+    }
+
+    /// Runs a one-time `withError`-guarded 0-ULP bit-equality check of
+    /// `siluProduct` against `silu(gate) * up` from `products`. Returns nil on
+    /// mismatch or error so the caller falls back cleanly to the stock path.
+    public static func verifiedSiluProduct(_ layers: [any UnaryLayer], _ x: MLXArray) -> MLXArray? {
+        guard siluEnvEnabled, layers.count == 2,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear],
+            nv[0].outputDimensions == nv[1].outputDimensions
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        guard (2 ... maxSiluRows).contains(rows) else { return nil }
+        let key = SiluParityKey(rows: rows, inputs: inputs, outputs: nv[0].outputDimensions)
+        if let cached = siluParityLock.withLock({ siluParityVerdict[key] }) {
+            return cached ? siluProduct(layers, x) : nil
+        }
+        let checked: MLXArray? = (try? withError { () -> MLXArray? in
+            guard let fused = siluProduct(layers, x),
+                let pair = products(layers, x), pair.count == 2
+            else { return nil }
+            let ref = MLXNN.silu(pair[0]) * pair[1]
+            let differing = (
+                contiguous(fused).view(dtype: .uint16)
+                    .!= contiguous(ref).view(dtype: .uint16)
+            ).asType(.int32).sum().item(Int.self)
+            return differing == 0 ? fused : nil
+        }) ?? nil
+        let passed = checked != nil
+        siluParityLock.withLock { siluParityVerdict[key] = passed }
+        return checked
+    }
+
+    /// Compiles and 0-ULP verifies `siluProduct` for rows 1 to 8 on non-zero
+    /// BF16 rows before any timed window.
+    public static func verifyAndWarmSilu(
+        _ layers: [any UnaryLayer], width: Int, dtype: DType,
+        rows: ClosedRange<Int> = 1 ... maximumRows
+    ) {
+        guard siluEnvEnabled, dtype == .bfloat16, layers.count == 2,
+            layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear })
+        else { return }
+        let maxR = rows.upperBound
+        var vals = [Float]()
+        vals.reserveCapacity(maxR * width)
+        for row in 0 ..< maxR {
+            for col in 0 ..< width {
+                vals.append(Float(((col + row * 11) % 31) - 15) * 0.125)
+            }
+        }
+        let full = MLXArray(vals, [1, maxR, width]).asType(dtype)
+        for r in rows {
+            let x = contiguous(full[0 ..< 1, 0 ..< r, 0...])
+            if let out = verifiedSiluProduct(layers, x) {
+                eval(out)
+            }
+        }
     }
 }

@@ -334,7 +334,11 @@ public enum CBv2SmallProjection {
     /// eight rows: registers).
     static func rowsPerThread(rows: Int, split: Bool) -> Int {
         if let o = rowsPerThreadOverride { return split ? o.split : o.flat }
-        return 2
+        // K-split segments at 2 to 5 rows carry at most 20 chains per lane
+        // with four rows per thread (the eight-row case above carries 16 at
+        // two), and keep twice the weight bytes in flight: measured 1.05x to
+        // 1.6x faster at 3 and 4 rows on every split FP8 shape. Same chains.
+        return split && rows >= 2 && rows <= 5 ? 4 : 2
     }
 
     /// Two codes per bit operation in the weight decode, with the exact
@@ -347,7 +351,7 @@ public enum CBv2SmallProjection {
     /// (deeper measured slower: registers), 4 (up to 4 rows) or 2 for the
     /// BN = 1 rows (o projection: 32 iterations per lane).
     static func prefetchDepth(rows: Int, split: Bool) -> Int {
-        split ? 1 : (rows <= 4 ? 4 : 2)
+        split ? (rows >= 2 && rows <= 4 ? 2 : 1) : (rows <= 4 ? 4 : 2)
     }
 
     /// Activation rows outermost in the inner loop (same chains).

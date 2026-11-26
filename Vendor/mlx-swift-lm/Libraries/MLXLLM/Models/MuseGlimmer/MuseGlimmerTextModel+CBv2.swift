@@ -319,6 +319,13 @@ extension MuseGlimmerTextModel {
             offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+        if let gatedCache = attending as? any CBv2GatedAttendingLayerCache,
+            let gated = gatedCache.updateAndAttendGated(
+                queries: queries, keys: keys, values: values,
+                gate: p[3], scale: a.scale, sinks: nil)
+        {
+            return verifyOutputProjection(a.outputProj, gated)
+        }
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         // Gate the `[B, L, H, D]` view of the attention output directly: the
@@ -409,6 +416,11 @@ extension MuseGlimmerTextModel {
     }
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
+        if verifyRows(x) != nil, !MuseGlimmerVerifyProjections.selfTest,
+            let fused = CBv2VerifyNVFP4.verifiedSiluProduct([mlp.gateProj, mlp.upProj], x)
+        {
+            return verifyDownProjection(mlp.downProj, fused)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
@@ -745,6 +757,11 @@ extension MuseGlimmerTextModel {
                     }
                 }
                 eval(outputs)
+                if site == "gate_up" {
+                    CBv2VerifyNVFP4.verifyAndWarmSilu(
+                        group, width: width, dtype: dtype,
+                        rows: 2 ... CBv2VerifyNVFP4.maxSiluRows)
+                }
             }
         }
         if lmHead is ModelOptWeightOnlyNVFP4Linear, let width = inputs(lmHead) {
