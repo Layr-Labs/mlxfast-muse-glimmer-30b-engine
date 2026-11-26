@@ -510,6 +510,13 @@ public protocol CBv2SequenceKV: AnyObject {
     /// attention runs against this row between the speculative `update()`
     /// and this commit except through the views that update returned.
     func commitSpeculativeWrite()
+    /// True when this row supports in-place 1-slot KV copy for leaf-tree verification.
+    var supportsSpeculativeTreeCopy: Bool { get }
+    /// True when this row has full KV headroom for a speculative tree window of `totalWidth`.
+    func hasSpeculativeTreeHeadroom(for totalWidth: Int) -> Bool
+    /// Copy one token's K/V entry within the active speculative window.
+    @discardableResult
+    func copySpeculativeToken(fromOffsetFromEnd: Int, toOffsetFromEnd: Int) -> MLXArray?
     /// Advance the absolute position counter WITHOUT writing storage.
     /// Only valid on a FRESH windowed state during prefix-cache adoption:
     /// the engine recomputes the trailing window tokens for windowed layers,
@@ -534,6 +541,16 @@ extension CBv2SequenceKV {
     public func beginSpeculativeWrite() {}
     /// Default: no-op.
     public func commitSpeculativeWrite() {}
+    /// True when this row supports in-place 1-slot KV copy for leaf-tree verification.
+    public var supportsSpeculativeTreeCopy: Bool { false }
+    /// True when this row has full KV headroom for a speculative tree window of `totalWidth`.
+    public func hasSpeculativeTreeHeadroom(for totalWidth: Int) -> Bool { false }
+    /// Copy one token's K/V entry within the active speculative window.
+    @discardableResult
+    public func copySpeculativeToken(fromOffsetFromEnd: Int, toOffsetFromEnd: Int) -> MLXArray? {
+        preconditionFailure(
+            "copySpeculativeToken is unsupported on \(type(of: self))")
+    }
 }
 
 /// Factory for per-sequence KV state; implemented by the v1 contiguous

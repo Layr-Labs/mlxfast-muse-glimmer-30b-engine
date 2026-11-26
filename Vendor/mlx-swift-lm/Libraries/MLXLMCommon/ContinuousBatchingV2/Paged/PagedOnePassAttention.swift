@@ -51,8 +51,25 @@ public enum PagedOnePassAttention {
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
+    private struct SegmentLaunchKey: Hashable {
+        let bindings: Int
+        let kvHeads: Int
+        let dtype: DType
+        let batch: Int
+        let queryHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let hpt: Int
+        let simdgroups: Int
+        let partitionTokens: Int
+        let softcap: Bool
+        let hasTree: Bool
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var segmentLaunches:
+        [SegmentLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
     nonisolated(unsafe) private static var checked = 0
     nonisolated(unsafe) private static var differing = 0
 
@@ -133,10 +150,32 @@ public enum PagedOnePassAttention {
                 seqinfo: seqinfo, params: params, previous: previous,
                 valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
                 kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
-                partitionTokens: ptok, softcap: softcap, source: source)
+                partitionTokens: ptok, softcap: softcap, hasTree: false, source: source)
             outputs += [result.fence, result.out]
+            if CBv2TreeVerifyScope.isActive {
+                let treeHeld =
+                    (try? withError { () -> Bool in
+                        let treeResult = segments(
+                            queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                            seqinfo: seqinfo, params: params, previous: result.fence,
+                            valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                            kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                            partitionTokens: ptok, softcap: softcap, hasTree: true, source: source)
+                        eval(treeResult.fence, treeResult.out)
+                        return true
+                    }) ?? false
+                if !treeHeld {
+                    CBv2TreeVerifyScope.disableAfterVerificationFailure()
+                }
+            }
         }
         eval(outputs)
+        if CBv2TreeVerifyScope.isActive,
+            !PagedSegmentTransfers.warmAndVerifyCopy(
+                dtype: dtype, kvHeads: kvHeads, headDim: headDim, pageSize: pageSize)
+        {
+            CBv2TreeVerifyScope.disableAfterVerificationFailure()
+        }
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
@@ -205,7 +244,7 @@ public enum PagedOnePassAttention {
             \(scratch)
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
-                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, HAS_TREE>(
                 q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
                 simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -214,7 +253,7 @@ public enum PagedOnePassAttention {
 
     private static func name(
         _ kind: String, dtype: DType, headDim: Int, pageSize: Int, gqa: Int, hpt: Int,
-        simdgroups: Int, partitionTokens: Int, softcap: Bool
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, hasTree: Bool = false
     ) -> String {
         let d: String
         switch dtype {
@@ -225,7 +264,7 @@ public enum PagedOnePassAttention {
         }
         return "cbv2_paged_onepass_\(kind)_\(d)_d\(headDim)_s\(pageSize)_g\(gqa)_h\(hpt)"
             + "_n\(simdgroups)_t\(partitionTokens)_p\(maxPartitions)_cap\(softcap ? 1 : 0)"
-            + "_b\(block)"
+            + "_b\(block)" + (hasTree ? "_tree1" : "")
     }
 
     /// Direct-slab entry: `[B, QH, D]` in the slab dtype.
@@ -270,7 +309,7 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, hasTree: Bool = false, source: String, probe: Bool = false
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
@@ -279,7 +318,7 @@ public enum PagedOnePassAttention {
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                softcap: softcap, hasTree: hasTree)
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -295,22 +334,48 @@ public enum PagedOnePassAttention {
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
-        let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
-            template: [
-                ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
-                ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
-                ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
-            ],
-            // The probe asks for the same thread count as one (tg / 2, 2, 1)
-            // threadgroup: MLX accepts that shape only when the pipeline
-            // holds `tg` threads as compiled, and throws otherwise.
-            grid: probe
-                ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1)
-                : (kvHeads * (gqa / hpt) * tg, b, 1),
-            threadGroup: probe ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1) : (tg, 1, 1),
-            outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+        let inputs = [queries] + backing + [seqinfo, params, previous, valueOffsets, records]
+        if probe {
+            let outputs = kernel(
+                inputs,
+                template: [
+                    ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                    ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                    ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                    ("HAS_TREE", hasTree),
+                ],
+                // The probe asks for the same thread count as one (tg / 2, 2, 1)
+                // threadgroup: MLX accepts that shape only when the pipeline
+                // holds `tg` threads as compiled, and throws otherwise.
+                grid: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+                threadGroup: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+            return (outputs[0], outputs[1])
+        }
+        let launchKey = SegmentLaunchKey(
+            bindings: bindings, kvHeads: kvHeads, dtype: dtype, batch: b, queryHeads: qh,
+            headDim: d, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
+            partitionTokens: partitionTokens, softcap: softcap, hasTree: hasTree)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ segmentLaunches[launchKey] }) {
+            launch = hit
+        } else {
+            let made = kernel.prepare(
+                template: [
+                    ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                    ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                    ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                    ("HAS_TREE", hasTree),
+                ],
+                grid: (kvHeads * (gqa / hpt) * tg, b, 1),
+                threadGroup: (tg, 1, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+            lock.withLock { segmentLaunches[launchKey] = made }
+            launch = made
+        }
+        let outputs = launch(inputs)
         return (outputs[0], outputs[1])
     }
 }

@@ -1004,6 +1004,18 @@ public final class PagedKVPool {
     // group's fence chain (see file header — slice updates on the slabs
     // are forbidden). Runtime K/V must match their observed native dtype.
 
+    /// Copy one token's KV entry between two physical slots in a segmented group.
+    @discardableResult
+    func copyTokenSlot(group key: PagedKVGroupKey, fromSlot: Int32, toSlot: Int32) -> MLXArray? {
+        guard !usesStepOwnedAttention, !key.isAsymmetric, key.quantization == nil else {
+            return nil
+        }
+        let g = group(key)
+        guard g.segmentLayout != nil else { return nil }
+        PagedSegmentTransfers.copySlot(group: g, fromSlot: fromSlot, toSlot: toSlot)
+        return g.writeFence
+    }
+
     /// Scatter `slots.count` tokens into the group's slabs. `keys`/`values`
     /// are `[kvHeads, n, headDim]`; `slots[i]` is token `i`'s physical
     /// position as `page * pageSize + slot`.

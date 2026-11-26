@@ -323,6 +323,43 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
+    public var supportsSpeculativeTreeCopy: Bool {
+        !released && !pool.usesStepOwnedAttention && !groupKey.isAsymmetric
+            && groupKey.quantization == nil && pool.group(groupKey).segmentLayout != nil
+    }
+
+    public func hasSpeculativeTreeHeadroom(for totalWidth: Int) -> Bool {
+        supportsSpeculativeTreeCopy
+            && absoluteOffset >= frozenHighWater
+            && absoluteOffset + totalWidth <= maxLength
+            && (windowSize == nil
+                || (totalWidth <= pool.config.maxPrefillChunk && speculativeHeadroom >= totalWidth))
+    }
+
+    /// Copy one token's K/V entry within the active speculative window from
+    /// `absoluteOffset - 1 - fromOffsetFromEnd` into `absoluteOffset - 1 - toOffsetFromEnd`
+    /// (called at finalize before `rollback` when a leaf-tree branch is accepted).
+    @discardableResult
+    public func copySpeculativeToken(fromOffsetFromEnd: Int, toOffsetFromEnd: Int) -> MLXArray? {
+        precondition(supportsSpeculativeTreeCopy, "[PagedSequenceKV] tree copy unsupported")
+        precondition(fromOffsetFromEnd >= 0 && toOffsetFromEnd >= 0)
+        if fromOffsetFromEnd == toOffsetFromEnd { return nil }
+        let fromPos = absoluteOffset - 1 - fromOffsetFromEnd
+        let toPos = absoluteOffset - 1 - toOffsetFromEnd
+        precondition(fromPos >= baseOffset && toPos >= baseOffset)
+        if let base = speculativeBase {
+            precondition(fromPos >= base && toPos >= base, "tree copy outside speculative window")
+        }
+        let s = pool.config.pageSize
+        let fromLogical = fromPos / s
+        let toLogical = toPos / s
+        let fromPage = table[ringPages.map { fromLogical % $0 } ?? fromLogical]
+        let toPage = table[ringPages.map { toLogical % $0 } ?? toLogical]
+        let fromSlot = fromPage * Int32(s) + Int32(fromPos % s)
+        let toSlot = toPage * Int32(s) + Int32(toPos % s)
+        return pool.copyTokenSlot(group: groupKey, fromSlot: fromSlot, toSlot: toSlot)
+    }
+
     private weak var nativeSpeculationOwner: CBv2NativePagedMTPWork?
 
     public func beginSpeculativeWrite() {

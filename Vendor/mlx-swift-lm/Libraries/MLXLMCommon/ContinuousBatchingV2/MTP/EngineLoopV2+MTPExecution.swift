@@ -981,22 +981,91 @@ extension EngineLoopV2 {
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
-        let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        var targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        var activeTreePlan: CBv2TreeVerifyPlan? = nil
+        var treeLeafTokenArray: MLXArray? = nil
+        if CBv2TreeVerifyScope.isActive, batch == 1, CBv2DraftRegime.lowAcceptance,
+            k >= 1, k <= 6,
+            nativeShutdownState == nil, CBv2NativePagedMTPWork.current == nil,
+            mtp.config.acceptance == .exact,
+            mtp.config.verificationMode != .serialTarget,
+            mtp.drafter.batchesVerifyColumnsAsDecodeRows,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            verifyRows[0].rec.request.tokenConstraint == nil,
+            rowMetadata[0].freeSpan == nil,
+            verifyRows[0].rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon,
+            (mtp.model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec == nil,
+            let treeProposer = mtp.drafter as? any CBv2MTPLeafTreeProposing,
+            let assistantState = rowMetadata[0].assistantState,
+            let altTokens = treeProposer.roundAlternateTokens(requestState: assistantState),
+            altTokens.ndim == 2, altTokens.dim(0) >= k, altTokens.dim(1) >= 2
+        {
+            let spare = 8 - (1 + k)
+            var leafSpecs: [(parent: Int, rank: Int)] = []
+            if spare >= 1 { leafSpecs.append((0, 0)) }
+            if spare >= 2 { leafSpecs.append((0, 1)) }
+            if spare >= 3 && k >= 2 { leafSpecs.append((1, 0)) }
+            if spare >= 4 {
+                if k >= 3 {
+                    leafSpecs.append((2, 0))
+                } else if k >= 2 {
+                    leafSpecs.append((1, 1))
+                }
+            }
+            let totalWidth = 1 + k + leafSpecs.count
+            if !leafSpecs.isEmpty,
+                totalWidth <= CBv2PagedSpeculation.maxSpeculativeSpan,
+                rowMetadata[0].storageRows.allSatisfy({
+                    $0.hasSpeculativeTreeHeadroom(for: totalWidth)
+                })
+            {
+                let leafCols = leafSpecs.map { spec in
+                    altTokens[spec.parent ..< (spec.parent + 1), spec.rank ..< (spec.rank + 1)]
+                }
+                targetColumns.append(contentsOf: leafCols)
+                treeLeafTokenArray = concatenated(leafCols, axis: 1)
+                activeTreePlan = CBv2TreeVerifyPlan(
+                    spineDepth: k, leafParents: leafSpecs.map(\.parent))
+            }
+        }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        CBv2TreeVerifyScope.current = activeTreePlan
+        let target:
+            (
+                scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
+                shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+                policyTopTwo: (ids: MLXArray, values: MLXArray)?,
+                cacheInnerState: [MLXArray],
+                diagnostics: [CBv2LogitDiagnosticPacket],
+                recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+            )
+        do {
+            target = try mtpBuildTargetVerification(
+                columns: targetColumns, rows: verifyRows, driver: mtp)
+            CBv2TreeVerifyScope.current = nil
+        } catch {
+            CBv2TreeVerifyScope.current = nil
+            throw error
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        let spineScores =
+            activeTreePlan == nil ? target.scores : target.scores[0..., 0 ..< (1 + k)]
+        var packetParts = [draftIDs.reshaped([-1]), spineScores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
+        }
+        if let treePlan = activeTreePlan, let leafTokens = treeLeafTokenArray {
+            let leafScores = target.scores[0..., (1 + k) ..< treePlan.totalWidth]
+            packetParts.append(leafTokens.reshaped([-1]))
+            packetParts.append(leafScores.reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -1013,6 +1082,8 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.treeLeafParents = activeTreePlan?.leafParents
+        result.treeLeafTokens = treeLeafTokenArray
         return result
     }
 

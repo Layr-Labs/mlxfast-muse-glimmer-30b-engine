@@ -1295,15 +1295,29 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             row.write(keys: keys[index], values: values[index])
         }
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
+        let tree =
+            b == 1
+            ? CBv2TreeVerifyScope.current.flatMap { $0.totalWidth == l ? $0 : nil } : nil
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
         descriptors.reserveCapacity(b * l)
         for row in rows {
+            let basePos = row.absoluteOffset - l
             for t in 0 ..< l {
+                let info: PagedAttentionKernel.SeqInfoRow
+                if let tree, t > tree.spineDepth {
+                    let parent = tree.leafParents[t - (tree.spineDepth + 1)]
+                    var leafInfo = row.seqInfoRow(
+                        attending: attendRange(row: row, qPosFromEnd: l - 1 - (parent + 1)))
+                    leafInfo.lastRemapPos = basePos + t
+                    info = leafInfo
+                } else {
+                    info = row.seqInfoRow(
+                        attending: attendRange(row: row, qPosFromEnd: l - 1 - t))
+                }
                 descriptors.append(
                     PagedSegmentDispatchPlan.Row(
                         pages: row.table,
-                        info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        info: info,
                         identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
             }
         }

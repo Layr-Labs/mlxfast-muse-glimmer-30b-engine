@@ -39,6 +39,13 @@ public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
     func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
 }
 
+/// Optional drafter capability exposing per-position top-2/top-3 alternate
+/// draft tokens (`[depth, 2]`, int32) for in-budget (`M <= 8`) leaf-tree
+/// verification during low-acceptance rounds.
+public protocol CBv2MTPLeafTreeProposing: AnyObject {
+    func roundAlternateTokens(requestState: any CBv2MTPRequestState) -> MLXArray?
+}
+
 /// Runtime availability for type-erased model adapters whose static wrapper
 /// type cannot express whether the wrapped target implements top-two.
 public protocol CBv2MTPPolicyTopTwoCapabilityProviding: AnyObject {
