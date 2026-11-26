@@ -79,17 +79,17 @@ public enum CBv2VerifyScales {
 
         uint qa[4][TN];
         uint sa[TN][2];
-        float4 xa[4][TM][2];
+        typename cb_sc_xvec<U16X>::type xa[4][TM][2];
         uint qb[4][TN];
         uint sb[TN][2];
-        float4 xb[4][TM][2];
+        typename cb_sc_xvec<U16X>::type xb[4][TM][2];
 
         #define CB_SC_LOAD(KK, Q, S, X) \\
             MO_WO_UNROLL for (short block = 0; block < 4; block++) { \\
                 const int b = (KK) + 32 * block; \\
                 MO_WO_UNROLL for (short t = 0; t < TN; t++) { Q[block][t] = wl[t][b / 8]; } \\
                 MO_WO_UNROLL for (short mt = 0; mt < TM; mt++) { \\
-                    MO_WO_UNROLL for (short j = 0; j < 2; j++) { X[block][mt][j] = mo_wo_load4(xr[mt][j] + b); } } } \\
+                    MO_WO_UNROLL for (short j = 0; j < 2; j++) { X[block][mt][j] = cb_sc_load_x<U16X>(xr[mt][j] + b); } } } \\
             MO_WO_UNROLL for (short t = 0; t < TN; t++) { \\
                 if (SV) { \\
                     const uint2 raw = sv[t][(KK) / BK]; \\
@@ -112,7 +112,7 @@ public enum CBv2VerifyScales {
                     fs[t] = float(s[t]) * 16384.0f; } \\
                 MO_WO_UNROLL for (short i = 0; i < 4; i++) { \\
                     float2 bf[TM]; \\
-                    MO_WO_UNROLL for (short mt = 0; mt < TM; mt++) { bf[mt] = float2(X[block][mt][0][i], X[block][mt][1][i]); } \\
+                    MO_WO_UNROLL for (short mt = 0; mt < TM; mt++) { bf[mt] = float2(cb_sc_x_elem(X[block][mt][0], i), cb_sc_x_elem(X[block][mt][1], i)); } \\
                     MO_WO_UNROLL for (short t = 0; t < TN; t++) { \\
                         const float2 a = FS ? cb_sc_pair_f(Q[block][t], i, fs[t]) : mo_wo_pair(Q[block][t], i, s[t]); \\
                         MO_WO_UNROLL for (short mt = 0; mt < TM; mt++) { mo_wo_mma(C[t][mt], a, bf[mt]); } } } } }
@@ -221,6 +221,126 @@ public enum CBv2VerifyScales {
             return float2(as_type<half2>(p)) * fs;
         }
 
+        template <bool U16> struct cb_sc_xvec { using type = float4; };
+        template <> struct cb_sc_xvec<true> { using type = ushort4; };
+
+        template <bool U16, typename T>
+        inline typename cb_sc_xvec<U16>::type cb_sc_load_x(const device T* ptr) {
+            if constexpr (U16) {
+                return ushort4(*(const device packed_ushort4*)ptr);
+            } else {
+                return mo_wo_load4(ptr);
+            }
+        }
+
+        inline float cb_sc_x_elem(ushort4 v, short i) { return float(as_type<bfloat>(v[i])); }
+        inline float cb_sc_x_elem(float4 v, short i) { return v[i]; }
+
+        // Whole-chunk 8-row NVFP4 tile helper for grouped multi-segment dispatches
+        // (`nvfp4.qkvg`): exact `cb_sc_e4m3x2` + `ushort4` BF16 activations.
+        template <typename T, int V, int K, int N>
+        inline void cb_sc_nvfp4_grouped_tile(
+            const device uint32_t* w, const device uint8_t* scales, const device T* x,
+            float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* partials) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr int BN = 8;
+            constexpr short TM = (V + 7) / 8;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            static_assert(K % BK == 0, "whole chunks only");
+            const short qid = simd_lid / 4;
+            const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+            const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const int y_col = tile * BN;
+
+            const device T* xr[TM][2];
+            float2 C[TM];
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+                }
+                C[mt] = float2(0);
+            }
+            const int row = min(y_col + fm, N - 1);
+            const device uint* wl = (const device uint*)(
+                (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+            const device uint8_t* sl = scales + size_t(row) * row_scales + fn / 4;
+
+            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                uint qa[4];
+                ushort4 xa[4][TM][2];
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    qa[block] = wl[b / 8];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xa[block][mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                }
+                const uint sa0 = uint(sl[k / 16]) | (uint(sl[k / 16 + 2]) << 16);
+                const uint sa1 = uint(sl[k / 16 + 4]) | (uint(sl[k / 16 + 6]) << 16);
+                const half2 hs0 = cb_sc_e4m3x2(sa0);
+                const half2 hs1 = cb_sc_e4m3x2(sa1);
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const half s = (block < 2) ? hs0[block] : hs1[block - 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        const float2 a = mo_wo_pair(qa[block], i, s);
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xa[block][mt][0][i])),
+                                float(as_type<bfloat>(xa[block][mt][1][i])));
+                            mo_wo_mma(C[mt], a, bf);
+                        }
+                    }
+                }
+            }
+
+            constexpr int tile_elems = TM * 2;
+            if (simd_gid > 0) {
+                threadgroup float* p = partials + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    p[(mt * 2 + 0) * 32] = C[mt][0];
+                    p[(mt * 2 + 1) * 32] = C[mt][1];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        C[mt][0] += p[(mt * 2 + 0) * 32];
+                        C[mt][1] += p[(mt * 2 + 1) * 32];
+                    }
+                }
+                const int out = y_col + fm;
+                if (out < N) {
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            if (8 * mt + fn + j < V) {
+                                y[size_t(8 * mt + fn + j) * N + out] =
+                                    mo_wo_result<T>(C[mt][j], true, tensor_scale0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         """
 
     private static let nvfp4Kernel = MLXFast.metalKernel(
@@ -229,6 +349,54 @@ public enum CBv2VerifyScales {
         outputNames: ["y"],
         source: nvfp4Source,
         header: nvfp4Header)
+
+    private static func makeGroupedNVFP4Kernel(segments: Int) -> MLXFast.MLXFastKernel {
+        var inputs = [String](), outputs = [String]()
+        var body = """
+            constexpr int TILE_ELEMS = ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+
+            """
+        var offset = "0"
+        for i in 0 ..< segments {
+            inputs += ["w\(i)", "sc\(i)", "ts\(i)"]
+            outputs.append("y\(i)")
+            let tiles = "((N\(i) + 7) / 8)"
+            body += """
+                \(i == 0 ? "" : "else ")if (tg < \(offset) + \(tiles)) {
+                    cb_sc_nvfp4_grouped_tile<T, V, K, N\(i)>(
+                        w\(i), sc\(i), x, ts\(i)[0], y\(i), tg - (\(offset)), sg, sl, partials);
+                }
+
+                """
+            offset += " + \(tiles)"
+        }
+        inputs.append("x")
+        return MLXFast.metalKernel(
+            name: "cbv2_verify_scales_nvfp4_grouped_\(segments)",
+            inputNames: inputs, outputNames: outputs, source: body, header: nvfp4Header)
+    }
+
+    private static let groupedNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = [
+        2: makeGroupedNVFP4Kernel(segments: 2),
+        4: makeGroupedNVFP4Kernel(segments: 4),
+    ]
+
+    private static let scaleCacheLock = NSLock()
+    nonisolated(unsafe) private static var scale1Cache: [ObjectIdentifier: MLXArray] = [:]
+
+    static func cachedTensorScale1(_ layer: ModelOptWeightOnlyNVFP4Linear) -> MLXArray {
+        let key = ObjectIdentifier(layer)
+        return scaleCacheLock.withLock {
+            if let existing = scale1Cache[key] { return existing }
+            let arr = layer.weightScale2.reshaped(1)
+            scale1Cache[key] = arr
+            return arr
+        }
+    }
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
@@ -259,7 +427,7 @@ public enum CBv2VerifyScales {
             ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
             ("SCALED", tensorScale != nil), ("NB", rowsPerTile), ("PF", prefetch),
             ("SV", vectorScales), ("FS", floatScale), ("SD", stockScaleDecode),
-            ("RG", rowGroups), ("CH", chunksInFlight),
+            ("RG", rowGroups), ("CH", chunksInFlight), ("U16X", x.dtype == .bfloat16),
         ]
         let result = nvfp4Kernel(
             [weight, blockScales, x.reshaped(rows, inputs), tensorScale?.reshaped(1) ?? unit],
@@ -522,8 +690,8 @@ public enum CBv2VerifyScales {
                 l.weightScale2.dtype == .float32, l.weightScale2.size == 1
             else { return nil }
             return nvfp4Product(
-                x, weight: l.weight, blockScales: l.weightScale, tensorScale: l.weightScale2,
-                rowsPerTile: 8)
+                x, weight: l.weight, blockScales: l.weightScale,
+                tensorScale: cachedTensorScale1(l), rowsPerTile: 8)
         }
         if let l = layer as? ModelOptCalibratedLinear {
             // Measured faster only for the MLP shapes: gate/up (vector loads) and
@@ -548,13 +716,55 @@ public enum CBv2VerifyScales {
     }
 
     /// `product` for every layer, or nil unless it applies to all of them.
+    /// Uses a single multi-segment dispatch for 2- or 4-layer bfloat16 NVFP4 groups.
     public static func products(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
+        if let grouped = nvfp4GroupedProducts(layers, x) { return grouped }
         var out: [MLXArray] = []
         for layer in layers {
             guard let y = product(layer, x) else { return nil }
             out.append(y)
         }
         return out
+    }
+
+    public static func nvfp4GroupedProducts(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
+        guard x.dtype == .bfloat16, let kernel = groupedNVFP4Kernels[layers.count],
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear]
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0, inputs % 128 == 0 else { return nil }
+        let rows = x.size / inputs
+        guard (1 ... 8).contains(rows),
+            rows > ModelOptWeightOnlyNVFP4RowExact.scalarRows,
+            ModelOptWeightOnlyNVFP4RowExact.supports(rows: rows, inputs: inputs, dtype: x.dtype)
+        else { return nil }
+        var arrays: [MLXArray] = []
+        arrays.reserveCapacity(nv.count * 3 + 1)
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs),
+        ]
+        var shapes: [[Int]] = []
+        shapes.reserveCapacity(nv.count)
+        var tiles = 0
+        for (i, l) in nv.enumerated() {
+            let outputs = l.outputDimensions
+            guard l.inputDimensions == inputs, outputs >= 8,
+                l.weight.dtype == .uint32, l.weight.shape == [outputs, inputs / 8],
+                l.weightScale.dtype == .uint8, l.weightScale.shape == [outputs, inputs / 16],
+                l.weightScale2.dtype == .float32, l.weightScale2.size == 1
+            else { return nil }
+            arrays += [l.weight, l.weightScale, cachedTensorScale1(l)]
+            template.append(("N\(i)", outputs))
+            shapes.append([rows, outputs])
+            tiles += (outputs + 7) / 8
+        }
+        arrays.append(x.reshaped(rows, inputs))
+        let results = kernel(
+            arrays, template: template,
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: nv.count))
+        let lead = Array(x.shape.dropLast())
+        return zip(results, nv).map { $0.reshaped(lead + [$1.outputDimensions]) }
     }
 
     /// Runs `product` on zero rows at every count in `rows` so MLX compiles

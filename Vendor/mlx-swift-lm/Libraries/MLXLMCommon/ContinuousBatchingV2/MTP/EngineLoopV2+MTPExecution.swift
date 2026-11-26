@@ -858,10 +858,21 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        // Low-acceptance rounds draft with the drafter's cheaper form.
+        // Low-acceptance rounds draft with the drafter's cheaper form and,
+        // when enabled, verify a multi-leaf tree strictly within M <= 8.
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        let verifyTree: CBv2VerifyTree? =
+            (batch == 1 && CBv2DraftRegime.verifyTreeMode != 0
+                && mtp.shouldUseVerifyTree(for: verifyRows[0].rec.id)
+                && mtp.config.verificationMode != .serialTarget
+                && verifyRows[0].rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+                && verifyRows[0].rec.request.tokenConstraint == nil
+                && rowMetadata[0].freeSpan == nil)
+            ? CBv2VerifyTree.make(mode: CBv2DraftRegime.verifyTreeMode, k: k) : nil
+        CBv2DraftRegime.activeVerifyTree = verifyTree
+        defer { CBv2DraftRegime.activeVerifyTree = nil }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -1013,6 +1024,7 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.verifyTree = verifyTree
         return result
     }
 

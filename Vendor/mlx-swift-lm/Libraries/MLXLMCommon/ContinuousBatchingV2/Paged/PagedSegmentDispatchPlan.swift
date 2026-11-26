@@ -4,8 +4,9 @@ import Foundation
 /// partition, so physical placement cannot change the softmax reduction order.
 struct PagedSegmentDispatchPlan {
     static let maximumBindings = 17
+    static let recordMaxPages = maximumBindings + 1
     static let recordHeader = 8
-    static let recordStride = recordHeader + 2 * maximumBindings
+    static let recordStride = recordHeader + 2 * recordMaxPages
     static let bindingClasses = [1, 4, 8, 17]
 
     struct Row {
@@ -110,7 +111,10 @@ struct PagedSegmentDispatchPlan {
                 let end =
                     info.attendStart + min(info.attendLength, (partition + 1) * partitionTokens)
                 let first = start / pageSize
-                let last = (end - 1) / pageSize
+                var last = (end - 1) / pageSize
+                if info.treeAncPacked != 0 && partition == partitions - 1 {
+                    last = max(last, info.maxAttendedPos / pageSize)
+                }
                 let pages = (first ... last).map { logical -> Int32 in
                     let index = logical % info.tableLength
                     precondition(index < row.pages.count)

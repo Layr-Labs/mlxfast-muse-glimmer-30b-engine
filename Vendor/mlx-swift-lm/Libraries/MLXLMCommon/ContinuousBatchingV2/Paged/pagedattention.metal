@@ -310,6 +310,8 @@ inline void paged_attention_part_cached_impl(
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+    const int tree_base = info[6];
+    const uint tree_anc = uint(info[7]);
 
     // Partitions past this row's attended length: nothing to do, and the
     // output slot is never read by the merge pass.
@@ -403,7 +405,10 @@ inline void paged_attention_part_cached_impl(
             load_row<T, EPT>(knew + tile_src, lane, kf);
             load_row<T, EPT>(vnew + tile_src, lane, vf);
         } else {
-            const int pos = attend_start + i;
+            const int raw_pos = attend_start + i;
+            const int pos = (tree_anc != 0u && raw_pos >= tree_base)
+                ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                : raw_pos;
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
@@ -644,6 +649,8 @@ inline void paged_attention_onepass_impl(
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+    const int tree_base = info[6];
+    const uint tree_anc = uint(info[7]);
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
     const int hi = min(attend_len, lo + PTOK);
@@ -690,7 +697,10 @@ inline void paged_attention_onepass_impl(
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
-                    const int pos = attend_start + first + (j0 + u) * NSG;
+                    const int raw_pos = attend_start + first + (j0 + u) * NSG;
+                    const int pos = (tree_anc != 0u && raw_pos >= tree_base)
+                        ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                        : raw_pos;
                     const int lpage = pos / S;
                     const int slot = pos % S;
                     if (lpage != cur_lpage) {
@@ -741,7 +751,10 @@ inline void paged_attention_onepass_impl(
         }
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
-            const int pos = attend_start + i;
+            const int raw_pos = attend_start + i;
+            const int pos = (tree_anc != 0u && raw_pos >= tree_base)
+                ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                : raw_pos;
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);

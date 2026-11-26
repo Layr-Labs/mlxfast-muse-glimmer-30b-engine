@@ -573,11 +573,26 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Tree verification metadata (zero for linear causal decode):
+        /// `treeBase` is the absolute KV offset of tree slot 0; `treeAncPacked`
+        /// packs 4-bit ancestor slot indices `[0, ..., leaf]` at nibbles `0...treeDepth`.
+        var treeBase: Int32 = 0
+        var treeAncPacked: UInt32 = 0
+        var treeDepth: Int = 0
+
+        var maxAttendedPos: Int {
+            var m = attendStart + attendLength - 1
+            if treeAncPacked != 0 {
+                let leaf = Int((treeAncPacked >> (4 * treeDepth)) & 0xF)
+                m = max(m, Int(treeBase) + leaf)
+            }
+            return m
+        }
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), 0, treeBase, Int32(bitPattern: treeAncPacked),
             ]
         }
     }

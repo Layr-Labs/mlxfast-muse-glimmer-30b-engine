@@ -1297,14 +1297,36 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
         descriptors.reserveCapacity(b * l)
-        for row in rows {
+        if let tree = CBv2DraftRegime.activeVerifyTree, b == 1, l == tree.totalSlots {
+            let row = rows[0]
+            let treeBase = row.absoluteOffset - l
             for t in 0 ..< l {
+                let qPos = treeBase + tree.posDeltas[t]
+                var start = row.baseOffset
+                if let window = row.windowSize {
+                    start = max(start, qPos - window + 1)
+                }
+                let length = qPos - start + 1
                 descriptors.append(
                     PagedSegmentDispatchPlan.Row(
                         pages: row.table,
                         info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            attending: (start, length),
+                            treeBase: Int32(treeBase),
+                            treeAncPacked: tree.ancPacked[t],
+                            treeDepth: tree.posDeltas[t]),
                         identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        } else {
+            for row in rows {
+                for t in 0 ..< l {
+                    descriptors.append(
+                        PagedSegmentDispatchPlan.Row(
+                            pages: row.table,
+                            info: row.seqInfoRow(
+                                attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+                }
             }
         }
         let result = PagedSegmentAttention.decode(

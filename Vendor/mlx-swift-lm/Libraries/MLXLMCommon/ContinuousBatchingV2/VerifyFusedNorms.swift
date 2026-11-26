@@ -154,21 +154,63 @@ public enum VerifyFusedNorms {
             sq2, blocks, extra, lid, lane, sg, nsg, shared_b, bcast_b);
         float var2 = total2 * inv;
         float r2 = metal::precise::rsqrt(var2 + eps2);
-        for (int k = 0; k < MAXV; k++) {
-          if (live[k]) {
-            int e = idx[k];
-            float o = f2[k] * r2;
-            o = o * (1.0f + static_cast<float>(w2[e]));
-            yr[e] = static_cast<bfloat16_t>(o);
+        if constexpr (CAST_FP8_) {
+          const float m0 = fp8_mu[0];
+          const float m1 = fp8_mu[1];
+          const float bound = fp8_bd[0];
+          const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+          for (int k = 0; k < MAXV; k++) {
+            if (live[k]) {
+              int e = idx[k];
+              float o = f2[k] * r2;
+              o = o * (1.0f + static_cast<float>(w2[e]));
+              bfloat16_t yb = static_cast<bfloat16_t>(o);
+              float scaled = static_cast<float>(yb) * m0;
+              uint8_t bits = modelopt_e4m3_bits(scaled);
+              float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+              bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+              yr[e] = static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+            }
+          }
+        } else {
+          for (int k = 0; k < MAXV; k++) {
+            if (live[k]) {
+              int e = idx[k];
+              float o = f2[k] * r2;
+              o = o * (1.0f + static_cast<float>(w2[e]));
+              yr[e] = static_cast<bfloat16_t>(o);
+            }
           }
         }
         """
 
     static let kernel = MLXFast.metalKernel(
         name: "verify_add_norm_norm",
-        inputNames: ["residual", "x", "w1", "w2", "params"],
+        inputNames: ["residual", "x", "w1", "w2", "params", "fp8_mu", "fp8_bd"],
         outputNames: ["h", "y"],
-        source: source, header: header)
+        source: source, header: ModelOptActivationKernels.header + header)
+
+    private struct ParamsKey: Hashable {
+        let width: Int
+        let eps1Bits: UInt32
+        let eps2Bits: UInt32
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var paramsCache: [ParamsKey: MLXArray] = [:]
+    nonisolated(unsafe) private static let dummyFP8Mu = MLXArray([Float(1), Float(1)])
+    nonisolated(unsafe) private static let dummyFP8Bound = MLXArray([Float(448)])
+
+    private static func cachedParams(width: Int, eps1: Float, eps2: Float) -> MLXArray {
+        let key = ParamsKey(width: width, eps1Bits: eps1.bitPattern, eps2Bits: eps2.bitPattern)
+        return cacheLock.withLock {
+            if let existing = paramsCache[key] { return existing }
+            let arr = MLXArray([Float(1.0 / Double(width)), eps1, eps2])
+            eval(arr)
+            paramsCache[key] = arr
+            return arr
+        }
+    }
 
     /// `(residual + centeredRMSNorm(x, w1, eps1), centeredRMSNorm(that, w2, eps2))`.
     /// `residual` and `x` are `[..., width]` BF16 with fewer than 32 rows.
@@ -179,10 +221,29 @@ public enum VerifyFusedNorms {
         let rows = x.size / width
         let tg = threadgroupSize(width: width)
         let blocks = width / (tg * readsPerThread)
-        let params = MLXArray([Float(1.0 / Double(width)), eps1, eps2])
+        let params = cachedParams(width: width, eps1: eps1, eps2: eps2)
         let out = kernel(
-            [residual, x, w1, w2, params],
-            template: [("D_", width), ("BLOCKS_", blocks)],
+            [residual, x, w1, w2, params, dummyFP8Mu, dummyFP8Bound],
+            template: [("D_", width), ("BLOCKS_", blocks), ("CAST_FP8_", false)],
+            grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
+            outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
+        return (out[0], out[1])
+    }
+
+    /// `(residual + centeredRMSNorm(x, w1, eps1), fp8Cast(centeredRMSNorm(that, w2, eps2)))`
+    /// in one dispatch, bit-identical to `fusedAddNormNorm` followed by `ModelOptActivationKernels.fp8`.
+    public static func fusedAddNormNormCastFP8(
+        residual: MLXArray, x: MLXArray, w1: MLXArray, eps1: Float, w2: MLXArray, eps2: Float,
+        multipliers: MLXArray, overflowBound: MLXArray
+    ) -> (h: MLXArray, yCast: MLXArray) {
+        let width = x.dim(-1)
+        let rows = x.size / width
+        let tg = threadgroupSize(width: width)
+        let blocks = width / (tg * readsPerThread)
+        let params = cachedParams(width: width, eps1: eps1, eps2: eps2)
+        let out = kernel(
+            [residual, x, w1, w2, params, multipliers, overflowBound],
+            template: [("D_", width), ("BLOCKS_", blocks), ("CAST_FP8_", true)],
             grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
             outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
         return (out[0], out[1])
@@ -250,7 +311,8 @@ public enum VerifyFusedQK {
           const uint half_dims = D_ / 2;
           bool low = lane < 16;
           int batch_offset = offsets[b * OFFB_];
-          float L = scale * static_cast<float>(l + batch_offset);
+          const uint pos_delta = (l < 8u) ? ((uint(TREE_POS_) >> (l * 4u)) & 0xFu) : l;
+          float L = scale * static_cast<float>(int(pos_delta) + batch_offset);
           for (int i = 0; i < 4; i++) {
             float other = simd_shuffle_xor(v[i], ushort(16));
             uint px = (low ? lane : lane - 16) * 4 + i;
@@ -282,22 +344,50 @@ public enum VerifyFusedQK {
         headDim == 128 && dtype == .bfloat16
     }
 
+    private struct QKParamsKey: Hashable {
+        let epsBits: UInt32
+        let qScaleBits: UInt32
+        let baseBits: UInt32
+        let rScaleBits: UInt32
+    }
+
+    private static let qkLock = NSLock()
+    nonisolated(unsafe) private static var qkParamsCache: [QKParamsKey: MLXArray] = [:]
+    nonisolated(unsafe) private static let zeroOffset = MLXArray.zeros([1], type: Int32.self)
+
+    private static func cachedQKParams(
+        eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float
+    ) -> MLXArray {
+        let baseLog = log2(ropeBase ?? 1)
+        let key = QKParamsKey(
+            epsBits: eps.bitPattern, qScaleBits: queryScale.bitPattern,
+            baseBits: baseLog.bitPattern, rScaleBits: ropeScale.bitPattern)
+        return qkLock.withLock {
+            if let existing = qkParamsCache[key] { return existing }
+            let arr = MLXArray([eps, queryScale, baseLog, ropeScale])
+            eval(arr)
+            qkParamsCache[key] = arr
+            return arr
+        }
+    }
+
     /// `queries` `[B, L, H*D]`, `keys` `[B, L, KVH*D]` (BF16, straight from
     /// the projections). `ropeBase` nil skips RoPE (NoPE layers).
     public static func apply(
         queries: MLXArray, keys: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
         eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float = 1,
-        offsets: MLXArray?
+        offsets: MLXArray?, posDeltas: UInt32 = 0x7654_3210
     ) -> (queries: MLXArray, keys: MLXArray) {
         let (b, l) = (queries.dim(0), queries.dim(1))
-        let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) }
-            ?? MLXArray.zeros([1], type: Int32.self)
-        let params = MLXArray([eps, queryScale, log2(ropeBase ?? 1), ropeScale])
+        let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) } ?? zeroOffset
+        let params = cachedQKParams(
+            eps: eps, queryScale: queryScale, ropeBase: ropeBase, ropeScale: ropeScale)
         let out = kernel(
             [queries, keys, offs, params],
             template: [
                 ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
                 ("ROPE_", ropeBase != nil), ("OFFB_", offs.size == 1 ? 0 : 1),
+                ("TREE_POS_", Int(posDeltas)),
             ],
             grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],

@@ -244,12 +244,17 @@ extension EngineLoopV2 {
             /// the target token at the first rejection or bonus position.
             /// Equals `targets` position-for-position under exact acceptance.
             var committed: [Int]
+            /// Verify slot indices `[0, ...]` corresponding to `committed`.
+            var path: [Int]
             var accepted: Int
             /// Accepted drafts plus one, cut at the length bound and a stop token.
             var naturalEmitted: Int
+            var branchHit = false
             var constraintFailure: String? = nil
             var nonFiniteAfterPrefix = false
         }
+
+        let verifyTree = verify.verifyTree
 
         // Resolve each row's natural target-authoritative prefix, then choose
         // one committed width for the rectangular step, unless the drafter's
@@ -301,25 +306,47 @@ extension EngineLoopV2 {
                 outcomes.append(
                     RowOutcome(
                         batchIndex: batchIndex, metadata: metadata, rec: rec,
-                        targets: targets, committed: [], accepted: 0, naturalEmitted: limit))
+                        targets: targets, committed: [], path: Array(0 ..< targetWidth),
+                        accepted: 0, naturalEmitted: limit))
                 continue
             }
 
             var accepted = 0
-            if let span = metadata.freeSpan {
-                while accepted < k, targets[accepted] == drafts[accepted],
-                    span.continues(with: drafts[accepted])
-                {
-                    accepted += 1
+            var path: [Int] = []
+            var committed: [Int] = []
+            var branchHit = false
+            if let tree = verifyTree, metadata.freeSpan == nil, acceptBase == nil {
+                var cur = 0
+                path.append(0)
+                while true {
+                    let want = targets[cur]
+                    committed.append(want)
+                    if let child = tree.children[cur].first(where: { drafts[$0 - 1] == want }) {
+                        if child != cur + 1 { branchHit = true }
+                        path.append(child)
+                        cur = child
+                    } else {
+                        break
+                    }
                 }
-            } else if let acceptBase {
-                while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
-                    accepted += 1
-                }
+                accepted = path.count - 1
             } else {
-                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+                if let span = metadata.freeSpan {
+                    while accepted < k, targets[accepted] == drafts[accepted],
+                        span.continues(with: drafts[accepted])
+                    {
+                        accepted += 1
+                    }
+                } else if let acceptBase {
+                    while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
+                        accepted += 1
+                    }
+                } else {
+                    while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+                }
+                committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
+                path = Array(0 ..< targetWidth)
             }
-            let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
@@ -332,7 +359,9 @@ extension EngineLoopV2 {
             // A position this row would commit was decided by non-finite
             // target logits: commit nothing and fail the request exactly like
             // any other finalize-time verify failure.
-            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+            if path.prefix(naturalEmitted).contains(where: {
+                targets[$0] == Int(CBv2NonFiniteLogits.invalidTarget)
+            }) {
                 nonFiniteVerifyFailures += 1
                 step.discard.insert(id)
                 releaseDiscarded(metadata)
@@ -347,8 +376,10 @@ extension EngineLoopV2 {
                     rec: rec,
                     targets: targets,
                     committed: committed,
+                    path: path,
                     accepted: accepted,
-                    naturalEmitted: naturalEmitted))
+                    naturalEmitted: naturalEmitted,
+                    branchHit: branchHit))
         }
 
         if let logits = verify.constraintLogits {
@@ -532,6 +563,25 @@ extension EngineLoopV2 {
                     }
                 }
             }
+            if outcome.branchHit && confirmed >= 2 {
+                var copyFences: [MLXArray] = []
+                copyFences.reserveCapacity(metadata.storageRows.count)
+                for sequence in metadata.storageRows {
+                    if let paged = sequence as? PagedSequenceKV {
+                        let treeBase = paged.absoluteOffset - targetWidth
+                        for dstIdx in 1 ..< confirmed {
+                            let srcSlot = outcome.path[dstIdx]
+                            if srcSlot != dstIdx,
+                                let fence = paged.copyTokenSlot(
+                                    from: treeBase + srcSlot, to: treeBase + dstIdx)
+                            {
+                                copyFences.append(fence)
+                            }
+                        }
+                    }
+                }
+                if !copyFences.isEmpty { eval(copyFences) }
+            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -544,12 +594,17 @@ extension EngineLoopV2 {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
+                let committedDraftsArray: MLXArray =
+                    outcome.branchHit
+                    ? MLXArray(kept.prefix(committedDraftCount).map { Int32($0) })
+                        .reshaped([1, committedDraftCount])
+                    : verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount]
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
+                    committedDraftTokens: committedDraftsArray,
                     committedTargetHidden: verify.lastHidden[
                         batchIndex ..< batchIndex + 1,
                         0 ..< committedDraftCount,
@@ -608,16 +663,23 @@ extension EngineLoopV2 {
                 audit: CBv2MTPRoundAuditRecord(
                     requestID: id.raw, drafted: k,
                     accepted: accepted, committed: confirmed))
-            let rejectionObserved = accepted < k && confirmed > accepted
+            let effectiveDraftedDepth =
+                (verifyTree != nil && !outcome.branchHit && accepted == verifyTree!.chainDepth)
+                ? verifyTree!.chainDepth : k
+            let rejectionObserved = accepted < effectiveDraftedDepth && confirmed > accepted
             let acceptanceTruncated =
-                !rejectionObserved && confirmed <= accepted && confirmed < k
+                !rejectionObserved && confirmed <= accepted && confirmed < effectiveDraftedDepth
             mtp.observeRequestAcceptance(
                 id: id,
-                draftedDepth: k,
+                draftedDepth: effectiveDraftedDepth,
                 acceptedDepth: observedAccepted,
                 committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
+            mtp.updateTreeCooldown(
+                for: id, wasTree: verifyTree != nil,
+                chainDepth: verifyTree?.chainDepth ?? k,
+                accepted: observedAccepted, branchHit: outcome.branchHit)
 
             if let finishReason {
                 if let state = metadata.assistantState {
@@ -634,8 +696,11 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                let hiddenColumn =
+                    verifyTree != nil
+                    ? outcome.path[confirmed - 1]
+                    : CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears
@@ -670,16 +735,20 @@ extension EngineLoopV2 {
                 // drafter keeps it only for this carry object; its all-accepted
                 // block also needs the carry token to be the verify's own
                 // bonus target.
-                if confirmed == accepted + 1, committedDraftCount == accepted,
-                    hiddenColumn == accepted, accepted <= k,
-                    let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
+                if let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
                     let state = metadata.assistantState
                 {
-                    speculator.confirmSpeculation(
-                        carryHidden: carryHidden, acceptedDrafts: accepted,
-                        carryTokenIsTarget: kept[accepted]
-                            == Int(host[draftCount + batchIndex * targetWidth + accepted]),
-                        requestState: state)
+                    if !outcome.branchHit,
+                        confirmed == accepted + 1, committedDraftCount == accepted,
+                        hiddenColumn == accepted, accepted <= k
+                    {
+                        speculator.confirmSpeculation(
+                            carryHidden: carryHidden, acceptedDrafts: accepted,
+                            carryTokenIsTarget: kept[accepted] == outcome.targets[accepted],
+                            requestState: state)
+                    } else {
+                        speculator.dropSpeculation(requestState: state)
+                    }
                 }
             }
         }

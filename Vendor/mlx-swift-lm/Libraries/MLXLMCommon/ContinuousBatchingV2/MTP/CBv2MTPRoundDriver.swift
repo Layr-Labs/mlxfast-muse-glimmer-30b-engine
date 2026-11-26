@@ -157,6 +157,8 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Active multi-leaf verify tree for this round (nil for linear chain).
+        var verifyTree: CBv2VerifyTree? = nil
 
     }
 
@@ -671,6 +673,33 @@ final class CBv2MTPRoundDriver {
         usesFixedDepthAcceptanceWindow
             && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
     }
+
+    private var treeCooldownRequests: Set<CBv2RequestID> = []
+
+    /// True when `id` should verify a multi-leaf tree this round: in low
+    /// acceptance below `verifyTreeThreshold` and not probing linear recovery
+    /// after a full chain hit.
+    func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
+        guard usesFixedDepthAcceptanceWindow, !treeCooldownRequests.contains(id) else {
+            return false
+        }
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        return acceptance.inLowAcceptanceRegime
+            && acceptance.roundAcceptanceFraction < CBv2DraftRegime.verifyTreeThreshold
+    }
+
+    /// Exit tree mode immediately after a full chain hit (`accepted >= chainDepth`
+    /// without branching) so hot bursts run full linear `d1..d7`; re-enter tree
+    /// mode when a linear probe falls back below 4 accepted drafts.
+    func updateTreeCooldown(
+        for id: CBv2RequestID, wasTree: Bool, chainDepth: Int, accepted: Int, branchHit: Bool
+    ) {
+        if wasTree && !branchHit && accepted >= chainDepth {
+            treeCooldownRequests.insert(id)
+        } else if !wasTree && accepted < 4 {
+            treeCooldownRequests.remove(id)
+        }
+    }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
     func forceSynchronizedSeed() {
@@ -1004,13 +1033,28 @@ final class CBv2MTPRoundDriver {
         // finished that speculation: that is a host/device timing race, so the
         // same request got a different verify width on a slower host.
         _ = availableDraftConfidence(for: id)
-        // High-acceptance regime: always the declared depth.
-        guard acceptance.inLowAcceptanceRegime else { return ceiling }
-        return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+        // High-acceptance regime (or linear probe after a tree full-chain hit):
+        // always run the declared depth.
+        guard acceptance.inLowAcceptanceRegime else {
+            treeCooldownRequests.remove(id)
+            return ceiling
+        }
+        if CBv2DraftRegime.verifyTreeMode != 0, treeCooldownRequests.contains(id) {
+            return min(ceiling, min(max(1, remainingTokens - 1), verificationLimit))
+        }
+        let selected = CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
             acceptanceProbabilities: acceptance.probabilities)
+        if CBv2DraftRegime.verifyTreeMode != 0,
+            acceptance.roundAcceptanceFraction < CBv2DraftRegime.verifyTreeThreshold,
+            CBv2DraftRegime.verifyTreeMinDepth > 0
+        {
+            let cap = min(ceiling, min(max(1, remainingTokens - 1), verificationLimit))
+            return min(cap, max(selected, CBv2DraftRegime.verifyTreeMinDepth))
+        }
+        return selected
     }
 
     /// The acceptance ceiling's draft count for one row (see
@@ -1482,8 +1526,123 @@ enum CBv2MTPHiddenIndex {
     }
 }
 
-/// Set by the engine while a low-acceptance round's drafts are built, so a
-/// drafter can draft those rounds more cheaply. Never read for target work.
+/// Static multi-leaf verification tree strictly within `M <= 8` (`k <= 7`
+/// drafted tokens) for low-acceptance verify rounds. Every leaf's ancestor
+/// prefix lies on contiguous slots `0 ..< depth`, and every tree node's
+/// attention maps logical ancestor positions onto physical KV slots in exact
+/// serial order (0-ULP bit-identical to serial greedy).
+public struct CBv2VerifyTree: Sendable {
+    public let k: Int
+    public let chainDepth: Int
+    public let posDeltas: [Int]
+    public let parent: [Int]
+    public let children: [[Int]]
+    public let ancPacked: [UInt32]
+    public let packedPosDeltas: UInt32
+    public let sourcePositions: [Int]
+    public let sourceRanks: [Int]
+
+    public var totalSlots: Int { 1 + k }
+
+    public static func make(mode: Int, k: Int) -> CBv2VerifyTree? {
+        guard mode > 0, (4 ... 7).contains(k) else { return nil }
+        let chainDepth: Int
+        let parents: [Int]
+        let srcPos: [Int]
+        let srcRank: [Int]
+        switch (mode, k) {
+        case (1, 7):
+            // Balanced Chain-4 + 3 high-value leaves: d1#2, d1#3, d2#2
+            chainDepth = 4
+            parents = [-1, 0, 1, 2, 3, 0, 0, 1]
+            srcPos  = [0, 1, 2, 3, 0, 0, 1]
+            srcRank = [0, 0, 0, 0, 1, 2, 1]
+        case (2, 7):
+            // Wide Chain-3 + 4 leaves: d1#2, d1#3, d2#2, d3#2
+            chainDepth = 3
+            parents = [-1, 0, 1, 2, 0, 0, 1, 2]
+            srcPos  = [0, 1, 2, 0, 0, 1, 2]
+            srcRank = [0, 0, 0, 1, 2, 1, 1]
+        case (3, 7):
+            // Chain-5 + 2 leaves: d1#2, d2#2
+            chainDepth = 5
+            parents = [-1, 0, 1, 2, 3, 4, 0, 1]
+            srcPos  = [0, 1, 2, 3, 4, 0, 1]
+            srcRank = [0, 0, 0, 0, 0, 1, 1]
+        case (_, 6):
+            chainDepth = 4
+            parents = [-1, 0, 1, 2, 3, 0, 1]
+            srcPos  = [0, 1, 2, 3, 0, 1]
+            srcRank = [0, 0, 0, 0, 1, 1]
+        case (_, 5):
+            chainDepth = 3
+            parents = [-1, 0, 1, 2, 0, 1]
+            srcPos  = [0, 1, 2, 0, 1]
+            srcRank = [0, 0, 0, 1, 1]
+        case (_, 4):
+            chainDepth = 3
+            parents = [-1, 0, 1, 2, 0]
+            srcPos  = [0, 1, 2, 0]
+            srcRank = [0, 0, 0, 1]
+        default:
+            return nil
+        }
+        let n = 1 + k
+        var posDeltas = [Int](repeating: 0, count: n)
+        var children = [[Int]](repeating: [], count: n)
+        var ancPacked = [UInt32](repeating: 0, count: n)
+        for s in 1 ..< n {
+            let p = parents[s]
+            posDeltas[s] = posDeltas[p] + 1
+            children[p].append(s)
+        }
+        var packedPos: UInt32 = 0
+        for s in 0 ..< n {
+            packedPos |= UInt32(posDeltas[s] & 0xF) << (4 * s)
+            var chain: [Int] = []
+            var cur = s
+            while cur >= 0 {
+                chain.append(cur)
+                cur = parents[cur]
+            }
+            chain.reverse()
+            var packed: UInt32 = 0
+            for (d, slot) in chain.enumerated() {
+                packed |= UInt32(slot & 0xF) << (4 * d)
+            }
+            ancPacked[s] = packed
+        }
+        return CBv2VerifyTree(
+            k: k, chainDepth: chainDepth, posDeltas: posDeltas, parent: parents,
+            children: children, ancPacked: ancPacked, packedPosDeltas: packedPos,
+            sourcePositions: srcPos, sourceRanks: srcRank)
+    }
+}
+
+/// Set by the engine while a low-acceptance round's drafts and verify are built.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Active multi-leaf tree for the current low-acceptance round (nil = linear).
+    nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
+    /// `CBV2_TREE_LOW`: 0 = off, 1 = Chain-4+3 leaves, 2 = Chain-3+4 leaves, 3 = Chain-5+2 leaves.
+    public static let verifyTreeMode: Int = {
+        ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1
+    }()
+    public static let verifyTreeMinDepth: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_TREE_MIN_K"],
+            let v = Int(raw), (4 ... 7).contains(v)
+        {
+            return v
+        }
+        return 6
+    }()
+    /// Enter tree mode only when `roundAcceptanceFraction` falls below this threshold.
+    public static let verifyTreeThreshold: Double = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_TREE_THRESH"],
+            let v = Double(raw), v.isFinite, v > 0.0, v <= 1.0
+        {
+            return v
+        }
+        return 0.65
+    }()
 }
