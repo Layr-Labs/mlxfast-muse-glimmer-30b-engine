@@ -106,7 +106,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers whose attention half (not the MLP) takes the prompt arithmetic:
     /// a finer step than a whole layer, so the timed prefill lands closer to
     /// its 2.0 ceiling without crossing it.
-    static let promptAttentionLayers: Set<Int> = [14, 15]
+    static let promptAttentionLayers: Set<Int> = [13, 14, 15]
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
@@ -232,6 +232,9 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        let addNormNorm = VerifyFusedNorms.PreparedAddNormNorm(
+            like: h, eps1: configuration.postNormEps, eps2: configuration.rmsNormEps)
+        let qk = VerifyFusedQK.Prepared()
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -248,19 +251,31 @@ extension MuseGlimmerTextModel {
             }
             let attention = fusedVerifyAttention(
                 layer.selfAttention, layerIndex: index, layerInput,
-                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
+                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets,
+                qk: qk)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
-            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
-                residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                w2: pre.weight, eps2: pre.eps)
+            let (mid, feedInput): (MLXArray, MLXArray)
+            if post.eps == configuration.postNormEps && pre.eps == configuration.rmsNormEps {
+                (mid, feedInput) = addNormNorm(
+                    residual: h, x: attention, w1: post.weight, w2: pre.weight)
+            } else {
+                (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                    w2: pre.weight, eps2: pre.eps)
+            }
             let feed = groupedVerifyFeed(layer.mlp, feedInput)
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
-                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
-                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                    w2: next.weight, eps2: next.eps)
+                if postFF.eps == configuration.postNormEps && next.eps == configuration.rmsNormEps {
+                    (h, layerInput) = addNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, w2: next.weight)
+                } else {
+                    (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                        w2: next.weight, eps2: next.eps)
+                }
             } else {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
@@ -284,8 +299,17 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        if !MuseGlimmerVerifyProjections.selfTest,
+            let direct = CBv2VerifyScales.verifiedNVFP4ReadoutTopTwo(
+                lmHead, trunk.normed,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+        {
+            return (direct.ids, direct.values, direct.nonFinite, trunk.hidden)
+        }
+        guard let product = CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -299,7 +323,8 @@ extension MuseGlimmerTextModel {
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
     func fusedVerifyAttention(
         _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
-        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?,
+        qk: VerifyFusedQK.Prepared? = nil
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         guard VerifyFusedQK.enabled,
@@ -311,7 +336,7 @@ extension MuseGlimmerTextModel {
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
         let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
-        let (queries, keys) = VerifyFusedQK.apply(
+        let (queries, keys) = (qk ?? VerifyFusedQK.Prepared())(
             queries: p[0], keys: p[1],
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
             eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
@@ -326,9 +351,15 @@ extension MuseGlimmerTextModel {
         // the merge to `[B, L, H * D]` is free. Reshaping the transposed view
         // first materializes a copy per layer (one more dispatch and a full
         // read and write of the output). Same elements, same expression.
-        let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
-        output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
-            .reshaped(batch, length, -1)
+        if let gated = Self.directVerifySigmoidGate(
+            output: output.transposed(0, 2, 1, 3), gate: p[3], batch: batch, length: length)
+        {
+            output = gated
+        } else {
+            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+            output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
+                .reshaped(batch, length, -1)
+        }
         return verifyOutputProjection(a.outputProj, output)
     }
 }
@@ -388,7 +419,223 @@ extension MuseGlimmerTextModel {
             }
         }
         eval(warm)
+        Self.verifyAndWarmDirectElementwise(
+            dtype: dtype,
+            attentionWidth: a.heads * a.headDimensions,
+            intermediateWidth: configuration.intermediateSize)
         warmVerifyProjections(dtype: dtype)
+    }
+}
+
+// MARK: - Direct verify elementwise kernels (0-ULP verified, auto-fallback)
+
+extension MuseGlimmerTextModel {
+    private static let directGateEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_DIRECT_GATE"] != "0"
+    private static let directSiluEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_DIRECT_SILU"] != "0"
+
+    private struct DirectElementwiseKey: Hashable {
+        let kind: Int
+        let batch: Int
+        let length: Int
+        let width: Int
+    }
+
+    private struct ReadoutLaunchKey: Hashable {
+        let shape: [Int]
+        let multBits: UInt32
+        let capBits: UInt32
+    }
+
+    private static let directElementwiseLock = NSLock()
+    nonisolated(unsafe) private static var directGateVerified = false
+    nonisolated(unsafe) private static var directSiluVerified = false
+    nonisolated(unsafe) private static var directElementwiseLaunches:
+        [DirectElementwiseKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var readoutLaunches:
+        [ReadoutLaunchKey: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)] = [:]
+
+    private static let verifySigmoidGateKernel = MLXFast.metalKernel(
+        name: "muse_glimmer_verify_sigmoid_gate",
+        inputNames: ["x", "gate"],
+        outputNames: ["y"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint n4 = uint(N4_);
+            if (idx >= n4) { return; }
+            const device vec<bfloat16_t, 4>* xs = (const device vec<bfloat16_t, 4>*)x;
+            const device vec<bfloat16_t, 4>* gs = (const device vec<bfloat16_t, 4>*)gate;
+            device vec<bfloat16_t, 4>* ys = (device vec<bfloat16_t, 4>*)y;
+            const vec<bfloat16_t, 4> xv = xs[idx];
+            const vec<bfloat16_t, 4> gv = gs[idx];
+            vec<bfloat16_t, 4> ov;
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+              const float gf = float(gv[i]);
+              const float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(gf)));
+              const bfloat16_t sig = bfloat16_t((gf < 0.0f) ? sy : (1.0f - sy));
+              ov[i] = xv[i] * sig;
+            }
+            ys[idx] = ov;
+            """,
+        ensureRowContiguous: true)
+
+    private static let verifySiluProductKernel = MLXFast.metalKernel(
+        name: "muse_glimmer_verify_silu_product",
+        inputNames: ["gate", "up"],
+        outputNames: ["y"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint n4 = uint(N4_);
+            if (idx >= n4) { return; }
+            const device vec<bfloat16_t, 4>* gs = (const device vec<bfloat16_t, 4>*)gate;
+            const device vec<bfloat16_t, 4>* us = (const device vec<bfloat16_t, 4>*)up;
+            device vec<bfloat16_t, 4>* ys = (device vec<bfloat16_t, 4>*)y;
+            const vec<bfloat16_t, 4> gv = gs[idx];
+            const vec<bfloat16_t, 4> uv = us[idx];
+            vec<bfloat16_t, 4> ov;
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+              const float gf = float(gv[i]);
+              const float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(gf)));
+              const bfloat16_t sig = bfloat16_t((gf < 0.0f) ? sy : (1.0f - sy));
+              const bfloat16_t silu = gv[i] * sig;
+              ov[i] = silu * uv[i];
+            }
+            ys[idx] = ov;
+            """,
+        ensureRowContiguous: true)
+
+    private static func directVerifySigmoidGateLaunch(
+        batch: Int, length: Int, width: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = DirectElementwiseKey(kind: 0, batch: batch, length: length, width: width)
+        if let hit = directElementwiseLock.withLock({ directElementwiseLaunches[key] }) {
+            return hit
+        }
+        let n4 = (batch * length * width) / 4
+        let tg = 256
+        let gridX = ((n4 + tg - 1) / tg) * tg
+        let made = verifySigmoidGateKernel.prepare(
+            template: [("N4_", n4)],
+            grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+            outputShapes: [[batch, length, width]], outputDTypes: [.bfloat16])
+        directElementwiseLock.withLock { directElementwiseLaunches[key] = made }
+        return made
+    }
+
+    private static func directVerifySiluProductLaunch(
+        batch: Int, length: Int, width: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = DirectElementwiseKey(kind: 1, batch: batch, length: length, width: width)
+        if let hit = directElementwiseLock.withLock({ directElementwiseLaunches[key] }) {
+            return hit
+        }
+        let n4 = (batch * length * width) / 4
+        let tg = 256
+        let gridX = ((n4 + tg - 1) / tg) * tg
+        let made = verifySiluProductKernel.prepare(
+            template: [("N4_", n4)],
+            grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+            outputShapes: [[batch, length, width]], outputDTypes: [.bfloat16])
+        directElementwiseLock.withLock { directElementwiseLaunches[key] = made }
+        return made
+    }
+
+    static func directVerifySigmoidGate(
+        output: MLXArray, gate: MLXArray, batch: Int, length: Int
+    ) -> MLXArray? {
+        guard directGateEnabled, directGateVerified,
+            output.dtype == .bfloat16, gate.dtype == .bfloat16,
+            gate.ndim == 3, gate.dim(0) == batch, gate.dim(1) == length
+        else { return nil }
+        let width = gate.dim(2)
+        guard width > 0, (batch * length * width) % 4 == 0,
+            output.size == batch * length * width
+        else { return nil }
+        let launch = directVerifySigmoidGateLaunch(batch: batch, length: length, width: width)
+        return launch([output, gate])[0]
+    }
+
+    static func directVerifySiluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray? {
+        guard directSiluEnabled, directSiluVerified,
+            gate.dtype == .bfloat16, up.dtype == .bfloat16,
+            gate.ndim == 3, gate.shape == up.shape
+        else { return nil }
+        let (batch, length, width) = (gate.dim(0), gate.dim(1), gate.dim(2))
+        guard width > 0, (batch * length * width) % 4 == 0 else { return nil }
+        let launch = directVerifySiluProductLaunch(batch: batch, length: length, width: width)
+        return launch([gate, up])[0]
+    }
+
+    private static func verifyAndWarmDirectElementwise(
+        dtype: DType, attentionWidth: Int, intermediateWidth: Int
+    ) {
+        guard dtype == .bfloat16, Device.defaultDevice().deviceType == .gpu else { return }
+        let n = 4096
+        let aVals: [Float] = (0 ..< n).map { idx in
+            switch idx % 8 {
+            case 0: return 0.0
+            case 1: return -0.0001220703125
+            case 2: return 0.0001220703125
+            case 3: return Float((idx % 41) - 20) * 0.75
+            default: return Float(((idx * 13 + 5) % 97) - 48) * 0.1875
+            }
+        }
+        let bVals: [Float] = (0 ..< n).map { idx in
+            Float(((idx * 17 + 7) % 89) - 44) * 0.125
+        }
+        if directGateEnabled, attentionWidth > 0, attentionWidth % 4 == 0 {
+            let ok = (try? MLX.withError { errors -> Bool in
+                let x = MLXArray(aVals, [1, 1, n]).asType(.bfloat16)
+                let g = MLXArray(bVals, [1, 1, n]).asType(.bfloat16)
+                let got = directVerifySigmoidGateLaunch(batch: 1, length: 1, width: n)([x, g])[0]
+                let ref = MuseGlimmerFusion.sigmoidGate([x, g])[0]
+                let diff = (
+                    contiguous(got).view(dtype: .uint16) .!= contiguous(ref).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                eval(diff)
+                try errors.check()
+                return diff.item(Int.self) == 0
+            }) ?? false
+            if ok {
+                var warm = [MLXArray]()
+                for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                    let z = MLXArray.zeros([1, rows, attentionWidth], dtype: .bfloat16)
+                    warm.append(
+                        directVerifySigmoidGateLaunch(batch: 1, length: rows, width: attentionWidth)(
+                            [z, z])[0])
+                }
+                eval(warm)
+                directElementwiseLock.withLock { directGateVerified = true }
+            }
+        }
+        if directSiluEnabled, intermediateWidth > 0, intermediateWidth % 4 == 0 {
+            let ok = (try? MLX.withError { errors -> Bool in
+                let g = MLXArray(aVals, [1, 1, n]).asType(.bfloat16)
+                let u = MLXArray(bVals, [1, 1, n]).asType(.bfloat16)
+                let got = directVerifySiluProductLaunch(batch: 1, length: 1, width: n)([g, u])[0]
+                let ref = compiledSiluProduct(g, u)
+                let diff = (
+                    contiguous(got).view(dtype: .uint16) .!= contiguous(ref).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                eval(diff)
+                try errors.check()
+                return diff.item(Int.self) == 0
+            }) ?? false
+            if ok {
+                var warm = [MLXArray]()
+                for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                    let z = MLXArray.zeros([1, rows, intermediateWidth], dtype: .bfloat16)
+                    warm.append(
+                        directVerifySiluProductLaunch(
+                            batch: 1, length: rows, width: intermediateWidth)([z, z])[0])
+                }
+                eval(warm)
+                directElementwiseLock.withLock { directSiluVerified = true }
+            }
+        }
     }
 }
 
@@ -410,7 +657,9 @@ extension MuseGlimmerTextModel {
 
     func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
-        return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
+        let activated =
+            Self.directVerifySiluProduct(gu[0], gu[1]) ?? compiledSiluProduct(gu[0], gu[1])
+        return verifyDownProjection(mlp.downProj, activated)
     }
 
     nonisolated(unsafe) private static var groupedWarmed = Set<ObjectIdentifier>()
@@ -573,7 +822,9 @@ extension MuseGlimmerTextModel {
                 routed = CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
+                routed =
+                    CBv2VerifyNVFP4.products(layers, x)
+                    ?? CBv2VerifyScales.products(layers, x)
                 kind = "nvfp4.qkvg"
             }
             if let routed {
@@ -689,15 +940,27 @@ extension MuseGlimmerTextModel {
         checkRouted([product], [lmHead], normedHidden, kind: "nvfp4.lm_head")
         let cap = configuration.finalLogitSoftcapping
         if cap > 0, product.dtype == .bfloat16, product.size % 4 == 0 {
-            let n4 = product.size / 4
-            let tg = 256
-            let gridX = ((n4 + tg - 1) / tg) * tg
-            let params = MLXArray([configuration.outputMultiplier, cap])
-            return Self.readoutKernel(
-                [product, params],
-                template: [("N4_", n4)],
-                grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
-                outputShapes: [product.shape], outputDTypes: [product.dtype])[0]
+            let mult = configuration.outputMultiplier
+            let key = ReadoutLaunchKey(
+                shape: product.shape, multBits: mult.bitPattern, capBits: cap.bitPattern)
+            let entry: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)
+            if let hit = Self.directElementwiseLock.withLock({ Self.readoutLaunches[key] }) {
+                entry = hit
+            } else {
+                let n4 = product.size / 4
+                let tg = 256
+                let gridX = ((n4 + tg - 1) / tg) * tg
+                let made = (
+                    launch: Self.readoutKernel.prepare(
+                        template: [("N4_", n4)],
+                        grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+                        outputShapes: [product.shape], outputDTypes: [product.dtype]),
+                    params: MLXArray([mult, cap])
+                )
+                Self.directElementwiseLock.withLock { Self.readoutLaunches[key] = made }
+                entry = made
+            }
+            return entry.launch([product, entry.params])[0]
         }
         var logits = product * configuration.outputMultiplier
         if cap > 0 { logits = tanh(logits / cap) * cap }
@@ -757,6 +1020,11 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            CBv2VerifyScales.verifyAndWarmNVFP4ReadoutTopTwo(
+                lmHead, width: width, dtype: dtype,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping,
+                rows: 2 ... CBv2VerifyScales.maxFusedLMHeadRows)
         }
     }
 }
