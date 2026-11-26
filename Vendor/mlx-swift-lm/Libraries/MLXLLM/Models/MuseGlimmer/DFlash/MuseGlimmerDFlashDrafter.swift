@@ -946,6 +946,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
     }
 
+    /// Rows the last layer computes in a low-acceptance round
+    /// (`CBV2_DFLASH_LAST_ROWS=7` restores the seven-row slice).
+    private static let lastLayerLowRows: Int =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_LAST_ROWS"].flatMap { Int($0) } ?? 13
+
     /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
     /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
     private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
@@ -986,7 +991,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         if let first = copies.first {
             let width = model.configuration.hiddenSize
             var warm = [MLXArray]()
-            for rows in [model.configuration.blockSize, 7] {
+            for rows in [model.configuration.blockSize, 7, lastLayerLowRows] {
                 let x = MLXArray.zeros([1, rows, width], dtype: model.activationDType)
                 warm.append(first.down(compiledSiluProduct(first.gate(x), first.up(x))))
             }
@@ -1064,12 +1069,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 values = concatenated([context.values[index ..< index + 1], values], axis: 2)
             }
             if index == lastIndex {
-                let active = 1 ..< (1 + draftCount)
+                // Below 8 rows MLX sends every affine product here to the
+                // vector kernels. At 8, q/o/down take the NAX split-K route
+                // (gate/up need 13).
+                // Proposals only: rows past `draftCount` are dropped below.
+                let activeRows =
+                    CBv2DraftRegime.lowAcceptance
+                    ? min(max(draftCount, Self.lastLayerLowRows), block - 1) : draftCount
+                let active = 1 ..< (1 + activeRows)
                 let xActive = x[0..., active, 0...]
                 let queries = MLXFast.RoPE(
                     attention.qNorm(
                         attention.qProj(xActive).reshaped([
-                            1, draftCount, c.attentionHeads, c.headDimensions,
+                            1, activeRows, c.attentionHeads, c.headDimensions,
                         ]).transposed(0, 2, 1, 3)),
                     dimensions: c.headDimensions, traditional: false,
                     base: c.ropeTheta, scale: 1, offset: position + 1)
@@ -1079,11 +1091,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 var h = hidden[0..., active, 0...]
                     + attention.oProj(
                         attended.transposed(0, 2, 1, 3).reshaped([
-                            1, draftCount, c.attentionHeads * c.headDimensions,
+                            1, activeRows, c.attentionHeads * c.headDimensions,
                         ]))
                 let mx = layer.postAttentionNorm(h)
                 h = h + draftMLP(index, layer.mlp, mx)
-                return model.norm(h).reshaped([draftCount, c.hiddenSize])
+                return model.norm(h).reshaped([activeRows, c.hiddenSize])[0 ..< draftCount, 0...]
             }
             let queries = MLXFast.RoPE(
                 attention.qNorm(
