@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 
 // MARK: - Hierarchical top-2
@@ -211,9 +212,58 @@ package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXAr
     return (outputs[0], outputs[1])
 }
 
+package enum CBv2BF16Readout {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cached: (
+        multiplier: UInt32, softcap: UInt32, tables: (verify: MLXArray, draft: MLXArray)
+    )?
+
+    private static let build = MLXFast.metalKernel(
+        name: "cbv2_bf16_readout_table",
+        inputNames: ["params"],
+        outputNames: ["verify", "draft"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const bfloat16_t raw = as_type<bfloat16_t>(ushort(i));
+            const bfloat16_t mult = bfloat16_t(params[0]);
+            const bfloat16_t cap = bfloat16_t(params[1]);
+            const bfloat16_t scaled = raw * mult;
+            bfloat16_t verify_score = scaled;
+            bfloat16_t draft_score = scaled;
+            if (params[1] > 0.0f) {
+                const bfloat16_t q = scaled / cap;
+                const bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
+                verify_score = t * cap;
+                draft_score = bfloat16_t(metal::precise::tanh(float(scaled / cap))) * cap;
+            }
+            verify[i] = verify_score;
+            draft[i] = draft_score;
+            """)
+
+    package static func tables(outputMultiplier: Float, softcap: Float)
+        -> (verify: MLXArray, draft: MLXArray)
+    {
+        let m = outputMultiplier.bitPattern
+        let c = softcap.bitPattern
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached, cached.multiplier == m, cached.softcap == c {
+            return cached.tables
+        }
+        let entries = 1 << 16
+        let outputs = build(
+            [MLXArray([outputMultiplier, softcap])],
+            grid: (entries, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[entries], [entries]], outputDTypes: [.bfloat16, .bfloat16])
+        let tables = (verify: outputs[0], draft: outputs[1])
+        cached = (m, c, tables)
+        return tables
+    }
+}
+
 private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
     name: "cbv2_fused_readout_top2_s1",
-    inputNames: ["raw_logits", "params"],
+    inputNames: ["raw_logits", "readout_table"],
     outputNames: ["partial_ids", "partial_values", "partial_nf"],
     source: """
         constexpr uint CHUNKS = 64;
@@ -225,10 +275,6 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         const uint start = chunk * chunk_size;
         const uint end = min(vocab, start + chunk_size);
 
-        const bfloat16_t mult = bfloat16_t(params[0]);
-        const bfloat16_t cap = bfloat16_t(params[1]);
-        const bool has_cap = params[1] > 0.0f;
-
         const device bfloat16_t* row_ptr = raw_logits + ulong(row) * ulong(vocab);
         darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
         uint local_nf = 0u;
@@ -237,13 +283,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         const uint end4 = end & ~3u;
         if (lid == 0) {
             for (uint i = start; i < min(start4, end); i++) {
-                bfloat16_t s = row_ptr[i] * mult;
-                if (has_cap) {
-                    bfloat16_t q = s / cap;
-                    bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                    s = t * cap;
-                }
-                float fv = float(s);
+                const float fv = float(readout_table[as_type<ushort>(row_ptr[i])]);
                 if (!isfinite(fv)) { local_nf = 1u; }
                 darkbloom_qwen35_mtp_top2_insert(local, fv, i);
             }
@@ -257,13 +297,8 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
                 const uint base_i = start4 + (j << 2);
                 #pragma unroll
                 for (uint k = 0; k < 4; k++) {
-                    bfloat16_t s = v[k] * mult;
-                    if (has_cap) {
-                        bfloat16_t q = s / cap;
-                        bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                        s = t * cap;
-                    }
-                    float fv = float(s);
+                    const bfloat16_t raw = v[k];
+                    const float fv = float(readout_table[as_type<ushort>(raw)]);
                     if (!isfinite(fv)) { local_nf = 1u; }
                     darkbloom_qwen35_mtp_top2_insert(local, fv, base_i + k);
                 }
@@ -272,13 +307,7 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
         if (lid == 0) {
             const uint tail_start = max(start4, end4);
             for (uint i = tail_start; i < end; i++) {
-                bfloat16_t s = row_ptr[i] * mult;
-                if (has_cap) {
-                    bfloat16_t q = s / cap;
-                    bfloat16_t t = bfloat16_t(metal::precise::tanh(float(q)));
-                    s = t * cap;
-                }
-                float fv = float(s);
+                const float fv = float(readout_table[as_type<ushort>(row_ptr[i])]);
                 if (!isfinite(fv)) { local_nf = 1u; }
                 darkbloom_qwen35_mtp_top2_insert(local, fv, i);
             }
@@ -384,10 +413,10 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
     let rows = batch * width
     precondition(rows > 0 && vocab >= 2)
     let chunks = 64
-    let params = MLXArray([outputMultiplier, softcap])
+    let table = CBv2BF16Readout.tables(outputMultiplier: outputMultiplier, softcap: softcap).verify
     let flat = rawProduct.reshaped([rows, vocab])
     let partials = cbv2FusedReadoutTopTwoStage1(
-        [flat, params],
+        [flat, table],
         template: [("V_", vocab)],
         grid: (256 * chunks, rows, 1),
         threadGroup: (256, 1, 1),

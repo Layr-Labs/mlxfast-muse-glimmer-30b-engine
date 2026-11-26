@@ -144,6 +144,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    private let draftReadoutTable: MLXArray?
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -183,17 +184,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
         contextKeyEpilogue = ContextKeyEpilogue(model)
+        if let textTarget = target as? MuseGlimmerTextModel, model.activationDType == .bfloat16 {
+            draftReadoutTable = CBv2BF16Readout.tables(
+                outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping).draft
+        } else {
+            draftReadoutTable = nil
+        }
         try MLX.withError { errors in
             var warm = [maskEmbedding]
-            if let textTarget = target as? MuseGlimmerTextModel,
-                model.activationDType == .bfloat16
-            {
+            if let draftReadoutTable {
                 let dummyLogits = MLXArray.zeros(
                     [1, target.dflashVocabularySize], dtype: .bfloat16)
-                let (t, conf) = Self.fusedArgMaxAndConfidence(
-                    dummyLogits,
-                    outputMultiplier: textTarget.configuration.outputMultiplier,
-                    softcap: textTarget.configuration.finalLogitSoftcapping)
+                let (t, conf) = Self.fusedArgMaxAndConfidence(dummyLogits, table: draftReadoutTable)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
             }
             if let epilogue = contextKeyEpilogue {
@@ -836,10 +839,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let memo: (tokens: MLXArray, hidden: MLXArray)
         let confidence: MLXArray
         if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
-            let (tokens, conf) = Self.fusedArgMaxAndConfidence(
-                logits,
+            let table = draftReadoutTable ?? CBv2BF16Readout.tables(
                 outputMultiplier: textTarget.configuration.outputMultiplier,
-                softcap: textTarget.configuration.finalLogitSoftcapping)
+                softcap: textTarget.configuration.finalLogitSoftcapping).draft
+            let (tokens, conf) = Self.fusedArgMaxAndConfidence(logits, table: table)
             memo = (tokens: tokens, hidden: rows)
             confidence = conf
         } else {
@@ -1112,7 +1115,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// with one read of `logits` (2.8 MB) and a 64-way partial reduction.
     private static let argMaxConfStage1 = MLXFast.metalKernel(
         name: "dflash_argmax_conf_s1",
-        inputNames: ["logits", "params"],
+        inputNames: ["logits", "readout_table"],
         outputNames: ["p_raw", "p_idx", "p_sc", "p_sum"],
         source: """
             constexpr int V = V_;
@@ -1127,10 +1130,6 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             const int start = int(chunk) * chunk_size;
             const int end = min(V, start + chunk_size);
             const device bfloat16_t* row_ptr = logits + size_t(row) * size_t(V);
-            const bfloat16_t b_mult = bfloat16_t(params[0]);
-            const bfloat16_t b_cap = bfloat16_t(params[1]);
-            const bool has_cap = params[1] > 0.0f;
-
             float best_raw = -INFINITY;
             int best_idx = V;
             float best_sc = -INFINITY;
@@ -1142,11 +1141,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 best_raw = raw_f;
                 best_idx = i;
               }
-              bfloat16_t s_bf = raw_bf * b_mult;
-              if (has_cap) {
-                s_bf = bfloat16_t(metal::precise::tanh(float(s_bf / b_cap))) * b_cap;
-              }
-              const float sc = float(s_bf);
+              const float sc = float(readout_table[as_type<ushort>(raw_bf)]);
               if (sc > best_sc) {
                 sum_exp = (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sc) + 1.0f) : 1.0f;
                 best_sc = sc;
@@ -1249,14 +1244,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             """)
 
     private static func fusedArgMaxAndConfidence(
-        _ logits: MLXArray, outputMultiplier: Float, softcap: Float
+        _ logits: MLXArray, table: MLXArray
     ) -> (tokens: MLXArray, confidence: MLXArray) {
         let rows = logits.dim(0)
         let vocab = logits.dim(1)
         let chunks = 64
-        let params = MLXArray([outputMultiplier, softcap])
         let partials = argMaxConfStage1(
-            [logits, params],
+            [logits, table],
             template: [("V_", vocab)],
             grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks], [rows, chunks]],
