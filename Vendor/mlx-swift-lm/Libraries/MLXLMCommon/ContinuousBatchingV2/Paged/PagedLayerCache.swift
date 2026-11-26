@@ -1297,14 +1297,58 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
         descriptors.reserveCapacity(b * l)
-        for row in rows {
+        let dynTreeMeta: MLXArray? =
+            (b == 1 && CBv2DraftRegime.activeDynamicTreeK > 0
+                && l == CBv2DraftRegime.activeDynamicTreeK + 1)
+            ? CBv2DraftRegime.activeDynamicTreeMeta : nil
+        if dynTreeMeta != nil {
+            let row = rows[0]
+            let treeBase = row.absoluteOffset - l
+            let win = row.windowSize ?? 0
+            let planStart = row.windowSize.map { max(row.baseOffset, treeBase - $0 + 1) } ?? row.baseOffset
             for t in 0 ..< l {
+                let planLen = (treeBase + t) - planStart + 1
                 descriptors.append(
                     PagedSegmentDispatchPlan.Row(
                         pages: row.table,
                         info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            attending: (planStart, planLen),
+                            treeBase: Int32(treeBase),
+                            treeAncPacked: UInt32(win),
+                            treeDepth: t,
+                            isDynamicTree: true),
                         identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        } else if let tree = CBv2DraftRegime.activeVerifyTree, b == 1, l == tree.totalSlots {
+            let row = rows[0]
+            let treeBase = row.absoluteOffset - l
+            for t in 0 ..< l {
+                let qPos = treeBase + tree.posDeltas[t]
+                var start = row.baseOffset
+                if let window = row.windowSize {
+                    start = max(start, qPos - window + 1)
+                }
+                let length = qPos - start + 1
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: (start, length),
+                            treeBase: Int32(treeBase),
+                            treeAncPacked: tree.ancPacked[t],
+                            treeDepth: tree.posDeltas[t]),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        } else {
+            for row in rows {
+                for t in 0 ..< l {
+                    descriptors.append(
+                        PagedSegmentDispatchPlan.Row(
+                            pages: row.table,
+                            info: row.seqInfoRow(
+                                attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+                }
             }
         }
         let result = PagedSegmentAttention.decode(
@@ -1315,7 +1359,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            treeMeta: dynTreeMeta)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

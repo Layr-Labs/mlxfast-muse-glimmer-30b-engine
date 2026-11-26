@@ -29,7 +29,7 @@ enum PagedSegmentAttention {
     /// arithmetic are identical; only the buffers' origin differs.
     static func inputNames(bindings: Int, allocatesScratch: Bool = false) -> [String] {
         ["q", "knew", "vnew"] + (0 ..< bindings).map { "segment\($0)" }
-            + ["seqinfo", "params", "previous", "value_offsets", "records"]
+            + ["seqinfo", "params", "previous", "value_offsets", "records", "tree_meta"]
             + (allocatesScratch ? [] : ["partials", "meta"])
     }
 
@@ -45,11 +45,12 @@ enum PagedSegmentAttention {
             }
             threadgroup float q_smem[HPT * D];
             threadgroup float red_smem[NSG * HPT * (D + 2)];
-            cbv2::paged_attention_part_cached_impl<T, D, S, GQA, HPT, NSG, PTOK, HAS_WRITE, HAS_SOFTCAP>(
+            cbv2::paged_attention_part_cached_impl<T, D, S, GQA, HPT, NSG, PTOK, HAS_WRITE, HAS_SOFTCAP, cbv2::PagedSegmentAccessor<T, SEGMENTS>, const device bool*, DYN_TREE>(
                 q, knew, vnew, cache, seqinfo, seqinfo, params, KVH, 0, record[6],
                 q_smem, red_smem, partials, meta,
                 position, thread_position_in_threadgroup, simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
+                thread_index_in_simdgroup,
+                0, 0, -1, 0, 1, false, nullptr, false, nullptr, 0, 0, tree_meta);
             """
     }
 
@@ -99,6 +100,21 @@ enum PagedSegmentAttention {
         }
     }
 
+    nonisolated(unsafe) private static let dummyTreeMeta: MLXArray = {
+        let arr = MLXArray.zeros([18], type: Int32.self)
+        eval(arr)
+        return arr
+    }()
+
+    static let orderedMergeBody: String = """
+        const int heads = partials_shape[1];
+        const int maxpart = partials_shape[2];
+        cbv2::paged_attention_merge_impl<T, D, PTOK, HAS_SINKS, DYN_TREE>(
+            partials, meta, seqinfo, sinks, heads, maxpart, out,
+            threadgroup_position_in_grid,
+            thread_index_in_simdgroup, 0, tree_meta);
+        """
+
     static func mergeKernel(key: PagedAttentionKernelKey, source: String)
         -> MLXFast.MLXFastKernel
     {
@@ -114,8 +130,8 @@ enum PagedSegmentAttention {
             // barrier when this prior kernel output is consumed. An alias-only
             // Depends node cannot provide that barrier for hidden writes.
             let made = MLXFast.metalKernel(
-                name: name, inputNames: ["partials", "meta", "seqinfo", "sinks", "previous"],
-                outputNames: ["out"], source: PagedAttentionMSL.mergeBody,
+                name: name, inputNames: ["partials", "meta", "seqinfo", "sinks", "previous", "tree_meta"],
+                outputNames: ["out"], source: orderedMergeBody,
                 header: source, ensureRowContiguous: true)
             kernels[name] = made
             mergeKernels[key] = made
@@ -130,7 +146,8 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        treeMeta: MLXArray? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -185,13 +202,14 @@ enum PagedSegmentAttention {
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, treeMeta: treeMeta,
+                maxPart: plan.maxPartitions)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
                     queries: q, newKeys: nil, newValues: nil, group: group, rows: rows,
                     sinks: nil, params: params, softcap: softcap, source: source,
-                    dispatchCache: nil, zeroFilledScratch: true)
+                    dispatchCache: nil, zeroFilledScratch: true, treeMeta: treeMeta)
                 PagedOnePassAttention.compare(onePass: result.out, twoPass: reference)
                 return reference
             }
@@ -236,6 +254,7 @@ enum PagedSegmentAttention {
             let inputs =
                 [q, k, v] + backing + [
                     seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
+                    treeMeta ?? dummyTreeMeta,
                 ]
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("D", d), ("S", group.pageSize),
@@ -243,6 +262,7 @@ enum PagedSegmentAttention {
                 ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
                 ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
                 ("STRIDE", PagedSegmentDispatchPlan.recordStride),
+                ("DYN_TREE", treeMeta != nil),
             ]
             let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
             if let partials, let meta {
@@ -269,8 +289,11 @@ enum PagedSegmentAttention {
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
         return mergeKernel(key: mergeKey, source: source)(
-            [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
-            template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
+            [partials!, meta!, seqinfo, mergeSinks, group.writeFence, treeMeta ?? dummyTreeMeta],
+            template: [
+                ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
+                ("DYN_TREE", treeMeta != nil),
+            ],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
     }
