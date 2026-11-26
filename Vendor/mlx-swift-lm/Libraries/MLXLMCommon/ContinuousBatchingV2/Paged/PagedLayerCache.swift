@@ -527,6 +527,37 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttendImpl(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks,
+            gate: nil, appliedGate: nil)
+    }
+
+    /// Verify-window fast path that fuses `output * sigmoid(gate)` into
+    /// `PagedOnePassAttention` when eligible and verified. Returns
+    /// `(output, gated)` where `gated == true` means `output` is already gated
+    /// and shaped `[B, L, QH * D]`; otherwise `output` is the standard
+    /// `[B, QH, L, D]` attention output and the caller applies its gate.
+    public func updateAndAttendGated(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, gate: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> (output: MLXArray, gated: Bool) {
+        let validGate: MLXArray? =
+            (sinks == nil && queries.ndim == 4 && gate.ndim == 3
+                && gate.dim(0) == queries.dim(0) && gate.dim(1) == queries.dim(2)
+                && gate.dim(2) == queries.dim(1) * queries.dim(3))
+            ? gate : nil
+        var applied = false
+        let out = updateAndAttendImpl(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks,
+            gate: validGate, appliedGate: &applied)
+        return (out, applied)
+    }
+
+    private func updateAndAttendImpl(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?,
+        gate: MLXArray?, appliedGate: UnsafeMutablePointer<Bool>?
+    ) -> MLXArray {
         guard
             pool.writeValidation.validate(
                 keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
@@ -620,7 +651,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dropPrefillMirrors()
             output = attendRectangularColumns(
                 queries: queries, keys: keys, values: values,
-                rows: pagedRows, scale: scale, sinks: effectiveSinks)
+                rows: pagedRows, scale: scale, sinks: effectiveSinks,
+                gate: gate, appliedGate: appliedGate)
         } else {
             precondition(
                 boundSpanContext == nil || b == 1,
@@ -1177,7 +1209,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func attendRectangularColumns(
         queries: MLXArray, keys: MLXArray?, values: MLXArray?,
         rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
-        tableProvider: PagedLayerCache? = nil
+        tableProvider: PagedLayerCache? = nil,
+        gate: MLXArray? = nil, appliedGate: UnsafeMutablePointer<Bool>? = nil
     ) -> MLXArray {
         precondition((keys == nil) == (values == nil))
         precondition(
@@ -1215,7 +1248,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         if mtpBatchesRectangularColumnsAsRows, tableProvider == nil, let keys, let values,
             let output = attendColumnsAsDecodeRows(
                 queries: queries, keys: keys, values: values, rows: rows, scale: scale,
-                sinks: sinks)
+                sinks: sinks, gate: gate, appliedGate: appliedGate)
         {
             return output
         }
@@ -1271,7 +1304,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// round's writes leave every column's window in place.
     private func attendColumnsAsDecodeRows(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
+        gate: MLXArray? = nil, appliedGate: UnsafeMutablePointer<Bool>? = nil
     ) -> MLXArray? {
         let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
         guard (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !rows.isEmpty,
@@ -1307,6 +1341,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
             }
         }
+        let flatGate: MLXArray? = gate.flatMap {
+            $0.dtype == group.dtype ? $0.reshaped(b * l, qh, d) : nil
+        }
+        var didGate = false
         let result = PagedSegmentAttention.decode(
             queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
             newKeys: nil, newValues: nil, group: group, rows: descriptors,
@@ -1315,8 +1353,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            gate: flatGate,
+            appliedGate: &didGate)
         mtpColumnsAsRowsCalls += 1
+        appliedGate?.pointee = didGate
+        if didGate {
+            let output = result.reshaped(b, l, qh * d)
+            return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
+        }
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }

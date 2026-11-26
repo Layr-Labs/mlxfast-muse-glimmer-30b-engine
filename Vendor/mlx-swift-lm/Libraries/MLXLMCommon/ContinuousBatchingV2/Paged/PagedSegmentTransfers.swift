@@ -12,13 +12,15 @@ enum PagedSegmentTransfers {
         const int token = records[r * 3];
         const int page = records[r * 3 + 1];
         const int slot = records[r * 3 + 2];
-        const int n = keys_shape[1];
         if (page > 0) {
-            const size_t source = ((size_t)h * n + token) * D + d;
+            const size_t k_src = (size_t)h * keys_strides[0]
+                + (size_t)token * keys_strides[1] + (size_t)d * keys_strides[2];
+            const size_t v_src = (size_t)h * values_strides[0]
+                + (size_t)token * values_strides[1] + (size_t)d * values_strides[2];
             const size_t target = (((size_t)page * H + h) * S + slot) * D + d;
             device T* destination = storage;
-            destination[target] = keys[source];
-            destination[VBASE + target] = values[source];
+            destination[target] = keys[k_src];
+            destination[VBASE + target] = values[v_src];
         }
         if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
         """
@@ -48,8 +50,19 @@ enum PagedSegmentTransfers {
         outputNames: ["witness"], source: "witness[0] = previous[0] + 1;",
         ensureRowContiguous: true)
 
+    private struct WriteLaunchKey: Hashable {
+        let dtype: DType
+        let kvHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let valueOffset: Int
+        let count: Int
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var writeLaunches:
+        [WriteLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     private static func kernel(
         reading: Bool, dtype: DType,
@@ -74,7 +87,7 @@ enum PagedSegmentTransfers {
                     : (reading
                         ? PagedQuantizedTransfers.readBody : PagedQuantizedTransfers.writeBody),
                 header: quantization == nil ? "" : PagedQuantizedMetal.header,
-                ensureRowContiguous: quantization == nil,
+                ensureRowContiguous: reading && quantization == nil,
                 mutableInputs: [reading ? "output" : "storage"])
             kernels[key] = made
             return made
@@ -166,21 +179,45 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
-            group.writeFence =
-                kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
-                    [k, v, segment.storage, records(triples), group.writeFence] + offset,
-                    template: [
-                        ("T", group.dtype), ("H", group.key.kvHeads),
-                        ("D", group.key.headDim), ("S", group.pageSize),
-                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
-                        + quantizationTemplate(group),
-                    grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                    threadGroup: (
-                        group.key.quantization == nil
-                            ? min(256, group.key.headDim) : group.key.headDim, 1, 1
-                    ),
-                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+            if group.key.quantization == nil {
+                let count = triples.count / 3
+                let launchKey = WriteLaunchKey(
+                    dtype: group.dtype, kvHeads: group.key.kvHeads, headDim: group.key.headDim,
+                    pageSize: group.pageSize, valueOffset: segment.valueOffset, count: count)
+                let launch: MLXFast.MLXFastKernel.Launch
+                if let hit = lock.withLock({ writeLaunches[launchKey] }) {
+                    launch = hit
+                } else {
+                    let kobj = kernel(reading: false, dtype: group.dtype, quantization: nil)
+                    let made = kobj.prepare(
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                            ("VBASE", segment.valueOffset),
+                        ],
+                        grid: (group.key.headDim, group.key.kvHeads, count),
+                        threadGroup: (min(256, group.key.headDim), 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])
+                    lock.withLock { writeLaunches[launchKey] = made }
+                    launch = made
+                }
+                group.writeFence = launch([
+                    k, v, segment.storage, records(triples), group.writeFence,
+                ])[0]
+            } else {
+                let offset = [quantizedValueBase(segment)]
+                group.writeFence =
+                    kernel(
+                        reading: false, dtype: group.dtype, quantization: group.key.quantization)(
+                        [k, v, segment.storage, records(triples), group.writeFence] + offset,
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                        ] + quantizationTemplate(group),
+                        grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
+                        threadGroup: (group.key.headDim, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+            }
         }
     }
 
