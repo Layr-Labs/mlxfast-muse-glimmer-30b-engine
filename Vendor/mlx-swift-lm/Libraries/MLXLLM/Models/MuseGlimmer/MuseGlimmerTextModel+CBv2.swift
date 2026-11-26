@@ -284,8 +284,17 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        if !MuseGlimmerVerifyProjections.selfTest,
+            let direct = CBv2VerifyScales.verifiedNVFP4ReadoutTopTwo(
+                lmHead, trunk.normed,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+        {
+            return (direct.ids, direct.values, direct.nonFinite, trunk.hidden)
+        }
+        guard let product = CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -757,6 +766,11 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            CBv2VerifyScales.verifyAndWarmNVFP4ReadoutTopTwo(
+                lmHead, width: width, dtype: dtype,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping,
+                rows: 2 ... CBv2VerifyScales.maxFusedLMHeadRows)
         }
     }
 }
