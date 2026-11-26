@@ -675,10 +675,18 @@ extension EngineLoopV2 {
                     let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
                     let state = metadata.assistantState
                 {
+                    var greedyPrefix = 0
+                    while greedyPrefix < k,
+                        host[batchIndex * k + greedyPrefix]
+                            == host[draftCount + batchIndex * targetWidth + greedyPrefix]
+                    {
+                        greedyPrefix += 1
+                    }
                     speculator.confirmSpeculation(
                         carryHidden: carryHidden, acceptedDrafts: accepted,
                         carryTokenIsTarget: kept[accepted]
                             == Int(host[draftCount + batchIndex * targetWidth + accepted]),
+                        acceptedIsGreedyPrefix: accepted == greedyPrefix,
                         requestState: state)
                 }
             }
@@ -717,18 +725,16 @@ public protocol CBv2MTPPostVerifySpeculating: CBv2MTPRequestStatefulDrafter {
     /// `[1, depth + 1]` are the verify's per-position target tokens and
     /// `targetHidden` `[1, depth + 1, H]` its hidden rows, both lazy.
     /// `draftsBlock`: the all-accepted outcome's next block may be drafted
-    /// too (work every outcome shares is always eligible).
     /// Returns the arrays to submit; empty when it does not speculate.
     func speculateNextRound(
-        targetTokens: MLXArray, targetHidden: MLXArray, depth: Int, draftsBlock: Bool,
-        requestState: any CBv2MTPRequestState) -> [MLXArray]
+        draftTokens: MLXArray?, targetTokens: MLXArray, targetHidden: MLXArray, depth: Int,
+        draftsBlock: Bool, requestState: any CBv2MTPRequestState) -> [MLXArray]
     /// Finalize committed `acceptedDrafts` drafts of the round and stored
     /// `carryHidden` (this object, verify row `acceptedDrafts`) as the row's
     /// carry; `carryTokenIsTarget` when its token is the verify's own target
-    /// at that row.
     func confirmSpeculation(
         carryHidden: MLXArray, acceptedDrafts: Int, carryTokenIsTarget: Bool,
-        requestState: any CBv2MTPRequestState)
+        acceptedIsGreedyPrefix: Bool, requestState: any CBv2MTPRequestState)
     /// Forget any speculation (its submission failed).
     func dropSpeculation(requestState: any CBv2MTPRequestState)
     /// `[n]` float32, lazy: the confirmed speculation's per-row top-1
@@ -774,9 +780,13 @@ extension EngineLoopV2 {
             mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        let lowAcceptance = mtp.inLowAcceptanceRegime(verify.rows[0].id)
+        let drafts = lowAcceptance ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
+        CBv2DraftRegime.lowAcceptance = lowAcceptance
+        defer { CBv2DraftRegime.lowAcceptance = false }
         let roots = speculator.speculateNextRound(
-            targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
-            draftsBlock: draftsBlock, requestState: state)
+            draftTokens: drafts, targetTokens: targets, targetHidden: verify.lastHidden,
+            depth: k, draftsBlock: draftsBlock, requestState: state)
         guard !roots.isEmpty else { return }
         do {
             try withError { fault in
