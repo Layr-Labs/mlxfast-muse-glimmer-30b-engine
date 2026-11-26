@@ -2,6 +2,7 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -209,6 +210,7 @@ extension EngineLoopV2 {
         }
         guard
             completedNativeReadback({
+                Self.pollUntilAvailable(verify.acceptancePacket)
                 host = verify.acceptancePacket.asArray(Int32.self)
                 CBv2CoreInstrumentation.recordHostSync()
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
@@ -786,5 +788,23 @@ extension EngineLoopV2 {
         } catch {
             speculator.dropSpeculation(requestState: state)
         }
+    }
+}
+
+extension EngineLoopV2 {
+    /// Spins on the array's completion event (no wait, no sleep) for at most
+    /// 250 ms, so the blocking read that follows returns without a
+    /// command-buffer wake-up. The read itself is unchanged.
+    /// `CBV2_POLLED_READBACK=0` turns it off.
+    static let polledReadback =
+        ProcessInfo.processInfo.environment["CBV2_POLLED_READBACK"] != "0"
+
+    static func pollUntilAvailable(_ array: MLXArray) {
+        guard polledReadback else { return }
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ 250_000_000
+        var available = false
+        while _mlx_array_is_available(&available, array.ctx) == 0, !available,
+            DispatchTime.now().uptimeNanoseconds < deadline
+        {}
     }
 }
