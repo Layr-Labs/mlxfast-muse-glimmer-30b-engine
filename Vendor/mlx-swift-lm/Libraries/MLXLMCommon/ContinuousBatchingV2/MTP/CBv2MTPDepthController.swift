@@ -583,6 +583,19 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             0.85 * pow(0.98, Double($0))
         }
 
+    /// The fixed-depth window's own per-position estimates. They are updated
+    /// by exactly the same rule as `probabilities`; only their starting
+    /// values differ: `init(flatPrior:)` starts the first
+    /// `windowHeadPositions` positions at `min(prior, windowHeadPrior)` and
+    /// the deeper ones at the prior. `probabilities` keeps gating the
+    /// post-verify speculation exactly as before.
+    private(set) var windowProbabilities: [Double] =
+        (0 ..< CBv2MTPRequestAcceptanceState.maximumDepth).map {
+            0.85 * pow(0.98, Double($0))
+        }
+    static let windowHeadPrior = 0.7
+    static let windowHeadPositions = 3
+
     /// Draft-confidence calibration: per position, the mean logit of the
     /// drafter's top-1 probability over rounds whose target outcome at that
     /// position was observed, and how many such rounds there were. Only
@@ -663,6 +676,9 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     init(flatPrior: Double) {
         let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
         probabilities = Array(repeating: prior, count: Self.maximumDepth)
+        windowProbabilities = (0 ..< Self.maximumDepth).map { position in
+            position < Self.windowHeadPositions ? min(prior, Self.windowHeadPrior) : prior
+        }
     }
 
     /// Records positions whose target outcome was actually observed and, after
@@ -681,6 +697,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
 
         for position in 0 ..< accepted {
             probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+            windowProbabilities[position] += Self.alpha * (1.0 - windowProbabilities[position])
         }
         // Regime signal: only rounds whose outcome was fully observed (a
         // rejection, or every draft accepted) count; a truncation does not.
@@ -694,13 +711,18 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
+            windowProbabilities[accepted] += Self.alpha * (0.0 - windowProbabilities[accepted])
         } else if !rejectionObserved, !endedByTruncation,
-            drafted > 0, accepted == drafted, drafted < Self.maximumDepth,
-            probabilities[drafted] < 0.95
+            drafted > 0, accepted == drafted, drafted < Self.maximumDepth
         {
             // A fully accepted round is bounded evidence that the hot chain
             // may profitably extend one position farther.
-            probabilities[drafted] += Self.alpha * (0.95 - probabilities[drafted])
+            if probabilities[drafted] < 0.95 {
+                probabilities[drafted] += Self.alpha * (0.95 - probabilities[drafted])
+            }
+            if windowProbabilities[drafted] < 0.95 {
+                windowProbabilities[drafted] += Self.alpha * (0.95 - windowProbabilities[drafted])
+            }
         }
     }
 

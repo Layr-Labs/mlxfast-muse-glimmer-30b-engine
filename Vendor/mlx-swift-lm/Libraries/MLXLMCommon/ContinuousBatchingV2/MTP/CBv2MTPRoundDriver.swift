@@ -1010,7 +1010,7 @@ final class CBv2MTPRoundDriver {
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
-            acceptanceProbabilities: acceptance.probabilities)
+            acceptanceProbabilities: acceptance.windowProbabilities)
     }
 
     /// The acceptance ceiling's draft count for one row (see
