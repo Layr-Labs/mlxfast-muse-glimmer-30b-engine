@@ -15,7 +15,23 @@ import MLXFast
 /// Kill switch: `MUSE_PAGED_ONEPASS=0` (two-pass path).
 public enum PagedOnePassAttention {
     private static let environment = ProcessInfo.processInfo.environment
+    /// Kill switch: `MUSE_PAGED_ONEPASS=0` (two-pass path).
     static let enabled = environment["MUSE_PAGED_ONEPASS"] != "0"
+    /// Kill switch for fused sigmoid(gate) epilogue in one-pass verify attention.
+    static let gatedEnvEnabled = environment["MUSE_PAGED_ONEPASS_GATE"] != "0"
+    nonisolated(unsafe) private static var gatedParityPassed: Bool?
+    public static var gatedEnabled: Bool {
+        guard enabled, gatedEnvEnabled, !threadgroupProbeFailed else { return false }
+        return lock.withLock { gatedParityPassed ?? false }
+    }
+    /// Kill switch for shared-KV multi-row gated one-pass verify attention (4 rows/TG, HPT=1).
+    static let sharedKVGatedEnvEnabled = environment["MUSE_PAGED_ONEPASS_SHARED_KV"] != "0"
+    static let sharedKVRowsPerTile = 4
+    nonisolated(unsafe) private static var sharedKVGatedParityPassed: Bool?
+    public static var sharedKVGatedEnabled: Bool {
+        guard gatedEnabled, sharedKVGatedEnvEnabled else { return false }
+        return lock.withLock { sharedKVGatedParityPassed ?? false }
+    }
     /// Each state issues the K/V loads of 4 tokens before using them (same bits).
     /// `MUSE_PAGED_ONEPASS_BLOCK=0` restores the per-token loop.
     static let block = environment["MUSE_PAGED_ONEPASS_BLOCK"] == "0" ? 1 : 4
@@ -137,6 +153,158 @@ public enum PagedOnePassAttention {
             outputs += [result.fence, result.out]
         }
         eval(outputs)
+        if gatedEnvEnabled, dtype == .bfloat16, let firstBindings = PagedSegmentDispatchPlan.bindingClasses.first {
+            // One-time 0-ULP parity check of the gated one-pass kernel on
+            // non-zero inputs spanning negative, zero, and positive gate values.
+            // Guarded with `withError` so any Metal JIT/runtime error cleanly
+            // falls back to stock without aborting the engine.
+            let passed: Bool = (try? withError { () -> Bool in
+                let qVals = (0 ..< (queryHeads * headDim)).map { idx -> Float in
+                    Float(((idx * 5) % 29) - 14) * 0.125
+                }
+                let gVals = (0 ..< (queryHeads * headDim)).map { idx -> Float in
+                    Float(((idx * 7) % 33) - 16) * 0.25
+                }
+                let kvVals = (0 ..< (2 * pageElements)).map { idx -> Float in
+                    Float(((idx * 3) % 23) - 11) * 0.125
+                }
+                let qTest = MLXArray(qVals, [1, queryHeads, headDim]).asType(dtype)
+                let gTest = MLXArray(gVals, [1, queryHeads, headDim]).asType(dtype)
+                let sTest = MLXArray(kvVals).asType(dtype)
+                let offsets = [Int64](repeating: Int64(pageElements), count: max(8, firstBindings))
+                let backing = [MLXArray](repeating: sTest, count: firstBindings)
+                let ungated = segments(
+                    queries: qTest, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source)
+                let gated = segmentsGated(
+                    queries: qTest, gate: gTest, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source)
+                let ref = ungated.out * sigmoid(gTest)
+                let differing = (
+                    contiguous(gated.out).view(dtype: .uint16)
+                        .!= contiguous(ref).view(dtype: .uint16)
+                ).asType(.int32).sum().item(Int.self)
+                guard differing == 0 else { return false }
+                var gatedOutputs = [MLXArray]()
+                let zeroGate = MLXArray.zeros([1, queryHeads, headDim], dtype: dtype)
+                for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                    let bOffsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
+                    let r = segmentsGated(
+                        queries: q, gate: zeroGate,
+                        backing: [MLXArray](repeating: storage, count: bindings),
+                        seqinfo: seqinfo, params: params, previous: previous,
+                        valueOffsets: MLXArray(bOffsets), records: MLXArray(record), dtype: dtype,
+                        kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                        partitionTokens: ptok, softcap: softcap, source: source)
+                    gatedOutputs += [r.fence, r.out]
+                }
+                eval(gatedOutputs)
+                return true
+            }) ?? false
+            lock.withLock { gatedParityPassed = passed }
+            if passed, sharedKVGatedEnvEnabled,
+                let sharedHpt = eligibleSharedKV(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 2, rows: 8,
+                    rpt: sharedKVRowsPerTile)
+            {
+                let allSharedPassed: Bool = (try? withError { () -> Bool in
+                    // 0-ULP parity check on 8 and 7 causal rows spanning both a
+                    // 16-token page boundary and a 256-token partition boundary
+                    // (attend_len = 254..261, where group 0 crosses parts 1 -> 2).
+                    let pagesInStorage = 2
+                    let twoPageVals = (0 ..< (pagesInStorage * 2 * pageElements)).map { idx -> Float in
+                        Float(((idx * 5) % 29) - 14) * 0.125
+                    }
+                    let twoPageStorage = MLXArray(twoPageVals).asType(dtype)
+                    let twoPageOffsets = [Int64](
+                        repeating: Int64(pagesInStorage * pageElements),
+                        count: max(8, firstBindings))
+                    let sharedBacking = [MLXArray](repeating: twoPageStorage, count: firstBindings)
+                    let pagesPerPart = ptok / pageSize
+                    func makePartRecord(row: Int, part: Int, pageCount: Int, maxParts: Int) -> [Int32] {
+                        var rec = [Int32](repeating: 0, count: PagedSegmentDispatchPlan.recordStride)
+                        rec[0] = Int32(row)
+                        rec[1] = Int32(part)
+                        rec[2] = Int32(part * pagesPerPart)
+                        rec[3] = Int32(pageCount)
+                        rec[6] = Int32(maxParts)
+                        for p in 0 ..< pageCount {
+                            rec[PagedSegmentDispatchPlan.recordHeader + 2 * p] = 0
+                            rec[PagedSegmentDispatchPlan.recordHeader + 2 * p + 1] = Int32(p & 1)
+                        }
+                        return rec
+                    }
+                    for testRows in [8, 7] {
+                        let baseLen = ptok - 2
+                        let lens = (0 ..< testRows).map { baseLen + $0 }
+                        var seqData = [Int32]()
+                        seqData.reserveCapacity(testRows * 8)
+                        var recData = [Int32]()
+                        let maxP = lens.map { ($0 + ptok - 1) / ptok }.max() ?? 1
+                        for (rIdx, len) in lens.enumerated() {
+                            let numPages = (len + pageSize - 1) / pageSize
+                            seqData += [0, Int32(len), Int32(numPages), 0, 0, 0, 0, 0]
+                            let parts = (len + ptok - 1) / ptok
+                            for p in 0 ..< parts {
+                                let remPages = min(pagesPerPart, numPages - p * pagesPerPart)
+                                recData += makePartRecord(
+                                    row: rIdx, part: p, pageCount: remPages, maxParts: maxP)
+                            }
+                        }
+                        let qMultiVals = (0 ..< (testRows * queryHeads * headDim)).map { idx -> Float in
+                            Float(((idx * 7 + 3) % 31) - 15) * 0.125
+                        }
+                        let gMultiVals = (0 ..< (testRows * queryHeads * headDim)).map { idx -> Float in
+                            Float(((idx * 11 + 5) % 37) - 18) * 0.25
+                        }
+                        let qMulti = MLXArray(qMultiVals, [testRows, queryHeads, headDim]).asType(dtype)
+                        let gMulti = MLXArray(gMultiVals, [testRows, queryHeads, headDim]).asType(dtype)
+                        let seqMulti = MLXArray(seqData, [testRows, 8])
+                        let recMulti = MLXArray(recData)
+                        let refSingle = segmentsGated(
+                            queries: qMulti, gate: gMulti, backing: sharedBacking,
+                            seqinfo: seqMulti, params: params, previous: previous,
+                            valueOffsets: MLXArray(twoPageOffsets), records: recMulti,
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source)
+                        let candShared = segmentsSharedKVGated(
+                            queries: qMulti, gate: gMulti, backing: sharedBacking,
+                            seqinfo: seqMulti, params: params, previous: previous,
+                            valueOffsets: MLXArray(twoPageOffsets), records: recMulti,
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: sharedHpt,
+                            rpt: sharedKVRowsPerTile, simdgroups: nsg, partitionTokens: ptok,
+                            softcap: softcap, source: source)
+                        let diff = (
+                            contiguous(candShared.out).view(dtype: .uint16)
+                                .!= contiguous(refSingle.out).view(dtype: .uint16)
+                        ).asType(.int32).sum().item(Int.self)
+                        guard diff == 0 else { return false }
+                    }
+                    let zeroGate = MLXArray.zeros([1, queryHeads, headDim], dtype: dtype)
+                    var warmShared = [MLXArray]()
+                    for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                        let bOffsets = [Int64](
+                            repeating: Int64(pageElements), count: max(8, bindings))
+                        let r = segmentsSharedKVGated(
+                            queries: q, gate: zeroGate,
+                            backing: [MLXArray](repeating: storage, count: bindings),
+                            seqinfo: seqinfo, params: params, previous: previous,
+                            valueOffsets: MLXArray(bOffsets), records: MLXArray(record),
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: sharedHpt,
+                            rpt: sharedKVRowsPerTile, simdgroups: nsg, partitionTokens: ptok,
+                            softcap: softcap, source: source)
+                        warmShared += [r.fence, r.out]
+                    }
+                    eval(warmShared)
+                    return true
+                }) ?? false
+                lock.withLock { sharedKVGatedParityPassed = allSharedPassed }
+            }
+        }
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
@@ -162,6 +330,22 @@ public enum PagedOnePassAttention {
             rows <= 64, 32 * simdgroups * maxPartitions <= 1024
         else { return nil }
         return headsPerThreadgroup(headDim: headDim, gqa: gqa, simdgroups: simdgroups)
+    }
+
+    static func eligibleSharedKV(
+        headDim: Int, gqa: Int, simdgroups: Int, partitions: Int, rows: Int, rpt: Int
+    ) -> Int? {
+        guard !threadgroupProbeFailed, partitions >= 1, partitions <= maxPartitions,
+            rows >= 2, rows <= 64, (2 ... 8).contains(rpt),
+            32 * simdgroups * maxPartitions <= 1024
+        else { return nil }
+        let hpt = 1
+        guard gqa % hpt == 0 else { return nil }
+        let floats =
+            rpt * hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
+            + maxPartitions * hpt * (headDim + 2)
+        guard floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit else { return nil }
+        return hpt
     }
 
     private static let scratch = """
@@ -310,6 +494,152 @@ public enum PagedOnePassAttention {
                 ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1)
                 : (kvHeads * (gqa / hpt) * tg, b, 1),
             threadGroup: probe ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1) : (tg, 1, 1),
+            outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    private static func segmentGatedBody(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const int row = threadgroup_position_in_grid.y;
+            int first = 0;
+            for (int r = 0; r < row; r++) {
+                first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own = (seqinfo[row * 8 + 1] + PTOK - 1) / PTOK;
+            const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
+            const device int32_t* record =
+                records + (first + min(wanted, own - 1)) * STRIDE;
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            \(scratch)
+            cbv2::paged_attention_onepass_impl<
+                T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, true>(
+                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, gate);
+            """
+    }
+
+    /// Segmented entry with fused `output * sigmoid(gate)` epilogue.
+    static func segmentsGated(
+        queries: MLXArray, gate: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
+        previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
+        kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
+        softcap: Bool, source: String
+    ) -> (fence: MLXArray, out: MLXArray) {
+        let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        let gqa = qh / kvHeads
+        let bindings = backing.count
+        let kernelName =
+            name(
+                "segments_gated\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d,
+                pageSize: pageSize, gqa: gqa, hpt: hpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap)
+        let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
+            if let existing = kernels[kernelName] { return existing }
+            let made = MLXFast.metalKernel(
+                name: kernelName,
+                inputNames: ["q", "gate"] + (0 ..< bindings).map { "segment\($0)" }
+                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
+                outputNames: ["fence", "out"], source: segmentGatedBody(bindings: bindings),
+                header: source, ensureRowContiguous: true)
+            kernels[kernelName] = made
+            return made
+        }
+        let tg = 32 * simdgroups * maxPartitions
+        let outputs = kernel(
+            [queries, gate] + backing + [seqinfo, params, previous, valueOffsets, records],
+            template: [
+                ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+            ],
+            grid: (kvHeads * (gqa / hpt) * tg, b, 1),
+            threadGroup: (tg, 1, 1),
+            outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    private static func segmentSharedKVGatedBody(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const int total_rows = q_shape[0];
+            const int group = threadgroup_position_in_grid.y;
+            const int row0 = group * RPT;
+            const int row_last = min(total_rows - 1, row0 + RPT - 1);
+            int first = 0;
+            for (int r = 0; r < row_last; r++) {
+                first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own = (seqinfo[row_last * 8 + 1] + PTOK - 1) / PTOK;
+            const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
+            const device int32_t* record =
+                records + (first + min(wanted, own - 1)) * STRIDE;
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            threadgroup float q_smem[RPT * HPT * D];
+            threadgroup float red_smem[MAXPART * NSG * HPT * (D + 2)];
+            threadgroup float part_smem[MAXPART * HPT * (D + 2)];
+            cbv2::paged_attention_onepass_shared_kv_impl<
+                T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, true, RPT>(
+                q, cache, seqinfo, seqinfo, params, KVH, 0, total_rows,
+                q_smem, red_smem, part_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, gate);
+            """
+    }
+
+    /// Segmented entry sharing KV loads across up to `rpt` causal verify rows
+    /// per threadgroup with fused `output * sigmoid(gate)` epilogue.
+    static func segmentsSharedKVGated(
+        queries: MLXArray, gate: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
+        previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
+        kvHeads: Int, pageSize: Int, hpt: Int, rpt: Int, simdgroups: Int, partitionTokens: Int,
+        softcap: Bool, source: String
+    ) -> (fence: MLXArray, out: MLXArray) {
+        let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        let gqa = qh / kvHeads
+        let bindings = backing.count
+        let kernelName =
+            name(
+                "segments_sharedkv_r\(rpt)_gated\(bindings)_kvh\(kvHeads)", dtype: dtype,
+                headDim: d, pageSize: pageSize, gqa: gqa, hpt: hpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap)
+        let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
+            if let existing = kernels[kernelName] { return existing }
+            let made = MLXFast.metalKernel(
+                name: kernelName,
+                inputNames: ["q", "gate"] + (0 ..< bindings).map { "segment\($0)" }
+                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
+                outputNames: ["fence", "out"],
+                source: segmentSharedKVGatedBody(bindings: bindings),
+                header: source, ensureRowContiguous: true)
+            kernels[kernelName] = made
+            return made
+        }
+        let tg = 32 * simdgroups * maxPartitions
+        let groups = (b + rpt - 1) / rpt
+        let outputs = kernel(
+            [queries, gate] + backing + [seqinfo, params, previous, valueOffsets, records],
+            template: [
+                ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                ("RPT", rpt),
+            ],
+            grid: (kvHeads * (gqa / hpt) * tg, groups, 1),
+            threadGroup: (tg, 1, 1),
             outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
         return (outputs[0], outputs[1])
     }
