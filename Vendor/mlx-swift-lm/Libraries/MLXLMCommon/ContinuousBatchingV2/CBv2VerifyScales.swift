@@ -232,6 +232,39 @@ public enum CBv2VerifyScales {
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
+    private struct NVFP4LaunchKey: Hashable {
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+        let scaled: Bool
+        let rowsPerTile: Int
+        let prefetch: Bool
+        let vectorScales: Bool
+        let floatScale: Bool
+        let stockScaleDecode: Bool
+        let rowGroups: Int
+        let chunksInFlight: Int
+    }
+
+    private struct FP8LaunchKey: Hashable {
+        let dtype: DType
+        let bm: Int
+        let bn: Int
+        let inputs: Int
+        let outputs: Int
+        let rows: Int
+        let packedDecode: Bool
+        let vectorWeights: Bool
+        let vectorActivations: Bool
+    }
+
+    private static let launchLock = NSLock()
+    nonisolated(unsafe) private static var nvfp4LaunchCache:
+        [NVFP4LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var fp8LaunchCache:
+        [FP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
     /// Whether `nvfp4Product` takes these operands: 1 to 8 rows of K % 128 == 0.
     public static func nvfp4Supports(rows: Int, inputs: Int, outputs: Int, dtype: DType) -> Bool {
         (1 ... 8).contains(rows) && inputs % 128 == 0 && outputs >= 8
@@ -253,19 +286,34 @@ public enum CBv2VerifyScales {
         precondition(
             nvfp4Supports(rows: rows, inputs: inputs, outputs: outputs, dtype: x.dtype)
                 && [8, 16, 32].contains(rowsPerTile) && [1, 2, 4].contains(rowGroups))
-        let tiles = (outputs + rowsPerTile - 1) / rowsPerTile
-        let groups = (tiles + rowGroups - 1) / rowGroups
-        let template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
-            ("SCALED", tensorScale != nil), ("NB", rowsPerTile), ("PF", prefetch),
-            ("SV", vectorScales), ("FS", floatScale), ("SD", stockScaleDecode),
-            ("RG", rowGroups), ("CH", chunksInFlight),
-        ]
-        let result = nvfp4Kernel(
-            [weight, blockScales, x.reshaped(rows, inputs), tensorScale?.reshaped(1) ?? unit],
-            template: template,
-            grid: (32, 8, rowGroups * groups), threadGroup: (32, 8, rowGroups),
-            outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
+        let key = NVFP4LaunchKey(
+            dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs,
+            scaled: tensorScale != nil, rowsPerTile: rowsPerTile, prefetch: prefetch,
+            vectorScales: vectorScales, floatScale: floatScale,
+            stockScaleDecode: stockScaleDecode, rowGroups: rowGroups,
+            chunksInFlight: chunksInFlight)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ nvfp4LaunchCache[key] }) {
+            launch = hit
+        } else {
+            let tiles = (outputs + rowsPerTile - 1) / rowsPerTile
+            let groups = (tiles + rowGroups - 1) / rowGroups
+            let template: [(String, any KernelTemplateArg)] = [
+                ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
+                ("SCALED", tensorScale != nil), ("NB", rowsPerTile), ("PF", prefetch),
+                ("SV", vectorScales), ("FS", floatScale), ("SD", stockScaleDecode),
+                ("RG", rowGroups), ("CH", chunksInFlight),
+            ]
+            let made = nvfp4Kernel.prepare(
+                template: template,
+                grid: (32, 8, rowGroups * groups), threadGroup: (32, 8, rowGroups),
+                outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])
+            launchLock.withLock { nvfp4LaunchCache[key] = made }
+            launch = made
+        }
+        let result = launch([
+            weight, blockScales, x.reshaped(rows, inputs), tensorScale?.reshaped(1) ?? unit,
+        ])[0]
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
@@ -464,15 +512,27 @@ public enum CBv2VerifyScales {
                 && vectors.dim(1) == inputs)
         let bn = splitsK ? 8 : 1
         let bm = rowGroups
-        let groups = (outputs + bm * 2 - 1) / (bm * 2)
-        let template: [(String, any KernelTemplateArg)] = [
-            ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("K", inputs), ("N", outputs),
-            ("V", count), ("PD", packedDecode), ("WV", vectorWeights), ("AV", vectorActivations),
-        ]
-        return fp8Kernel(
-            [mat, scale, vectors], template: template,
-            grid: (groups * 32, bn, bm), threadGroup: (32, bn, bm),
-            outputShapes: [[count, outputs]], outputDTypes: [vectors.dtype])[0]
+        let key = FP8LaunchKey(
+            dtype: vectors.dtype, bm: bm, bn: bn, inputs: inputs, outputs: outputs, rows: count,
+            packedDecode: packedDecode, vectorWeights: vectorWeights,
+            vectorActivations: vectorActivations)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ fp8LaunchCache[key] }) {
+            launch = hit
+        } else {
+            let groups = (outputs + bm * 2 - 1) / (bm * 2)
+            let template: [(String, any KernelTemplateArg)] = [
+                ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("K", inputs), ("N", outputs),
+                ("V", count), ("PD", packedDecode), ("WV", vectorWeights), ("AV", vectorActivations),
+            ]
+            let made = fp8Kernel.prepare(
+                template: template,
+                grid: (groups * 32, bn, bm), threadGroup: (32, bn, bm),
+                outputShapes: [[count, outputs]], outputDTypes: [vectors.dtype])
+            launchLock.withLock { fp8LaunchCache[key] = made }
+            launch = made
+        }
+        return launch([mat, scale, vectors])[0]
     }
 
     /// The stock product the FP8 kernel reproduces (tests and benchmarks).
