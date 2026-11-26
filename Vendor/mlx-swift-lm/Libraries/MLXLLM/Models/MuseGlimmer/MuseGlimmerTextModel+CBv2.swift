@@ -305,6 +305,7 @@ extension MuseGlimmerTextModel {
         guard VerifyFusedQK.enabled,
             VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
         else {
+            if CBv2VerifyTree.active(columns: length) != nil { CBv2VerifyTree.failed = true }
             return a(x, mask: .none, cache: attending as? KVCache, ropeOffsets: ropeOffsets)
         }
         let theta = configuration.layerRopeTheta[layerIndex]
@@ -384,6 +385,24 @@ extension MuseGlimmerTextModel {
                                 ? nil : MLXArray.zeros([batch], type: Int32.self))
                         warm += [out.queries, out.keys]
                     }
+                }
+            }
+            // Draft-tree windows: the per-row position variant of each width.
+            if let rope {
+                for layout in CBv2VerifyTree.reachableLayouts(maxDrafts: 7) {
+                    let rows = layout.columns
+                    let out = CBv2VerifyTree.building(layout) {
+                        VerifyFusedQK.apply(
+                            queries: MLXArray.zeros(
+                                [1, rows, a.heads * a.headDimensions], dtype: dtype),
+                            keys: MLXArray.zeros(
+                                [1, rows, a.kvHeads * a.headDimensions], dtype: dtype),
+                            heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: rope,
+                            offsets: MLXArray.zeros([1], type: Int32.self))
+                    }
+                    warm += [out.queries, out.keys]
                 }
             }
         }
@@ -546,10 +565,28 @@ enum MuseGlimmerVerifyProjections {
 extension MuseGlimmerTextModel {
     private var routesVerifyProjections: Bool { MuseGlimmerVerifyProjections.enabled }
 
+    /// Low-acceptance windows' FP8 products on simdgroup matrices (not
+    /// row-exact; never under the bitwise self-test).
+    private func matrixFP8(_ layers: [ModelOptCalibratedLinear], _ x: MLXArray) -> [MLXArray]? {
+        guard !MuseGlimmerVerifyProjections.selfTest else { return nil }
+        return CBv2SmallProjection.fp8MatrixProducts(layers, x)
+    }
+
     private func verifyRows(_ x: MLXArray) -> Int? {
         guard routesVerifyProjections, numerics.isExact(x) else { return nil }
         let rows = MuseGlimmerNumerics.rows(x)
         return (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows) ? rows : nil
+    }
+
+    /// The load-time tuner's schedule for this group at `rows`, if one beat the
+    /// default routing (`CBv2VerifyTuner`); nil otherwise.
+    private func tunedVerify(_ layers: [any UnaryLayer], _ rows: Int, _ x: MLXArray)
+        -> [MLXArray]?
+    {
+        guard let v = CBv2VerifyTuner.variant(layers[0] as AnyObject, rows: rows) else {
+            return nil
+        }
+        return CBv2VerifyTuner.apply(v, layers, x)
     }
 
     /// The self-test's reference: each layer's own row-exact product.
@@ -566,11 +603,14 @@ extension MuseGlimmerTextModel {
     /// `CBv2SmallProjection`, all NVFP4 through `CBv2VerifyScales`; otherwise
     /// the frontier's grouped or per-layer products.
     func verifyAttentionProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil {
+        if let rows = verifyRows(x) {
             var routed: [MLXArray]?
             var kind = ""
-            if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+            if let tuned = tunedVerify(layers, rows, x) {
+                routed = tuned
+                kind = "tuned.qkvg"
+            } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
+                routed = matrixFP8(fp8, x) ?? CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
                 routed = CBv2VerifyScales.products(layers, x)
@@ -587,11 +627,16 @@ extension MuseGlimmerTextModel {
     /// The attention output projection: FP8 through `CBv2SmallProjection`
     /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyScales`.
     func verifyOutputProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-        if verifyRows(x) != nil {
+        if let rows = verifyRows(x) {
             var routed: MLXArray?
             var kind = ""
-            if let fp8 = layer as? ModelOptCalibratedLinear {
-                routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
+            if let tuned = tunedVerify([layer], rows, x)?.first {
+                routed = tuned
+                kind = "tuned.o"
+            } else if let fp8 = layer as? ModelOptCalibratedLinear {
+                routed =
+                    matrixFP8([fp8], x)?.first
+                    ?? CBv2SmallProjection.fp8Products([fp8], x)?.first
                 kind = "fp8.o"
             } else if layer is ModelOptWeightOnlyNVFP4Linear {
                 routed = CBv2VerifyScales.product(layer, x)
@@ -609,14 +654,17 @@ extension MuseGlimmerTextModel {
     /// launch; an FP8 pair through `CBv2SmallProjection` (one cast and one
     /// product launch).
     func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
-        if verifyRows(x) != nil {
+        if let rows = verifyRows(x) {
             var routed: [MLXArray]?
             var kind = ""
-            if let pair = CBv2VerifyNVFP4.products(layers, x) {
+            if let tuned = tunedVerify(layers, rows, x) {
+                routed = tuned
+                kind = "tuned.gate_up"
+            } else if let pair = CBv2VerifyNVFP4.products(layers, x) {
                 routed = pair
                 kind = "nvfp4.gate_up"
             } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                routed = matrixFP8(fp8, x) ?? CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.gate_up"
             }
             if let routed {
@@ -635,16 +683,20 @@ extension MuseGlimmerTextModel {
         if let rows = verifyRows(x) {
             var routed: MLXArray?
             var kind = ""
-            if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
+            if let tuned = tunedVerify([layer], rows, x)?.first {
+                routed = tuned
+                kind = "tuned.down"
+            } else if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
                 routed =
                     rows >= 7
                     ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.down"
             } else if let fp8 = layer as? ModelOptCalibratedLinear {
                 routed =
-                    rows >= 6
-                    ? CBv2VerifyScales.product(layer, x)
-                    : CBv2SmallProjection.fp8Products([fp8], x)?.first
+                    matrixFP8([fp8], x)?.first
+                    ?? (rows >= 6
+                        ? CBv2VerifyScales.product(layer, x)
+                        : CBv2SmallProjection.fp8Products([fp8], x)?.first)
                 kind = "fp8.down"
             }
             if let routed {
@@ -683,8 +735,9 @@ extension MuseGlimmerTextModel {
     /// `CBv2VerifyScales` (8-row tiles), then the same multiplier and softcap
     /// fused into one vectorized pass. Other calls run `outputLogits` itself.
     func verifyOutputLogits(_ normedHidden: MLXArray) -> MLXArray {
-        guard verifyRows(normedHidden) != nil, lmHead is ModelOptWeightOnlyNVFP4Linear,
-            let product = CBv2VerifyScales.product(lmHead, normedHidden)
+        guard let rows = verifyRows(normedHidden), lmHead is ModelOptWeightOnlyNVFP4Linear,
+            let product = tunedVerify([lmHead], rows, normedHidden)?.first
+                ?? CBv2VerifyScales.product(lmHead, normedHidden)
         else { return outputLogits(normedHidden) }
         checkRouted([product], [lmHead], normedHidden, kind: "nvfp4.lm_head")
         let cap = configuration.finalLogitSoftcapping
@@ -735,6 +788,10 @@ extension MuseGlimmerTextModel {
                     let width = inputs(group[0])
                 else { continue }
                 var outputs = [MLXArray]()
+                // Both the record's products and the low-acceptance matrix ones.
+                for matrix in [false, true] {
+                CBv2SmallProjection.fp8MatrixRounds = matrix
+                defer { CBv2SmallProjection.fp8MatrixRounds = false }
                 for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                     let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                     switch site {
@@ -744,6 +801,7 @@ extension MuseGlimmerTextModel {
                     default: outputs.append(verifyDownProjection(group[0], x))
                     }
                 }
+                }
                 eval(outputs)
             }
         }
@@ -752,11 +810,81 @@ extension MuseGlimmerTextModel {
                 (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
                     verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
                 })
+            tuneVerifyProjections(dtype: dtype)
             let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
                 MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
         }
+    }
+}
+
+// MARK: - Load-time schedule choice for the verify projections
+
+extension MuseGlimmerTextModel {
+    /// Chooses, per layer shape and verify row count (2 to 8), among the
+    /// existing exact schedules of the verify projections by timing them on
+    /// the loaded weights (`CBv2VerifyTuner`). A candidate whose output is not
+    /// bit-identical to the stock row-exact product is dropped. Runs once, in
+    /// the engine-build warm-up; `CBV2_VERIFY_TUNE=0` turns it off.
+    func tuneVerifyProjections(dtype: DType) {
+        guard CBv2VerifyTuner.enabled, MuseGlimmerVerifyProjections.enabled,
+            numerics.exactWindows
+        else { return }
+        func shapeKey(_ layers: [any UnaryLayer]) -> (String, Bool, Int)? {
+            var parts = [String]()
+            var fp8 = false
+            var width = 0
+            for layer in layers {
+                guard let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape
+                else { return nil }
+                parts.append("\(shape.format):\(shape.inputs)x\(shape.outputs)")
+                fp8 = fp8 || layer is ModelOptCalibratedLinear
+                width = shape.inputs
+            }
+            return (parts.joined(separator: ","), fp8, width)
+        }
+        var order = [String]()
+        var classes = [String: CBv2VerifyTuner.Group]()
+        func add(_ site: CBv2VerifyTuner.Site, _ layers: [any UnaryLayer]) {
+            guard let (key, fp8, width) = shapeKey(layers), width > 0 else { return }
+            let id = site.rawValue + " " + key
+            if classes[id] == nil {
+                classes[id] = .init(site: site, key: key, fp8: fp8, width: width, groups: [])
+                order.append(id)
+            }
+            classes[id]!.groups.append(layers)
+        }
+        for layer in model.layers {
+            let a = layer.selfAttention
+            let mlp = layer.mlp
+            add(.gateUp, [mlp.gateProj, mlp.upProj])
+            add(.down, [mlp.downProj])
+            add(.o, [a.outputProj])
+            add(.qkvg, [a.queryProj, a.keyProj, a.valueProj, a.gateProj])
+        }
+        if lmHead is ModelOptWeightOnlyNVFP4Linear { add(.lmHead, [lmHead]) }
+        // Layer groups of one class must share the probed weights' shape only; the
+        // order lists the heaviest sites first.
+        let weight: [CBv2VerifyTuner.Site: Int] = [
+            .gateUp: 0, .down: 1, .lmHead: 2, .qkvg: 3, .o: 4,
+        ]
+        let sorted = order.compactMap { classes[$0] }.sorted {
+            (weight[$0.site] ?? 9) < (weight[$1.site] ?? 9)
+        }
+        CBv2VerifyTuner.tune(
+            sorted, dtype: dtype,
+            stock: { group, x in group.map { self.numerics.project($0, x) } },
+            baseline: { site, group, x in
+                switch site {
+                case .qkvg: return self.verifyAttentionProjections(group, x)
+                case .o: return [self.verifyOutputProjection(group[0], x)]
+                case .gateUp: return self.verifyFeedInputProjections(group, x)
+                case .down: return [self.verifyDownProjection(group[0], x)]
+                case .lmHead:
+                    return [CBv2VerifyScales.product(group[0], x) ?? self.numerics.project(group[0], x)]
+                }
+            })
     }
 }

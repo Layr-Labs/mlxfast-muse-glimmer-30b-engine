@@ -135,6 +135,16 @@ public enum PagedOnePassAttention {
                 kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                 partitionTokens: ptok, softcap: softcap, source: source)
             outputs += [result.fence, result.out]
+            if CBv2VerifyTree.enabled {
+                // The draft-tree variant (branch rows skip a range).
+                let tree = segments(
+                    queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                    seqinfo: seqinfo, params: params, previous: previous,
+                    valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                    kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source, holes: true)
+                outputs += [tree.fence, tree.out]
+            }
         }
         eval(outputs)
     }
@@ -146,7 +156,7 @@ public enum PagedOnePassAttention {
         while hpt >= 1 {
             let floats =
                 hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                + maxPartitions * hpt * (headDim + 2)
+                + maxPartitions * hpt * (headDim + 2) + 2 * headDim
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -178,7 +188,8 @@ public enum PagedOnePassAttention {
         cbv2::paged_attention_onepass_impl<
             T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP, cbv2::PagedSlabAccessor<T>,
             BLOCK>(
-            q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem, out,
+            q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem,
+            (threadgroup float*)nullptr, out,
             threadgroup_position_in_grid, thread_position_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """
@@ -203,10 +214,16 @@ public enum PagedOnePassAttention {
                 fence[0] = previous[0] + 1;
             }
             \(scratch)
+            #ifdef CBV2_TREE_HOLES
+            threadgroup float leaf_smem[2 * D];
+            threadgroup float* leaf = leaf_smem;
+            #else
+            threadgroup float* leaf = nullptr;
+            #endif
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
                 cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
-                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, leaf, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
                 simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
             """
@@ -270,7 +287,7 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, holes: Bool = false
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
@@ -279,7 +296,7 @@ public enum PagedOnePassAttention {
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                softcap: softcap) + (holes ? "_holes" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -290,7 +307,8 @@ public enum PagedOnePassAttention {
                 inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
                     + ["seqinfo", "params", "previous", "value_offsets", "records"],
                 outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                header: holes ? "#define CBV2_TREE_HOLES 1\n" + source : source,
+                ensureRowContiguous: true)
             kernels[kernelName] = made
             return made
         }

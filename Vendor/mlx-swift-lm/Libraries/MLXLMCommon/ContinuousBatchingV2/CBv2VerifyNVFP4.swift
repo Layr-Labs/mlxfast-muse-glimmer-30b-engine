@@ -283,7 +283,8 @@ public enum CBv2VerifyNVFP4 {
     /// `ModelOptWeightOnlyNVFP4RowExact.product(x, weight:, blockScales:,
     /// tensorScale:)` bit for bit, or nil when this shape is not taken.
     public static func product(
-        _ x: MLXArray, weight: MLXArray, blockScales: MLXArray, tensorScale: MLXArray? = nil
+        _ x: MLXArray, weight: MLXArray, blockScales: MLXArray, tensorScale: MLXArray? = nil,
+        geometry tuned: Geometry? = nil
     ) -> MLXArray? {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
@@ -292,7 +293,7 @@ public enum CBv2VerifyNVFP4 {
             takes(weight: weight, blockScales: blockScales, tensorScale: tensorScale, inputs: inputs)
         else { return nil }
         let outputs = weight.dim(0)
-        let g = geometry(rows: rows, inputs: inputs)
+        let g = tuned ?? geometry(rows: rows, inputs: inputs)
         let tile = 8 * g.fragments
         let template: [(String, any KernelTemplateArg)] = [
             ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("PF", g.prefetch),
@@ -308,14 +309,20 @@ public enum CBv2VerifyNVFP4 {
 
     /// `layer.rowExactProduct(x)` of the Muse Glimmer tower for a weight-only
     /// NVFP4 layer, or nil.
-    public static func product(_ layer: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray) -> MLXArray? {
-        product(x, weight: layer.weight, blockScales: layer.weightScale, tensorScale: layer.weightScale2)
+    public static func product(
+        _ layer: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray, geometry: Geometry? = nil
+    ) -> MLXArray? {
+        product(
+            x, weight: layer.weight, blockScales: layer.weightScale,
+            tensorScale: layer.weightScale2, geometry: geometry)
     }
 
     /// The products of two sibling NVFP4 layers of one input (MLP gate and
     /// up), one launch, each equal to its layer's own row-exact product; nil
     /// when the pair is not taken.
-    public static func products(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
+    public static func products(
+        _ layers: [any UnaryLayer], _ x: MLXArray, geometry tuned: Geometry? = nil
+    ) -> [MLXArray]? {
         guard layers.count == 2, let nv = layers as? [ModelOptWeightOnlyNVFP4Linear] else {
             return nil
         }
@@ -329,7 +336,7 @@ public enum CBv2VerifyNVFP4 {
                     tensorScale: layer.weightScale2, inputs: inputs)
             else { return nil }
         }
-        let g = geometry(rows: rows, inputs: inputs)
+        let g = tuned ?? geometry(rows: rows, inputs: inputs)
         let tile = 8 * g.fragments
         var arrays = [MLXArray]()
         var template: [(String, any KernelTemplateArg)] = [

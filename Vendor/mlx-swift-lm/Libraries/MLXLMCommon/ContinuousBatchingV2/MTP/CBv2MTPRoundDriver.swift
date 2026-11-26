@@ -157,6 +157,16 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// The draft tree this window verified (`CBv2VerifyTree`); nil for
+        /// a chain, or when a layer could not honor the tree.
+        var tree: CBv2VerifyTreeLayout? = nil
+        /// Every layer built the tree's leaf positions and masks, so leaf
+        /// rows are the target's own steps.
+        var treeLeavesValid = false
+        /// Adaptive-arm index this single-row round was planned with.
+        var adaptArm: Int? = nil
+        /// Packet index of the dynamic leaf's depth (nil: not dynamic).
+        var treeLeafDepthIndex: Int? = nil
 
     }
 
@@ -339,6 +349,15 @@ final class CBv2MTPRoundDriver {
 
     /// Plan-scoped: rows the planner offered a 1+k round this plan.
     private(set) var roundMarks: [CBv2RequestID: Int] = [:]
+    /// Rounds whose window is a draft tree (`CBv2VerifyTree`); the round
+    /// mark is the tree's draft count.
+    private(set) var treeMarks: [CBv2RequestID: CBv2VerifyTreeLayout] = [:]
+    /// Online exact-policy choice for low-acceptance rounds
+    /// (`CBv2MTPAdaptiveArms`); nil when `CBV2_ADAPT=0`.
+    let adaptConfig = CBv2AdaptConfig.fromEnvironment()
+    private var adaptControllers: [CBv2RequestID: CBv2AdaptController] = [:]
+    /// Plan-scoped: arm index each row's round was planned with.
+    private(set) var adaptMarks: [CBv2RequestID: Int] = [:]
     /// Plan-scoped: eligible rows without a valid carry — their decode step
     /// this plan is a SEED step (eager forwardWithHidden, hidden captured).
     private(set) var seedMarks: Set<CBv2RequestID> = []
@@ -529,6 +548,8 @@ final class CBv2MTPRoundDriver {
             depthController.beginWorkload(rowIDs: rowIDs)
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
+        if !treeMarks.isEmpty { treeMarks = [:] }
+        if !adaptMarks.isEmpty { adaptMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
@@ -670,6 +691,65 @@ final class CBv2MTPRoundDriver {
     func inLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
         usesFixedDepthAcceptanceWindow
             && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
+    }
+    func treeMark(for id: CBv2RequestID) -> CBv2VerifyTreeLayout? { treeMarks[id] }
+    func adaptMark(for id: CBv2RequestID) -> Int? { adaptMarks[id] }
+    /// Deepest dynamic leaf for this row's round (its arm's, else the default).
+    func leafDepthLimit(for id: CBv2RequestID) -> Int? {
+        guard let config = adaptConfig, let arm = adaptMarks[id] else { return nil }
+        return config.arms[arm].leafDepth
+    }
+    func adaptObserve(
+        _ id: CBv2RequestID, arm: Int, nowNanos: UInt64, tokens: Int, countBefore: Int
+    ) {
+        adaptControllers[id]?.observe(
+            arm: arm, nowNanos: nowNanos, tokens: tokens, countBefore: countBefore)
+    }
+    func adaptResetAnchor(_ id: CBv2RequestID) { adaptControllers[id]?.resetAnchor() }
+
+    /// A draft tree for a low-acceptance request's short chain: the chain
+    /// plus the drafter's second choice at depths 1 ... chain, within the
+    /// declared depth. Verify rows up to the declared window cost about the
+    /// same as the chain alone (the projections read each weight once), so
+    /// the leaves are paid by the rounds where the chain stops early.
+    func treeLayout(for id: CBv2RequestID, chain: Int, remainingTokens: Int)
+        -> CBv2VerifyTreeLayout?
+    {
+        if CBv2VerifyTree.enabled, CBv2VerifyTree.dynamicLeafEnabled {
+            // Same width as the chain it replaces: k - 1 chain drafts and a
+            // leaf at the depth the round's own probabilities favor.
+            guard usesFixedDepthAcceptanceWindow,
+                drafter is any CBv2MTPTreeDrafter,
+                (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime,
+                chain >= 2, remainingTokens > chain + 1
+            else { return nil }
+            // Low-acceptance rounds pick among exact policies online; the
+            // high-acceptance regime never reaches this point.
+            if let adaptConfig {
+                var controller =
+                    adaptControllers[id] ?? CBv2AdaptController(config: adaptConfig)
+                let arm = controller.nextArm()
+                adaptControllers[id] = controller
+                adaptMarks[id] = arm
+                guard adaptConfig.arms[arm].leafDepth != nil else { return nil }
+            }
+            return CBv2VerifyTreeLayout.dynamic(chain: chain - 1)
+        }
+        guard usesFixedDepthAcceptanceWindow,
+            drafter is any CBv2MTPTreeDrafter,
+            (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime,
+            let layout = CBv2VerifyTree.layout(
+                chain: chain, maxDrafts: config.maxDraftTokens,
+                blockDrafts: config.maxDraftTokens),
+            remainingTokens > layout.drafts + 1
+        else { return nil }
+        return layout
+    }
+
+    func markTree(_ id: CBv2RequestID, layout: CBv2VerifyTreeLayout) {
+        guard !targetOnlyMediaRequests.contains(id) else { return }
+        roundMarks[id] = layout.drafts
+        treeMarks[id] = layout
     }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
@@ -1175,6 +1255,11 @@ final class CBv2MTPRoundDriver {
         carries.removeValue(forKey: id)
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
+        treeMarks.removeValue(forKey: id)
+        adaptMarks.removeValue(forKey: id)
+        if let controller = adaptControllers.removeValue(forKey: id) {
+            FileHandle.standardError.write(Data("ADAPT \(controller.summary())\n".utf8))
+        }
         seedMarks.remove(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
@@ -1213,6 +1298,9 @@ final class CBv2MTPRoundDriver {
         rawCostEstimators.removeAll(keepingCapacity: false)
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
         roundMarks.removeAll(keepingCapacity: false)
+        treeMarks.removeAll(keepingCapacity: false)
+        adaptMarks.removeAll(keepingCapacity: false)
+        adaptControllers.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
