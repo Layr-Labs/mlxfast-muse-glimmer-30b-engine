@@ -543,6 +543,38 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         writtenHighWater = max(writtenHighWater, absoluteOffset)
     }
 
+    /// Whether `copyToken` can run on this row: plain native K/V, no
+    /// step-owned tickets.
+    var canCopyToken: Bool {
+        !released && !pool.usesStepOwnedAttention && groupKey.quantization == nil
+            && !groupKey.isAsymmetric
+    }
+
+    /// Copies the K/V of positions `source ..< source + count` onto
+    /// `destination ..< destination + count`, all written and inside the
+    /// current frontier (a tree round's branch rows onto the committed
+    /// positions after the accepted chain; the ranges do not overlap). One
+    /// gather and one in-place write dispatch; the cursor does not move.
+    func copyTokens(from source: Int, to destination: Int, count: Int) {
+        guard canCopyToken, count > 0, source != destination else { return }
+        precondition(
+            source >= baseOffset && source + count <= absoluteOffset
+                && destination >= baseOffset && destination + count <= absoluteOffset
+                && (destination + count <= source || source + count <= destination),
+            "[PagedSequenceKV] token copy outside the written range")
+        let (keys, values) = gatherRange(start: source, count: count)
+        let s = pool.config.pageSize
+        let slots = (destination ..< destination + count).map { position -> Int32 in
+            let lp = position / s
+            let index = ringPages.map { lp % $0 } ?? lp
+            precondition(index < table.count, "[PagedSequenceKV] token copy past the page table")
+            return table[index] * Int32(s) + Int32(position % s)
+        }
+        pool.writeTokens(
+            group: groupKey, slots: slots, keys: keys.squeezed(axis: 0),
+            values: values.squeezed(axis: 0))
+    }
+
     /// Reserve the destination for ONE decode token and advance the
     /// frontier WITHOUT touching storage — the paged decode kernel writes
     /// the tile in place (fused write, see PagedAttentionKernel.decode).

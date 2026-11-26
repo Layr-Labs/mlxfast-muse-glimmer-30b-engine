@@ -135,6 +135,16 @@ public enum PagedOnePassAttention {
                 kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                 partitionTokens: ptok, softcap: softcap, source: source)
             outputs += [result.fence, result.out]
+            if CBv2VerifyTree.enabled {
+                // The draft-tree variant (branch rows skip a range).
+                let tree = segments(
+                    queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                    seqinfo: seqinfo, params: params, previous: previous,
+                    valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                    kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source, holes: true)
+                outputs += [tree.fence, tree.out]
+            }
         }
         eval(outputs)
     }
@@ -270,7 +280,7 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, holes: Bool = false
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
@@ -279,7 +289,7 @@ public enum PagedOnePassAttention {
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                softcap: softcap) + (holes ? "_holes" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -290,7 +300,8 @@ public enum PagedOnePassAttention {
                 inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
                     + ["seqinfo", "params", "previous", "value_offsets", "records"],
                 outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                header: holes ? "#define CBV2_TREE_HOLES 1\n" + source : source,
+                ensureRowContiguous: true)
             kernels[kernelName] = made
             return made
         }

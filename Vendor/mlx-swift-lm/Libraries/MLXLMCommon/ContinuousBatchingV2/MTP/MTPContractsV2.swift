@@ -394,6 +394,24 @@ public struct CBv2MTPCommittedTargetObservation {
 /// Alternate drafter seam for autoregressive assistants such as Qwen3.5/3.6.
 /// Calls are row-local so histories and assistant-cache offsets may differ;
 /// the target verifier may still batch the resulting columns as `[B,1]`.
+/// A request-stateful drafter that offers its second choice at each block
+/// position of the current round, for draft-tree verify windows
+/// (`CBv2VerifyTree`). Called after the round's index-0 draft step.
+public protocol CBv2MTPTreeDrafter: CBv2MTPRequestStatefulDrafter {
+    /// `[1]` int32: the second-ranked proposal at block position `index`
+    /// (depth `index + 1`); nil when this round has none.
+    func alternativeDraft(index: Int, requestState: any CBv2MTPRequestState) -> MLXArray?
+    /// `[1]` int32: the round's own proposal at block position `index`,
+    /// without staging it as a chain draft; nil when this round has none.
+    func proposalDraft(index: Int, requestState: any CBv2MTPRequestState) -> MLXArray?
+    /// The leaf with the most expected accepted tokens among the second
+    /// choices at depths 1 ... `maxDepth`, picked on the device: `depth`
+    /// `[1]` int32 (1-based) and its `token` `[1]` int32; nil when this
+    /// round has none.
+    func dynamicLeaf(maxDepth: Int, requestState: any CBv2MTPRequestState)
+        -> (depth: MLXArray, token: MLXArray)?
+}
+
 public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// Opt in only when observation builds lazy assistant-state mutations that
     /// must join the current target-step fence. Default false preserves existing
