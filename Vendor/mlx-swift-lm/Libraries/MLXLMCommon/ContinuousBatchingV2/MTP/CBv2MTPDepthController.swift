@@ -576,7 +576,7 @@ final class CBv2MTPDepthController {
 struct CBv2MTPRequestAcceptanceState: Equatable {
     /// Bounded by each drafter's qualified captured-window contract.
     static let maximumDepth = 7
-    private static let alpha = 0.15
+    private static let alpha = 0.25
 
     private(set) var probabilities: [Double] =
         (0 ..< CBv2MTPRequestAcceptanceState.maximumDepth).map {
