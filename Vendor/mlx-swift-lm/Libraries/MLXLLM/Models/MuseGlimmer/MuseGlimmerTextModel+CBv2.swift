@@ -106,7 +106,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers whose attention half (not the MLP) takes the prompt arithmetic:
     /// a finer step than a whole layer, so the timed prefill lands closer to
     /// its 2.0 ceiling without crossing it.
-    static let promptAttentionLayers: Set<Int> = [14, 15]
+    static let promptAttentionLayers: Set<Int> = [12, 13, 14, 15]
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
