@@ -60,6 +60,14 @@ public enum CBv2VerifyNVFP4 {
 
     static let tileHelper = """
 
+        // `mo_wo_e4m3` of the low byte of each 16-bit half of `x` (NaN codes included).
+        inline half2 cb_vn_e4m3x2(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
         // One tile of 8 * TN outputs of one projection: the stock matrix
         // kernel's arithmetic (see CBv2VerifyNVFP4) on 8 * TN rows.
         template <typename T, int V, int K, int N, int TN, int PF, bool SCALED>
@@ -102,71 +110,129 @@ public enum CBv2VerifyNVFP4 {
                 sl[t] = scales + size_t(row) * row_scales + fn / 4;
             }
 
-            // Rolling buffer (PF 1): slot `block` holds this chunk's block and is
-            // refilled with the next chunk's block once read.
-            uint qb[4][TN];
-            uint sb[4][TN];
-            if (PF == 1 && int(simd_gid) * BK < K) {
-                const int k0 = simd_gid * BK;
-                MO_WO_UNROLL
-                for (short block = 0; block < 4; block++) {
-                    const int b = k0 + 32 * block;
+            if constexpr (PF == 1) {
+                // Rolling buffer (PF 1): slot `block` holds this chunk's block and is
+                // refilled with the next chunk's block once read.
+                uint qb[4][TN];
+                uint sb[4][TN];
+                if (int(simd_gid) * BK < K) {
+                    const int k0 = simd_gid * BK;
                     MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        qb[block][t] = wl[t][b / 8];
-                        sb[block][t] = sl[t][b / 16];
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k0 + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            qb[block][t] = wl[t][b / 8];
+                            sb[block][t] = sl[t][b / 16];
+                        }
                     }
                 }
-            }
-            for (int k = simd_gid * BK; k < K; k += WK * BK) {
-                const int kn = k + WK * BK;
-                const bool more = kn < K;
-                MO_WO_UNROLL
-                for (short block = 0; block < 4; block++) {
-                    const int b = k + 32 * block;
-                    ushort4 xv[TM][2];
+                for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                    const int kn = k + WK * BK;
+                    const bool more = kn < K;
                     MO_WO_UNROLL
-                    for (short mt = 0; mt < TM; mt++) {
-                        MO_WO_UNROLL
-                        for (short j = 0; j < 2; j++) {
-                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
-                        }
-                    }
-                    uint q[TN];
-                    half s[TN];
-                    MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        if (PF == 1) {
-                            q[t] = qb[block][t];
-                            s[t] = mo_wo_e4m3(sb[block][t]);
-                        } else {
-                            q[t] = wl[t][b / 8];
-                            s[t] = mo_wo_e4m3(sl[t][b / 16]);
-                        }
-                    }
-                    if (PF == 1 && more) {
-                        const int bn = kn + 32 * block;
-                        MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) {
-                            qb[block][t] = wl[t][bn / 8];
-                            sb[block][t] = sl[t][bn / 16];
-                        }
-                    }
-                    MO_WO_UNROLL
-                    for (short i = 0; i < 4; i++) {
-                        float2 bf[TM];
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        ushort4 xv[TM][2];
                         MO_WO_UNROLL
                         for (short mt = 0; mt < TM; mt++) {
-                            bf[mt] = float2(
-                                float(as_type<bfloat>(xv[mt][0][i])),
-                                float(as_type<bfloat>(xv[mt][1][i])));
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                            }
                         }
+                        uint q[TN];
+                        half s[TN];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
-                            const float2 a = mo_wo_pair(q[t], i, s[t]);
+                            q[t] = qb[block][t];
+                            s[t] = mo_wo_e4m3(sb[block][t]);
+                        }
+                        if (more) {
+                            const int bn = kn + 32 * block;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                qb[block][t] = wl[t][bn / 8];
+                                sb[block][t] = sl[t][bn / 16];
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            float2 bf[TM];
                             MO_WO_UNROLL
                             for (short mt = 0; mt < TM; mt++) {
-                                mo_wo_mma(C[t][mt], a, bf[mt]);
+                                bf[mt] = float2(
+                                    float(as_type<bfloat>(xv[mt][0][i])),
+                                    float(as_type<bfloat>(xv[mt][1][i])));
+                            }
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(q[t], i, s[t]);
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Whole-chunk load batching with compact BF16 activation registers
+                // and packed 2-way E4M3 scale decode: identical MMA order and bits.
+                for (int k = simd_gid * BK; k < K; k += WK * BK) {
+                    uint qa[4][TN];
+                    uint sa[TN][2];
+                    ushort4 xv[4][TM][2];
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            qa[block][t] = wl[t][b / 8];
+                        }
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                xv[block][mt][j] =
+                                    ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                            }
+                        }
+                    }
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        sa[t][0] = uint(sl[t][k / 16]) | (uint(sl[t][k / 16 + 2]) << 16);
+                        sa[t][1] = uint(sl[t][k / 16 + 4]) | (uint(sl[t][k / 16 + 6]) << 16);
+                    }
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        hs[t][0] = cb_vn_e4m3x2(sa[t][0]);
+                        hs[t][1] = cb_vn_e4m3x2(sa[t][1]);
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            s[t] = hs[t][block / 2][block % 2];
+                        }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            float2 bf[TM];
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                bf[mt] = float2(
+                                    float(as_type<bfloat>(xv[block][mt][0][i])),
+                                    float(as_type<bfloat>(xv[block][mt][1][i])));
+                            }
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
                             }
                         }
                     }
@@ -256,8 +322,51 @@ public enum CBv2VerifyNVFP4 {
     }
 
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
-        1: kernel(segments: 1), 2: kernel(segments: 2),
+        1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
+
+    private struct LaunchKey: Hashable {
+        let segments: Int
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let fragments: Int
+        let prefetch: Int
+        let scaled: Bool
+        let outputs: [Int]
+    }
+
+    private static let launchLock = NSLock()
+    nonisolated(unsafe) private static var launchCache: [LaunchKey: MLXFast.MLXFastKernel.Launch] =
+        [:]
+
+    private static func preparedLaunch(
+        segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
+        scaled: Bool, outputs: [Int]
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = LaunchKey(
+            segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
+            prefetch: prefetch, scaled: scaled, outputs: outputs)
+        if let hit = launchLock.withLock({ launchCache[key] }) { return hit }
+        let tile = 8 * fragments
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
+            ("SCALED", scaled),
+        ]
+        var shapes = [[Int]]()
+        shapes.reserveCapacity(outputs.count)
+        var tiles = 0
+        for (i, n) in outputs.enumerated() {
+            template.append(("N\(i)", n))
+            shapes.append([rows, n])
+            tiles += (n + tile - 1) / tile
+        }
+        let made = kernels[segments]!.prepare(
+            template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
+        launchLock.withLock { launchCache[key] = made }
+        return made
+    }
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
@@ -293,16 +402,12 @@ public enum CBv2VerifyNVFP4 {
         else { return nil }
         let outputs = weight.dim(0)
         let g = geometry(rows: rows, inputs: inputs)
-        let tile = 8 * g.fragments
-        let template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("PF", g.prefetch),
-            ("SCALED", tensorScale != nil), ("N0", outputs),
-        ]
-        let result = kernels[1]!(
-            [weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs)],
-            template: template,
-            grid: (32, 8 * ((outputs + tile - 1) / tile), 1), threadGroup: (32, 8, 1),
-            outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
+        let launch = preparedLaunch(
+            segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: g.fragments,
+            prefetch: g.prefetch, scaled: tensorScale != nil, outputs: [outputs])
+        let result = launch([
+            weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs),
+        ])[0]
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
@@ -312,11 +417,13 @@ public enum CBv2VerifyNVFP4 {
         product(x, weight: layer.weight, blockScales: layer.weightScale, tensorScale: layer.weightScale2)
     }
 
-    /// The products of two sibling NVFP4 layers of one input (MLP gate and
-    /// up), one launch, each equal to its layer's own row-exact product; nil
-    /// when the pair is not taken.
+    /// The products of sibling NVFP4 layers of one input (MLP gate and up;
+    /// attention q, k, v and gate), one launch, each equal to its layer's own
+    /// row-exact product; nil when the group is not taken.
     public static func products(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
-        guard layers.count == 2, let nv = layers as? [ModelOptWeightOnlyNVFP4Linear] else {
+        guard kernels[layers.count] != nil, layers.count >= 2,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear]
+        else {
             return nil
         }
         let inputs = x.dim(-1)
@@ -330,25 +437,20 @@ public enum CBv2VerifyNVFP4 {
             else { return nil }
         }
         let g = geometry(rows: rows, inputs: inputs)
-        let tile = 8 * g.fragments
         var arrays = [MLXArray]()
-        var template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("PF", g.prefetch),
-            ("SCALED", true),
-        ]
-        var shapes = [[Int]]()
-        var tiles = 0
-        for (i, layer) in nv.enumerated() {
+        arrays.reserveCapacity(nv.count * 3 + 1)
+        var outputDims = [Int]()
+        outputDims.reserveCapacity(nv.count)
+        for layer in nv {
             let outputs = layer.weight.dim(0)
             arrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
-            template.append(("N\(i)", outputs))
-            shapes.append([rows, outputs])
-            tiles += (outputs + tile - 1) / tile
+            outputDims.append(outputs)
         }
         arrays.append(x.reshaped(rows, inputs))
-        let results = kernels[2]!(
-            arrays, template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: shapes, outputDTypes: [x.dtype, x.dtype])
+        let launch = preparedLaunch(
+            segments: nv.count, dtype: x.dtype, rows: rows, inputs: inputs,
+            fragments: g.fragments, prefetch: g.prefetch, scaled: true, outputs: outputDims)
+        let results = launch(arrays)
         let lead = Array(x.shape.dropLast())
         return zip(results, nv).map { $0.reshaped(lead + [$1.weight.dim(0)]) }
     }

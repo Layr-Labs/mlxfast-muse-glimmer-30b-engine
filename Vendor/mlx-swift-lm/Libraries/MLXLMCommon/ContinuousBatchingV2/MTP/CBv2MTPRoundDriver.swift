@@ -1482,8 +1482,10 @@ enum CBv2MTPHiddenIndex {
     }
 }
 
-/// Set by the engine while a low-acceptance round's drafts are built, so a
-/// drafter can draft those rounds more cheaply. Never read for target work.
+/// Set by the engine while a round's drafts are built, so a drafter can
+/// draft low-acceptance rounds more cheaply and match the planned draft depth.
+/// Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    nonisolated(unsafe) public static var plannedDepth: Int? = nil
 }

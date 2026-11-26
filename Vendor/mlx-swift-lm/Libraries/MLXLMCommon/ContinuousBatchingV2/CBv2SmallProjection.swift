@@ -410,14 +410,43 @@ public enum CBv2SmallProjection {
         let shape = FP8Shape(
             vectorDecode: vectorDecode, rowsOuter: rowsOuter, weights: layers.count, outputs: layers.count,
             segments: segments)
-        let tiles = segments.reduce(0) { $0 + $1.tiles }
-        return fp8Kernel(shape)(
-            arrays,
-            template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
-            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: layers.map { [rows, $0.outputDimensions] },
-            outputDTypes: Array(repeating: flat.dtype, count: layers.count))
+        let outputDims = layers.map(\.outputDimensions)
+        let launchKey = FP8LaunchKey(
+            shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ fp8LaunchCache[launchKey] }) {
+            launch = hit
+        } else {
+            let tiles = segments.reduce(0) { $0 + $1.tiles }
+            let made = fp8Kernel(shape).prepare(
+                template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: outputDims.map { [rows, $0] },
+                outputDTypes: Array(repeating: flat.dtype, count: outputDims.count))
+            lock.withLock { fp8LaunchCache[launchKey] = made }
+            launch = made
+        }
+        return launch(arrays)
     }
+
+    private struct FP8LaunchKey: Hashable {
+        let shape: FP8Shape
+        let dtype: DType
+        let inputs: Int
+        let rows: Int
+        let outputs: [Int]
+    }
+
+    private struct CastLaunchKey: Hashable {
+        let segments: Int
+        let dtype: DType
+        let count: Int
+    }
+
+    nonisolated(unsafe) private static var fp8LaunchCache:
+        [FP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var castLaunchCache:
+        [CastLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     /// The activation cast of `ModelOptActivationKernels.fp8` for each layer's
     /// own multipliers and bound, one launch (`CBv2GroupedProjection`'s cast).
@@ -451,7 +480,7 @@ public enum CBv2SmallProjection {
     }
 
     nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
-        2: castKernel(segments: 2), 4: castKernel(segments: 4),
+        1: castKernel(segments: 1), 2: castKernel(segments: 2), 4: castKernel(segments: 4),
     ]
 
     /// The row-exact products of FP8 sibling projections of one activation
@@ -468,27 +497,30 @@ public enum CBv2SmallProjection {
             layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: x.dtype) })
         else { return nil }
         let flat = x.reshaped(rows, inputs)
-        let cast: MLXArray
-        if layers.count == 1 {
-            guard case .fp8(let mu, let bound) = layers[0].graphConstants!.storage else {
+        guard let castKernel = castKernels[layers.count] else { return nil }
+        var castInputs: [MLXArray] = [flat]
+        castInputs.reserveCapacity(1 + layers.count * 2)
+        for layer in layers {
+            guard case .fp8(let mu, let bound) = layer.graphConstants!.storage else {
                 return nil
             }
-            cast = ModelOptActivationKernels.fp8(flat, multipliers: mu, overflowBound: bound)
-        } else {
-            guard let castKernel = castKernels[layers.count] else { return nil }
-            var castInputs: [MLXArray] = [flat]
-            for layer in layers {
-                guard case .fp8(let mu, let bound) = layer.graphConstants!.storage else {
-                    return nil
-                }
-                castInputs += [mu, bound]
-            }
-            let total = layers.count * rows * inputs
-            cast = castKernel(
-                castInputs, template: [("T", x.dtype), ("COUNT", rows * inputs)],
-                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
-                outputShapes: [[total]], outputDTypes: [x.dtype])[0]
+            castInputs += [mu, bound]
         }
+        let count = rows * inputs
+        let castKey = CastLaunchKey(segments: layers.count, dtype: x.dtype, count: count)
+        let castLaunch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ castLaunchCache[castKey] }) {
+            castLaunch = hit
+        } else {
+            let total = layers.count * count
+            let made = castKernel.prepare(
+                template: [("T", x.dtype), ("COUNT", count)],
+                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
+                outputShapes: [[total]], outputDTypes: [x.dtype])
+            lock.withLock { castLaunchCache[castKey] = made }
+            castLaunch = made
+        }
+        let cast = castLaunch(castInputs)[0]
         let lead = Array(x.shape.dropLast())
         return zip(fp8Run(layers, flat, cast: cast, rows: rows), layers).map {
             $0.reshaped(lead + [$1.outputDimensions])

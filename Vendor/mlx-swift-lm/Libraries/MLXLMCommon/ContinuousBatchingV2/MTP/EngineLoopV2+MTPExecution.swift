@@ -858,10 +858,15 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        // Low-acceptance rounds draft with the drafter's cheaper form.
+        // Low-acceptance rounds draft with the drafter's cheaper form, and
+        // single-row rounds only need proposals up to the planned depth `k`.
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
-        defer { CBv2DraftRegime.lowAcceptance = false }
+        CBv2DraftRegime.plannedDepth = batch == 1 ? k : nil
+        defer {
+            CBv2DraftRegime.lowAcceptance = false
+            CBv2DraftRegime.plannedDepth = nil
+        }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
