@@ -905,7 +905,7 @@ enum CBv2MTPMarginalDepthPolicy {
     /// observing: a depth-zero plan would record no acceptance and could
     /// never reopen the window. Emitted tokens are the target's own either
     /// way; only the number of verify rows changes.
-    static let fixedWindowFlatPrior = 0.9
+    static let fixedWindowFlatPrior = 0.7
     /// One extra verify row as a fraction of a full target step. Round costs
     /// at declared depths 3/5/7 on a request that accepts every draft give a
     /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
