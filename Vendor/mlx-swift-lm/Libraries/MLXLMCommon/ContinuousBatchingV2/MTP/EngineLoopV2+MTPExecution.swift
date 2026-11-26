@@ -862,6 +862,12 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        // A draft tree: one row, a chain plus the drafter's second choices.
+        let tree = batch == 1 ? mtp.treeMark(for: verifyRows[0].rec.id) : nil
+        let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+        var treeLeavesBuilt = tree != nil && treeDrafter != nil
+        var leafDepth: MLXArray? = nil
+        if let tree { precondition(tree.drafts == k, "CBv2 MTP: tree width != round depth") }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -904,11 +910,37 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
                     }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
+                    let result: (tokens: MLXArray, hidden: MLXArray)
+                    if let tree, tree.dynamicLeaf, draftIndex + 1 == tree.columns - 1 {
+                        // The dynamic leaf: the device picks its depth.
+                        let leaf = treeDrafter?.dynamicLeaf(
+                            maxDepth: tree.dynamicLeafDepths, requestState: requestState)
+                        if leaf == nil { treeLeavesBuilt = false }
+                        leafDepth = leaf?.depth
+                        result = (
+                            leaf?.token.asType(.int32) ?? MLXArray([Int32(0)]),
+                            currentHidden[index]
+                        )
+                    } else if let tree, let slot = tree.proposalIndex(column: draftIndex + 1) {
+                        // Branch column: the second choice where the branch
+                        // starts, then the block's own deeper proposals.
+                        let token =
+                            slot.alternative
+                            ? treeDrafter?.alternativeDraft(
+                                index: slot.index, requestState: requestState)
+                            : treeDrafter?.proposalDraft(
+                                index: slot.index, requestState: requestState)
+                        if token == nil { treeLeavesBuilt = false }
+                        result = (
+                            token?.asType(.int32) ?? MLXArray([Int32(0)]), currentHidden[index]
+                        )
+                    } else {
+                        result = stateful.draftStep(
+                            tokens: currentTokens[index],
+                            hidden: currentHidden[index],
+                            shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                            requestState: requestState)
+                    }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
@@ -983,8 +1015,29 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        if tree?.dynamicLeaf == true, leafDepth == nil { treeLeavesBuilt = false }
+        CBv2VerifyTree.begin(treeLeavesBuilt ? tree : nil, leafDepth: leafDepth)
+        // Low-acceptance windows take the FP8 matrix products.
+        CBv2SmallProjection.fp8MatrixRounds =
+            batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
+        defer { CBv2SmallProjection.fp8MatrixRounds = false }
+        var treeHonored = false
+        let target: (
+            scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
+            shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+            policyTopTwo: (ids: MLXArray, values: MLXArray)?,
+            cacheInnerState: [MLXArray],
+            diagnostics: [CBv2LogitDiagnosticPacket],
+            recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+        )
+        do {
+            target = try mtpBuildTargetVerification(
+                columns: targetColumns, rows: verifyRows, driver: mtp)
+            treeHonored = CBv2VerifyTree.end()
+        } catch {
+            _ = CBv2VerifyTree.end()
+            throw error
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -997,6 +1050,12 @@ extension EngineLoopV2 {
         }
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
+        }
+        // The dynamic leaf's depth rides last in the packet.
+        var leafDepthIndex: Int? = nil
+        if treeLeavesBuilt, tree?.dynamicLeaf == true, let leafDepth {
+            leafDepthIndex = packetParts.reduce(0) { $0 + $1.size }
+            packetParts.append(leafDepth.asType(packetParts[0].dtype).reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -1013,6 +1072,9 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.tree = tree
+        result.treeLeavesValid = tree != nil && treeHonored
+        result.treeLeafDepthIndex = leafDepthIndex
         return result
     }
 

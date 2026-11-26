@@ -153,6 +153,13 @@ extension EngineLoopV2 {
         guard let mtp else { return 0 }
         switch mtpPlanAction(for: rec, recordSkips: true) {
         case .round(let k):
+            if let layout = mtp.treeLayout(
+                for: rec.id, chain: k,
+                remainingTokens: rec.request.maxTokens - rec.generatedTokenCount)
+            {
+                mtp.markTree(rec.id, layout: layout)
+                return layout.drafts
+            }
             mtp.markRound(rec.id, k: k)
             return k
         case .seed:
