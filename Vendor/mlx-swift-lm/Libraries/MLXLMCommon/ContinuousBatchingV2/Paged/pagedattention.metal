@@ -230,6 +230,9 @@ template <typename T> struct PagedSlabAccessor {
     PagedKVPage<T> read_page(const device int32_t* table, int logical, int length) const {
         return write_page(table[logical % length]);
     }
+    PagedKVPage<T> remap_page(const device int32_t* table, int logical, int length) const {
+        return read_page(table, logical, length);
+    }
 };
 
 // records: row, partition, first logical page, page count, write binding,
@@ -256,6 +259,9 @@ template <typename T, int N, bool NODIV = false> struct PagedSegmentAccessor {
         const int index = logical - record[2];
         if (index < 0 || index >= record[3]) return page(0, 0);
         return page(record[8 + 2 * index], record[9 + 2 * index]);
+    }
+    PagedKVPage<T> remap_page(const device int32_t* ignored, int logical, int length) const {
+        return page(record[4], record[5]);
     }
 };
 
@@ -403,12 +409,20 @@ inline void paged_attention_part_cached_impl(
             load_row<T, EPT>(knew + tile_src, lane, kf);
             load_row<T, EPT>(vnew + tile_src, lane, vf);
         } else {
-            const int pos = attend_start + i;
-            const int lpage = pos / S;
-            const int slot = pos % S;
-            const auto page = cache.read_page(table, lpage, table_len);
-            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
-            page.template load<EPT>(base, lane, kf, vf);
+            const int last_remap = !HAS_WRITE ? info[6] : 0;
+            if (!HAS_WRITE && last_remap > 0 && i == attend_len - 1) {
+                const int slot = last_remap % S;
+                const auto page = cache.remap_page(table, last_remap / S, table_len);
+                const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+            } else {
+                const int pos = attend_start + i;
+                const int lpage = pos / S;
+                const int slot = pos % S;
+                const auto page = cache.read_page(table, lpage, table_len);
+                const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+            }
         }
 
 #pragma unroll
@@ -609,7 +623,7 @@ inline void paged_attention_merge_impl(
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool HAS_TREE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -681,6 +695,7 @@ inline void paged_attention_onepass_impl(
         constexpr int E4 = EPT < 4 ? EPT : 4;
         const int first = lo + state;
         const int count = first < hi ? (hi - first + NSG - 1) / NSG : 0;
+        const int last_remap = HAS_TREE ? info[6] : 0;
         int cur_lpage = -1;
         const device T* cur_key = nullptr;
         const device T* cur_value = nullptr;
@@ -690,18 +705,27 @@ inline void paged_attention_onepass_impl(
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
-                    const int pos = attend_start + first + (j0 + u) * NSG;
-                    const int lpage = pos / S;
-                    const int slot = pos % S;
-                    if (lpage != cur_lpage) {
-                        const auto page = cache.read_page(table, lpage, table_len);
-                        cur_key = page.key;
-                        cur_value = page.value;
-                        cur_lpage = lpage;
+                    const int idx = first + (j0 + u) * NSG;
+                    if (HAS_TREE && last_remap > 0 && idx == attend_len - 1) {
+                        const auto page = cache.remap_page(table, last_remap / S, table_len);
+                        const size_t base =
+                            ((size_t)kv_head * S + (size_t)(last_remap % S)) * D + lane * EPT;
+                        kr[u] = *reinterpret_cast<const device vec<T, 4>*>(page.key + base);
+                        vr[u] = *reinterpret_cast<const device vec<T, 4>*>(page.value + base);
+                    } else {
+                        const int pos = attend_start + idx;
+                        const int lpage = pos / S;
+                        const int slot = pos % S;
+                        if (lpage != cur_lpage) {
+                            const auto page = cache.read_page(table, lpage, table_len);
+                            cur_key = page.key;
+                            cur_value = page.value;
+                            cur_lpage = lpage;
+                        }
+                        const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
+                        kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
+                        vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
                     }
-                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
-                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
-                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
                 }
             }
 #pragma unroll
@@ -740,13 +764,20 @@ inline void paged_attention_onepass_impl(
             }
         }
     } else if (active) {
+        const int last_remap = HAS_TREE ? info[6] : 0;
         for (int i = lo + state; i < hi; i += NSG) {
-            const int pos = attend_start + i;
-            const int lpage = pos / S;
-            const int slot = pos % S;
-            const auto page = cache.read_page(table, lpage, table_len);
-            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
-            page.template load<EPT>(base, lane, kf, vf);
+            if (HAS_TREE && last_remap > 0 && i == attend_len - 1) {
+                const auto page = cache.remap_page(table, last_remap / S, table_len);
+                const size_t base = ((size_t)kv_head * S + (size_t)(last_remap % S)) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+            } else {
+                const int pos = attend_start + i;
+                const int lpage = pos / S;
+                const int slot = pos % S;
+                const auto page = cache.read_page(table, lpage, table_len);
+                const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+            }
 
 #pragma unroll
             for (int g = 0; g < HPT; g++) {

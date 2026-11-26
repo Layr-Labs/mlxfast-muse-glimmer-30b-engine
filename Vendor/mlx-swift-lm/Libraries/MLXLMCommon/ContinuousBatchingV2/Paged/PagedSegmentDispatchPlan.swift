@@ -118,12 +118,29 @@ struct PagedSegmentDispatchPlan {
                     precondition(layout.isUsable(page), "work item names a poison or invalid page")
                     return page
                 }
-                let writer: Int32? = hasWrite && partition == partitions - 1 ? info.writePage : nil
-                if let writer {
-                    precondition(
-                        writer == pages.last, "fused write must target the newest attended page")
+                let isLastPartition = partition == partitions - 1
+                var writer: Int32? = hasWrite && isLastPartition ? info.writePage : nil
+                if hasWrite {
+                    precondition(info.lastRemapPos == 0, "tree remap cannot combine with fused write")
+                    if let writer {
+                        precondition(
+                            writer == pages.last, "fused write must target the newest attended page")
+                    }
+                } else if isLastPartition && info.lastRemapPos > 0 {
+                    // Reuse the idle write (binding, local) record fields [4, 5] for
+                    // the leaf column's single remapped final KV page, keeping the
+                    // partition page count strictly within maximumBindings.
+                    let remapLogical = info.lastRemapPos / pageSize
+                    let remapIndex = remapLogical % info.tableLength
+                    precondition(remapIndex < row.pages.count)
+                    let remapPage = row.pages[remapIndex]
+                    precondition(layout.isUsable(remapPage), "tree remap names an invalid page")
+                    writer = remapPage
                 }
-                let needed = Set(pages.map { layout.segmentIndex(page: $0) })
+                var needed = Set(pages.map { layout.segmentIndex(page: $0) })
+                if let writer {
+                    needed.insert(layout.segmentIndex(page: writer))
+                }
                 precondition(needed.count <= Self.maximumBindings)
                 if segments.union(needed).count > Self.maximumBindings { flush() }
                 segments.formUnion(needed)

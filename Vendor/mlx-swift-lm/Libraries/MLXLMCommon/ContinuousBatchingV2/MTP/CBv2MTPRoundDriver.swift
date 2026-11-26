@@ -157,6 +157,11 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Non-nil when this single-row verify window appended alternate leaf
+        /// branches (`leafParents[m]` is the spine column `0 ..< k` whose
+        /// rejection leaf `m` catches). Packet ends with `[leafTokens, leafTargets]`.
+        var treeLeafParents: [Int]? = nil
+        var treeLeafTokens: MLXArray? = nil
 
     }
 
