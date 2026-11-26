@@ -51,8 +51,24 @@ public enum PagedOnePassAttention {
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
+    private struct SegmentLaunchKey: Hashable {
+        let bindings: Int
+        let kvHeads: Int
+        let dtype: DType
+        let batch: Int
+        let queryHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let hpt: Int
+        let simdgroups: Int
+        let partitionTokens: Int
+        let softcap: Bool
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var segmentLaunches:
+        [SegmentLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
     nonisolated(unsafe) private static var checked = 0
     nonisolated(unsafe) private static var differing = 0
 
@@ -295,22 +311,46 @@ public enum PagedOnePassAttention {
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
-        let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
-            template: [
-                ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
-                ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
-                ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
-            ],
-            // The probe asks for the same thread count as one (tg / 2, 2, 1)
-            // threadgroup: MLX accepts that shape only when the pipeline
-            // holds `tg` threads as compiled, and throws otherwise.
-            grid: probe
-                ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1)
-                : (kvHeads * (gqa / hpt) * tg, b, 1),
-            threadGroup: probe ? (forceProbeFailure ? 2 * tg : tg / 2, 2, 1) : (tg, 1, 1),
-            outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+        let inputs = [queries] + backing + [seqinfo, params, previous, valueOffsets, records]
+        if probe {
+            let outputs = kernel(
+                inputs,
+                template: [
+                    ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                    ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                    ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                ],
+                // The probe asks for the same thread count as one (tg / 2, 2, 1)
+                // threadgroup: MLX accepts that shape only when the pipeline
+                // holds `tg` threads as compiled, and throws otherwise.
+                grid: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+                threadGroup: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+            return (outputs[0], outputs[1])
+        }
+        let launchKey = SegmentLaunchKey(
+            bindings: bindings, kvHeads: kvHeads, dtype: dtype, batch: b, queryHeads: qh,
+            headDim: d, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
+            partitionTokens: partitionTokens, softcap: softcap)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ segmentLaunches[launchKey] }) {
+            launch = hit
+        } else {
+            let made = kernel.prepare(
+                template: [
+                    ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+                    ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+                    ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+                ],
+                grid: (kvHeads * (gqa / hpt) * tg, b, 1),
+                threadGroup: (tg, 1, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+            lock.withLock { segmentLaunches[launchKey] = made }
+            launch = made
+        }
+        let outputs = launch(inputs)
         return (outputs[0], outputs[1])
     }
 }

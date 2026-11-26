@@ -604,7 +604,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// draft never shrink its window.
     private(set) var roundAcceptanceFraction = 1.0
     private static let regimeAlpha = 0.15
-    static let lowAcceptanceRegimeThreshold = 0.75
+    static let lowAcceptanceRegimeThreshold = 0.84
 
     var inLowAcceptanceRegime: Bool {
         roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
