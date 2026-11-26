@@ -573,11 +573,15 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Absolute positions `[holeStart, holeEnd)` this row skips (a draft
+        /// tree's leaf skips the chain past its parent). Empty by default.
+        var holeStart: Int = 0
+        var holeEnd: Int = 0
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), 0, Int32(holeStart), Int32(holeEnd),
             ]
         }
     }
@@ -814,6 +818,11 @@ public enum PagedAttentionKernel {
         let key = PagedAttentionKernelKey(
             pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
             simdgroups: 0, hasSinks: false, hasSoftcap: false, partitionTokens: 0)
+        if CBv2KernelLog.enabled {
+            CBv2KernelLog.observe(
+                "bulk_write", template: "S\(pageSize)",
+                inputs: [keys, values, slots, prevFence, kSlab, vSlab], outputs: [.int32])
+        }
         let outputs = kernel(for: key, source: kernelSource)(
             [keys, values, slots, prevFence, kSlab, vSlab],
             template: [

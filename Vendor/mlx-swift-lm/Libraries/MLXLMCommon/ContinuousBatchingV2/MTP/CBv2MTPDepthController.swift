@@ -610,6 +610,30 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
     }
 
+    /// Regime-observed rounds, and how many of the latest ended in the low
+    /// regime in a row.
+    private(set) var regimeRounds = 0
+    private(set) var lowRegimeStreak = 0
+    /// Draft-tree hysteresis: entered after `CBv2VerifyTree.treeEntryStreak`
+    /// consecutive low rounds with the fraction under
+    /// `CBv2VerifyTree.treeEntryFraction` (and at least that many observed
+    /// rounds); left as soon as the request leaves the low regime.
+    private(set) var treeRegimeLatched = false
+    var inTreeRegime: Bool { treeRegimeLatched && inLowAcceptanceRegime }
+
+    private mutating func updateTreeRegime() {
+        regimeRounds &+= 1
+        if inLowAcceptanceRegime { lowRegimeStreak &+= 1 } else { lowRegimeStreak = 0 }
+        if !inLowAcceptanceRegime {
+            treeRegimeLatched = false
+        } else if !treeRegimeLatched, regimeRounds >= CBv2VerifyTree.treeEntryStreak,
+            lowRegimeStreak >= CBv2VerifyTree.treeEntryStreak,
+            roundAcceptanceFraction < CBv2VerifyTree.treeEntryFraction
+        {
+            treeRegimeLatched = true
+        }
+    }
+
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
     /// per speculative round. The request's own running totals (rounds that
     /// drafted, tokens those rounds committed) bound the next round's draft
@@ -691,6 +715,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             let fraction = Double(accepted) / Double(drafted)
             roundAcceptanceFraction +=
                 Self.regimeAlpha * (fraction - roundAcceptanceFraction)
+            updateTreeRegime()
         }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])

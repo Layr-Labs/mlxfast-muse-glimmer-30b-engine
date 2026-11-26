@@ -157,6 +157,23 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// The draft tree this window verified (`CBv2VerifyTree`); nil for
+        /// a chain, or when a layer could not honor the tree.
+        var tree: CBv2VerifyTreeLayout? = nil
+        /// Every layer built the tree's leaf positions and masks, so leaf
+        /// rows are the target's own steps.
+        var treeLeavesValid = false
+        /// Dynamic trees: the window's depth `k` and the drafter's top-1
+        /// proposal at each block position (host), so the window observes
+        /// the top-1 chain the record would have verified.
+        var treeWindow: Int? = nil
+        var treeTopOne: [Int] = []
+        /// GPU-built tree: the packet's last `treeDeviceMetaCount` words are
+        /// the builder's layout and the block's top-1 (`tree` is then the
+        /// placeholder chain until finalize decodes them). `treeClipped`: a
+        /// windowed layer clipped a draft column's range.
+        var treeDeviceMetaCount: Int? = nil
+        var treeClipped = false
 
     }
 
@@ -339,6 +356,12 @@ final class CBv2MTPRoundDriver {
 
     /// Plan-scoped: rows the planner offered a 1+k round this plan.
     private(set) var roundMarks: [CBv2RequestID: Int] = [:]
+    /// Rounds whose window is a draft tree (`CBv2VerifyTree`); the round
+    /// mark is the tree's draft count.
+    private(set) var treeMarks: [CBv2RequestID: CBv2VerifyTreeLayout] = [:]
+    /// Dynamic-tree rounds: the window's own depth `k` (the marked layout is
+    /// a placeholder chain at the tree's width, chosen after the draft).
+    private(set) var treeWindows: [CBv2RequestID: Int] = [:]
     /// Plan-scoped: eligible rows without a valid carry — their decode step
     /// this plan is a SEED step (eager forwardWithHidden, hidden captured).
     private(set) var seedMarks: Set<CBv2RequestID> = []
@@ -529,6 +552,8 @@ final class CBv2MTPRoundDriver {
             depthController.beginWorkload(rowIDs: rowIDs)
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
+        if !treeMarks.isEmpty { treeMarks = [:] }
+        if !treeWindows.isEmpty { treeWindows = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
@@ -670,6 +695,51 @@ final class CBv2MTPRoundDriver {
     func inLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
         usesFixedDepthAcceptanceWindow
             && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
+    }
+    /// Whether `id` is in the draft-tree regime: low acceptance held long
+    /// and deep enough (`CBv2MTPRequestAcceptanceState.inTreeRegime`).
+    func inTreeRegime(_ id: CBv2RequestID) -> Bool {
+        usesFixedDepthAcceptanceWindow && CBv2VerifyTree.enabled
+            && (requestAcceptance[id] ?? initialRequestAcceptance).inTreeRegime
+    }
+    func treeMark(for id: CBv2RequestID) -> CBv2VerifyTreeLayout? { treeMarks[id] }
+    func treeWindow(for id: CBv2RequestID) -> Int? { treeWindows[id] }
+
+    /// A same-width draft tree for a low-acceptance request's window of `chain`
+    /// drafts: a chain of `chain - 1` plus the drafter's second choice at depth
+    /// 1 as the last column. The verify width is the chain's, so the weight
+    /// bytes per round are unchanged; any other round returns nil and takes
+    /// the record's chain with no tree work at all.
+    func treeLayout(
+        for id: CBv2RequestID, chain: Int, remainingTokens: Int, contextTokens: Int
+    ) -> (layout: CBv2VerifyTreeLayout, window: Int?)? {
+        guard usesFixedDepthAcceptanceWindow,
+            drafter is any CBv2MTPTreeDrafter,
+            // Hysteresis: a brief dip of a high-acceptance request takes
+            // the record's chain round, never a tree.
+            (requestAcceptance[id] ?? initialRequestAcceptance).inTreeRegime
+        else { return nil }
+        // Dynamic: `max(k, N)` drafts, topology chosen once the block exists.
+        let width = min(
+            max(chain, CBv2VerifyTree.dynamicMinimumDrafts), config.maxDraftTokens,
+            CBv2VerifyTree.maxDrafts)
+        if CBv2VerifyTree.dynamic, chain >= 1, width >= chain,
+            CBv2VerifyTree.fits(contextTokens: contextTokens, drafts: width),
+            remainingTokens > width + 1
+        {
+            return (CBv2VerifyTreeLayout(chain: width, branchDepths: [], branchLengths: []), chain)
+        }
+        guard CBv2VerifyTree.fits(contextTokens: contextTokens, drafts: chain),
+            chain >= CBv2VerifyTree.minimumWindow, remainingTokens > chain + 1
+        else { return nil }
+        return (CBv2VerifyTreeLayout.leafAtDepthOne(chain: chain - 1), nil)
+    }
+
+    func markTree(_ id: CBv2RequestID, layout: CBv2VerifyTreeLayout, window: Int? = nil) {
+        guard !targetOnlyMediaRequests.contains(id) else { return }
+        roundMarks[id] = layout.drafts
+        treeMarks[id] = layout
+        if let window { treeWindows[id] = window } else { treeWindows.removeValue(forKey: id) }
     }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
@@ -1175,6 +1245,8 @@ final class CBv2MTPRoundDriver {
         carries.removeValue(forKey: id)
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
+        treeMarks.removeValue(forKey: id)
+        treeWindows.removeValue(forKey: id)
         seedMarks.remove(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
@@ -1213,6 +1285,8 @@ final class CBv2MTPRoundDriver {
         rawCostEstimators.removeAll(keepingCapacity: false)
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
         roundMarks.removeAll(keepingCapacity: false)
+        treeMarks.removeAll(keepingCapacity: false)
+        treeWindows.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
@@ -1486,4 +1560,11 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// The round being drafted verifies a draft tree (static or dynamic):
+    /// its block keeps second choices. False for every chain round, which
+    /// then runs the record's argmax passes only.
+    nonisolated(unsafe) public static var treeRound = false
+    /// The round being drafted is a dynamic tree round: its block needs the
+    /// fused top-4 (`rankedCandidates`).
+    nonisolated(unsafe) public static var dynamicTreeRound = false
 }
