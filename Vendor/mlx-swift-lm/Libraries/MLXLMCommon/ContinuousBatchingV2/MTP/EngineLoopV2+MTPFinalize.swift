@@ -226,13 +226,28 @@ extension EngineLoopV2 {
         }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
+        let treeLeafParents = verify.treeLeafParents ?? []
+        let leafCount = treeLeafParents.count
+        let totalWindowWidth = targetWidth + leafCount
         // Typical acceptance appends its [B, k] mask after every other part.
         let acceptBase: Int? =
             verify.hasAcceptMask
             ? draftCount + verify.rows.count * targetWidth
                 + (verify.shortlistIDs != nil ? verify.rows.count * targetWidth : 0)
             : nil
+        let treePacketBase: Int =
+            draftCount + verify.rows.count * targetWidth
+            + (verify.shortlistIDs != nil ? verify.rows.count * targetWidth : 0)
+            + (verify.hasAcceptMask ? verify.rows.count * k : 0)
         var anyRejected = false
+
+        struct AcceptedLeafHit {
+            let leafIndex: Int
+            let leafColumn: Int
+            let spineAccepted: Int
+            let leafToken: Int
+            let bonusTarget: Int
+        }
 
         struct RowOutcome {
             let batchIndex: Int
@@ -249,6 +264,7 @@ extension EngineLoopV2 {
             var naturalEmitted: Int
             var constraintFailure: String? = nil
             var nonFiniteAfterPrefix = false
+            var acceptedLeaf: AcceptedLeafHit? = nil
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -319,8 +335,28 @@ extension EngineLoopV2 {
             } else {
                 while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             }
-            let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
+            var committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
             var naturalEmitted = accepted + 1
+            var acceptedLeaf: AcceptedLeafHit? = nil
+            if batchIndex == 0, leafCount > 0, accepted < k,
+                targets[accepted] != Int(CBv2NonFiniteLogits.invalidTarget)
+            {
+                for m in 0 ..< leafCount where treeLeafParents[m] == accepted {
+                    let leafToken = Int(host[treePacketBase + m])
+                    if leafToken == targets[accepted] {
+                        let bonusTarget = Int(host[treePacketBase + leafCount + m])
+                        acceptedLeaf = AcceptedLeafHit(
+                            leafIndex: m,
+                            leafColumn: targetWidth + m,
+                            spineAccepted: accepted,
+                            leafToken: leafToken,
+                            bonusTarget: bonusTarget)
+                        committed = Array(drafts[0 ..< accepted]) + [leafToken, bonusTarget]
+                        naturalEmitted = accepted + 2
+                        break
+                    }
+                }
+            }
             naturalEmitted = min(
                 naturalEmitted,
                 rec.request.maxTokens - rec.generatedTokenCount)
@@ -332,7 +368,20 @@ extension EngineLoopV2 {
             // A position this row would commit was decided by non-finite
             // target logits: commit nothing and fail the request exactly like
             // any other finalize-time verify failure.
-            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+            let hasNonFinite: Bool
+            if let hit = acceptedLeaf {
+                let spineCheckCount = min(naturalEmitted, hit.spineAccepted + 1)
+                let bonusNonFinite =
+                    naturalEmitted > hit.spineAccepted + 1
+                    && hit.bonusTarget == Int(CBv2NonFiniteLogits.invalidTarget)
+                hasNonFinite =
+                    targets[..<spineCheckCount].contains(Int(CBv2NonFiniteLogits.invalidTarget))
+                    || bonusNonFinite
+            } else {
+                hasNonFinite = targets[..<naturalEmitted].contains(
+                    Int(CBv2NonFiniteLogits.invalidTarget))
+            }
+            if hasNonFinite {
                 nonFiniteVerifyFailures += 1
                 step.discard.insert(id)
                 releaseDiscarded(metadata)
@@ -348,7 +397,8 @@ extension EngineLoopV2 {
                     targets: targets,
                     committed: committed,
                     accepted: accepted,
-                    naturalEmitted: naturalEmitted))
+                    naturalEmitted: naturalEmitted,
+                    acceptedLeaf: acceptedLeaf))
         }
 
         if let logits = verify.constraintLogits {
@@ -498,7 +548,12 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts,
                     targets: outcome.targets)
             }
-            let rejected = (1 + k) - confirmed
+            let schedulerRejected = (1 + k) - confirmed
+            let kvRejected = totalWindowWidth - confirmed
+            let usedAcceptedLeaf: AcceptedLeafHit? =
+                outcome.acceptedLeaf.flatMap { hit in
+                    confirmed == hit.spineAccepted + 2 ? hit : nil
+                }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -520,7 +575,7 @@ extension EngineLoopV2 {
                         evaluations.count == 1 + k,
                         "CBv2 recurrent MTP verification generation count mismatch")
                     do {
-                        for evaluation in evaluations.suffix(rejected).reversed() {
+                        for evaluation in evaluations.suffix(schedulerRejected).reversed() {
                             try evaluation.rollback()
                         }
                         for evaluation in evaluations.prefix(confirmed) {
@@ -532,32 +587,68 @@ extension EngineLoopV2 {
                     }
                 }
             }
-            if rejected > 0 {
-                for sequence in metadata.storageRows { sequence.rollback(rejected) }
+            if let hit = usedAcceptedLeaf {
+                let fromOffsetFromEnd = (totalWindowWidth - 1) - hit.leafColumn
+                let toOffsetFromEnd = (totalWindowWidth - 1) - (hit.spineAccepted + 1)
+                var copyFences: [MLXArray] = []
+                copyFences.reserveCapacity(metadata.storageRows.count)
+                for sequence in metadata.storageRows {
+                    if let fence = sequence.copySpeculativeToken(
+                        fromOffsetFromEnd: fromOffsetFromEnd,
+                        toOffsetFromEnd: toOffsetFromEnd)
+                    {
+                        copyFences.append(fence)
+                    }
+                }
+                if !copyFences.isEmpty { asyncEval(copyFences) }
+            }
+            if kvRejected > 0 {
+                for sequence in metadata.storageRows { sequence.rollback(kvRejected) }
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
-            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            let committedDraftCount =
+                usedAcceptedLeaf.map { $0.spineAccepted + 1 }
+                ?? min(accepted, max(0, confirmed - 1))
             if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
+                let committedDrafts: MLXArray
+                if let hit = usedAcceptedLeaf, let leafTokens = verify.treeLeafTokens {
+                    let leafSlice = leafTokens[
+                        batchIndex ..< (batchIndex + 1),
+                        hit.leafIndex ..< (hit.leafIndex + 1)]
+                    committedDrafts =
+                        hit.spineAccepted == 0
+                        ? leafSlice
+                        : concatenated(
+                            [
+                                verify.draftIDs[
+                                    batchIndex ..< (batchIndex + 1),
+                                    0 ..< hit.spineAccepted],
+                                leafSlice,
+                            ],
+                            axis: 1)
+                } else {
+                    committedDrafts = verify.draftIDs[
+                        batchIndex ..< (batchIndex + 1),
+                        0 ..< committedDraftCount]
+                }
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
+                    committedDraftTokens: committedDrafts,
                     committedTargetHidden: verify.lastHidden[
-                        batchIndex ..< batchIndex + 1,
+                        batchIndex ..< (batchIndex + 1),
                         0 ..< committedDraftCount,
                         0...])
             }
-            if rejected > 0 {
-                scheduler.discardPendingSamples(id: id, count: rejected)
-                scheduler.rollbackComputed(id: id, tokens: rejected)
+            if schedulerRejected > 0 {
+                scheduler.discardPendingSamples(id: id, count: schedulerRejected)
+                scheduler.rollbackComputed(id: id, tokens: schedulerRejected)
             }
             // The speculative suffix is now reconciled in BOTH the page tables
             // and scheduler record. Publish only the accepted frontier; doing
@@ -634,15 +725,17 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                let hiddenColumn =
+                    usedAcceptedLeaf?.leafColumn
+                    ?? CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears
                 // the threshold; otherwise the draft falls back to the full
                 // head for that round.
                 var carryShortlist: MLXArray?
-                if let shortlistIDs = verify.shortlistIDs {
+                if usedAcceptedLeaf == nil, let shortlistIDs = verify.shortlistIDs {
                     let massBase = draftCount + verify.rows.count * targetWidth
                     let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
                     if mass >= Self.mtpShortlistMassThresholdPPM {
@@ -651,7 +744,7 @@ extension EngineLoopV2 {
                 }
                 let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
                     let base =
-                        (batchIndex * targetWidth + hiddenColumn) * 2
+                        (batchIndex * totalWindowWidth + hiddenColumn) * 2
                     return Double(values[base] - values[base + 1])
                 }
                 let carryHidden = verify.lastHidden[
@@ -670,7 +763,8 @@ extension EngineLoopV2 {
                 // drafter keeps it only for this carry object; its all-accepted
                 // block also needs the carry token to be the verify's own
                 // bonus target.
-                if confirmed == accepted + 1, committedDraftCount == accepted,
+                if usedAcceptedLeaf == nil, confirmed == accepted + 1,
+                    committedDraftCount == accepted,
                     hiddenColumn == accepted, accepted <= k,
                     let speculator = mtp.drafter as? any CBv2MTPPostVerifySpeculating,
                     let state = metadata.assistantState
@@ -774,8 +868,12 @@ extension EngineLoopV2 {
             mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        let spineHidden =
+            verify.treeLeafParents == nil
+            ? verify.lastHidden
+            : verify.lastHidden[0 ..< 1, 0 ..< (k + 1), 0...]
         let roots = speculator.speculateNextRound(
-            targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
+            targetTokens: targets, targetHidden: spineHidden, depth: k,
             draftsBlock: draftsBlock, requestState: state)
         guard !roots.isEmpty else { return }
         do {

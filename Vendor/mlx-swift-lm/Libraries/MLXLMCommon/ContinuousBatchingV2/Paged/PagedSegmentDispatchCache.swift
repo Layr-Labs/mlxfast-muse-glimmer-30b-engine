@@ -65,6 +65,7 @@ final class PagedSegmentDispatchCache {
             let lastPage: Int
             let partitions: Int
             let writePage: Int32?
+            let remapPage: Int?
         }
         let rows: [Row]
         let pageSize: Int
@@ -139,7 +140,8 @@ final class PagedSegmentDispatchCache {
                     firstPage: info.attendStart / pageSize,
                     alignedStart: info.attendStart % pageSize == 0, lastPage: lastPage,
                     partitions: (info.attendLength - 1) / partitionTokens + 1,
-                    writePage: hasWrite ? info.writePage : nil))
+                    writePage: hasWrite ? info.writePage : nil,
+                    remapPage: info.lastRemapPos > 0 ? info.lastRemapPos / pageSize : nil))
         }
         return Key(
             rows: identities, pageSize: group.pageSize,

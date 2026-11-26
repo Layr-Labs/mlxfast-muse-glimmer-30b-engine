@@ -573,11 +573,15 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Optional absolute KV position remapped onto the final attended index
+        /// (`attendLength - 1`) for leaf-tree verification (`info[6]`). Zero for
+        /// all linear decode/verify rows.
+        var lastRemapPos: Int = 0
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), 0, Int32(lastRemapPos), 0,
             ]
         }
     }

@@ -106,7 +106,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers whose attention half (not the MLP) takes the prompt arithmetic:
     /// a finer step than a whole layer, so the timed prefill lands closer to
     /// its 2.0 ceiling without crossing it.
-    static let promptAttentionLayers: Set<Int> = [14, 15]
+    static let promptAttentionLayers: Set<Int> = [13, 14, 15]
 
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
@@ -232,6 +232,9 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        let addNormNorm = VerifyFusedNorms.PreparedAddNormNorm(
+            like: h, eps1: configuration.postNormEps, eps2: configuration.rmsNormEps)
+        let qk = VerifyFusedQK.Prepared()
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -248,19 +251,31 @@ extension MuseGlimmerTextModel {
             }
             let attention = fusedVerifyAttention(
                 layer.selfAttention, layerIndex: index, layerInput,
-                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
+                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets,
+                qk: qk)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
-            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
-                residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                w2: pre.weight, eps2: pre.eps)
+            let (mid, feedInput): (MLXArray, MLXArray)
+            if post.eps == configuration.postNormEps && pre.eps == configuration.rmsNormEps {
+                (mid, feedInput) = addNormNorm(
+                    residual: h, x: attention, w1: post.weight, w2: pre.weight)
+            } else {
+                (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                    w2: pre.weight, eps2: pre.eps)
+            }
             let feed = groupedVerifyFeed(layer.mlp, feedInput)
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
                 let next = layers[index + 1].inputLayerNorm
-                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
-                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                    w2: next.weight, eps2: next.eps)
+                if postFF.eps == configuration.postNormEps && next.eps == configuration.rmsNormEps {
+                    (h, layerInput) = addNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, w2: next.weight)
+                } else {
+                    (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                        w2: next.weight, eps2: next.eps)
+                }
             } else {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
@@ -284,8 +299,17 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        if !MuseGlimmerVerifyProjections.selfTest,
+            let direct = CBv2VerifyScales.verifiedNVFP4ReadoutTopTwo(
+                lmHead, trunk.normed,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping)
+        {
+            return (direct.ids, direct.values, direct.nonFinite, trunk.hidden)
+        }
+        guard let product = CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -299,7 +323,8 @@ extension MuseGlimmerTextModel {
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
     func fusedVerifyAttention(
         _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
-        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?,
+        qk: VerifyFusedQK.Prepared? = nil
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         guard VerifyFusedQK.enabled,
@@ -311,7 +336,7 @@ extension MuseGlimmerTextModel {
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
         let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
-        let (queries, keys) = VerifyFusedQK.apply(
+        let (queries, keys) = (qk ?? VerifyFusedQK.Prepared())(
             queries: p[0], keys: p[1],
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
             eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
@@ -384,6 +409,83 @@ extension MuseGlimmerTextModel {
                                 ? nil : MLXArray.zeros([batch], type: Int32.self))
                         warm += [out.queries, out.keys]
                     }
+                    if CBv2TreeVerifyScope.isActive, base != nil, rows >= 2 {
+                        let q = MLXArray.zeros([1, rows, a.heads * a.headDimensions], dtype: dtype)
+                        let k = MLXArray.zeros(
+                            [1, rows, a.kvHeads * a.headDimensions], dtype: dtype)
+                        let rowPos = MLXArray([Int32](repeating: 0, count: 8))
+                        let out = VerifyFusedQK.Prepared()(
+                            queries: q, keys: k, heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: base,
+                            offsets: MLXArray.zeros([1], type: Int32.self), rowPos: rowPos)
+                        warm += [out.queries, out.keys]
+                    }
+                }
+            }
+            if CBv2TreeVerifyScope.isActive, let rope {
+                let qkTestPassed =
+                    (try? MLX.withError { errors -> Bool in
+                        let rows = 4
+                        let qVals: [Float] = (0 ..< (rows * a.heads * a.headDimensions)).map { idx in
+                            Float(((idx * 7 + 3) % 29) - 14) * 0.125
+                        }
+                        let kVals: [Float] = (0 ..< (rows * a.kvHeads * a.headDimensions)).map { idx in
+                            Float(((idx * 5 + 1) % 31) - 15) * 0.125
+                        }
+                        let qIn = MLXArray(qVals, [1, rows, a.heads * a.headDimensions])
+                            .asType(dtype)
+                        let kIn = MLXArray(kVals, [1, rows, a.kvHeads * a.headDimensions])
+                            .asType(dtype)
+                        let off = MLXArray([Int32(37)])
+                        let prep = VerifyFusedQK.Prepared()
+                        let ref = prep(
+                            queries: qIn, keys: kIn, heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: rope, offsets: off)
+                        let linearPos = MLXArray([Int32(0), 1, 2, 3, 0, 0, 0, 0])
+                        let got = prep(
+                            queries: qIn, keys: kIn, heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: rope, offsets: off,
+                            rowPos: linearPos)
+                        let qDiff = (
+                            contiguous(ref.queries).view(dtype: .uint16)
+                                .!= contiguous(got.queries).view(dtype: .uint16)
+                        ).asType(.int32).sum()
+                        let kDiff = (
+                            contiguous(ref.keys).view(dtype: .uint16)
+                                .!= contiguous(got.keys).view(dtype: .uint16)
+                        ).asType(.int32).sum()
+                        let branchPos = MLXArray([Int32(0), 1, 2, 1, 0, 0, 0, 0])
+                        let dupQ = concatenated(
+                            [qIn[0..., 0 ..< 3, 0...], qIn[0..., 1 ..< 2, 0...]], axis: 1)
+                        let dupK = concatenated(
+                            [kIn[0..., 0 ..< 3, 0...], kIn[0..., 1 ..< 2, 0...]], axis: 1)
+                        let branched = prep(
+                            queries: dupQ, keys: dupK, heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: rope, offsets: off,
+                            rowPos: branchPos)
+                        let bqDiff = (
+                            contiguous(branched.queries[0..., 0..., 3 ..< 4, 0...])
+                                .view(dtype: .uint16)
+                                .!= contiguous(ref.queries[0..., 0..., 1 ..< 2, 0...])
+                                .view(dtype: .uint16)
+                        ).asType(.int32).sum()
+                        let bkDiff = (
+                            contiguous(branched.keys[0..., 0..., 3 ..< 4, 0...])
+                                .view(dtype: .uint16)
+                                .!= contiguous(ref.keys[0..., 0..., 1 ..< 2, 0...])
+                                .view(dtype: .uint16)
+                        ).asType(.int32).sum()
+                        eval(qDiff, kDiff, bqDiff, bkDiff)
+                        try errors.check()
+                        return qDiff.item(Int.self) == 0 && kDiff.item(Int.self) == 0
+                            && bqDiff.item(Int.self) == 0 && bkDiff.item(Int.self) == 0
+                    }) ?? false
+                if !qkTestPassed {
+                    CBv2TreeVerifyScope.disableAfterVerificationFailure()
                 }
             }
         }
@@ -573,7 +675,9 @@ extension MuseGlimmerTextModel {
                 routed = CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
+                routed =
+                    CBv2VerifyNVFP4.products(layers, x)
+                    ?? CBv2VerifyScales.products(layers, x)
                 kind = "nvfp4.qkvg"
             }
             if let routed {
@@ -757,6 +861,11 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            CBv2VerifyScales.verifyAndWarmNVFP4ReadoutTopTwo(
+                lmHead, width: width, dtype: dtype,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping,
+                rows: 2 ... CBv2VerifyScales.maxFusedLMHeadRows)
         }
     }
 }
