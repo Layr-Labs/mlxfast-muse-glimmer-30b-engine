@@ -786,14 +786,97 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// MTP rectangular verification attends a column BEHIND the frontier.
     func seqInfoRow(
         attending range: (start: Int, length: Int),
-        writeTarget: (page: Int32, slot: Int)? = nil
+        writeTarget: (page: Int32, slot: Int)? = nil,
+        treeBase: Int32 = 0,
+        treeAncPacked: UInt32 = 0,
+        treeDepth: Int = 0,
+        isDynamicTree: Bool = false
     ) -> PagedAttentionKernel.SeqInfoRow {
         PagedAttentionKernel.SeqInfoRow(
             attendStart: range.start,
             attendLength: range.length,
             tableLength: decodeTableLength,
             writePage: writeTarget?.page ?? 0,
-            writeSlot: writeTarget?.slot ?? 0)
+            writeSlot: writeTarget?.slot ?? 0,
+            treeBase: treeBase,
+            treeAncPacked: treeAncPacked,
+            treeDepth: treeDepth,
+            isDynamicTree: isDynamicTree)
+    }
+
+    var kvGroupForCopy: PagedKVGroup { pool.group(groupKey) }
+
+    /// Reserves physical destinations for `count` tokens and returns single-segment
+    /// transfer triples for fused Q/K-norm/RoPE/KV-write without touching storage.
+    /// Returns `nil` (leaving cursor unchanged) when the write spans multiple segments
+    /// or requires fallback handling.
+    func prepareSingleSegmentDirectWrite(count n: Int)
+        -> (group: PagedKVGroup, segment: PagedKVSegment, triples: [Int32])?
+    {
+        guard n > 0, !released, !pool.writeValidation.isFaulted,
+            !pool.usesStepOwnedAttention,
+            immutableCopyScratch == nil,
+            absoluteOffset >= frozenHighWater,
+            absoluteOffset + n <= maxLength,
+            windowSize == nil || n <= pool.config.maxPrefillChunk
+        else { return nil }
+        let group = pool.group(groupKey)
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil
+        else { return nil }
+        if let base = speculativeBase, absoluteOffset + n - base > speculativeHeadroom {
+            return nil
+        }
+        guardSpeculativeSpan(adding: n)
+        let s = pool.config.pageSize
+        var slots = [Int32]()
+        slots.reserveCapacity(n)
+        for i in 0 ..< n {
+            let pos = absoluteOffset + i
+            let physical = ensurePage(logicalPage: pos / s)
+            slots.append(physical * Int32(s) + Int32(pos % s))
+        }
+        let buckets = PagedSegmentTransfers.buckets(group: group, slots: slots)
+        guard buckets.count == 1 else { return nil }
+        absoluteOffset += n
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
+        return (group: group, segment: buckets[0].0, triples: buckets[0].1)
+    }
+
+    /// Resolves physical `(srcSlot, dstSlot)` in the group's paged segment layout
+    /// for batched in-place branch-hit KV compaction; nil falls back to `copyTokenSlot`.
+    func resolveDirectCopySlots(from srcPos: Int, to dstPos: Int)
+        -> (group: PagedKVGroup, src: Int32, dst: Int32)?
+    {
+        guard srcPos != dstPos, !released, !pool.writeValidation.isFaulted else { return nil }
+        let group = pool.group(groupKey)
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil
+        else { return nil }
+        let s = pool.config.pageSize
+        let srcLogical = srcPos / s
+        let srcIdx = ringPages.map { srcLogical % $0 } ?? srcLogical
+        guard srcIdx >= 0, srcIdx < table.count else { return nil }
+        let srcPhys = table[srcIdx]
+        guard group.isAllocatable(srcPhys) else { return nil }
+        let dstPhys = ensurePage(logicalPage: dstPos / s)
+        return (
+            group,
+            srcPhys * Int32(s) + Int32(srcPos % s),
+            dstPhys * Int32(s) + Int32(dstPos % s)
+        )
+    }
+
+    /// Copies one written token's K/V from `srcPos` to `dstPos` in place (used
+    /// when a verify-tree branch commits), returning the updated group fence.
+    public func copyTokenSlot(from srcPos: Int, to dstPos: Int) -> MLXArray? {
+        guard srcPos != dstPos, !released, !pool.writeValidation.isFaulted else { return nil }
+        let (k, v) = gatherRange(start: srcPos, count: 1)
+        let s = pool.config.pageSize
+        let physical = ensurePage(logicalPage: dstPos / s)
+        let dstSlot = physical * Int32(s) + Int32(dstPos % s)
+        pool.writeTokens(
+            group: groupKey, slots: [dstSlot],
+            keys: k.squeezed(axis: 0), values: v.squeezed(axis: 0))
+        return pool.group(groupKey).writeFence
     }
 
     /// Kernel-facing row descriptor for decode: the absolute range the

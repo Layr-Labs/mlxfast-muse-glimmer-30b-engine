@@ -403,7 +403,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         hostPositionOffsets = pagedRows.map { Int32($0.absoluteOffset) }
-        devicePositionOffsets = MLXArray(hostPositionOffsets)
+        devicePositionOffsets = nil
         deviceOffsetsDivergeFromHost = false
     }
 
@@ -1260,6 +1260,121 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
+    /// Prepares single-row, single-segment paged KV write metadata so `VerifyFusedQK.applyAndWrite`
+    /// can write normalized/RoPE keys and values straight into the segment without intermediate
+    /// transpose/copy/write dispatches. Returns `nil` (leaving state untouched) on fallback cases.
+    public func prepareSingleRowDirectVerifyWrite(count l: Int, dtype: DType)
+        -> CBv2DirectVerifyKVTarget?
+    {
+        guard mtpSerializesRectangularAttention, mtpBatchesRectangularColumnsAsRows,
+            kind.sharesKVWithLayer == nil, kind.headDim == kind.valueHeadDim,
+            pagedRows.count == 1, (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l),
+            !usesGatheredNativeDecode, !pool.usesStepOwnedAttention,
+            !pool.writeValidation.isFaulted,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            boundSpanContext == nil, attentionMetadata == nil, attentionPacket == nil
+        else { return nil }
+        let row = pagedRows[0]
+        let group = pool.group(row.groupKey)
+        guard group.dtype == dtype,
+            let prep = row.prepareSingleSegmentDirectWrite(count: l)
+        else { return nil }
+        return CBv2DirectVerifyKVTarget(
+            group: prep.group, segment: prep.segment, triples: prep.triples,
+            pageSize: pool.config.pageSize, kvHeads: group.key.kvHeads, headDim: group.key.headDim)
+    }
+
+    /// Attends `[1, L, QH, D]` verify queries whose K/V columns were already written into the
+    /// paged KV segment by `VerifyFusedQK.applyAndWrite`, returning `[1, L, QH, D]` directly.
+    public func attendColumnsPreWritten(
+        queriesBLHD: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        let (b, l, qh, d) = (
+            queriesBLHD.dim(0), queriesBLHD.dim(1), queriesBLHD.dim(2), queriesBLHD.dim(3))
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let group = pool.group(pagedRows[0].groupKey)
+        let (descriptors, dynTreeMeta) = buildColumnsAsRowsDescriptors(rows: pagedRows, b: b, l: l)
+        let result = PagedSegmentAttention.decode(
+            queries: queriesBLHD.reshaped(b * l, qh, d),
+            newKeys: nil, newValues: nil, group: group, rows: descriptors,
+            sinks: preparedSinks(effectiveSinks), params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            treeMeta: dynTreeMeta)
+        mtpColumnsAsRowsCalls += 1
+        advancePositionOffsets(by: l)
+        let output = result.reshaped(b, l, qh, d)
+        return finishAttentionCall(
+            output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
+    }
+
+    private func buildColumnsAsRowsDescriptors(rows: [PagedSequenceKV], b: Int, l: Int)
+        -> (descriptors: [PagedSegmentDispatchPlan.Row], dynTreeMeta: MLXArray?)
+    {
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(b * l)
+        let dynTreeMeta: MLXArray? =
+            (b == 1 && CBv2DraftRegime.activeDynamicTreeK > 0
+                && l == CBv2DraftRegime.activeDynamicTreeK + 1)
+            ? CBv2DraftRegime.activeDynamicTreeMeta : nil
+        if dynTreeMeta != nil {
+            let row = rows[0]
+            let treeBase = row.absoluteOffset - l
+            let win = row.windowSize ?? 0
+            let planStart = row.windowSize.map { max(row.baseOffset, treeBase - $0 + 1) } ?? row.baseOffset
+            for t in 0 ..< l {
+                let planLen = (treeBase + t) - planStart + 1
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: (planStart, planLen),
+                            treeBase: Int32(treeBase),
+                            treeAncPacked: UInt32(win),
+                            treeDepth: t,
+                            isDynamicTree: true),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        } else if let tree = CBv2DraftRegime.activeVerifyTree, b == 1, l == tree.totalSlots {
+            let row = rows[0]
+            let treeBase = row.absoluteOffset - l
+            for t in 0 ..< l {
+                let qPos = treeBase + tree.posDeltas[t]
+                var start = row.baseOffset
+                if let window = row.windowSize {
+                    start = max(start, qPos - window + 1)
+                }
+                let length = qPos - start + 1
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: (start, length),
+                            treeBase: Int32(treeBase),
+                            treeAncPacked: tree.ancPacked[t],
+                            treeDepth: tree.posDeltas[t]),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        } else {
+            for row in rows {
+                for t in 0 ..< l {
+                    descriptors.append(
+                        PagedSegmentDispatchPlan.Row(
+                            pages: row.table,
+                            info: row.seqInfoRow(
+                                attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+                }
+            }
+        }
+        return (descriptors, dynTreeMeta)
+    }
+
     /// `mtpBatchesRectangularColumnsAsRows`: `[B, QH, L, D]` as `B * L`
     /// decode rows of one segmented dispatch. Nil, before anything is
     /// written, for a round this path does not take.
@@ -1295,18 +1410,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             row.write(keys: keys[index], values: values[index])
         }
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
-        var descriptors: [PagedSegmentDispatchPlan.Row] = []
-        descriptors.reserveCapacity(b * l)
-        for row in rows {
-            for t in 0 ..< l {
-                descriptors.append(
-                    PagedSegmentDispatchPlan.Row(
-                        pages: row.table,
-                        info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
-                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
-            }
-        }
+        let (descriptors, dynTreeMeta) = buildColumnsAsRowsDescriptors(rows: rows, b: b, l: l)
         let result = PagedSegmentAttention.decode(
             queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
             newKeys: nil, newValues: nil, group: group, rows: descriptors,
@@ -1315,7 +1419,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            treeMeta: dynTreeMeta)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

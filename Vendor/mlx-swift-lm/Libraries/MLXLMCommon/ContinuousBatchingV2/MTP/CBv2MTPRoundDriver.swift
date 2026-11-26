@@ -157,6 +157,13 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Active static verify tree for this round (nil for linear or dynamic).
+        var verifyTree: CBv2VerifyTree? = nil
+        /// True when the round used a GPU-dynamic tree whose packed parent word
+        /// rides as the final Int32 of `acceptancePacket`.
+        var hasDynamicTree = false
+        /// GPU `[18]` int32 tree descriptor for post-verify outcome speculation.
+        var dynTreeMeta: MLXArray? = nil
 
     }
 
@@ -326,6 +333,8 @@ final class CBv2MTPRoundDriver {
     /// Qwen acceptance is request-owned; raw nonchained wall cost is shared
     /// only within a compatible decode-row bucket.
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
+    /// Optional per-request tree cooldown set when `CBV2_TREE_COOLDOWN=1`.
+    private var treeCooldownRequests: Set<CBv2RequestID> = []
     /// Plan-scoped: the confirmed post-verify speculation's lazy draft
     /// confidence for each row whose window this plan offered it to, kept
     /// until that round's finalize calibrates with it. Cleared every plan.
@@ -671,6 +680,22 @@ final class CBv2MTPRoundDriver {
         usesFixedDepthAcceptanceWindow
             && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
     }
+
+    func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
+        inLowAcceptanceRegime(id)
+            && (!CBv2DraftRegime.treeCooldownEnabled || !treeCooldownRequests.contains(id))
+    }
+
+    func updateTreeCooldown(
+        for id: CBv2RequestID, wasTree: Bool, chainDepth: Int, k: Int, accepted: Int, branchHit: Bool
+    ) {
+        guard CBv2DraftRegime.treeCooldownEnabled else { return }
+        if wasTree && !branchHit && chainDepth < k && accepted >= chainDepth {
+            treeCooldownRequests.insert(id)
+        } else if !wasTree && accepted < 4 {
+            treeCooldownRequests.remove(id)
+        }
+    }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
     func forceSynchronizedSeed() {
@@ -1006,11 +1031,20 @@ final class CBv2MTPRoundDriver {
         _ = availableDraftConfidence(for: id)
         // High-acceptance regime: always the declared depth.
         guard acceptance.inLowAcceptanceRegime else { return ceiling }
-        return CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+        var depth = CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
             offeredDepth: ceiling,
             remainingTokens: remainingTokens,
             verificationLimit: verificationLimit,
             acceptanceProbabilities: acceptance.probabilities)
+        if CBv2DraftRegime.treeAdditiveSlot,
+            CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
+            shouldUseVerifyTree(for: id)
+        {
+            let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
+            let target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            depth = min(ceiling, min(remainingTokens - 1, min(verificationLimit, target)))
+        }
+        return max(1, depth)
     }
 
     /// The acceptance ceiling's draft count for one row (see
@@ -1165,6 +1199,7 @@ final class CBv2MTPRoundDriver {
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
+        treeCooldownRequests.remove(id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -1179,6 +1214,7 @@ final class CBv2MTPRoundDriver {
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
+        treeCooldownRequests.remove(id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1217,6 +1253,7 @@ final class CBv2MTPRoundDriver {
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
+        treeCooldownRequests.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
@@ -1482,8 +1519,265 @@ enum CBv2MTPHiddenIndex {
     }
 }
 
-/// Set by the engine while a low-acceptance round's drafts are built, so a
-/// drafter can draft those rounds more cheaply. Never read for target work.
+/// Multi-leaf verification tree strictly within `M <= 8` (`k <= 7` drafted
+/// tokens) for low-acceptance verify rounds. Every leaf's ancestor prefix lies
+/// on contiguous slots `0 ..< depth`, and every tree node's attention maps
+/// logical ancestor positions onto physical KV slots in exact serial order
+/// (0-ULP bit-identical to serial greedy).
+public struct CBv2VerifyTree: Sendable {
+    public let k: Int
+    public let chainDepth: Int
+    public let posDeltas: [Int]
+    public let parent: [Int]
+    public let children: [[Int]]
+    public let ancPacked: [UInt32]
+    public let packedPosDeltas: UInt32
+    public let sourcePositions: [Int]
+    public let sourceRanks: [Int]
+
+    public var totalSlots: Int { 1 + k }
+
+    public static func make(mode: Int, k: Int) -> CBv2VerifyTree? {
+        guard mode > 0, (3 ... 7).contains(k) else { return nil }
+        let chainDepth: Int
+        let parents: [Int]
+        let srcPos: [Int]
+        let srcRank: [Int]
+        switch (mode, k) {
+        case (1, 7):
+            chainDepth = 4
+            parents = [-1, 0, 1, 2, 3, 0, 0, 1]
+            srcPos = [0, 1, 2, 3, 0, 0, 1]
+            srcRank = [0, 0, 0, 0, 1, 2, 1]
+        case (2, 7):
+            chainDepth = 3
+            parents = [-1, 0, 1, 2, 0, 0, 1, 2]
+            srcPos = [0, 1, 2, 0, 0, 1, 2]
+            srcRank = [0, 0, 0, 1, 2, 1, 1]
+        case (3, 7):
+            chainDepth = 5
+            parents = [-1, 0, 1, 2, 3, 4, 0, 1]
+            srcPos = [0, 1, 2, 3, 4, 0, 1]
+            srcRank = [0, 0, 0, 0, 0, 1, 1]
+        case (_, 6):
+            chainDepth = 5
+            parents = [-1, 0, 1, 2, 3, 4, 0]
+            srcPos = [0, 1, 2, 3, 4, 0]
+            srcRank = [0, 0, 0, 0, 0, 1]
+        case (_, 5):
+            chainDepth = 4
+            parents = [-1, 0, 1, 2, 3, 0]
+            srcPos = [0, 1, 2, 3, 0]
+            srcRank = [0, 0, 0, 0, 1]
+        case (_, 4):
+            chainDepth = 3
+            parents = [-1, 0, 1, 2, 0]
+            srcPos = [0, 1, 2, 0]
+            srcRank = [0, 0, 0, 1]
+        case (_, 3):
+            chainDepth = 2
+            parents = [-1, 0, 1, 0]
+            srcPos = [0, 1, 0]
+            srcRank = [0, 0, 1]
+        default:
+            return nil
+        }
+        let n = 1 + k
+        var posDeltas = [Int](repeating: 0, count: n)
+        var children = [[Int]](repeating: [], count: n)
+        var ancPacked = [UInt32](repeating: 0, count: n)
+        for s in 1 ..< n {
+            let p = parents[s]
+            posDeltas[s] = posDeltas[p] + 1
+            children[p].append(s)
+        }
+        var packedPos: UInt32 = 0
+        for s in 0 ..< n {
+            packedPos |= UInt32(posDeltas[s] & 0xF) << (4 * s)
+            var chain: [Int] = []
+            var cur = s
+            while cur >= 0 {
+                chain.append(cur)
+                cur = parents[cur]
+            }
+            chain.reverse()
+            var packed: UInt32 = 0
+            for (d, slot) in chain.enumerated() {
+                packed |= UInt32(slot & 0xF) << (4 * d)
+            }
+            ancPacked[s] = packed
+        }
+        return CBv2VerifyTree(
+            k: k, chainDepth: chainDepth, posDeltas: posDeltas, parent: parents,
+            children: children, ancPacked: ancPacked, packedPosDeltas: packedPos,
+            sourcePositions: srcPos, sourceRanks: srcRank)
+    }
+
+    /// Reconstructs a verify tree from the GPU-packed parent word written into
+    /// `treeMeta[17]`: bits `0..27` hold 4-bit parents for slots `1...k`, and
+    /// bits `28..31` hold `chainDepth`.
+    public static func fromPackedParents(_ packed: UInt32, k: Int) -> CBv2VerifyTree {
+        let n = 1 + k
+        var parents = [Int](repeating: 0, count: n)
+        parents[0] = -1
+        for s in 1 ..< n {
+            let p = Int((packed >> (4 * (s - 1))) & 0xF)
+            parents[s] = min(p, s - 1)
+        }
+        let rawChain = Int((packed >> 28) & 0xF)
+        let chainDepth = max(1, min(k, rawChain == 0 ? k : rawChain))
+        var posDeltas = [Int](repeating: 0, count: n)
+        var children = [[Int]](repeating: [], count: n)
+        var ancPacked = [UInt32](repeating: 0, count: n)
+        for s in 1 ..< n {
+            let p = parents[s]
+            posDeltas[s] = posDeltas[p] + 1
+            children[p].append(s)
+        }
+        var packedPos: UInt32 = 0
+        for s in 0 ..< n {
+            packedPos |= UInt32(posDeltas[s] & 0xF) << (4 * s)
+            var chain: [Int] = []
+            var cur = s
+            while cur >= 0 {
+                chain.append(cur)
+                cur = parents[cur]
+            }
+            chain.reverse()
+            var anc: UInt32 = 0
+            for (d, slot) in chain.enumerated() {
+                anc |= UInt32(slot & 0xF) << (4 * d)
+            }
+            ancPacked[s] = anc
+        }
+        return CBv2VerifyTree(
+            k: k, chainDepth: chainDepth, posDeltas: posDeltas, parent: parents,
+            children: children, ancPacked: ancPacked, packedPosDeltas: packedPos,
+            sourcePositions: [], sourceRanks: [])
+    }
+}
+
+/// Set by the engine while a low-acceptance round's drafts and verify are built.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
+    nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
+    /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
+    nonisolated(unsafe) public static var activeDynamicTreeK: Int = 0
+    /// GPU `[18]` int32 tree descriptor emitted by the drafter for the active round:
+    /// `[0] = packedPosDeltas`, `[1...8] = ancPacked[0...7]`, `[9...16] = depth[0...7]`,
+    /// `[17] = packedParents`.
+    nonisolated(unsafe) public static var activeDynamicTreeMeta: MLXArray? = nil
+    /// `CBV2_TREE_LOW=0` disables tree verification on low-acceptance rounds.
+    public static let verifyTreeMode: Int = {
+        ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1
+    }()
+    /// `CBV2_DYN_TREE=0` disables GPU-dynamic tree selection (falls back to static tree).
+    public static let dynamicTreeEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DYN_TREE"] != "0"
+    /// Minimum verify draft count `k` eligible for dynamic tree (`CBV2_TREE_MIN_WIDTH`, default 3).
+    public static let dynamicTreeMinWidth: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_TREE_MIN_WIDTH"],
+            let v = Int(raw), (2 ... 7).contains(v)
+        {
+            return v
+        }
+        return 3
+    }()
+    /// Maximum verify draft count `k` eligible for dynamic tree (`CBV2_TREE_MAX_WIDTH`, default 7).
+    public static let dynamicTreeMaxWidth: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_TREE_MAX_WIDTH"],
+            let v = Int(raw), (2 ... 7).contains(v)
+        {
+            return v
+        }
+        return 7
+    }()
+    /// Maximum branch leaves placed for `k < 5` (`CBV2_DYN_TREE_MAX_LEAVES`, default 1).
+    public static let dynamicTreeMaxLeaves: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_MAX_LEAVES"],
+            let v = Int(raw), (0 ... 4).contains(v)
+        {
+            return v
+        }
+        return 1
+    }()
+    /// Maximum branch slots placed for `k == 5` (`CBV2_DYN_TREE_MAX_LEAVES_5`, defaults to `dynamicTreeMaxLeaves`).
+    public static let dynamicTreeMaxLeavesAt5: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_MAX_LEAVES_5"],
+            let v = Int(raw), (0 ... 4).contains(v)
+        {
+            return v
+        }
+        return dynamicTreeMaxLeaves
+    }()
+    /// Maximum branch slots placed for `k >= 6` (`CBV2_DYN_TREE_MAX_LEAVES_6`, defaults to `dynamicTreeMaxLeavesAt5`).
+    public static let dynamicTreeMaxLeavesAt6: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_MAX_LEAVES_6"],
+            let v = Int(raw), (0 ... 4).contains(v)
+        {
+            return v
+        }
+        return dynamicTreeMaxLeavesAt5
+    }()
+    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
+    public static let dynamicTreeMaxBranchLen: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
+            let v = Int(raw), (1 ... 4).contains(v)
+        {
+            return v
+        }
+        return 1
+    }()
+    /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.75).
+    public static let dynamicTreeContDecay: Float = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_CONT_DECAY"],
+            let v = Float(raw), v.isFinite, v >= 0.0, v <= 2.0
+        {
+            return v
+        }
+        return 0.75
+    }()
+    /// Maximum parent chain depth allowed to host branch leaves (`CBV2_DYN_TREE_MAX_DEPTH`, default 3).
+    public static let dynamicTreeMaxLeafDepth: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_MAX_DEPTH"],
+            let v = Int(raw), (1 ... 6).contains(v)
+        {
+            return v
+        }
+        return 3
+    }()
+    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 1.0).
+    public static let dynamicTreeTemp: Float = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TEMP"],
+            let v = Float(raw), v.isFinite, v > 0.05, v <= 10.0
+        {
+            return v
+        }
+        return 1.0
+    }()
+    /// Chain EV multiplier (`CBV2_DYN_TREE_BONUS`, default 0.0; `0.0` always places best EV leaf(s)).
+    public static let dynamicTreeChainBonus: Float = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BONUS"],
+            let v = Float(raw), v.isFinite, v >= 0.0, v <= 5.0
+        {
+            return v
+        }
+        return 0.0
+    }()
+    /// Survival decay multiplier per depth (`CBV2_DYN_TREE_DECAY`, default 1.0).
+    public static let dynamicTreeDecay: Float = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_DECAY"],
+            let v = Float(raw), v.isFinite, v > 0.1, v <= 2.0
+        {
+            return v
+        }
+        return 1.0
+    }()
+    /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
+    public static let treeCooldownEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_COOLDOWN"] == "1"
+    /// Reserve dynamic-tree leaf slots additively instead of shrinking chain depth (`CBV2_TREE_ADDITIVE=1` enables).
+    public static let treeAdditiveSlot: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_ADDITIVE"] == "1"
 }
