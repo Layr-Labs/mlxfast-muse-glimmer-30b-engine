@@ -41,6 +41,25 @@ public enum CBv2SmallProjection {
 
     // MARK: FP8
 
+    /// A schedule choice for one FP8 product (the load-time verify tuner):
+    /// rows per thread for the K-split and flat segments (clamped as the
+    /// default is) and the weight-word prefetch depth (0: the default).
+    /// Every choice gives the same bytes.
+    public struct FP8Tuning: Hashable, Sendable {
+        public var tmSplit: Int
+        public var tmFlat: Int
+        public var prefetch: Int
+        /// Activation rows outermost in the inner loop (the same chains,
+        /// fewer values live).
+        public var rowsOuter: Bool
+        public init(tmSplit: Int, tmFlat: Int, prefetch: Int, rowsOuter: Bool = false) {
+            self.tmSplit = tmSplit
+            self.tmFlat = tmFlat
+            self.prefetch = prefetch
+            self.rowsOuter = rowsOuter
+        }
+    }
+
     static let fp8Helper = """
 
         #define CBV2_SP_UNROLL _Pragma("clang loop unroll(full)")
@@ -387,7 +406,8 @@ public enum CBv2SmallProjection {
     }
 
     private static func fp8Run(
-        _ layers: [ModelOptCalibratedLinear], _ flat: MLXArray, cast: MLXArray, rows: Int
+        _ layers: [ModelOptCalibratedLinear], _ flat: MLXArray, cast: MLXArray, rows: Int,
+        tuning: FP8Tuning? = nil
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         var segments = [FP8Segment]()
@@ -395,20 +415,22 @@ public enum CBv2SmallProjection {
         for (i, layer) in layers.enumerated() {
             arrays += [layer.weight, layer.graphConstants!.outputScale]
             for run in fp8Runs(layer) {
-                let tm = min(
-                    rowsPerThread(rows: rows, split: run.split), run.rows.count, max(1, 32 / rows))
+                let wanted = tuning.map { run.split ? $0.tmSplit : $0.tmFlat }
+                    ?? rowsPerThread(rows: rows, split: run.split)
+                let tm = min(wanted, run.rows.count, max(1, 32 / rows))
                 segments.append(
                     FP8Segment(
                         weight: i, row0: run.rows.lowerBound, rows: run.rows.count,
                         input: layers.count == 1 ? 0 : i, output: i,
                         column0: run.rows.lowerBound, outputWidth: layer.outputDimensions,
                         split: run.split, tm: tm,
-                        prefetch: prefetchOverride ?? prefetchDepth(rows: rows, split: run.split)))
+                        prefetch: (tuning?.prefetch).flatMap { $0 > 0 ? $0 : nil }
+                            ?? prefetchOverride ?? prefetchDepth(rows: rows, split: run.split)))
             }
         }
         arrays.append(cast)
         let shape = FP8Shape(
-            vectorDecode: vectorDecode, rowsOuter: rowsOuter, weights: layers.count, outputs: layers.count,
+            vectorDecode: vectorDecode, rowsOuter: tuning?.rowsOuter ?? rowsOuter, weights: layers.count, outputs: layers.count,
             segments: segments)
         let tiles = segments.reduce(0) { $0 + $1.tiles }
         return fp8Kernel(shape)(
@@ -458,8 +480,9 @@ public enum CBv2SmallProjection {
     /// (`x`: `[..., K]`, 1 to 8 rows): each equal, bit for bit, to the layer's
     /// own `rowExactForward` (or `graphForward` for one row). nil when a layer
     /// is not one this file takes.
-    public static func fp8Products(_ layers: [ModelOptCalibratedLinear], _ x: MLXArray)
-        -> [MLXArray]?
+    public static func fp8Products(
+        _ layers: [ModelOptCalibratedLinear], _ x: MLXArray, tuning: FP8Tuning? = nil
+    ) -> [MLXArray]?
     {
         let inputs = x.dim(-1)
         guard inputs > 0, !layers.isEmpty else { return nil }
@@ -490,7 +513,7 @@ public enum CBv2SmallProjection {
                 outputShapes: [[total]], outputDTypes: [x.dtype])[0]
         }
         let lead = Array(x.shape.dropLast())
-        return zip(fp8Run(layers, flat, cast: cast, rows: rows), layers).map {
+        return zip(fp8Run(layers, flat, cast: cast, rows: rows, tuning: tuning), layers).map {
             $0.reshaped(lead + [$1.outputDimensions])
         }
     }
@@ -741,9 +764,10 @@ public enum CBv2SmallProjection {
     /// (`x`: `[..., K]`, 1 to 8 rows), each equal, bit for bit, to
     /// `ModelOptWeightOnlyNVFP4RowExact.product` with the layer's tensor
     /// scale (matrix kernel); nil when not taken.
-    public static func nvfp4Products(_ layers: [ModelOptWeightOnlyNVFP4Linear], _ x: MLXArray)
-        -> [MLXArray]?
-    {
+    public static func nvfp4Products(
+        _ layers: [ModelOptWeightOnlyNVFP4Linear], _ x: MLXArray,
+        tile: (tn: Int, prefetch: Bool)? = nil
+    ) -> [MLXArray]? {
         let inputs = x.dim(-1)
         guard inputs > 0, !layers.isEmpty else { return nil }
         let rows = x.size / inputs
@@ -761,7 +785,8 @@ public enum CBv2SmallProjection {
                 layer.weightScale.shape == [outputs, inputs / 16], layer.weightScale.size >= 8,
                 layer.weightScale2.dtype == .float32, layer.weightScale2.size == 1
             else { return nil }
-            let (tn, prefetch) = nvfp4Tile(outputs: outputs, inputs: inputs)
+            let (tn, prefetch) = tile.map { ($0.tn, $0.prefetch && inputs % 128 == 0) }
+                ?? nvfp4Tile(outputs: outputs, inputs: inputs)
             segments.append(NVFP4Segment(outputs: outputs, tn: tn, prefetch: prefetch))
             arrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
         }

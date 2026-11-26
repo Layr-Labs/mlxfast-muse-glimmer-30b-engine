@@ -504,7 +504,12 @@ public enum CBv2VerifyScales {
     /// The exact product of `layer` for the verify rows `x` through these
     /// kernels: NVFP4 at 1 to 8 rows (8-row tiles), FP8 at 2 to 8 rows.
     /// Nil where they do not apply; the caller then runs the stock product.
-    public static func product(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray? {
+    /// `tileRows` / `prefetch` (NVFP4) and `rowGroupsOverride` / `anyShape`
+    /// (FP8) are the load-time tuner's choices: scheduling only.
+    public static func product(
+        _ layer: any UnaryLayer, _ x: MLXArray, tileRows: Int = 8, prefetch: Bool = false,
+        rowGroupsOverride: Int? = nil, anyShape: Bool = false
+    ) -> MLXArray? {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
@@ -523,12 +528,12 @@ public enum CBv2VerifyScales {
             else { return nil }
             return nvfp4Product(
                 x, weight: l.weight, blockScales: l.weightScale, tensorScale: l.weightScale2,
-                rowsPerTile: 8)
+                rowsPerTile: tileRows, prefetch: prefetch)
         }
         if let l = layer as? ModelOptCalibratedLinear {
             // Measured faster only for the MLP shapes: gate/up (vector loads) and
             // down at 6 to 8 rows (four row groups); attention keeps the stock product.
-            let mlp = l.outputDimensions >= 16384 || (inputs >= 16384 && rows >= 6)
+            let mlp = anyShape || l.outputDimensions >= 16384 || (inputs >= 16384 && rows >= 6)
             // Activations are read as 16-bit lanes (`as_type<vec<T, 4>>(ushort4)`).
             guard mlp, l.format == .fp8, l.execution == .graph, l.inputDimensions == inputs,
                 inputs > 64, inputs % 4 == 0, l.weightDType == x.dtype, (2 ... 8).contains(rows),
@@ -540,7 +545,10 @@ public enum CBv2VerifyScales {
             return fp8Forward(
                 l, x,
                 rowGroups: {
-                    fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
+                    if let o = rowGroupsOverride {
+                        return o > 1 && !($0 && $1 % 8 == 0) ? 1 : o
+                    }
+                    return fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
                 },
                 packedDecode: false)
         }
