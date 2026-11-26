@@ -69,18 +69,27 @@ public enum CBv2SmallProjection {
         // Rows TM of one output tile, K split over 8 simdgroups (SPLIT, the
         // stock BN = 8) or one simdgroup per TM rows (stock BN = 1, eight
         // simdgroups per threadgroup). `out_vec` is the output's first column
-        // for this segment; NOUT its row stride.
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, bool DV, int PF, bool VO>
+        // for this segment; NOUT its row stride. VG > 1 (V-split): VG
+        // adjacent threadgroups share one weight tile (the later ones read it
+        // from L2), each owning VR = ceil(V / VG) activation rows; rows past
+        // V repeat the group's last row and are not stored.
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, bool DV, int PF, bool VO, int VG = 1>
         inline void cbv2_sp_fp8(
             const device uint8_t* mat, float weight_scale, const device T* in_vec,
             device T* out_vec, int tile, uint simd_gid, uint simd_lid,
             threadgroup float* tgp) {
+            constexpr int VR = (V + VG - 1) / VG;
+            const int v0 = (tile % VG) * VR;
+            const int vvalid = min(VR, V - v0);
+            tile /= VG;
+            in_vec += size_t(v0) * K;
+            out_vec += size_t(v0) * NOUT;
             constexpr int BN = SPLIT ? 8 : 1;
             constexpr int TN = 4;
             constexpr int blockN = BN * 32 * TN;
             constexpr int n_iter = K / blockN;
             constexpr int leftover = K - blockN * n_iter;
-            constexpr int P = V * TM;
+            constexpr int P = VR * TM;
             static_assert(P <= 32, "at most 32 values per lane");
             constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
@@ -118,10 +127,10 @@ public enum CBv2SmallProjection {
                 if (i0 + d >= n_iter) {
                     break;
                 }
-                ushort4 av[V];
+                ushort4 av[VR];
                 CBV2_SP_UNROLL
-                for (int v = 0; v < V; v++) {
-                    av[v] = ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn));
+                for (int v = 0; v < VR; v++) {
+                    av[v] = ushort4(*(const device packed_ushort4*)(in_vec + min(v, vvalid - 1) * K + bn));
                 }
                 thread const uint* wq = wblk[d];
                 // Decoded weights of the four codes of each row's word. DV:
@@ -172,7 +181,7 @@ public enum CBv2SmallProjection {
                         }
                     }
                     CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
+                    for (int v = 0; v < VR; v++) {
                         CBV2_SP_UNROLL
                         for (int tn = 0; tn < TN; tn++) {
                             const float a = static_cast<float>(as_type<T>(av[v][tn]));
@@ -191,7 +200,7 @@ public enum CBv2SmallProjection {
                         inter[tm] = static_cast<T>(dec[tm][tn] * dscale);
                     }
                     CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
+                    for (int v = 0; v < VR; v++) {
                         const float a = static_cast<float>(as_type<T>(av[v][tn]));
                         CBV2_SP_UNROLL
                         for (int tm = 0; tm < TM; tm++) {
@@ -204,12 +213,12 @@ public enum CBv2SmallProjection {
               }
             }
             if (leftover > 0) {
-                thread float v_coeff[V][TN];
+                thread float v_coeff[VR][TN];
                 thread T inter[TN];
-                for (int v = 0; v < V; v++) {
+                for (int v = 0; v < VR; v++) {
                     for (int tn = 0; tn < TN; tn++) {
-                        v_coeff[v][tn] =
-                            bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                        v_coeff[v][tn] = bn + tn < K
+                            ? static_cast<float>(in_vec[min(v, vvalid - 1) * K + bn + tn]) : 0.0f;
                     }
                 }
                 for (int tm = 0; tm < TM; tm++) {
@@ -223,7 +232,7 @@ public enum CBv2SmallProjection {
                             inter[tn] = T(0);
                         }
                     }
-                    for (int v = 0; v < V; v++) {
+                    for (int v = 0; v < VR; v++) {
                         for (int tn = 0; tn < TN; tn++) {
                             r[v * TM + tm] += inter[tn] * v_coeff[v][tn];
                         }
@@ -244,14 +253,14 @@ public enum CBv2SmallProjection {
                     tgp[g * 32 + i] = r[0];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (g == 0 && holds && i < P) {
+                if (g == 0 && holds && i < P && i / TM < vvalid) {
                     float result = r[0];
                     for (int s = 1; s < BN; s++) {
                         result += tgp[s * 32 + i];
                     }
                     out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
                 }
-            } else if (holds && i < P) {
+            } else if (holds && i < P && i / TM < vvalid) {
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
             }
         }
@@ -271,8 +280,9 @@ public enum CBv2SmallProjection {
         var split: Bool
         var tm: Int
         var prefetch: Int
+        var vGroups: Int = 1
 
-        var tiles: Int { split ? (rows + tm - 1) / tm : (rows + 8 * tm - 1) / (8 * tm) }
+        var tiles: Int { vGroups * (split ? (rows + tm - 1) / tm : (rows + 8 * tm - 1) / (8 * tm)) }
     }
 
     struct FP8Shape: Hashable {
@@ -306,7 +316,7 @@ public enum CBv2SmallProjection {
             let end = offset + s.tiles
             body += """
                 \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter)>(
+                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter), \(s.vGroups)>(
                         m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                         xc + size_t(\(s.input)) * V * K,
                         y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -330,12 +340,35 @@ public enum CBv2SmallProjection {
         return String(h, radix: 36)
     }
 
-    /// Rows per thread: 2, as the stock schedule (4 measured 1.7x slower at
-    /// eight rows: registers).
-    static func rowsPerThread(rows: Int, split: Bool) -> Int {
+    /// Rows per thread. BN = 1 rows: 2 (the o projection is at bandwidth).
+    /// K-split tiles: the largest TM with rows * TM <= 16 (16 values per
+    /// lane; 32 spills), measured: 2 rows 4, 3 rows 5, 4 rows 4, 5 rows 3
+    /// for the MLP down projection and 2 otherwise. TM only decides which
+    /// thread owns which output chains (an odd TM uses the tail clamp).
+    static func rowsPerThread(rows: Int, split: Bool, inputs: Int) -> Int {
         if let o = rowsPerThreadOverride { return split ? o.split : o.flat }
-        return 2
+        guard split else { return 2 }
+        switch rows {
+        case 2: return 4
+        case 3: return 5
+        case 4: return 4
+        case 5: return inputs >= 16384 ? 3 : 2
+        default: return 2
+        }
     }
+
+    /// V-split for K-split tiles at 6 to 8 rows (qkvg, gate_up): two
+    /// adjacent threadgroups per weight tile, each with 4 (or 3) activation
+    /// rows at TM = 4 (16 values per lane instead of 32), the second one's
+    /// weight reads served by L2. Same chains, same order, same bytes from
+    /// DRAM; measured -22 to -33% on M4.
+    static func vGroups(rows: Int, split: Bool) -> Int {
+        if let o = vGroupsOverride { return o }
+        return split && rows >= 6 ? 2 : 1
+    }
+
+    /// Benchmarks only: V-split group count in place of the default.
+    nonisolated(unsafe) public static var vGroupsOverride: Int?
 
     /// Two codes per bit operation in the weight decode, with the exact
     /// factor 256 moved into the scale. Measured no faster and never used:
@@ -395,15 +428,20 @@ public enum CBv2SmallProjection {
         for (i, layer) in layers.enumerated() {
             arrays += [layer.weight, layer.graphConstants!.outputScale]
             for run in fp8Runs(layer) {
+                let vg = max(1, min(vGroups(rows: rows, split: run.split), rows))
+                let groupRows = (rows + vg - 1) / vg
                 let tm = min(
-                    rowsPerThread(rows: rows, split: run.split), run.rows.count, max(1, 32 / rows))
+                    vg > 1 && rowsPerThreadOverride == nil
+                        ? 4 : rowsPerThread(rows: rows, split: run.split, inputs: inputs),
+                    run.rows.count, max(1, 32 / groupRows))
                 segments.append(
                     FP8Segment(
                         weight: i, row0: run.rows.lowerBound, rows: run.rows.count,
                         input: layers.count == 1 ? 0 : i, output: i,
                         column0: run.rows.lowerBound, outputWidth: layer.outputDimensions,
                         split: run.split, tm: tm,
-                        prefetch: prefetchOverride ?? prefetchDepth(rows: rows, split: run.split)))
+                        prefetch: prefetchOverride ?? (vg > 1 ? 2 : prefetchDepth(rows: rows, split: run.split)),
+                        vGroups: vg))
             }
         }
         arrays.append(cast)

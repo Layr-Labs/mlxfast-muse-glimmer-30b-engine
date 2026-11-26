@@ -404,12 +404,185 @@ public enum CBv2GroupedProjection {
         2: castKernel(segments: 2), 4: castKernel(segments: 4),
     ]
 
+    // MARK: Dense BF16
+
+    /// MLX's single-row `gemv` (`gemv.h` GEMVKernel, SM = 1, SN = 32, TN = 4)
+    /// for several rows of one bf16 weight: lane `l` of K-simdgroup `g` sums
+    /// `k = i * blockN + 128 g + 4 l + t`, `i` then `t` ascending (fused
+    /// multiply-adds; a bf16 * bf16 product is exact in float), the leftover
+    /// step's `0 * 0` adds included, then the `shuffle_down` tree (16, 8, 4,
+    /// 2, 1) and, for MLX's K split (`K >= 16 N`, BN = 8), the join
+    /// `((T0 + T1) + ...) + T7`. Each output row equals that row's own
+    /// one-row product; TM rows of the weight per thread, all rows of the
+    /// activation per weight word.
+    private static let denseHelper = """
+
+        template <typename T, int K, int V, int N, int TM, bool SPLIT, int PF>
+        inline void cbv2_gd_bf16(
+            const device T* w, const device T* x, device T* y, int tile, uint sg, uint sl,
+            threadgroup float* tgp) {
+            constexpr int BN = SPLIT ? 8 : 1;
+            constexpr int blockN = BN * 128;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - n_iter * blockN;
+            constexpr int P = V * TM;
+            static_assert(P <= 32, "at most 32 values per lane");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr int PD = (PF > 1 && n_iter % PF == 0) ? PF : 1;
+            int out_row = SPLIT ? tile * TM : (tile * 8 + int(sg)) * TM;
+            if (!SPLIT && out_row >= N) {
+                return;
+            }
+            out_row = out_row + TM <= N ? out_row : N - TM;
+            int bn = (32 * (SPLIT ? int(sg) : 0) + int(sl)) * 4;
+            const device T* rows = w + size_t(out_row) * K;
+            float r[P2];
+            CBV2_SP_UNROLL
+            for (int j = 0; j < P2; j++) {
+                r[j] = 0.0f;
+            }
+            for (int i0 = 0; i0 < n_iter; i0 += PD) {
+                uint2 wb[PD][TM];
+                CBV2_SP_UNROLL
+                for (int d = 0; d < PD; d++) {
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wb[d][tm] = *(const device packed_uint2*)(rows + tm * K + bn + d * blockN);
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int d = 0; d < PD; d++) {
+                    uint2 xa[V];
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        xa[v] = *(const device packed_uint2*)(x + v * K + bn);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < 4; tn++) {
+                        float wf[TM];
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            const uint u = wb[d][tm][tn >> 1];
+                            wf[tm] = as_type<float>((tn & 1) ? (u & 0xFFFF0000u) : (u << 16));
+                        }
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const uint u = xa[v][tn >> 1];
+                            const float a = as_type<float>((tn & 1) ? (u & 0xFFFF0000u) : (u << 16));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] = fma(wf[tm], a, r[v * TM + tm]);
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+            }
+            if (leftover > 0) {
+                float a[V][4];
+                for (int v = 0; v < V; v++) {
+                    for (int tn = 0; tn < 4; tn++) {
+                        a[v][tn] = bn + tn < K ? static_cast<float>(x[v * K + bn + tn]) : 0.0f;
+                    }
+                }
+                for (int tm = 0; tm < TM; tm++) {
+                    T wt[4];
+                    for (int tn = 0; tn < 4; tn++) {
+                        wt[tn] = bn + tn < K ? rows[tm * K + bn + tn] : T(0);
+                    }
+                    for (int v = 0; v < V; v++) {
+                        for (int tn = 0; tn < 4; tn++) {
+                            r[v * TM + tm] += wt[tn] * a[v][tn];
+                        }
+                    }
+                }
+            }
+            const ushort lid = ushort(sl);
+            cbv2_sp_tree_step<P2, 16>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+            const bool holds = (sl & ((1u << SH) - 1u)) == 0;
+            const int i = int(sl >> SH);
+            if (SPLIT) {
+                if (holds) {
+                    tgp[int(sg) * 32 + i] = r[0];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0 && holds && i < P) {
+                    float result = r[0];
+                    for (int s = 1; s < 8; s++) {
+                        result += tgp[s * 32 + i];
+                    }
+                    y[(i / TM) * N + out_row + (i % TM)] = static_cast<T>(result);
+                }
+            } else if (holds && i < P) {
+                y[(i / TM) * N + out_row + (i % TM)] = static_cast<T>(r[0]);
+            }
+        }
+        """
+
+    /// Segment `i` (weight `w\(i)`, output `y\(i)`, `N\(i)` rows) takes the
+    /// next `CBV2_GD_TILES` threadgroups; callers order K-split segments first.
+    private static func denseKernel(segments: Int) -> MLXFast.MLXFastKernel {
+        var inputs = ["x"], outputs = [String]()
+        var body = """
+            threadgroup float tgp[8 * 32];
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+            const int tile = int(threadgroup_position_in_grid.y);
+
+            """
+        var offset = "0"
+        for i in 0 ..< segments {
+            inputs.append("w\(i)")
+            outputs.append("y\(i)")
+            body += """
+                constexpr bool S\(i) = K >= 16 * N\(i);
+                constexpr int TM\(i) = S\(i) ? TMS : TMF;
+                constexpr int C\(i) = S\(i) ? (N\(i) + TM\(i) - 1) / TM\(i) : (N\(i) + 8 * TM\(i) - 1) / (8 * TM\(i));
+
+                """
+        }
+        for i in 0 ..< segments {
+            body += """
+                \(i == 0 ? "" : "else ")if (tile < \(offset) + C\(i)) {
+                    cbv2_gd_bf16<T, K, V, N\(i), TM\(i), S\(i), (S\(i) ? 1 : PFF)>(
+                        w\(i), x, y\(i), tile - (\(offset)), sg, sl, tgp);
+                }
+
+                """
+            offset += " + C\(i)"
+        }
+        return MLXFast.metalKernel(
+            name: "cbv2_grouped_bf16_gemv_\(segments)", inputNames: inputs,
+            outputNames: outputs, source: body,
+            header: ModelOptActivationKernels.header + CBv2SmallProjection.fp8Helper + denseHelper)
+    }
+
+    nonisolated(unsafe) private static let denseKernels: [Int: MLXFast.MLXFastKernel] = [
+        2: denseKernel(segments: 2), 4: denseKernel(segments: 4),
+    ]
+
+    /// MLX's K split for a one-row product of `outputs` rows over `inputs`.
+    static func denseSplits(inputs: Int, outputs: Int) -> Bool { inputs >= 16 * outputs }
+
+    /// Rows of the weight per thread for flat (BN = 1) and K-split segments
+    /// and the flat segments' weight words loaded ahead (measured on M4,
+    /// interleaved A/B: TM 2 / 2, 4 words ahead up to 4 rows).
+    static func denseGeometry(rows: Int) -> (flat: Int, split: Int, prefetch: Int) {
+        (2, 2, rows <= 4 ? 4 : 1)
+    }
+
     // MARK: Entry
 
     /// What a group of projections takes: `nil` when it cannot be grouped.
     private enum Plan {
         case nvfp4([ModelOptWeightOnlyNVFP4Linear])
         case fp8([ModelOptCalibratedLinear])
+        case dense([Linear])
     }
 
     private static func plan(_ layers: [any UnaryLayer], rows: Int, dtype: DType) -> Plan? {
@@ -421,8 +594,31 @@ public enum CBv2GroupedProjection {
         if let calibrated = layers as? [ModelOptCalibratedLinear] {
             return fp8Plan(calibrated, rows: rows, dtype: dtype)
         }
+        if let dense = layers as? [Linear] {
+            return densePlan(dense, rows: rows, dtype: dtype)
+        }
         return nil
     }
+
+    /// Plain bf16 `Linear` (no bias, not a quantized subclass) of one input
+    /// width; the one-row path stays MLX's `gemv`.
+    private static func densePlan(_ layers: [Linear], rows: Int, dtype: DType) -> Plan? {
+        guard denseEnabled, dtype == .bfloat16, rows >= 2 else { return nil }
+        let inputs = layers[0].weight.dim(-1)
+        guard inputs > 64, inputs % 4 == 0 else { return nil }
+        for layer in layers {
+            guard type(of: layer) == Linear.self, layer.bias == nil, layer.weight.ndim == 2,
+                layer.weight.dtype == dtype, layer.weight.dim(1) == inputs,
+                layer.weight.dim(0) >= 8
+            else { return nil }
+        }
+        return .dense(layers)
+    }
+
+    /// Set `DARKBLOOM_MUSE_GLIMMER_GROUPED_DENSE=0` to run bf16 groups one
+    /// projection at a time.
+    public static let denseEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_MUSE_GLIMMER_GROUPED_DENSE"] != "0"
 
     private static func nvfp4Plan(
         _ layers: [ModelOptWeightOnlyNVFP4Linear], rows: Int, dtype: DType
@@ -537,6 +733,38 @@ public enum CBv2GroupedProjection {
             return zip(results, group).map {
                 $0.reshaped(lead + [$1.outputDimensions])
             }
+        case .dense(let group):
+            // K-split segments first (their tiles take longest), then flat.
+            let order = group.indices.filter {
+                denseSplits(inputs: inputs, outputs: group[$0].weight.dim(0))
+            } + group.indices.filter {
+                !denseSplits(inputs: inputs, outputs: group[$0].weight.dim(0))
+            }
+            let geometry = denseGeometry(rows: rows)
+            var template: [(String, any KernelTemplateArg)] = [
+                ("T", x.dtype), ("K", inputs), ("V", rows),
+                ("TMF", geometry.flat), ("TMS", geometry.split), ("PFF", geometry.prefetch),
+            ]
+            var arrays = [flat]
+            var shapes = [[Int]]()
+            var tiles = 0
+            for (slot, index) in order.enumerated() {
+                let outputs = group[index].weight.dim(0)
+                let split = denseSplits(inputs: inputs, outputs: outputs)
+                let tm = split ? geometry.split : geometry.flat
+                arrays.append(group[index].weight)
+                template.append(("N\(slot)", outputs))
+                shapes.append([rows, outputs])
+                tiles += split ? (outputs + tm - 1) / tm : (outputs + 8 * tm - 1) / (8 * tm)
+            }
+            let results = denseKernels[count]!(
+                arrays, template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: count))
+            var ordered = [MLXArray](repeating: results[0], count: count)
+            for (slot, index) in order.enumerated() {
+                ordered[index] = results[slot].reshaped(lead + [group[index].weight.dim(0)])
+            }
+            return ordered
         }
     }
 
@@ -550,6 +778,8 @@ public enum CBv2GroupedProjection {
             return "nvfp4 \(g[0].inputDimensions) " + g.map { String($0.outputDimensions) }.joined(separator: ",")
         case .fp8(let g):
             return "fp8 \(g[0].inputDimensions) " + g.map { String($0.outputDimensions) }.joined(separator: ",")
+        case .dense(let g):
+            return "bf16 \(g[0].weight.dim(1)) " + g.map { String($0.weight.dim(0)) }.joined(separator: ",")
         }
     }
 
@@ -558,6 +788,7 @@ public enum CBv2GroupedProjection {
     public static func warm(_ layers: [any UnaryLayer], dtype: DType, rows: ClosedRange<Int>) {
         guard let inputs = (layers.first as? ModelOptWeightOnlyNVFP4Linear)?.inputDimensions
             ?? (layers.first as? ModelOptCalibratedLinear)?.inputDimensions
+            ?? (layers.first as? Linear)?.weight.dim(1)
         else { return }
         for count in rows {
             let zeros = MLXArray.zeros([1, count, inputs], dtype: dtype)
