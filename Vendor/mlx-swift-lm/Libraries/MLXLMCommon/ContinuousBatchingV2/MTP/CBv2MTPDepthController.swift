@@ -610,6 +610,32 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
     }
 
+    /// Pooled deep-position acceptance for the fixed-depth window. A position
+    /// is observed only in rounds whose earlier drafts were all accepted, so
+    /// on a low-acceptance request the positions at or past
+    /// `windowTailStart` are reached too rarely for their own estimates to
+    /// leave the prior. Every outcome observed at any of them also feeds
+    /// this one shared estimate. Starts at 1 (no effect); `init(flatPrior:)`
+    /// starts it at the prior.
+    private(set) var windowTailProbability = 1.0
+    static let windowTailStart = 3
+    private static let windowTailAlpha = 0.10
+
+    /// The fixed-depth window's per-position estimates: `probabilities`,
+    /// with each deep position capped by the pooled tail estimate. The cap
+    /// only ever lowers an estimate, so a request whose deep drafts keep
+    /// being accepted sees exactly `probabilities`. `probabilities` itself
+    /// keeps gating the post-verify speculation exactly as before.
+    var windowProbabilities: [Double] {
+        var window = probabilities
+        var position = Self.windowTailStart
+        while position < window.count {
+            window[position] = min(window[position], windowTailProbability)
+            position += 1
+        }
+        return window
+    }
+
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
     /// per speculative round. The request's own running totals (rounds that
     /// drafted, tokens those rounds committed) bound the next round's draft
@@ -663,6 +689,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     init(flatPrior: Double) {
         let prior = flatPrior.isFinite ? min(max(flatPrior, 0), 1) : 0
         probabilities = Array(repeating: prior, count: Self.maximumDepth)
+        windowTailProbability = prior
     }
 
     /// Records positions whose target outcome was actually observed and, after
@@ -681,6 +708,12 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
 
         for position in 0 ..< accepted {
             probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+            if position >= Self.windowTailStart {
+                windowTailProbability += Self.windowTailAlpha * (1.0 - windowTailProbability)
+            }
+        }
+        if rejectionObserved, accepted < drafted, accepted >= Self.windowTailStart {
+            windowTailProbability += Self.windowTailAlpha * (0.0 - windowTailProbability)
         }
         // Regime signal: only rounds whose outcome was fully observed (a
         // rejection, or every draft accepted) count; a truncation does not.
