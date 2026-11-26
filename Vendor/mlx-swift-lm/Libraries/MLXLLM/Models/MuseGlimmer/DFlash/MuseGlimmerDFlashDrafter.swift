@@ -1036,6 +1036,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// slices queries, attention, O-proj, MLP and final norm to only the
     /// `draftCount` active rows (7 instead of 16), cutting final-layer work
     /// in half with mathematically identical proposals.
+    ///
+    /// In a low-acceptance round (`CBv2DraftRegime.lowAcceptance`) the final
+    /// layer instead runs on all `blockSize` rows, exactly like layers
+    /// `0 ..< last`, and only the final norm sees the active rows. On a
+    /// gen-17 GPU MLX sends an affine product with fewer than 8 rows to the
+    /// `affine_qmv_wide` vector kernel (`get_qmv_batch_limit` is 13 for these
+    /// shapes and the mid-row NAX route starts at 8), so the 7-row slice put
+    /// the last layer's q, o and 3-bit MLP (about 233 MB) on an arithmetic-
+    /// bound kernel, while at 16 rows they take the same NAX pipelines that
+    /// layers `0 ..< last` already run (no new shape, nothing to compile).
+    /// Rows `1 ..< 1 + draftCount` are the same functions of the same inputs
+    /// either way; only kernel rounding can differ, and only proposals depend
+    /// on them. `CBV2_DFLASH_LOW_FULL_LAST=0` restores the slice.
+    private static let lowAcceptanceFullLastLayer =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_LOW_FULL_LAST"] != "0"
+
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
@@ -1047,7 +1063,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let act = embeddings.dtype == model.activationDType
             ? embeddings : embeddings.asType(model.activationDType)
         var hidden = act.reshaped([1, block, c.hiddenSize])
-        let lastIndex = model.layers.count - 1
+        let fullLastLayer = CBv2DraftRegime.lowAcceptance && Self.lowAcceptanceFullLastLayer
+        let lastIndex = fullLastLayer ? -1 : model.layers.count - 1
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)
@@ -1103,6 +1120,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             hidden =
                 hidden
                 + draftMLP(index, layer.mlp, mx)
+        }
+        if fullLastLayer {
+            // The final norm on the active rows only, as the sliced path's.
+            return model.norm(hidden[0..., 1 ..< (1 + draftCount), 0...])
+                .reshaped([draftCount, c.hiddenSize])
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
