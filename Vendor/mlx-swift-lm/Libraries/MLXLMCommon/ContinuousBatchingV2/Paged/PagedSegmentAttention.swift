@@ -123,6 +123,116 @@ enum PagedSegmentAttention {
         }
     }
 
+    /// Verifies that every `rpt`-row group shares the exact same page table
+    /// identity and `attendStart`, with monotonically non-decreasing
+    /// `attendLength` so the group's last row's partition record covers all
+    /// rows in the group bit-identically.
+    private static func sharedKVGroupsEligible(
+        rows: [PagedSegmentDispatchPlan.Row], rpt: Int
+    ) -> Bool {
+        let count = rows.count
+        guard count >= 2, rpt >= 2 else { return false }
+        var base = 0
+        while base < count {
+            let end = min(count, base + rpt)
+            let first = rows[base]
+            guard let id0 = first.identity else { return false }
+            let start0 = first.info.attendStart
+            var prevLen = first.info.attendLength
+            for idx in (base + 1) ..< end {
+                let row = rows[idx]
+                guard let id = row.identity, id == id0,
+                    row.info.attendStart == start0,
+                    row.info.attendLength >= prevLen
+                else { return false }
+                prevLen = row.info.attendLength
+            }
+            base = end
+        }
+        return true
+    }
+
+    /// Like `decode` for read-only verify rows (`newKeys == nil, sinks == nil`),
+    /// fusing `output * sigmoid(gate)` into the one-pass paged kernel epilogue
+    /// when a single binding bucket is eligible, and falling back cleanly to
+    /// `decode` + `sigmoid` otherwise.
+    static func decodeGated(
+        queries: MLXArray, gate: MLXArray, group: PagedKVGroup,
+        rows: [PagedSegmentDispatchPlan.Row], params: MLXArray, softcap: Bool,
+        source: String, dispatchCache: PagedSegmentDispatchCache?,
+        seqinfoCache: PagedSegmentSeqinfoCache?, mergeScratch: PagedSegmentMergeScratch?
+    ) -> MLXArray {
+        var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
+        guard !group.writeValidation.isFaulted else { return q * sigmoid(gate) }
+        precondition(q.ndim == 3 && q.dim(0) == rows.count && gate.shape == q.shape)
+        let dtype = group.dtype
+        let b = q.dim(0)
+        let qh = q.dim(1)
+        let d = q.dim(2)
+        let kvh = group.key.kvHeads
+        precondition(d == group.key.headDim && qh % kvh == 0)
+        let gqa = qh / kvh
+        let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)!
+        let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
+        let splits = gqa / hpt
+        let (seqinfo, maxLength) =
+            seqinfoCache?.seqinfo(rows.map(\.info))
+            ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
+        let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
+            PagedAttentionKernel.partitionTokensForDispatch(
+                maxAttendLength: maxLength, batch: b, kvHeads: kvh,
+                headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
+        let prepared =
+            dispatchCache?.prepare(rows: rows, group: group, partitionTokens: ptok, hasWrite: false)
+            ?? PagedSegmentPreparedDispatch(
+                rows: rows, group: group, partitionTokens: ptok, hasWrite: false)
+        let plan = prepared.plan
+        if q.dtype != dtype { q = q.asType(dtype) }
+        let g = gate.dtype == dtype ? gate : gate.asType(dtype)
+        if dispatchCache != nil, PagedOnePassAttention.gatedEnabled,
+            plan.buckets.count == 1
+        {
+            let bucket = plan.buckets[0]
+            var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
+            backing.append(
+                contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
+            let rpt = PagedOnePassAttention.sharedKVRowsPerTile
+            if PagedOnePassAttention.sharedKVGatedEnabled,
+                let sharedHeads = PagedOnePassAttention.eligibleSharedKV(
+                    headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions,
+                    rows: b, rpt: rpt),
+                sharedKVGroupsEligible(rows: rows, rpt: rpt)
+            {
+                let result = PagedOnePassAttention.segmentsSharedKVGated(
+                    queries: q, gate: g, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
+                    records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
+                    pageSize: group.pageSize, hpt: sharedHeads, rpt: rpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source)
+                group.writeFence = result.fence
+                return result.out
+            }
+            if let heads = PagedOnePassAttention.eligible(
+                headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b)
+            {
+                let result = PagedOnePassAttention.segmentsGated(
+                    queries: q, gate: g, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
+                    records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
+                    pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
+                    softcap: softcap, source: source)
+                group.writeFence = result.fence
+                return result.out
+            }
+        }
+        let ungated = decode(
+            queries: q, newKeys: nil, newValues: nil, group: group, rows: rows,
+            sinks: nil, params: params, softcap: softcap, source: source,
+            dispatchCache: dispatchCache, zeroFilledScratch: true,
+            seqinfoCache: seqinfoCache, mergeScratch: mergeScratch)
+        return ungated * sigmoid(g)
+    }
+
     static func decode(
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],

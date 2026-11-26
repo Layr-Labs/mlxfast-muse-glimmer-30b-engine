@@ -607,9 +607,18 @@ inline void paged_attention_merge_impl(
 // part_smem[MAXPART * HPT * (D + 2)] floats.
 // BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
+// MLX `Sigmoid` (`unary_ops.h` + `bf16_math.h`) for fused attention-output gating,
+// written with explicit float exp/fabs + T casts for clean MSL overload resolution.
+template <typename T>
+inline T cbv2_paged_sigmoid(T x) {
+    const float xf = float(x);
+    const T y = T(1.0f) / (T(1.0f) + T(metal::precise::exp(metal::fabs(xf))));
+    return (xf < 0.0f) ? y : (T(1.0f) - y);
+}
+
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool HAS_GATE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -625,7 +634,8 @@ inline void paged_attention_onepass_impl(
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
-    uint lane
+    uint lane,
+    const device T* gate = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -845,11 +855,342 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t row_off =
+                ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + row_off;
+            if (HAS_GATE) {
+                const device T* grow = gate + row_off;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    const T v = T(gacc[e] * inv);
+                    orow[lane * EPT + e] = v * cbv2_paged_sigmoid(grow[lane * EPT + e]);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    orow[lane * EPT + e] = T(gacc[e] * inv);
+                }
+            }
+        }
+    }
+}
+
+// Multi-row shared-KV one-pass paged verify attention.
+// One threadgroup owns up to RPT consecutive causal verify rows of the same
+// request (sharing attend_start and page table, with monotonically non-decreasing
+// attend_len) for a head group of HPT query heads. Every K/V page lookup, vector
+// load, and BF16->FP32 conversion is performed once and reused across all rcount
+// rows in the exact same token order, partition split (PTOK), strided state
+// order (NSG), and merge order as `paged_attention_onepass_impl`, giving
+// bit-identical 0-ULP outputs while cutting KV reads and threadgroup memory.
+// Grid: threads = (KVH * (GQA/HPT) * 32 * NSG * MAXPART, ceil(B / RPT), 1),
+//       tg = (32 * NSG * MAXPART, 1, 1).
+// Threadgroup memory: q_smem[RPT * HPT * D],
+//   red_smem[MAXPART * NSG * HPT * (D + 2)],
+//   part_smem[MAXPART * HPT * (D + 2)] (reused sequentially across rcount rows).
+template <
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool HAS_GATE = false, int RPT = 4>
+inline void paged_attention_onepass_shared_kv_impl(
+    const device T* q,
+    thread const Cache& cache,
+    const device int32_t* tables,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int maxp,
+    const int total_rows,
+    threadgroup float* q_smem,
+    threadgroup float* red_smem,
+    threadgroup float* part_smem,
+    device T* out,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane,
+    const device T* gate = nullptr
+) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    static_assert(RPT >= 1 && RPT <= 8, "RPT in 1..8");
+    constexpr int SPLITS = GQA / HPT;
+    constexpr int EPT = D / 32;
+    constexpr int TG = 32 * NSG * MAXPART;
+    constexpr int RSTRIDE = D + 2;
+
+    const int kv_head = tgpig.x / SPLITS;
+    const int hgroup = tgpig.x % SPLITS;
+    const int group = tgpig.y;
+    const int row0 = group * RPT;
+    if (row0 >= total_rows) {
+        return;
+    }
+    const int rcount = min(RPT, total_rows - row0);
+    const int row_last = row0 + rcount - 1;
+    const int part = (int)sgitg / NSG;
+    const int state = (int)sgitg % NSG;
+    const int lin = tpitg.x;
+
+    const int lo = part * PTOK;
+    int attend_len_r[RPT];
+    int hi_r[RPT];
+    int parts_r[RPT];
+#pragma unroll
+    for (int rr = 0; rr < RPT; rr++) {
+        if (rr < rcount) {
+            const int al = seqinfo[(row0 + rr) * 8 + 1];
+            attend_len_r[rr] = al;
+            hi_r[rr] = min(al, lo + PTOK);
+            parts_r[rr] = (al + PTOK - 1) / PTOK;
+        } else {
+            attend_len_r[rr] = 0;
+            hi_r[rr] = 0;
+            parts_r[rr] = 0;
+        }
+    }
+    const device int32_t* info_last = seqinfo + row_last * 8;
+    const int attend_start = info_last[0];
+    const int attend_len_max = info_last[1];
+    const int table_len = info_last[2];
+    const int hi_max = min(attend_len_max, lo + PTOK);
+    const bool active_max = lo < attend_len_max;
+
+    const device int32_t* table = tables + (size_t)row_last * (size_t)maxp;
+    const float softcap = params[0];
+    const float scale = params[1];
+
+    const int q_head0 = kv_head * GQA + hgroup * HPT;
+    const int64_t qr = (int64_t)(kvh * GQA) * D;
+    for (int rr = 0; rr < rcount; rr++) {
+        const int b = row0 + rr;
+        for (int i = lin; i < HPT * D; i += TG) {
+            const int64_t offset =
+                (int64_t)b * qr + (q_head0 + i / D) * (int64_t)D + (i % D);
+            q_smem[(rr * HPT) * D + i] = float(q[offset]) * scale;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m[RPT][HPT];
+    float l[RPT][HPT];
+    float acc[RPT][HPT][EPT];
+#pragma unroll
+    for (int rr = 0; rr < RPT; rr++) {
+#pragma unroll
+        for (int g = 0; g < HPT; g++) {
+            m[rr][g] = -FLT_MAX;
+            l[rr][g] = 0.0f;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                acc[rr][g][e] = 0.0f;
             }
+        }
+    }
+
+    float kf[EPT];
+    float vf[EPT];
+    if (active_max && BLOCK > 1 && EPT == 4) {
+        constexpr int E4 = EPT < 4 ? EPT : 4;
+        const int first = lo + state;
+        const int count = first < hi_max ? (hi_max - first + NSG - 1) / NSG : 0;
+        const bool all_full = (rcount == RPT) && (hi_r[0] == hi_max);
+        int cur_lpage = -1;
+        const device T* cur_key = nullptr;
+        const device T* cur_value = nullptr;
+        for (int j0 = 0; j0 < count; j0 += BLOCK) {
+            vec<T, 4> kr[BLOCK];
+            vec<T, 4> vr[BLOCK];
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+                    const int pos = attend_start + first + (j0 + u) * NSG;
+                    const int lpage = pos / S;
+                    const int slot = pos % S;
+                    if (lpage != cur_lpage) {
+                        const auto page = cache.read_page(table, lpage, table_len);
+                        cur_key = page.key;
+                        cur_value = page.value;
+                        cur_lpage = lpage;
+                    }
+                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
+                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
+                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+                    const int tok_idx = first + (j0 + u) * NSG;
+#pragma unroll
+                    for (int e = 0; e < E4; e++) {
+                        kf[e] = float(kr[u][e]);
+                        vf[e] = float(vr[u][e]);
+                    }
+#pragma unroll
+                    for (int rr = 0; rr < RPT; rr++) {
+                        if (all_full || (rr < rcount && tok_idx < hi_r[rr])) {
+#pragma unroll
+                            for (int g = 0; g < HPT; g++) {
+                                float partial = 0.0f;
+#pragma unroll
+                                for (int e = 0; e < EPT; e++) {
+                                    partial += q_smem[(rr * HPT + g) * D + lane * EPT + e] * kf[e];
+                                }
+                                float qk = simd_sum(partial);
+                                if (HAS_SOFTCAP) {
+                                    qk = softcap * precise::tanh(qk / softcap);
+                                }
+                                qk *= M_LOG2E_F;
+
+                                const float m_new = max(m[rr][g], qk);
+                                const float corr = exp2(m[rr][g] - m_new);
+                                const float p = exp2(qk - m_new);
+                                l[rr][g] = l[rr][g] * corr + p;
+#pragma unroll
+                                for (int e = 0; e < EPT; e++) {
+                                    acc[rr][g][e] = acc[rr][g][e] * corr + p * vf[e];
+                                }
+                                m[rr][g] = m_new;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (active_max) {
+        const bool all_full = (rcount == RPT) && (hi_r[0] == hi_max);
+        for (int i = lo + state; i < hi_max; i += NSG) {
+            const int pos = attend_start + i;
+            const int lpage = pos / S;
+            const int slot = pos % S;
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+#pragma unroll
+            for (int rr = 0; rr < RPT; rr++) {
+                if (all_full || (rr < rcount && i < hi_r[rr])) {
+#pragma unroll
+                    for (int g = 0; g < HPT; g++) {
+                        float partial = 0.0f;
+#pragma unroll
+                        for (int e = 0; e < EPT; e++) {
+                            partial += q_smem[(rr * HPT + g) * D + lane * EPT + e] * kf[e];
+                        }
+                        float qk = simd_sum(partial);
+                        if (HAS_SOFTCAP) {
+                            qk = softcap * precise::tanh(qk / softcap);
+                        }
+                        qk *= M_LOG2E_F;
+
+                        const float m_new = max(m[rr][g], qk);
+                        const float corr = exp2(m[rr][g] - m_new);
+                        const float p = exp2(qk - m_new);
+                        l[rr][g] = l[rr][g] * corr + p;
+#pragma unroll
+                        for (int e = 0; e < EPT; e++) {
+                            acc[rr][g][e] = acc[rr][g][e] * corr + p * vf[e];
+                        }
+                        m[rr][g] = m_new;
+                    }
+                }
+            }
+        }
+    }
+
+    // Sequentially publish, partition-merge, and global-merge each row in the
+    // group using the shared `red_smem` and `part_smem` buffers.
+    for (int rr = 0; rr < rcount; rr++) {
+        const int b = row0 + rr;
+        const bool active_r = lo < attend_len_r[rr];
+        const int parts = parts_r[rr];
+
+        threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;
+#pragma unroll
+        for (int g = 0; g < HPT; g++) {
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                mine[g * RSTRIDE + lane * EPT + e] = acc[rr][g][e];
+            }
+            if (lane == 0) {
+                mine[g * RSTRIDE + D] = m[rr][g];
+                mine[g * RSTRIDE + D + 1] = l[rr][g];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_r) {
+            const threadgroup float* red = red_smem + (size_t)(part * NSG * HPT) * RSTRIDE;
+            for (int g = state; g < HPT; g += NSG) {
+                float pm = -FLT_MAX;
+                for (int s = 0; s < NSG; s++) {
+                    pm = max(pm, red[(size_t)(s * HPT + g) * RSTRIDE + D]);
+                }
+                float pl = 0.0f;
+                for (int s = 0; s < NSG; s++) {
+                    const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
+                    const float ls = red[(size_t)(s * HPT + g) * RSTRIDE + D + 1];
+                    pl += ls * exp2(ms - pm);
+                }
+                threadgroup float* prow = part_smem + (size_t)(part * HPT + g) * RSTRIDE;
+                for (int e = (int)lane; e < D; e += 32) {
+                    float v = 0.0f;
+                    for (int s = 0; s < NSG; s++) {
+                        const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
+                        v += red[(size_t)(s * HPT + g) * RSTRIDE + e] * exp2(ms - pm);
+                    }
+                    prow[e] = v;
+                }
+                if (lane == 0) {
+                    prow[D] = pm;
+                    prow[D + 1] = pl;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0) {
+            for (int g = state; g < HPT; g += NSG) {
+                float gm = -FLT_MAX;
+                for (int p = 0; p < parts; p++) {
+                    gm = max(gm, part_smem[(size_t)(p * HPT + g) * RSTRIDE + D]);
+                }
+                float gl = 0.0f;
+                float gacc[EPT];
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    gacc[e] = 0.0f;
+                }
+                for (int p = 0; p < parts; p++) {
+                    const threadgroup float* pp = part_smem + (size_t)(p * HPT + g) * RSTRIDE;
+                    const float ms = pp[D];
+                    const float ls = pp[D + 1];
+                    const float w = exp2(ms - gm);
+                    gl += ls * w;
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        gacc[e] += pp[lane * EPT + e] * w;
+                    }
+                }
+                const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+                const size_t row_off =
+                    ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+                device T* orow = out + row_off;
+                if (HAS_GATE) {
+                    const device T* grow = gate + row_off;
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        const T v = T(gacc[e] * inv);
+                        orow[lane * EPT + e] = v * cbv2_paged_sigmoid(grow[lane * EPT + e]);
+                    }
+                } else {
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        orow[lane * EPT + e] = T(gacc[e] * inv);
+                    }
+                }
+            }
+        }
+        if (rr + 1 < rcount) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }

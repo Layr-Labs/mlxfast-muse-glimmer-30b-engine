@@ -2030,6 +2030,111 @@ extension PagedLayerCache: KVCache {
 /// paged bank takes the rectangular verification path instead of the
 /// `preconditionFailure` the engine used to hit on any cache that is not the
 /// `final` `CBv2LayerCache`. See `PagedSeamContract.swift`.
+/// Opt-in verify-attention seam that fuses `output * sigmoid(gate)` into the
+/// one-pass paged attention epilogue and returns `[B, L, H * D]` contiguous
+/// directly. Returns nil before performing any KV write when ineligible, so
+/// callers fall back cleanly to `updateAndAttend` + separate gating.
+public protocol CBv2GatedAttendingLayerCache: CBv2AttendingLayerCache {
+    func updateAndAttendGated(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        gate: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray?
+}
+
+extension PagedLayerCache: CBv2GatedAttendingLayerCache {
+    /// Maximum verify span (`L`) routed through fused gated one-pass attention.
+    /// Defaults to 5 so short low-acceptance verify windows (`L = 2...5`) fuse
+    /// the sigmoid gate and share KV loads across rows without altering the
+    /// full-window (`L = 6...8`) verify schedule.
+    private static let maxGatedVerifySpan: Int = {
+        let upper = CBv2PagedSpeculation.maxSpeculativeSpan
+        if let raw = ProcessInfo.processInfo.environment["MUSE_PAGED_ONEPASS_GATE_MAX_ROWS"],
+            let value = Int(raw)
+        {
+            return min(max(value, 2), upper)
+        }
+        return min(5, upper)
+    }()
+
+    public func updateAndAttendGated(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        gate: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        guard PagedOnePassAttention.gatedEnabled, !PagedOnePassAttention.checks,
+            mtpSerializesRectangularAttention, mtpBatchesRectangularColumnsAsRows,
+            !usesGatheredNativeDecode, !segmentDecodeReference,
+            sinks == nil, !pool.usesStepOwnedAttention, !pool.writeValidation.isFaulted,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            boundSpanContext == nil, attentionMetadata == nil, attentionPacket == nil,
+            kind.sharesKVWithLayer == nil,
+            queries.ndim == 4
+        else { return nil }
+        let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+        guard (2 ... Self.maxGatedVerifySpan).contains(l),
+            b == pagedRows.count, !pagedRows.isEmpty,
+            keys.dim(0) == b, keys.dim(2) == l, values.shape == keys.shape,
+            gate.shape == [b, l, qh * d]
+        else { return nil }
+        let group = pool.group(pagedRows[0].groupKey)
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil,
+            queries.dtype == group.dtype, keys.dtype == group.dtype,
+            values.dtype == group.dtype, gate.dtype == group.dtype,
+            pagedRows.allSatisfy({ row in
+                row.groupKey == pagedRows[0].groupKey && !row.isReleased
+                    && row.absoluteOffset >= row.frozenHighWater
+                    && row.absoluteOffset + l <= row.maxLength
+                    && (row.windowSize == nil
+                        || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
+            })
+        else { return nil }
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: l, layerIndex: layerIndex),
+            validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: nil),
+            beginAttentionWork(queries: queries, rows: pagedRows)
+        else { return nil }
+        defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
+
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        for (index, row) in pagedRows.enumerated() {
+            row.write(keys: keys[index], values: values[index])
+        }
+        guard !pool.writeValidation.isFaulted else {
+            advancePositionOffsets(by: l)
+            return finishAttentionCall(
+                faultOutput(queries).transposed(0, 2, 1, 3).reshaped(b, l, -1))
+        }
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(b * l)
+        for row in pagedRows {
+            for t in 0 ..< l {
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        }
+        let gateFlat = gate.reshaped(b * l, qh, d)
+        let result = PagedSegmentAttention.decodeGated(
+            queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
+            gate: gateFlat, group: group, rows: descriptors,
+            params: params(scale: scale), softcap: attentionSoftcap != nil,
+            source: pool.kernelSource, dispatchCache: segmentDispatchCache,
+            seqinfoCache: pool.segmentSeqinfo, mergeScratch: columnsAsRowsScratch)
+        mtpColumnsAsRowsCalls += 1
+        advancePositionOffsets(by: l)
+        return finishAttentionCall(result.reshaped(b, l, qh * d))
+    }
+}
+
 extension PagedLayerCache: CBv2Qwen4GatheredCache {
     public var qwen4HasWriteFault: Bool { pool.writeValidation.isFaulted }
     public func qwen4ValidateProjectedKV(keys: MLXArray, values: MLXArray) -> Bool {

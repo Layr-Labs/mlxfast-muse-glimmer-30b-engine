@@ -183,6 +183,23 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
         contextKeyEpilogue = ContextKeyEpilogue(model)
+        blockQKEpilogue = BlockQKEpilogue(model).flatMap {
+            Self.verifyBlockQKEpilogue(
+                $0, model: model, draftCount: settings.maximumDraftTokens) ? $0 : nil
+        }
+        addRMSNormEpilogue = AddRMSNormEpilogue(model).flatMap {
+            Self.verifyAddRMSNormEpilogue(
+                $0, model: model, draftCount: settings.maximumDraftTokens) ? $0 : nil
+        }
+        if let textTarget = target as? MuseGlimmerTextModel,
+            model.activationDType == .bfloat16
+        {
+            readoutExpTable = Self.buildAndVerifyReadoutExpTable(
+                outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+        } else {
+            readoutExpTable = nil
+        }
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -190,11 +207,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             {
                 let dummyLogits = MLXArray.zeros(
                     [1, target.dflashVocabularySize], dtype: .bfloat16)
-                let (t, conf) = Self.fusedArgMaxAndConfidence(
-                    dummyLogits,
-                    outputMultiplier: textTarget.configuration.outputMultiplier,
-                    softcap: textTarget.configuration.finalLogitSoftcapping)
-                warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                if let expTable = readoutExpTable {
+                    let (t, conf) = Self.fusedArgMaxAndConfidenceLUT(
+                        dummyLogits, expTable: expTable)
+                    warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                } else {
+                    let (t, conf) = Self.fusedArgMaxAndConfidence(
+                        dummyLogits,
+                        outputMultiplier: textTarget.configuration.outputMultiplier,
+                        softcap: textTarget.configuration.finalLogitSoftcapping)
+                    warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                }
             }
             if let epilogue = contextKeyEpilogue {
                 let key = MLXArray.zeros([1, c.kvHeads * c.headDimensions], dtype: .bfloat16)
@@ -592,6 +615,362 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     }
 
     private let contextKeyEpilogue: ContextKeyEpilogue?
+    private let blockQKEpilogue: BlockQKEpilogue?
+    private let addRMSNormEpilogue: AddRMSNormEpilogue?
+    private let readoutExpTable: MLXArray?
+
+    private static let addRMSNormKernel = MLXFast.metalKernel(
+        name: "dflash_add_rmsnorm",
+        inputNames: ["res", "delta", "w", "params"],
+        outputNames: ["sum_out", "norm_out"],
+        source: """
+            constexpr uint NR = 4u;
+            constexpr uint D = uint(D_);
+            constexpr uint MAX_ITERS = uint(MAX_ITERS_);
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lsize = threads_per_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+
+            const device bfloat16_t* rp = res + size_t(row) * D + lid * NR;
+            const device bfloat16_t* dp = delta + size_t(row) * D + lid * NR;
+            const device bfloat16_t* wp = w + lid * NR;
+            device bfloat16_t* sp = sum_out + size_t(row) * D + lid * NR;
+            device bfloat16_t* np = norm_out + size_t(row) * D + lid * NR;
+
+            float vals[MAX_ITERS * NR];
+            float acc = 0.0f;
+            for (uint iter = 0; iter < MAX_ITERS; ++iter) {
+                const uint r = iter * lsize * NR;
+                const uint base = r + lid * NR;
+                if (base + NR <= D) {
+                    for (uint i = 0; i < NR; ++i) {
+                        const bfloat16_t hb = rp[r + i] + dp[r + i];
+                        if (WRITE_SUM_) { sp[r + i] = hb; }
+                        const float xi = float(hb);
+                        vals[iter * NR + i] = xi;
+                        acc += xi * xi;
+                    }
+                } else {
+                    for (uint i = 0; i < NR; ++i) {
+                        if (base + i < D) {
+                            const bfloat16_t hb = rp[r + i] + dp[r + i];
+                            if (WRITE_SUM_) { sp[r + i] = hb; }
+                            const float xi = float(hb);
+                            vals[iter * NR + i] = xi;
+                            acc += xi * xi;
+                        }
+                    }
+                }
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) {
+                local_sums[lane] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                local_sums[sg] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                acc = simd_sum(local_sums[lane]);
+                if (lane == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / float(D) + params[0]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv_mean[0];
+            for (uint iter = 0; iter < MAX_ITERS; ++iter) {
+                const uint r = iter * lsize * NR;
+                const uint base = r + lid * NR;
+                if (base + NR <= D) {
+                    for (uint i = 0; i < NR; ++i) {
+                        np[r + i] = wp[r + i] * static_cast<bfloat16_t>(vals[iter * NR + i] * inv);
+                    }
+                } else {
+                    for (uint i = 0; i < NR; ++i) {
+                        if (base + i < D) {
+                            np[r + i] = wp[r + i] * static_cast<bfloat16_t>(vals[iter * NR + i] * inv);
+                        }
+                    }
+                }
+            }
+            """)
+
+    private struct AddRMSNormEpilogue {
+        let hiddenSize: Int
+        let threadgroupSize: Int
+        let maxIters: Int
+        let eps: MLXArray
+
+        init?(_ model: MuseGlimmerDFlashDraftModel) {
+            guard ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_ADD_NORM"] != "0" else {
+                return nil
+            }
+            let c = model.configuration
+            guard !model.layers.isEmpty, c.hiddenSize > 0,
+                model.activationDType == .bfloat16, Device.defaultDevice().deviceType == .gpu
+            else { return nil }
+            let tg = min(1024, ((c.hiddenSize + 3) / 4 + 31) / 32 * 32)
+            let iters = (c.hiddenSize + tg * 4 - 1) / (tg * 4)
+            guard tg >= 32, (1 ... 8).contains(iters) else { return nil }
+            guard model.norm.weight.dtype == .bfloat16, model.norm.weight.shape == [c.hiddenSize],
+                model.norm.eps == c.rmsNormEps
+            else { return nil }
+            for layer in model.layers {
+                guard layer.inputNorm.weight.dtype == .bfloat16,
+                    layer.inputNorm.weight.shape == [c.hiddenSize],
+                    layer.inputNorm.eps == c.rmsNormEps,
+                    layer.postAttentionNorm.weight.dtype == .bfloat16,
+                    layer.postAttentionNorm.weight.shape == [c.hiddenSize],
+                    layer.postAttentionNorm.eps == c.rmsNormEps
+                else { return nil }
+            }
+            self.hiddenSize = c.hiddenSize
+            self.threadgroupSize = tg
+            self.maxIters = iters
+            self.eps = MLXArray([c.rmsNormEps])
+        }
+
+        func applyAddAndNorm(
+            residual: MLXArray, delta: MLXArray, weight: MLXArray, rows: Int
+        ) -> (sum: MLXArray, norm: MLXArray) {
+            let out = MuseGlimmerDFlashDrafter.addRMSNormKernel(
+                [residual, delta, weight, eps],
+                template: [("D_", hiddenSize), ("MAX_ITERS_", maxIters), ("WRITE_SUM_", 1)],
+                grid: (threadgroupSize, rows, 1),
+                threadGroup: (threadgroupSize, 1, 1),
+                outputShapes: [[1, rows, hiddenSize], [1, rows, hiddenSize]],
+                outputDTypes: [.bfloat16, .bfloat16])
+            return (out[0], out[1])
+        }
+
+        func applyAddAndNormOnly(
+            residual: MLXArray, delta: MLXArray, weight: MLXArray, rows: Int
+        ) -> MLXArray {
+            let out = MuseGlimmerDFlashDrafter.addRMSNormKernel(
+                [residual, delta, weight, eps],
+                template: [("D_", hiddenSize), ("MAX_ITERS_", maxIters), ("WRITE_SUM_", 0)],
+                grid: (threadgroupSize, rows, 1),
+                threadGroup: (threadgroupSize, 1, 1),
+                outputShapes: [[1], [1, rows, hiddenSize]],
+                outputDTypes: [.bfloat16, .bfloat16])
+            return out[1]
+        }
+    }
+
+    /// One-time 0-ULP parity self-test and warm-up of `AddRMSNormEpilogue` for
+    /// both full-block (`blockSize`) and final-layer (`draftCount`) row counts.
+    private static func verifyAddRMSNormEpilogue(
+        _ epilogue: AddRMSNormEpilogue, model: MuseGlimmerDFlashDraftModel, draftCount: Int
+    ) -> Bool {
+        let c = model.configuration
+        guard let firstLayer = model.layers.first else { return false }
+        let norm = firstLayer.postAttentionNorm
+        return (try? MLX.withError { errors -> Bool in
+            for rows in [c.blockSize, draftCount] {
+                let n = rows * c.hiddenSize
+                let resVals: [Float] = (0 ..< n).map { idx in
+                    Float(((idx * 5 + 1) % 29) - 14) * 0.125
+                }
+                let delVals: [Float] = (0 ..< n).map { idx in
+                    Float(((idx * 7 + 3) % 31) - 15) * 0.125
+                }
+                let res = MLXArray(resVals, [1, rows, c.hiddenSize]).asType(.bfloat16)
+                let delta = MLXArray(delVals, [1, rows, c.hiddenSize]).asType(.bfloat16)
+                let fused = epilogue.applyAddAndNorm(
+                    residual: res, delta: delta, weight: norm.weight, rows: rows)
+                let normOnly = epilogue.applyAddAndNormOnly(
+                    residual: res, delta: delta, weight: norm.weight, rows: rows)
+                let refSum = res + delta
+                let refNorm = norm(refSum)
+                let sumDiff = (
+                    contiguous(fused.sum).view(dtype: .uint16)
+                        .!= contiguous(refSum).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                let normDiff = (
+                    contiguous(fused.norm).view(dtype: .uint16)
+                        .!= contiguous(refNorm).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                let onlyDiff = (
+                    contiguous(normOnly).view(dtype: .uint16)
+                        .!= contiguous(refNorm).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                eval(sumDiff, normDiff, onlyDiff)
+                try errors.check()
+                guard sumDiff.item(Int.self) == 0 && normDiff.item(Int.self) == 0
+                    && onlyDiff.item(Int.self) == 0
+                else {
+                    return false
+                }
+            }
+            return true
+        }) ?? false
+    }
+
+    private static let blockQKKernel = MLXFast.metalKernel(
+        name: "dflash_block_qk_rope",
+        inputNames: ["q_in", "k_in", "qw", "kw", "dims", "params"],
+        outputNames: ["q_out", "k_out"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = threadgroup_position_in_grid.y;
+            const uint q_rows = uint(dims[0]);
+            const uint k_rows = uint(dims[1]);
+            const uint q_total = uint(QH_) * q_rows;
+            const bool is_q = group < q_total;
+            const uint local_group = is_q ? group : (group - q_total);
+            const uint rows = is_q ? q_rows : k_rows;
+            const uint heads = is_q ? uint(QH_) : uint(KVH_);
+            const uint row = local_group % rows;
+            const uint head = local_group / rows;
+            const device bfloat16_t* src = (is_q ? q_in : k_in)
+                + (size_t(row) * heads + head) * 128 + lane * 4;
+            const device bfloat16_t* weight = (is_q ? qw : kw) + lane * 4;
+            device bfloat16_t* dst = (is_q ? q_out : k_out)
+                + size_t(local_group) * 128 + lane * 4;
+
+            // Match rms_single_row: four adjacent channels per lane, then two SIMD sums.
+            float x[4];
+            float sum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = src[i];
+                sum += x[i] * x[i];
+            }
+            sum = simd_sum(sum);
+            sum = simd_sum(lane == 0 ? sum : 0.0f);
+            const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
+            const bool low = lane < 16;
+            const float pos = float((is_q ? dims[2] : dims[3]) + int(row));
+            for (uint i = 0; i < 4; ++i) {
+                const bfloat16_t norm = weight[i] * static_cast<bfloat16_t>(x[i] * inv);
+                const float v = static_cast<float>(norm);
+                const float other = simd_shuffle_xor(v, ushort(16));
+                const float d = float((lane % 16) * 4 + i) / 64.0f;
+                const float theta = pos * metal::exp2(-d * params[1]);
+                const float c = metal::fast::cos(theta);
+                const float s = metal::fast::sin(theta);
+                const float x1 = low ? v : other;
+                const float x2 = low ? other : v;
+                dst[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+            }
+            """)
+
+    private struct BlockQKEpilogue {
+        let attentionHeads: Int
+        let kvHeads: Int
+        let qWeights: [MLXArray]
+        let kWeights: [MLXArray]
+        let coefficients: MLXArray
+
+        init?(_ model: MuseGlimmerDFlashDraftModel) {
+            guard ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_BLOCK_QK"] != "0" else {
+                return nil
+            }
+            let c = model.configuration
+            guard !model.layers.isEmpty, c.headDimensions == 128,
+                model.activationDType == .bfloat16, Device.defaultDevice().deviceType == .gpu
+            else { return nil }
+            var qWeights: [MLXArray] = []
+            var kWeights: [MLXArray] = []
+            qWeights.reserveCapacity(model.layers.count)
+            kWeights.reserveCapacity(model.layers.count)
+            for layer in model.layers {
+                let qn = layer.attention.qNorm
+                let kn = layer.attention.kNorm
+                guard qn.weight.dtype == .bfloat16, qn.weight.shape == [128],
+                    qn.eps == c.rmsNormEps,
+                    kn.weight.dtype == .bfloat16, kn.weight.shape == [128],
+                    kn.eps == c.rmsNormEps
+                else { return nil }
+                qWeights.append(qn.weight)
+                kWeights.append(kn.weight)
+            }
+            self.attentionHeads = c.attentionHeads
+            self.kvHeads = c.kvHeads
+            self.qWeights = qWeights
+            self.kWeights = kWeights
+            self.coefficients = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+        }
+
+        func apply(
+            layer: Int, queries: MLXArray, keys: MLXArray,
+            qRows: Int, kRows: Int, qOffset: Int, kOffset: Int
+        ) -> (queries: MLXArray, keys: MLXArray) {
+            let dims = MLXArray([Int32(qRows), Int32(kRows), Int32(qOffset), Int32(kOffset)])
+            let out = MuseGlimmerDFlashDrafter.blockQKKernel(
+                [queries, keys, qWeights[layer], kWeights[layer], dims, coefficients],
+                template: [("QH_", attentionHeads), ("KVH_", kvHeads)],
+                grid: (32, attentionHeads * qRows + kvHeads * kRows, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1, attentionHeads, qRows, 128], [1, kvHeads, kRows, 128]],
+                outputDTypes: [.bfloat16, .bfloat16])
+            return (out[0], out[1])
+        }
+    }
+
+    /// One-time 0-ULP parity self-test and warm-up of `BlockQKEpilogue` for
+    /// both full-block (`block x block`) and final-layer (`draftCount x block`)
+    /// shapes. Guarded with `MLX.withError` so any Metal JIT/runtime error
+    /// falls back cleanly to stock without aborting drafter initialization.
+    private static func verifyBlockQKEpilogue(
+        _ epilogue: BlockQKEpilogue, model: MuseGlimmerDFlashDraftModel, draftCount: Int
+    ) -> Bool {
+        let c = model.configuration
+        guard let firstLayer = model.layers.first else { return false }
+        let attention = firstLayer.attention
+        let cases: [(qRows: Int, kRows: Int, qOffset: Int, kOffset: Int)] = [
+            (c.blockSize, c.blockSize, 137, 137),
+            (draftCount, c.blockSize, 138, 137),
+        ]
+        return (try? MLX.withError { errors -> Bool in
+            for tc in cases {
+                let qVals: [Float] = (0 ..< (tc.qRows * c.attentionHeads * c.headDimensions)).map { idx in
+                    Float(((idx * 5 + 3) % 29) - 14) * 0.125
+                }
+                let kVals: [Float] = (0 ..< (tc.kRows * c.kvHeads * c.headDimensions)).map { idx in
+                    Float(((idx * 7 + 5) % 31) - 15) * 0.125
+                }
+                let qRaw = MLXArray(qVals, [1, tc.qRows, c.attentionHeads * c.headDimensions])
+                    .asType(.bfloat16)
+                let kRaw = MLXArray(kVals, [1, tc.kRows, c.kvHeads * c.headDimensions])
+                    .asType(.bfloat16)
+                let fused = epilogue.apply(
+                    layer: 0, queries: qRaw, keys: kRaw,
+                    qRows: tc.qRows, kRows: tc.kRows, qOffset: tc.qOffset, kOffset: tc.kOffset)
+                let refQ = MLXFast.RoPE(
+                    attention.qNorm(
+                        qRaw.reshaped([1, tc.qRows, c.attentionHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: tc.qOffset)
+                let refK = MLXFast.RoPE(
+                    attention.kNorm(
+                        kRaw.reshaped([1, tc.kRows, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: tc.kOffset)
+                let qDiff = (
+                    contiguous(fused.queries).view(dtype: .uint16)
+                        .!= contiguous(refQ).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                let kDiff = (
+                    contiguous(fused.keys).view(dtype: .uint16)
+                        .!= contiguous(refK).view(dtype: .uint16)
+                ).asType(.int32).sum()
+                eval(qDiff, kDiff)
+                try errors.check()
+                guard qDiff.item(Int.self) == 0 && kDiff.item(Int.self) == 0 else {
+                    return false
+                }
+            }
+            return true
+        }) ?? false
+    }
 
     private static let contextKeysKernel = MLXFast.metalKernel(
         name: "dflash_context_keys",
@@ -836,10 +1215,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let memo: (tokens: MLXArray, hidden: MLXArray)
         let confidence: MLXArray
         if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
-            let (tokens, conf) = Self.fusedArgMaxAndConfidence(
-                logits,
-                outputMultiplier: textTarget.configuration.outputMultiplier,
-                softcap: textTarget.configuration.finalLogitSoftcapping)
+            let (tokens, conf): (MLXArray, MLXArray)
+            if let expTable = readoutExpTable {
+                (tokens, conf) = Self.fusedArgMaxAndConfidenceLUT(logits, expTable: expTable)
+            } else {
+                (tokens, conf) = Self.fusedArgMaxAndConfidence(
+                    logits,
+                    outputMultiplier: textTarget.configuration.outputMultiplier,
+                    softcap: textTarget.configuration.finalLogitSoftcapping)
+            }
             memo = (tokens: tokens, hidden: rows)
             confidence = conf
         } else {
@@ -1048,61 +1432,134 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ? embeddings : embeddings.asType(model.activationDType)
         var hidden = act.reshaped([1, block, c.hiddenSize])
         let lastIndex = model.layers.count - 1
+        guard let firstLayer = model.layers.first else {
+            return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
+        }
+        let canFuseQK = blockQKEpilogue != nil && position >= 0
+            && position <= Int(Int32.max) - max(block, draftCount + 1)
+        var x = firstLayer.inputNorm(hidden)
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
-            let x = layer.inputNorm(hidden)
-            var keys = MLXFast.RoPE(
-                attention.kNorm(
-                    attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+            let kRaw = attention.kProj(x)
             var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
                 .transposed(0, 2, 1, 3)
+            if index == lastIndex {
+                let active = 1 ..< (1 + draftCount)
+                let xActive = x[0..., active, 0...]
+                let qRaw = attention.qProj(xActive)
+                let queries: MLXArray
+                var keys: MLXArray
+                if canFuseQK, let epilogue = blockQKEpilogue,
+                    qRaw.dtype == .bfloat16, kRaw.dtype == .bfloat16
+                {
+                    (queries, keys) = epilogue.apply(
+                        layer: index, queries: qRaw, keys: kRaw,
+                        qRows: draftCount, kRows: block,
+                        qOffset: position + 1, kOffset: position)
+                } else {
+                    queries = MLXFast.RoPE(
+                        attention.qNorm(
+                            qRaw.reshaped([
+                                1, draftCount, c.attentionHeads, c.headDimensions,
+                            ]).transposed(0, 2, 1, 3)),
+                        dimensions: c.headDimensions, traditional: false,
+                        base: c.ropeTheta, scale: 1, offset: position + 1)
+                    keys = MLXFast.RoPE(
+                        attention.kNorm(
+                            kRaw.reshaped([1, block, c.kvHeads, c.headDimensions])
+                                .transposed(0, 2, 1, 3)),
+                        dimensions: c.headDimensions, traditional: false,
+                        base: c.ropeTheta, scale: 1, offset: position)
+                }
+                if let context {
+                    keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                    values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+                }
+                let activeMask = mask.map { $0[active, 0...] }
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
+                let oOut = attention.oProj(
+                    attended.transposed(0, 2, 1, 3).reshaped([
+                        1, draftCount, c.attentionHeads * c.headDimensions,
+                    ]))
+                let hBase = hidden[0..., active, 0...]
+                let h: MLXArray
+                let mx: MLXArray
+                if let addNorm = addRMSNormEpilogue,
+                    hBase.dtype == .bfloat16, oOut.dtype == .bfloat16
+                {
+                    (h, mx) = addNorm.applyAddAndNorm(
+                        residual: hBase, delta: oOut,
+                        weight: layer.postAttentionNorm.weight, rows: draftCount)
+                } else {
+                    h = hBase + oOut
+                    mx = layer.postAttentionNorm(h)
+                }
+                let mlpOut = draftMLP(index, layer.mlp, mx)
+                if let addNorm = addRMSNormEpilogue,
+                    h.dtype == .bfloat16, mlpOut.dtype == .bfloat16
+                {
+                    return addNorm.applyAddAndNormOnly(
+                        residual: h, delta: mlpOut, weight: model.norm.weight, rows: draftCount
+                    ).reshaped([draftCount, c.hiddenSize])
+                }
+                return model.norm(h + mlpOut).reshaped([draftCount, c.hiddenSize])
+            }
+            let qRaw = attention.qProj(x)
+            let queries: MLXArray
+            var keys: MLXArray
+            if canFuseQK, let epilogue = blockQKEpilogue,
+                qRaw.dtype == .bfloat16, kRaw.dtype == .bfloat16
+            {
+                (queries, keys) = epilogue.apply(
+                    layer: index, queries: qRaw, keys: kRaw,
+                    qRows: block, kRows: block, qOffset: position, kOffset: position)
+            } else {
+                queries = MLXFast.RoPE(
+                    attention.qNorm(
+                        qRaw.reshaped([1, block, c.attentionHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+                keys = MLXFast.RoPE(
+                    attention.kNorm(
+                        kRaw.reshaped([1, block, c.kvHeads, c.headDimensions])
+                            .transposed(0, 2, 1, 3)),
+                    dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: position)
+            }
             if let context {
                 keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
                 values = concatenated([context.values[index ..< index + 1], values], axis: 2)
             }
-            if index == lastIndex {
-                let active = 1 ..< (1 + draftCount)
-                let xActive = x[0..., active, 0...]
-                let queries = MLXFast.RoPE(
-                    attention.qNorm(
-                        attention.qProj(xActive).reshaped([
-                            1, draftCount, c.attentionHeads, c.headDimensions,
-                        ]).transposed(0, 2, 1, 3)),
-                    dimensions: c.headDimensions, traditional: false,
-                    base: c.ropeTheta, scale: 1, offset: position + 1)
-                let activeMask = mask.map { $0[active, 0...] }
-                let attended = MLXFast.scaledDotProductAttention(
-                    queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
-                var h = hidden[0..., active, 0...]
-                    + attention.oProj(
-                        attended.transposed(0, 2, 1, 3).reshaped([
-                            1, draftCount, c.attentionHeads * c.headDimensions,
-                        ]))
-                let mx = layer.postAttentionNorm(h)
-                h = h + draftMLP(index, layer.mlp, mx)
-                return model.norm(h).reshaped([draftCount, c.hiddenSize])
-            }
-            let queries = MLXFast.RoPE(
-                attention.qNorm(
-                    attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
             let attended = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-            hidden =
-                hidden
-                + attention.oProj(
-                    attended.transposed(0, 2, 1, 3).reshaped([
-                        1, block, c.attentionHeads * c.headDimensions,
-                    ]))
-            let mx = layer.postAttentionNorm(hidden)
-            hidden =
-                hidden
-                + draftMLP(index, layer.mlp, mx)
+            let oOut = attention.oProj(
+                attended.transposed(0, 2, 1, 3).reshaped([
+                    1, block, c.attentionHeads * c.headDimensions,
+                ]))
+            let mx: MLXArray
+            if let addNorm = addRMSNormEpilogue,
+                hidden.dtype == .bfloat16, oOut.dtype == .bfloat16
+            {
+                (hidden, mx) = addNorm.applyAddAndNorm(
+                    residual: hidden, delta: oOut,
+                    weight: layer.postAttentionNorm.weight, rows: block)
+            } else {
+                hidden = hidden + oOut
+                mx = layer.postAttentionNorm(hidden)
+            }
+            let mlpOut = draftMLP(index, layer.mlp, mx)
+            if let addNorm = addRMSNormEpilogue,
+                hidden.dtype == .bfloat16, mlpOut.dtype == .bfloat16
+            {
+                (hidden, x) = addNorm.applyAddAndNorm(
+                    residual: hidden, delta: mlpOut,
+                    weight: model.layers[index + 1].inputNorm.weight, rows: block)
+            } else {
+                hidden = hidden + mlpOut
+                x = model.layers[index + 1].inputNorm(hidden)
+            }
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
@@ -1247,6 +1704,218 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               }
             }
             """)
+
+    private static let buildReadoutExpTableKernel = MLXFast.metalKernel(
+        name: "dflash_build_readout_exp_table",
+        inputNames: ["params"],
+        outputNames: ["exp_table"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const bfloat16_t b_mult = bfloat16_t(params[0]);
+            const bfloat16_t b_cap = bfloat16_t(params[1]);
+            const bfloat16_t raw_bf = as_type<bfloat16_t>(ushort(idx));
+            bfloat16_t s_bf = raw_bf * b_mult;
+            if (params[1] > 0.0f) {
+              s_bf = bfloat16_t(metal::precise::tanh(float(s_bf / b_cap))) * b_cap;
+            }
+            exp_table[idx] = metal::exp(float(s_bf));
+            """)
+
+    private static let argMaxConfLUTStage1 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_lut_s1",
+        inputNames: ["logits", "exp_table"],
+        outputNames: ["p_raw", "p_idx", "p_sum"],
+        source: """
+            constexpr uint CHUNKS = 64u;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint chunk_size = (vocab + CHUNKS - 1u) / CHUNKS;
+            const uint start = chunk * chunk_size;
+            const uint end = min(vocab, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + ulong(row) * ulong(vocab);
+
+            float best_raw = -INFINITY;
+            int best_idx = int(vocab);
+            float sum_exp = 0.0f;
+
+            const uint start4 = (start + 3u) & ~3u;
+            const uint end4 = end & ~3u;
+            if (lid == 0) {
+              for (uint i = start; i < min(start4, end); i++) {
+                const bfloat16_t raw_bf = row_ptr[i];
+                const float v = float(raw_bf);
+                if (v > best_raw || (v == best_raw && int(i) < best_idx)) {
+                  best_raw = v;
+                  best_idx = int(i);
+                }
+                sum_exp += exp_table[as_type<ushort>(raw_bf)];
+              }
+            }
+            if (end4 > start4) {
+              const device vec<bfloat16_t, 4>* src4 =
+                  (const device vec<bfloat16_t, 4>*)(row_ptr + start4);
+              const uint count4 = (end4 - start4) >> 2;
+              for (uint j = lid; j < count4; j += 256u) {
+                const vec<bfloat16_t, 4> vv = src4[j];
+                const uint base_i = start4 + (j << 2);
+                #pragma unroll
+                for (uint k = 0; k < 4; k++) {
+                  const bfloat16_t raw_bf = vv[k];
+                  const float v = float(raw_bf);
+                  const int idx = int(base_i + k);
+                  if (v > best_raw || (v == best_raw && idx < best_idx)) {
+                    best_raw = v;
+                    best_idx = idx;
+                  }
+                  sum_exp += exp_table[as_type<ushort>(raw_bf)];
+                }
+              }
+            }
+            if (lid == 0) {
+              const uint tail_start = max(start4, end4);
+              for (uint i = tail_start; i < end; i++) {
+                const bfloat16_t raw_bf = row_ptr[i];
+                const float v = float(raw_bf);
+                if (v > best_raw || (v == best_raw && int(i) < best_idx)) {
+                  best_raw = v;
+                  best_idx = int(i);
+                }
+                sum_exp += exp_table[as_type<ushort>(raw_bf)];
+              }
+            }
+
+            const float sg_raw = simd_max(best_raw);
+            const int sg_idx = simd_min((best_raw == sg_raw) ? best_idx : int(vocab));
+            const float sg_sum = simd_sum(sum_exp);
+            threadgroup float sh_raw[8];
+            threadgroup int sh_idx[8];
+            threadgroup float sh_sum[8];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw;
+              sh_idx[sg] = sg_idx;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float v_raw = (lane < 8) ? sh_raw[lane] : -INFINITY;
+              const int v_idx = (lane < 8) ? sh_idx[lane] : int(vocab);
+              const float v_sum = (lane < 8) ? sh_sum[lane] : 0.0f;
+              const float tg_raw = simd_max(v_raw);
+              const int tg_idx = simd_min((v_raw == tg_raw) ? v_idx : int(vocab));
+              const float tg_sum = simd_sum(v_sum);
+              if (lane == 0) {
+                const uint out_i = row * CHUNKS + chunk;
+                p_raw[out_i] = tg_raw;
+                p_idx[out_i] = tg_idx;
+                p_sum[out_i] = tg_sum;
+              }
+            }
+            """)
+
+    private static let argMaxConfLUTStage2 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_lut_s2",
+        inputNames: ["p_raw", "p_idx", "p_sum", "exp_table"],
+        outputNames: ["tokens", "confidence"],
+        source: """
+            constexpr uint CHUNKS = 64u;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint idx = row * CHUNKS + lid;
+
+            const float v_raw = p_raw[idx];
+            const int v_idx = p_idx[idx];
+            const float v_sum = p_sum[idx];
+
+            const float sg_raw = simd_max(v_raw);
+            const int sg_idx = simd_min((v_raw == sg_raw) ? v_idx : int(vocab));
+            const float sg_sum = simd_sum(v_sum);
+
+            threadgroup float sh_raw[2];
+            threadgroup int sh_idx[2];
+            threadgroup float sh_sum[2];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw;
+              sh_idx[sg] = sg_idx;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float f_raw = (lane < 2) ? sh_raw[lane] : -INFINITY;
+              const int f_idx = (lane < 2) ? sh_idx[lane] : int(vocab);
+              const float f_sum = (lane < 2) ? sh_sum[lane] : 0.0f;
+
+              const float row_raw = simd_max(f_raw);
+              const int row_idx = simd_min((f_raw == row_raw) ? f_idx : int(vocab));
+              const float row_sum = simd_sum(f_sum);
+
+              if (lane == 0) {
+                tokens[row] = row_idx;
+                const float best_exp = exp_table[as_type<ushort>(bfloat16_t(row_raw))];
+                confidence[row] = (row_sum > 0.0f) ? (best_exp / row_sum) : 0.0f;
+              }
+            }
+            """)
+
+    private static func fusedArgMaxAndConfidenceLUT(
+        _ logits: MLXArray, expTable: MLXArray
+    ) -> (tokens: MLXArray, confidence: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let partials = argMaxConfLUTStage1(
+            [logits, expTable],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks]],
+            outputDTypes: [.float32, .int32, .float32])
+        let out = argMaxConfLUTStage2(
+            partials + [expTable],
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows]],
+            outputDTypes: [.int32, .float32])
+        return (out[0], out[1])
+    }
+
+    private static func buildAndVerifyReadoutExpTable(
+        outputMultiplier: Float, softcap: Float
+    ) -> MLXArray? {
+        guard ProcessInfo.processInfo.environment["CBV2_DRAFTER_CONF_LUT"] != "0",
+            Device.defaultDevice().deviceType == .gpu,
+            outputMultiplier.isFinite, outputMultiplier > 0,
+            softcap.isFinite, softcap > 0, softcap <= 40.0
+        else { return nil }
+        return (try? MLX.withError { errors -> MLXArray? in
+            let params = MLXArray([outputMultiplier, softcap])
+            let table = buildReadoutExpTableKernel(
+                [params],
+                grid: (65536, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[65536]], outputDTypes: [.float32])[0]
+            let testVocab = 1024
+            let vals: [Float] = (0 ..< (2 * testVocab)).map { idx in
+                Float(((idx * 17 + 5) % 101) - 50) * 0.25
+            }
+            let testLogits = MLXArray(vals, [2, testVocab]).asType(.bfloat16)
+            let lutRes = fusedArgMaxAndConfidenceLUT(testLogits, expTable: table)
+            let refRes = fusedArgMaxAndConfidence(
+                testLogits, outputMultiplier: outputMultiplier, softcap: softcap)
+            let tokDiff = (lutRes.tokens .!= refRes.tokens).asType(.int32).sum()
+            let maxConfDiff = abs(lutRes.confidence - refRes.confidence).max()
+            eval(table, tokDiff, maxConfDiff)
+            try errors.check()
+            guard tokDiff.item(Int.self) == 0,
+                maxConfDiff.item(Float.self) < 1e-4
+            else { return nil }
+            return table
+        }) ?? nil
+    }
 
     private static func fusedArgMaxAndConfidence(
         _ logits: MLXArray, outputMultiplier: Float, softcap: Float
