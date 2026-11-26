@@ -1486,4 +1486,8 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Set by the engine around a low-acceptance request's post-verify
+    /// speculation. A drafter may pick that block's proposals more cheaply;
+    /// it must not change the block's own computation. Never read for target work.
+    nonisolated(unsafe) public static var screenSpeculation = false
 }

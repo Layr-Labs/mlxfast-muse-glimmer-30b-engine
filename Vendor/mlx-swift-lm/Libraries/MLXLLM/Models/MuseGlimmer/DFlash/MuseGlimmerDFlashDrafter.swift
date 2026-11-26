@@ -196,6 +196,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
             }
+            if let head = draftHead, model.activationDType == .bfloat16, Self.headScreenEnabled {
+                let rows = MLXArray.zeros(
+                    [settings.maximumDraftTokens, head.inputDimensions], dtype: .bfloat16)
+                if let screened = screenedProposals(rows) {
+                    warm += [screened.tokens, screened.confidence]
+                }
+            }
             if let epilogue = contextKeyEpilogue {
                 let key = MLXArray.zeros([1, c.kvHeads * c.headDimensions], dtype: .bfloat16)
                 warm.append(epilogue.apply(Array(repeating: key, count: 5), rows: 1, position: 0))
@@ -489,6 +496,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
             draftCount: settings.maximumDraftTokens)
+        if screensHead(selection: s.selection), rows.dim(0) == settings.maximumDraftTokens,
+            let screened = screenedProposals(rows)
+        {
+            s.memo = (screened.tokens, rows)
+            return nil
+        }
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -566,6 +579,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
                 $0[1 ..< (1 + k), 0...]
             }
+        }
+        if states.count == 1, screensHead(selection: states[0].selection),
+            rows[0].dim(0) == k, let screened = screenedProposals(rows[0])
+        {
+            states[0].memo = (screened.tokens, rows[0])
+            states[0].prestarted = true
+            return
         }
         let logits = draftHeadProduct(
             rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
@@ -826,6 +846,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
                 context: (keys[0..., 0..., 0 ..< count, 0...], values[0..., 0..., 0 ..< count, 0...]),
                 mask: mask, draftCount: settings.maximumDraftTokens)
+        }
+        // A low-acceptance request's speculated block takes the same head
+        // screen as its startRound block (proposals only; the block itself is
+        // the pinned MLP's, as before). Any shape mismatch keeps the full head.
+        if Self.headScreenEnabled, CBv2DraftRegime.screenSpeculation,
+            rows.dim(0) == settings.maximumDraftTokens,
+            let screened = screenedProposals(rows)
+        {
+            speculation.memo = (tokens: screened.tokens, hidden: rows)
+            speculation.confidence = screened.confidence
+            s.speculation = speculation
+            return [screened.tokens, rows, projected.keys, projected.values, screened.confidence]
         }
         // startRound's head: the speculated memo must equal the normal one.
         let logits = draftHeadProduct(rows, readout: false)
@@ -1268,6 +1300,157 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputShapes: [[rows], [rows]],
             outputDTypes: [.int32, .float32])
         return (out[0], out[1])
+    }
+
+    // MARK: Head screen (proposals only)
+
+    private static let screenHeader = """
+        constant float FP4[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+        inline float e4m3f(uint8_t b) {
+          uint e = (b >> 3) & 0xF, m = b & 7;
+          float v = e == 0 ? float(m) * 0.001953125f : (1.f + float(m) * 0.125f) * exp2(float(int(e) - 7));
+          return (b & 0x80) ? -v : v;
+        }
+        template <int D_, int NG, int KK>
+        inline void dotgroups(const device uint* w, const device uint8_t* sc, const device bfloat16_t* x, uint lane, thread float* acc) {
+          for (int d = 0; d < D_; d++) acc[d] = 0.f;
+          for (int g = int(lane); g < NG; g += 32) {
+            const float s = e4m3f(sc[g]);
+            const uint w0 = w[2 * g], w1 = w[2 * g + 1];
+            float wv[16];
+            for (int i = 0; i < 8; i++) { wv[i] = FP4[(w0 >> (4 * i)) & 15] * s; wv[8 + i] = FP4[(w1 >> (4 * i)) & 15] * s; }
+            for (int d = 0; d < D_; d++) {
+              const device bfloat16_t* xr = x + d * KK + 16 * g; float t = 0.f;
+              for (int i = 0; i < 16; i++) t += wv[i] * float(xr[i]);
+              acc[d] += t;
+            }
+          }
+        }
+        """
+
+    /// Partial dot over the first `HG_` scale groups for every vocab row.
+    private static let screenPartialKernel = MLXFast.metalKernel(
+        name: "dflash_head_screen",
+        inputNames: ["w", "sc", "x"], outputNames: ["p"],
+        source: """
+            const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+            const uint row0 = (threadgroup_position_in_grid.x * 8 + sg) * RPS;
+            for (uint r = row0; r < min(row0 + RPS, uint(V_)); r++) {
+              float acc[D_];
+              dotgroups<D_, HG_, K_>(w + ulong(r) * KW_, sc + ulong(r) * G_, x, lane, acc);
+              for (int d = 0; d < D_; d++) {
+                float v = simd_sum(acc[d]);
+                if (lane == 0) p[ulong(d) * V_ + r] = v;
+              }
+            }
+            """,
+        header: screenHeader)
+
+    /// Top-2 rows by partial score per 1024-row chunk.
+    private static let screenKeepKernel = MLXFast.metalKernel(
+        name: "dflash_head_keep",
+        inputNames: ["p"], outputNames: ["c"],
+        source: """
+            const uint ch = threadgroup_position_in_grid.x, d = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint b = ch * CH_;
+            float v1 = -INFINITY, v2 = -INFINITY; int i1 = 0, i2 = 0;
+            for (uint j = b + lane; j < min(b + CH_, uint(V_)); j += 32) {
+              float v = p[ulong(d) * V_ + j];
+              if (v > v1) { v2 = v1; i2 = i1; v1 = v; i1 = int(j); }
+              else if (v > v2) { v2 = v; i2 = int(j); }
+            }
+            for (int k = 0; k < 2; k++) {
+              float m = simd_max(v1);
+              int mi = simd_min(v1 == m ? i1 : INT_MAX);
+              if (lane == 0) c[(d * NCH_ + ch) * 2 + k] = mi;
+              if (v1 == m && i1 == mi) { v1 = v2; i1 = i2; v2 = -INFINITY; }
+            }
+            """)
+
+    /// Full-K dot of each kept candidate row (unscaled by `weight_scale_2`).
+    private static let screenRescoreKernel = MLXFast.metalKernel(
+        name: "dflash_head_rescore",
+        inputNames: ["w", "sc", "x", "c"], outputNames: ["o"],
+        source: """
+            const uint q = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            if (q >= uint(D_ * NC_)) return;
+            const uint d = q / NC_;
+            const int r = c[q];
+            float acc[1];
+            dotgroups<1, G_, K_>(w + ulong(r) * KW_, sc + ulong(r) * G_, x + ulong(d) * K_, lane, acc);
+            float v = simd_sum(acc[0]);
+            if (lane == 0) o[q] = v;
+            """,
+        header: screenHeader)
+
+    private static let screenChunk = 1024
+    private static let screenRowsPerSimd = 4
+
+    /// Env gate for the draft-head screen (default on).
+    private static let headScreenEnabled =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_HEAD_SCREEN"] != "0"
+
+    /// Half-K screen, top-2 per chunk, exact full-K rescore of the survivors:
+    /// token ids `[D]` (int32) and an advisory top-1 confidence `[D]` (float32).
+    /// Proposals only; nil falls back to the stock head product.
+    private func screenedProposals(_ rows: MLXArray) -> (tokens: MLXArray, confidence: MLXArray)? {
+        guard let draftHead, rows.dtype == .bfloat16, rows.ndim == 2,
+            rows.dim(1) == draftHead.inputDimensions, draftHead.inputDimensions % 16 == 0,
+            rows.dim(0) >= 1, rows.dim(0) <= CBv2MTPConfig.testedMaxDraftTokens,
+            draftHead.outputDimensions == target.dflashVocabularySize,
+            draftHead.weight.dtype == .uint32, draftHead.weightScale.dtype == .uint8,
+            draftHead.weight.shape == [draftHead.outputDimensions, draftHead.inputDimensions / 8],
+            draftHead.weightScale.shape == [
+                draftHead.outputDimensions, draftHead.inputDimensions / 16,
+            ]
+        else { return nil }
+        let d = rows.dim(0)
+        let v = draftHead.outputDimensions
+        let k = draftHead.inputDimensions
+        let g = k / 16
+        let hg = g / 2
+        let nch = (v + Self.screenChunk - 1) / Self.screenChunk
+        let nc = nch * 2
+        let rps = Self.screenRowsPerSimd
+        let partial = Self.screenPartialKernel(
+            [draftHead.weight, draftHead.weightScale, rows],
+            template: [
+                ("D_", d), ("HG_", hg), ("V_", v), ("K_", k), ("KW_", k / 8), ("G_", g),
+                ("RPS", rps),
+            ],
+            grid: (256 * ((v + 8 * rps - 1) / (8 * rps)), 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[d * v]], outputDTypes: [.float32])[0]
+        let cand = Self.screenKeepKernel(
+            [partial],
+            template: [("V_", v), ("CH_", Self.screenChunk), ("NCH_", nch)],
+            grid: (32 * nch, d, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[d * nc]], outputDTypes: [.int32])[0]
+        let scores = Self.screenRescoreKernel(
+            [draftHead.weight, draftHead.weightScale, rows, cand],
+            template: [("D_", d), ("NC_", nc), ("K_", k), ("KW_", k / 8), ("G_", g)],
+            grid: (256 * ((d * nc + 7) / 8), 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[d * nc]], outputDTypes: [.float32])[0]
+            .reshaped([d, nc])
+        let best = scores.argMax(axis: 1, keepDims: true)
+        let tokens = takeAlong(cand.reshaped([d, nc]), best, axis: 1).squeezed(axis: 1)
+            .asType(.int32)
+        // Advisory confidence over the candidates, after the readout scale.
+        var logits = scores * draftHead.weightScale2
+        if let configuration = (target as? MuseGlimmerTextModel)?.configuration {
+            logits = logits * configuration.outputMultiplier
+            let cap = configuration.finalLogitSoftcapping
+            if cap > 0 { logits = tanh(logits / cap) * cap }
+        }
+        let confidence = (1 / exp(logits - logits.max(axis: 1, keepDims: true)).sum(axis: 1))
+            .asType(.float32)
+        return (tokens, confidence)
+    }
+
+    /// The screen serves only low-acceptance rounds without a coupled selection.
+    private func screensHead(selection: CBv2MTPProposalSelection?) -> Bool {
+        Self.headScreenEnabled && CBv2DraftRegime.lowAcceptance && selection == nil
     }
 
     private static let fastArgMaxStage1 = MLXFast.metalKernel(

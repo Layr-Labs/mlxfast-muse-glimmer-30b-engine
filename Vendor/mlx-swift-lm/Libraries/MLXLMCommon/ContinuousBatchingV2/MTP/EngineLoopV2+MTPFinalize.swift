@@ -774,6 +774,8 @@ extension EngineLoopV2 {
             mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        CBv2DraftRegime.screenSpeculation = mtp.inLowAcceptanceRegime(verify.rows[0].id)
+        defer { CBv2DraftRegime.screenSpeculation = false }
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
             draftsBlock: draftsBlock, requestState: state)
