@@ -1185,6 +1185,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             "rectangular verification needs one row per query batch entry")
         let l = queries.dim(2)
         var outputs: [MLXArray] = []
+        let treeActive = CBv2VerifyTree.active(columns: l) != nil
+        if treeActive, !(mtpBatchesRectangularColumnsAsRows && tableProvider == nil
+            && keys != nil && !usesGatheredNativeDecode)
+        {
+            CBv2VerifyTree.failed = true
+        }
         if usesGatheredNativeDecode {
             if let fused = decodeExactRectangularSDPA(
                 queries: queries, keys: keys, values: values,
@@ -1219,6 +1225,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         {
             return output
         }
+        if treeActive { CBv2VerifyTree.failed = true }
         if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
             let keys, let values
         {
@@ -1297,13 +1304,35 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
         descriptors.reserveCapacity(b * l)
+        // Draft tree: a leaf column skips the chain past its parent, so it
+        // attends the prefix, its parent's chain and itself.
+        let tree = b == 1 ? CBv2VerifyTree.active(columns: l) : nil
+        if tree != nil { CBv2VerifyTree.maskedAttentionCalls += 1 }
         for row in rows {
+            let seedPosition = row.absoluteOffset - l
             for t in 0 ..< l {
+                var info = row.seqInfoRow(
+                    attending: attendRange(row: row, qPosFromEnd: l - 1 - t))
+                if tree != nil, CBv2VerifyTree.deviceTopology != nil {
+                    // GPU-built tree: seqinfo stays the chain's (holes come
+                    // from the device buffer). Any column may be a branch's,
+                    // so the clip check covers every draft column; it is
+                    // monotone in `t`, so it trips exactly when the last
+                    // (branch) column's would.
+                    if t >= 1, info.attendStart > row.baseOffset { CBv2VerifyTree.clipped = true }
+                } else if let tree, let hole = tree.hole(column: t) {
+                    info.holeStart = seedPosition + hole.from
+                    info.holeEnd = seedPosition + hole.to
+                    // A windowed layer that clips the leaf's range would start
+                    // it later than a plain decode at its logical position
+                    // does (the window slides with the storage position), and
+                    // the reduction would differ: this layer is not exact.
+                    if info.attendStart > row.baseOffset { CBv2VerifyTree.failed = true }
+                }
                 descriptors.append(
                     PagedSegmentDispatchPlan.Row(
                         pages: row.table,
-                        info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        info: info,
                         identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
             }
         }
@@ -1315,7 +1344,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            holes: tree != nil,
+            deviceHoles: tree != nil ? CBv2VerifyTree.deviceTopology?.holes : nil)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

@@ -48,6 +48,9 @@ public enum PagedOnePassAttention {
     /// constrained pipeline on every dispatch (host string work per layer);
     /// the two-pass kernels are used instead. Same bytes either way.
     nonisolated(unsafe) private(set) static var threadgroupProbeFailed = false
+    nonisolated(unsafe) private static var treeProbeFailed = false
+    nonisolated(unsafe) private static var treeWarmedClasses = 0
+    nonisolated(unsafe) private static var deviceHolesWarmedClasses = 0
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
@@ -135,18 +138,92 @@ public enum PagedOnePassAttention {
                 kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                 partitionTokens: ptok, softcap: softcap, source: source)
             outputs += [result.fence, result.out]
+            if CBv2VerifyTree.enabled,
+                let treeHpt = eligible(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1,
+                    holes: true)
+            {
+                // The draft-tree variants (branch rows skip a range): holes
+                // from seqinfo, and for GPU-built trees from a separate
+                // seed-relative `[rows, 2]` buffer. They hold more registers
+                // and threadgroup memory than the chain's, so each gets the
+                // same probe: a pipeline that cannot hold the threadgroup
+                // would make MLX re-resolve a constrained one on every dispatch.
+                let deviceHoles = MLXArray.zeros([4, 2], type: Int32.self)
+                var variants: [MLXArray?] = [nil]
+                if CBv2VerifyTree.zeroSync { variants.append(deviceHoles) }
+                var treeHeld = true
+                for variant in variants {
+                    let held =
+                        (try? withError { () -> Bool in
+                            let probed = segments(
+                                queries: q,
+                                backing: [MLXArray](repeating: storage, count: bindings),
+                                seqinfo: seqinfo, params: params, previous: previous,
+                                valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: treeHpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, probe: true, holes: true, deviceHoles: variant)
+                            eval(probed.fence, probed.out)
+                            return true
+                        }) ?? false
+                    if logs {
+                        FileHandle.standardError.write(
+                            Data(
+                                "[onepass] tree threadgroup probe bindings=\(bindings) device=\(variant != nil) held=\(held)\n"
+                                    .utf8))
+                    }
+                    if variant == nil { treeHeld = held }
+                    guard held else { break }
+                    let tree = segments(
+                        queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                        seqinfo: seqinfo, params: params, previous: previous,
+                        valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                        kvHeads: kvHeads, pageSize: pageSize, hpt: treeHpt, simdgroups: nsg,
+                        partitionTokens: ptok, softcap: softcap, source: source, holes: true,
+                        deviceHoles: variant)
+                    outputs += [tree.fence, tree.out]
+                    if variant != nil { deviceHolesWarmedClasses += 1 }
+                }
+                guard treeHeld else {
+                    treeProbeFailed = true
+                    CBv2VerifyTree.disable()
+                    continue
+                }
+                treeWarmedClasses += 1
+            } else if CBv2VerifyTree.enabled {
+                CBv2VerifyTree.disable()
+            }
+        }
+        // A tree window attends through the one-pass kernel only (the
+        // two-pass kernels have no branch variant): ready when every binding
+        // class compiled and held its threadgroup, for contexts the one-pass
+        // kernel covers.
+        if CBv2VerifyTree.enabled, !treeProbeFailed,
+            treeWarmedClasses >= PagedSegmentDispatchPlan.bindingClasses.count
+        {
+            CBv2VerifyTree.setContextLimit(maxPartitions * ptok)
+            // GPU-built trees also need the device-hole variant of every class.
+            CBv2VerifyTree.setZeroSyncReady(
+                deviceHolesWarmedClasses >= PagedSegmentDispatchPlan.bindingClasses.count)
+        } else {
+            CBv2VerifyTree.disable()
         }
         eval(outputs)
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
     /// requested count whose threadgroup memory fits Metal's limit.
-    static func headsPerThreadgroup(headDim: Int, gqa: Int, simdgroups: Int) -> Int? {
+    /// The draft-tree hole variant also holds a K/V copy of its leaf row
+    /// (`2 * headDim` floats); no other variant reserves it.
+    static func headsPerThreadgroup(
+        headDim: Int, gqa: Int, simdgroups: Int, holes: Bool = false
+    ) -> Int? {
         var hpt = min(gqa, requestedHeads)
         while hpt >= 1 {
             let floats =
                 hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                + maxPartitions * hpt * (headDim + 2)
+                + maxPartitions * hpt * (headDim + 2) + (holes ? 2 * headDim : 0)
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -156,12 +233,13 @@ public enum PagedOnePassAttention {
     }
 
     static func eligible(
-        headDim: Int, gqa: Int, simdgroups: Int, partitions: Int, rows: Int
+        headDim: Int, gqa: Int, simdgroups: Int, partitions: Int, rows: Int, holes: Bool = false
     ) -> Int? {
         guard !threadgroupProbeFailed, partitions >= 1, partitions <= maxPartitions,
             rows <= 64, 32 * simdgroups * maxPartitions <= 1024
         else { return nil }
-        return headsPerThreadgroup(headDim: headDim, gqa: gqa, simdgroups: simdgroups)
+        return headsPerThreadgroup(
+            headDim: headDim, gqa: gqa, simdgroups: simdgroups, holes: holes)
     }
 
     private static let scratch = """
@@ -178,14 +256,15 @@ public enum PagedOnePassAttention {
         cbv2::paged_attention_onepass_impl<
             T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP, cbv2::PagedSlabAccessor<T>,
             BLOCK>(
-            q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem, out,
+            q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem,
+            (threadgroup float*)nullptr, out,
             threadgroup_position_in_grid, thread_position_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """
 
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
-    private static func segmentBody(bindings: Int) -> String {
+    private static func segmentBody(bindings: Int, deviceHoles: Bool = false) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
         return """
             const int row = threadgroup_position_in_grid.y;
@@ -203,12 +282,18 @@ public enum PagedOnePassAttention {
                 fence[0] = previous[0] + 1;
             }
             \(scratch)
+            #ifdef CBV2_TREE_HOLES
+            threadgroup float leaf_smem[2 * D];
+            threadgroup float* leaf = leaf_smem;
+            #else
+            threadgroup float* leaf = nullptr;
+            #endif
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
                 cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
-                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, leaf, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
-                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup\(deviceHoles ? ", hole_rel" : ""));
             """
     }
 
@@ -253,6 +338,10 @@ public enum PagedOnePassAttention {
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
+        CBv2KernelLog.observe(
+            kernelName, template: "PTOK\(partitionTokens),HPT\(hpt)",
+            inputs: [queries, kSlab, vSlab, tables, seqinfo, params, writeFence],
+            outputs: [dtype])
         return kernel(
             [queries, kSlab, vSlab, tables, seqinfo, params, writeFence],
             template: [
@@ -270,16 +359,20 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, holes: Bool = false,
+        deviceHoles: MLXArray? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
         let bindings = backing.count
+        // GPU-built tree: holes from `deviceHoles` (seed-relative, >= 8 int32).
+        let holeRel = holes ? deviceHoles : nil
+        let extra = holeRel.map { [$0] } ?? []
         let kernelName =
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                softcap: softcap) + (holes ? (holeRel != nil ? "_dholes" : "_holes") : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -288,15 +381,23 @@ public enum PagedOnePassAttention {
             let made = MLXFast.metalKernel(
                 name: kernelName,
                 inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
-                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
-                outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                    + ["seqinfo", "params", "previous", "value_offsets", "records"]
+                    + (holeRel != nil ? ["hole_rel"] : []),
+                outputNames: ["fence", "out"],
+                source: segmentBody(bindings: bindings, deviceHoles: holeRel != nil),
+                header: (holes ? "#define CBV2_TREE_HOLES 1\n" : "")
+                    + (holeRel != nil ? "#define CBV2_TREE_DEVICE_HOLES 1\n" : "") + source,
+                ensureRowContiguous: true)
             kernels[kernelName] = made
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
+        CBv2KernelLog.observe(
+            kernelName, template: "PTOK\(partitionTokens),HPT\(hpt),probe\(probe)",
+            inputs: [queries] + backing + [seqinfo, params, previous, valueOffsets, records] + extra,
+            outputs: [.int32, dtype])
         let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
+            [queries] + backing + [seqinfo, params, previous, valueOffsets, records] + extra,
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
                 ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),

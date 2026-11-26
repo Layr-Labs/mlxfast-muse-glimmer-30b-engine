@@ -57,7 +57,7 @@ extension MuseGlimmerDFlashTarget {
 /// in that round's pass.
 public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPPostVerifySpeculating,
-    @unchecked Sendable
+    CBv2MTPTreeDrafter, @unchecked Sendable
 {
     /// `startRound` builds the complete block and every later `draftStep`
     /// merely exposes a memo slice.  The proposal token roots the block and
@@ -195,6 +195,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                // Second choices (draft trees): the fused top-two passes.
+                let top = Self.fastArgMaxTopTwo(dummyLogits)
+                let conf2 = Self.fusedArgMaxConfidenceAndSecond(
+                    dummyLogits,
+                    outputMultiplier: textTarget.configuration.outputMultiplier,
+                    softcap: textTarget.configuration.finalLogitSoftcapping)
+                warm += [top.tokens, top.seconds, conf2.tokens, conf2.confidence, conf2.seconds]
+                if CBv2VerifyTree.dynamic {
+                    let four = Self.fusedArgMaxConfidenceAndTopFour(
+                        dummyLogits,
+                        outputMultiplier: textTarget.configuration.outputMultiplier,
+                        softcap: textTarget.configuration.finalLogitSoftcapping)
+                    warm += [four.tokens, four.confidence, four.ids, four.probs]
+                }
             }
             if let epilogue = contextKeyEpilogue {
                 let key = MLXArray.zeros([1, c.kvHeads * c.headDimensions], dtype: .bfloat16)
@@ -250,6 +264,14 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// This round's proposals `[maximumDraftTokens]` and their hidden
         /// rows `[maximumDraftTokens, hiddenSize]`.
         var memo: (tokens: MLXArray, hidden: MLXArray)?
+        /// Each memo row's second-ranked head product id `[rows]` int32
+        /// (draft trees), from the proposals' own argmax pass.
+        var seconds: MLXArray?
+        /// Each memo row's four best ids and softcapped probabilities
+        /// `[rows, 4]` (dynamic draft trees, low-acceptance rounds only).
+        var ranked: (ids: MLXArray, probs: MLXArray)?
+        /// The last round drafted in the low-acceptance regime.
+        var rankedRegime = false
         /// This round's coupled-proposal rule; nil proposes the argmax.
         var selection: CBv2MTPProposalSelection?
         /// `startRounds` already drafted this round's block.
@@ -294,6 +316,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The next block for the all-accepted outcome, when built; dropped
         /// at confirmation for any other outcome.
         var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        var seconds: MLXArray? = nil
+        var ranked: (ids: MLXArray, probs: MLXArray)? = nil
         /// `[maximumDraftTokens]` float32: each block row's top-1
         /// probability under the target's readout, evaluated with the
         /// speculation (`speculatedDraftConfidence`). Set with `memo`.
@@ -493,7 +517,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
-        s.memo = (proposals(logits, selection: s.selection), rows)
+        s.rankedRegime = CBv2DraftRegime.lowAcceptance
+        let proposed = proposalsAndSeconds(
+            logits, selection: s.selection, ranked: s.rankedRegime)
+        s.memo = (proposed.tokens, rows)
+        s.seconds = proposed.seconds
+        s.ranked = proposed.ranked
         return nil
     }
 
@@ -575,10 +604,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return
         }
         for (index, s) in states.enumerated() {
-            s.memo = (
-                proposals(logits[(index * k) ..< ((index + 1) * k), 0...], selection: s.selection),
-                rows[index]
-            )
+            let block = logits[(index * k) ..< ((index + 1) * k), 0...]
+            let proposed = proposalsAndSeconds(block, selection: s.selection)
+            s.memo = (proposed.tokens, rows[index])
+            s.seconds = proposed.seconds
+            s.ranked = nil
             s.prestarted = true
         }
     }
@@ -835,15 +865,33 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         let memo: (tokens: MLXArray, hidden: MLXArray)
         let confidence: MLXArray
+        var seconds: MLXArray? = nil
         if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
-            let (tokens, conf) = Self.fusedArgMaxAndConfidence(
-                logits,
-                outputMultiplier: textTarget.configuration.outputMultiplier,
-                softcap: textTarget.configuration.finalLogitSoftcapping)
-            memo = (tokens: tokens, hidden: rows)
-            confidence = conf
+            let multiplier = textTarget.configuration.outputMultiplier
+            let softcap = textTarget.configuration.finalLogitSoftcapping
+            if Self.wantsRanked(logits, lowAcceptance: s.rankedRegime) {
+                let out = Self.fusedArgMaxConfidenceAndTopFour(
+                    logits, outputMultiplier: multiplier, softcap: softcap)
+                memo = (tokens: out.tokens, hidden: rows)
+                confidence = out.confidence
+                seconds = out.ids[0..., 1]
+                speculation.ranked = (out.ids, out.probs)
+            } else if Self.wantsSeconds(logits) {
+                let out = Self.fusedArgMaxConfidenceAndSecond(
+                    logits, outputMultiplier: multiplier, softcap: softcap)
+                memo = (tokens: out.tokens, hidden: rows)
+                confidence = out.confidence
+                seconds = out.seconds
+            } else {
+                let (tokens, conf) = Self.fusedArgMaxAndConfidence(
+                    logits, outputMultiplier: multiplier, softcap: softcap)
+                memo = (tokens: tokens, hidden: rows)
+                confidence = conf
+            }
         } else {
-            memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+            let proposed = proposalsAndSeconds(logits, selection: nil)
+            memo = (tokens: proposed.tokens, hidden: rows)
+            seconds = proposed.seconds
             // Per-row top-1 probability of the proposal, softmax over the
             // target's readout scale: exp(max - logsumexp). Advisory only: it
             // sizes the next verify window and never changes a proposal.
@@ -851,9 +899,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             confidence = exp(scores.max(axis: -1) - scores.logSumExp(axis: -1))
         }
         speculation.memo = memo
+        speculation.seconds = seconds
         speculation.confidence = confidence
         s.speculation = speculation
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
+            + (speculation.ranked.map { [$0.ids, $0.probs] } ?? [])
     }
 
     /// The confirmed speculation's per-row draft confidence, still lazy (the
@@ -930,6 +980,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         guard let memo else { return .committed }
         s.memo = memo
+        s.seconds = speculation.seconds
+        s.ranked = speculation.ranked
         return .drafted
     }
 
@@ -1389,6 +1441,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let rows = logits.dim(0)
         let vocab = logits.dim(1)
         let chunks = 64
+        CBv2KernelLog.observe(
+            "dflash_fast_argmax", template: "V\(vocab)", inputs: [logits], outputs: [.float32, .int32])
         let partials = fastArgMaxStage1(
             [logits],
             template: [("V_", vocab)],
@@ -1403,18 +1457,685 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputDTypes: [.int32])[0]
     }
 
+    /// `dflash_fast_argmax_s1/s2` tracking the lexicographic top two
+    /// (value descending, id ascending) in the same single pass: the first
+    /// equals `fastArgMax`, the second is the argmax with the first excluded.
+    private static let fastArgMaxTopTwoStage1 = MLXFast.metalKernel(
+        name: "dflash_fast_argmax_top2_s1",
+        inputNames: ["logits"],
+        outputNames: ["p_val", "p_idx", "p_val2", "p_idx2"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint chunk_size = (vocab + CHUNKS - 1) / CHUNKS;
+            const uint start = chunk * chunk_size;
+            const uint end = min(vocab, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + ulong(row) * ulong(vocab);
+
+            float b1 = -INFINITY, b2 = -INFINITY;
+            int i1 = int(vocab), i2 = int(vocab);
+            const uint start4 = (start + 3u) & ~3u;
+            const uint end4 = end & ~3u;
+            if (lid == 0) {
+              for (uint i = start; i < min(start4, end); i++) {
+                const float v = float(row_ptr[i]);
+                if (v > b1 || (v == b1 && int(i) < i1)) { b2 = b1; i2 = i1; b1 = v; i1 = int(i); } else if (v > b2 || (v == b2 && int(i) < i2)) { b2 = v; i2 = int(i); }
+              }
+            }
+            if (end4 > start4) {
+              const device vec<bfloat16_t, 4>* src4 =
+                  (const device vec<bfloat16_t, 4>*)(row_ptr + start4);
+              const uint count4 = (end4 - start4) >> 2;
+              for (uint j = lid; j < count4; j += 256u) {
+                const vec<bfloat16_t, 4> vv = src4[j];
+                const uint base_i = start4 + (j << 2);
+                #pragma unroll
+                for (uint k = 0; k < 4; k++) {
+                  const float v = float(vv[k]);
+                  const int idx = int(base_i + k);
+                  if (v > b1 || (v == b1 && idx < i1)) { b2 = b1; i2 = i1; b1 = v; i1 = idx; } else if (v > b2 || (v == b2 && idx < i2)) { b2 = v; i2 = idx; }
+                }
+              }
+            }
+            if (lid == 0) {
+              const uint tail_start = max(start4, end4);
+              for (uint i = tail_start; i < end; i++) {
+                const float v = float(row_ptr[i]);
+                if (v > b1 || (v == b1 && int(i) < i1)) { b2 = b1; i2 = i1; b1 = v; i1 = int(i); } else if (v > b2 || (v == b2 && int(i) < i2)) { b2 = v; i2 = int(i); }
+              }
+            }
+
+
+                const float sv1 = simd_max(b1);
+                const int si1 = simd_min((b1 == sv1) ? i1 : int(V_));
+                const bool stook = (i1 == si1);
+                const float sc = stook ? b2 : b1;
+                const int sci = stook ? i2 : i1;
+                const float sv2 = simd_max(sc);
+                const int si2 = simd_min((sc == sv2) ? sci : int(V_));
+
+                threadgroup float sh1[8]; threadgroup int sh1i[8];
+                threadgroup float sh2[8]; threadgroup int sh2i[8];
+                if (lane == 0) { sh1[sg] = sv1; sh1i[sg] = si1; sh2[sg] = sv2; sh2i[sg] = si2; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0) {
+                  const float a = (lane < 8) ? sh1[lane] : -INFINITY;
+                  const int ai = (lane < 8) ? sh1i[lane] : int(V_);
+                  const float c = (lane < 8) ? sh2[lane] : -INFINITY;
+                  const int ci = (lane < 8) ? sh2i[lane] : int(V_);
+
+                const float tv1 = simd_max(a);
+                const int ti1 = simd_min((a == tv1) ? ai : int(V_));
+                const bool ttook = (ai == ti1);
+                const float tc = ttook ? c : a;
+                const int tci = ttook ? ci : ai;
+                const float tv2 = simd_max(tc);
+                const int ti2 = simd_min((tc == tv2) ? tci : int(V_));
+
+                  if (lane == 0) {
+                    const uint o = row * CHUNKS + chunk;
+                    p_val[o] = tv1; p_idx[o] = ti1; p_val2[o] = tv2; p_idx2[o] = ti2;
+                  }
+                }
+            """)
+
+    private static let fastArgMaxTopTwoStage2 = MLXFast.metalKernel(
+        name: "dflash_fast_argmax_top2_s2",
+        inputNames: ["p_val", "p_idx", "p_val2", "p_idx2"],
+        outputNames: ["tokens", "second"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint idx = row * CHUNKS + lid;
+            const float v1 = p_val[idx]; const int d1 = p_idx[idx];
+            const float v2 = p_val2[idx]; const int d2 = p_idx2[idx];
+
+            const float sv1 = simd_max(v1);
+            const int si1 = simd_min((v1 == sv1) ? d1 : int(V_));
+            const bool stook = (d1 == si1);
+            const float sc = stook ? v2 : v1;
+            const int sci = stook ? d2 : d1;
+            const float sv2 = simd_max(sc);
+            const int si2 = simd_min((sc == sv2) ? sci : int(V_));
+
+            threadgroup float sh1[2]; threadgroup int sh1i[2];
+            threadgroup float sh2[2]; threadgroup int sh2i[2];
+            if (lane == 0) { sh1[sg] = sv1; sh1i[sg] = si1; sh2[sg] = sv2; sh2i[sg] = si2; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float a = (lane < 2) ? sh1[lane] : -INFINITY;
+              const int ai = (lane < 2) ? sh1i[lane] : int(V_);
+              const float c = (lane < 2) ? sh2[lane] : -INFINITY;
+              const int ci = (lane < 2) ? sh2i[lane] : int(V_);
+
+            const float tv1 = simd_max(a);
+            const int ti1 = simd_min((a == tv1) ? ai : int(V_));
+            const bool ttook = (ai == ti1);
+            const float tc = ttook ? c : a;
+            const int tci = ttook ? ci : ai;
+            const float tv2 = simd_max(tc);
+            const int ti2 = simd_min((tc == tv2) ? tci : int(V_));
+
+              if (lane == 0) { tokens[row] = ti1; second[row] = ti2; }
+            }
+            """)
+
+    private static func fastArgMaxTopTwo(_ logits: MLXArray) -> (tokens: MLXArray, seconds: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        CBv2KernelLog.observe(
+            "dflash_fast_argmax_top2", template: "V\(vocab)", inputs: [logits],
+            outputs: [.float32, .int32, .float32, .int32])
+        let partials = fastArgMaxTopTwoStage1(
+            [logits],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: Array(repeating: [rows, chunks], count: 4),
+            outputDTypes: [.float32, .int32, .float32, .int32])
+        let out = fastArgMaxTopTwoStage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows]],
+            outputDTypes: [.int32, .int32])
+        return (out[0], out[1])
+    }
+
+    /// `dflash_argmax_conf_s1/s2` with the same top-two tracking of the raw
+    /// logits; tokens and confidence are those of `fusedArgMaxAndConfidence`.
+    private static let argMaxConfTopTwoStage1 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top2_s1",
+        inputNames: ["logits", "params"],
+        outputNames: ["p_raw", "p_idx", "p_sc", "p_sum", "p_raw2", "p_idx2"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            constexpr int chunk_size = (V + CHUNKS - 1) / CHUNKS;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+
+            const int start = int(chunk) * chunk_size;
+            const int end = min(V, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + size_t(row) * size_t(V);
+            const bfloat16_t b_mult = bfloat16_t(params[0]);
+            const bfloat16_t b_cap = bfloat16_t(params[1]);
+            const bool has_cap = params[1] > 0.0f;
+
+            float b1 = -INFINITY, b2 = -INFINITY;
+            int i1 = V, i2 = V;
+            float best_sc = -INFINITY;
+            float sum_exp = 0.0f;
+            for (int i = start + int(lid); i < end; i += 256) {
+              const bfloat16_t raw_bf = row_ptr[i];
+              const float raw_f = float(raw_bf);
+              if (raw_f > b1 || (raw_f == b1 && i < i1)) { b2 = b1; i2 = i1; b1 = raw_f; i1 = i; } else if (raw_f > b2 || (raw_f == b2 && i < i2)) { b2 = raw_f; i2 = i; }
+              bfloat16_t s_bf = raw_bf * b_mult;
+              if (has_cap) {
+                s_bf = bfloat16_t(metal::precise::tanh(float(s_bf / b_cap))) * b_cap;
+              }
+              const float sc = float(s_bf);
+              if (sc > best_sc) {
+                sum_exp = (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sc) + 1.0f) : 1.0f;
+                best_sc = sc;
+              } else {
+                sum_exp += metal::exp(sc - best_sc);
+              }
+            }
+
+
+                const float sv1 = simd_max(b1);
+                const int si1 = simd_min((b1 == sv1) ? i1 : int(V_));
+                const bool stook = (i1 == si1);
+                const float sc = stook ? b2 : b1;
+                const int sci = stook ? i2 : i1;
+                const float sv2 = simd_max(sc);
+                const int si2 = simd_min((sc == sv2) ? sci : int(V_));
+
+            const float sg_raw = sv1; const int sg_idx = si1;
+            const float sg_sc = simd_max(best_sc);
+            const float sg_sum = simd_sum(
+                (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sg_sc)) : 0.0f);
+
+            threadgroup float sh_raw[8]; threadgroup float sh_raw2[8]; threadgroup int sh_idx2[8];
+            threadgroup int sh_idx[8];
+            threadgroup float sh_sc[8];
+            threadgroup float sh_sum[8];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw; sh_raw2[sg] = sv2; sh_idx2[sg] = si2;
+              sh_idx[sg] = sg_idx;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float v_raw = (lane < 8) ? sh_raw[lane] : -INFINITY;
+              const int v_idx = (lane < 8) ? sh_idx[lane] : V;
+              const float v_sc = (lane < 8) ? sh_sc[lane] : -INFINITY;
+              const float v_sum = (lane < 8) ? sh_sum[lane] : 0.0f;
+
+              const float w2 = (lane < 8) ? sh_raw2[lane] : -INFINITY;
+              const int w2i = (lane < 8) ? sh_idx2[lane] : V;
+
+                const float tv1 = simd_max(v_raw);
+                const int ti1 = simd_min((v_raw == tv1) ? v_idx : int(V_));
+                const bool ttook = (v_idx == ti1);
+                const float tc = ttook ? w2 : v_raw;
+                const int tci = ttook ? w2i : v_idx;
+                const float tv2 = simd_max(tc);
+                const int ti2 = simd_min((tc == tv2) ? tci : int(V_));
+
+              const float tg_raw = tv1; const int tg_idx = ti1;
+              const float tg_sc = simd_max(v_sc);
+              const float tg_sum = simd_sum(
+                  (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - tg_sc)) : 0.0f);
+
+              if (lane == 0) {
+                const uint out_i = row * uint(CHUNKS) + chunk;
+                p_raw[out_i] = tg_raw; p_raw2[out_i] = tv2; p_idx2[out_i] = ti2;
+                p_idx[out_i] = tg_idx;
+                p_sc[out_i] = tg_sc;
+                p_sum[out_i] = tg_sum;
+              }
+            }
+            """)
+
+    private static let argMaxConfTopTwoStage2 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top2_s2",
+        inputNames: ["p_raw", "p_idx", "p_sc", "p_sum", "p_raw2", "p_idx2"],
+        outputNames: ["tokens", "confidence", "second"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint idx = row * uint(CHUNKS) + lid;
+
+            const float v_raw = p_raw[idx];
+            const int v_idx = p_idx[idx];
+            const float v_sc = p_sc[idx];
+            const float v_sum = p_sum[idx];
+
+            const float w2 = p_raw2[idx]; const int w2i = p_idx2[idx];
+
+                const float sv1 = simd_max(v_raw);
+                const int si1 = simd_min((v_raw == sv1) ? v_idx : int(V_));
+                const bool stook = (v_idx == si1);
+                const float sc = stook ? w2 : v_raw;
+                const int sci = stook ? w2i : v_idx;
+                const float sv2 = simd_max(sc);
+                const int si2 = simd_min((sc == sv2) ? sci : int(V_));
+
+            const float sg_raw = sv1; const int sg_idx = si1;
+            const float sg_sc = simd_max(v_sc);
+            const float sg_sum = simd_sum(
+                (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - sg_sc)) : 0.0f);
+
+            threadgroup float sh_raw[2]; threadgroup float sh_raw2[2]; threadgroup int sh_idx2[2];
+            threadgroup int sh_idx[2];
+            threadgroup float sh_sc[2];
+            threadgroup float sh_sum[2];
+            if (lane == 0) {
+              sh_raw[sg] = sg_raw; sh_raw2[sg] = sv2; sh_idx2[sg] = si2;
+              sh_idx[sg] = sg_idx;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float f_raw = (lane < 2) ? sh_raw[lane] : -INFINITY;
+              const int f_idx = (lane < 2) ? sh_idx[lane] : V;
+              const float f_sc = (lane < 2) ? sh_sc[lane] : -INFINITY;
+              const float f_sum = (lane < 2) ? sh_sum[lane] : 0.0f;
+
+              const float g2 = (lane < 2) ? sh_raw2[lane] : -INFINITY;
+              const int g2i = (lane < 2) ? sh_idx2[lane] : V;
+
+                const float tv1 = simd_max(f_raw);
+                const int ti1 = simd_min((f_raw == tv1) ? f_idx : int(V_));
+                const bool ttook = (f_idx == ti1);
+                const float tc = ttook ? g2 : f_raw;
+                const int tci = ttook ? g2i : f_idx;
+                const float tv2 = simd_max(tc);
+                const int ti2 = simd_min((tc == tv2) ? tci : int(V_));
+
+              const float row_raw = tv1; const int row_idx = ti1;
+              const float row_sc = simd_max(f_sc);
+              const float row_sum = simd_sum(
+                  (f_sum > 0.0f) ? (f_sum * metal::exp(f_sc - row_sc)) : 0.0f);
+
+              if (lane == 0) {
+                tokens[row] = row_idx; second[row] = ti2;
+                confidence[row] = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+              }
+            }
+            """)
+
+    private static func fusedArgMaxConfidenceAndSecond(
+        _ logits: MLXArray, outputMultiplier: Float, softcap: Float
+    ) -> (tokens: MLXArray, confidence: MLXArray, seconds: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let params = MLXArray([outputMultiplier, softcap])
+        let partials = argMaxConfTopTwoStage1(
+            [logits, params],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: Array(repeating: [rows, chunks], count: 6),
+            outputDTypes: [.float32, .int32, .float32, .float32, .float32, .int32])
+        let out = argMaxConfTopTwoStage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows], [rows]],
+            outputDTypes: [.int32, .float32, .int32])
+        return (out[0], out[1], out[2])
+    }
+
+    /// `dflash_argmax_conf_s1/s2` tracking the four best raw logits (value
+    /// descending, id ascending) per row in the same single pass; tokens and
+    /// confidence are bit-equal to `fusedArgMaxAndConfidence`'s. Each rank's
+    /// probability is `exp(sc - lse)` of its softcapped score. The cap is a
+    /// compile-time constant: behind a runtime flag Metal drops the bf16 cap
+    /// product (the shipped confidence is the uncapped softmax).
+    private static let topFourMacros = """
+        #define T4_BETTER(v, j, bv, bj) ((v) > (bv) || ((v) == (bv) && (j) < (bj)))
+        #define T4_PICK(p, a0, a1, a2, a3, d) \\
+          ((p) == 0 ? (a0) : (p) == 1 ? (a1) : (p) == 2 ? (a2) : (p) == 3 ? (a3) : (d))
+        #define T4_ROUND(OV, OJ) { \\
+          const float cv_ = T4_PICK(ptr, c0, c1, c2, c3, -INFINITY); \\
+          const int cj_ = T4_PICK(ptr, j0, j1, j2, j3, V); \\
+          const float mv_ = simd_max(cv_); \\
+          const int mj_ = simd_min((cv_ == mv_) ? cj_ : V); \\
+          if (cj_ == mj_) ptr++; \\
+          OV = mv_; OJ = mj_; }
+        #define T4_REDUCE(O0, O1, O2, O3, P0, P1, P2, P3) { int ptr = 0; \\
+          T4_ROUND(O0, P0) T4_ROUND(O1, P1) T4_ROUND(O2, P2) T4_ROUND(O3, P3) }
+
+        """
+
+    private static let argMaxConfTopFourStage1 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top4_s1",
+        inputNames: ["logits", "params"],
+        outputNames: ["p_raw", "p_idx", "p_sc", "p_sum", "p_scc", "p_sumc"],
+        source: topFourMacros + """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            constexpr int chunk_size = (V + CHUNKS - 1) / CHUNKS;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+
+            const int start = int(chunk) * chunk_size;
+            const int end = min(V, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + size_t(row) * size_t(V);
+            const bfloat16_t b_mult = bfloat16_t(params[0]);
+            const bfloat16_t b_cap = bfloat16_t(params[1]);
+
+            float c0 = -INFINITY, c1 = -INFINITY, c2 = -INFINITY, c3 = -INFINITY;
+            int j0 = V, j1 = V, j2 = V, j3 = V;
+            float best_sc = -INFINITY, best_cc = -INFINITY;
+            float sum_exp = 0.0f, sum_cap = 0.0f;
+            for (int i = start + int(lid); i < end; i += 256) {
+              const bfloat16_t raw_bf = row_ptr[i];
+              const float raw_f = float(raw_bf);
+              if (T4_BETTER(raw_f, i, c3, j3)) {
+                if (T4_BETTER(raw_f, i, c2, j2)) {
+                  c3 = c2; j3 = j2;
+                  if (T4_BETTER(raw_f, i, c1, j1)) {
+                    c2 = c1; j2 = j1;
+                    if (T4_BETTER(raw_f, i, c0, j0)) {
+                      c1 = c0; j1 = j0; c0 = raw_f; j0 = i;
+                    } else { c1 = raw_f; j1 = i; }
+                  } else { c2 = raw_f; j2 = i; }
+                } else { c3 = raw_f; j3 = i; }
+              }
+              bfloat16_t s_bf = raw_bf * b_mult;
+              const float sc = float(s_bf);
+              if (sc > best_sc) {
+                sum_exp = (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sc) + 1.0f) : 1.0f;
+                best_sc = sc;
+              } else {
+                sum_exp += metal::exp(sc - best_sc);
+              }
+              if (CAP_) {
+                const bfloat16_t q = s_bf / b_cap;
+                s_bf = bfloat16_t(metal::precise::tanh(float(q))) * b_cap;
+              }
+              const float cc = float(s_bf);
+              if (cc > best_cc) {
+                sum_cap = (sum_cap > 0.0f) ? (sum_cap * metal::exp(best_cc - cc) + 1.0f) : 1.0f;
+                best_cc = cc;
+              } else {
+                sum_cap += metal::exp(cc - best_cc);
+              }
+            }
+
+            float s0, s1, s2, s3; int k0, k1, k2, k3;
+            T4_REDUCE(s0, s1, s2, s3, k0, k1, k2, k3)
+            const float sg_sc = simd_max(best_sc);
+            const float sg_sum = simd_sum(
+                (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sg_sc)) : 0.0f);
+            const float sg_cc = simd_max(best_cc);
+            const float sg_sumc = simd_sum(
+                (sum_cap > 0.0f) ? (sum_cap * metal::exp(best_cc - sg_cc)) : 0.0f);
+
+            threadgroup float sh_raw[32];
+            threadgroup int sh_idx[32];
+            threadgroup float sh_sc[8];
+            threadgroup float sh_sum[8];
+            threadgroup float sh_cc[8];
+            threadgroup float sh_sumc[8];
+            if (lane == 0) {
+              sh_cc[sg] = sg_cc;
+              sh_sumc[sg] = sg_sumc;
+              sh_raw[sg * 4] = s0; sh_raw[sg * 4 + 1] = s1;
+              sh_raw[sg * 4 + 2] = s2; sh_raw[sg * 4 + 3] = s3;
+              sh_idx[sg * 4] = k0; sh_idx[sg * 4 + 1] = k1;
+              sh_idx[sg * 4 + 2] = k2; sh_idx[sg * 4 + 3] = k3;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const bool on = lane < 8;
+              c0 = on ? sh_raw[lane * 4] : -INFINITY; j0 = on ? sh_idx[lane * 4] : V;
+              c1 = on ? sh_raw[lane * 4 + 1] : -INFINITY; j1 = on ? sh_idx[lane * 4 + 1] : V;
+              c2 = on ? sh_raw[lane * 4 + 2] : -INFINITY; j2 = on ? sh_idx[lane * 4 + 2] : V;
+              c3 = on ? sh_raw[lane * 4 + 3] : -INFINITY; j3 = on ? sh_idx[lane * 4 + 3] : V;
+              const float v_sc = on ? sh_sc[lane] : -INFINITY;
+              const float v_sum = on ? sh_sum[lane] : 0.0f;
+              const float v_cc = on ? sh_cc[lane] : -INFINITY;
+              const float v_sumc = on ? sh_sumc[lane] : 0.0f;
+              float t0, t1, t2, t3; int u0, u1, u2, u3;
+              T4_REDUCE(t0, t1, t2, t3, u0, u1, u2, u3)
+              const float tg_sc = simd_max(v_sc);
+              const float tg_sum = simd_sum(
+                  (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - tg_sc)) : 0.0f);
+              const float tg_cc = simd_max(v_cc);
+              const float tg_sumc = simd_sum(
+                  (v_sumc > 0.0f) ? (v_sumc * metal::exp(v_cc - tg_cc)) : 0.0f);
+              if (lane == 0) {
+                const uint out_i = row * uint(CHUNKS) + chunk;
+                p_raw[out_i * 4] = t0; p_raw[out_i * 4 + 1] = t1;
+                p_raw[out_i * 4 + 2] = t2; p_raw[out_i * 4 + 3] = t3;
+                p_idx[out_i * 4] = u0; p_idx[out_i * 4 + 1] = u1;
+                p_idx[out_i * 4 + 2] = u2; p_idx[out_i * 4 + 3] = u3;
+                p_sc[out_i] = tg_sc;
+                p_sum[out_i] = tg_sum;
+                p_scc[out_i] = tg_cc;
+                p_sumc[out_i] = tg_sumc;
+              }
+            }
+            """)
+
+    private static let argMaxConfTopFourStage2 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top4_s2",
+        inputNames: ["p_raw", "p_idx", "p_sc", "p_sum", "p_scc", "p_sumc", "params"],
+        outputNames: ["tokens", "confidence", "top_ids", "top_probs"],
+        source: topFourMacros + """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint idx = row * uint(CHUNKS) + lid;
+
+            float c0 = p_raw[idx * 4], c1 = p_raw[idx * 4 + 1];
+            float c2 = p_raw[idx * 4 + 2], c3 = p_raw[idx * 4 + 3];
+            int j0 = p_idx[idx * 4], j1 = p_idx[idx * 4 + 1];
+            int j2 = p_idx[idx * 4 + 2], j3 = p_idx[idx * 4 + 3];
+            const float v_sc = p_sc[idx];
+            const float v_sum = p_sum[idx];
+            const float v_cc = p_scc[idx];
+            const float v_sumc = p_sumc[idx];
+
+            float s0, s1, s2, s3; int k0, k1, k2, k3;
+            T4_REDUCE(s0, s1, s2, s3, k0, k1, k2, k3)
+            const float sg_sc = simd_max(v_sc);
+            const float sg_sum = simd_sum(
+                (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - sg_sc)) : 0.0f);
+            const float sg_cc = simd_max(v_cc);
+            const float sg_sumc = simd_sum(
+                (v_sumc > 0.0f) ? (v_sumc * metal::exp(v_cc - sg_cc)) : 0.0f);
+
+            threadgroup float sh_raw[8];
+            threadgroup int sh_idx[8];
+            threadgroup float sh_sc[2];
+            threadgroup float sh_sum[2];
+            threadgroup float sh_cc[2];
+            threadgroup float sh_sumc[2];
+            if (lane == 0) {
+              sh_cc[sg] = sg_cc;
+              sh_sumc[sg] = sg_sumc;
+              sh_raw[sg * 4] = s0; sh_raw[sg * 4 + 1] = s1;
+              sh_raw[sg * 4 + 2] = s2; sh_raw[sg * 4 + 3] = s3;
+              sh_idx[sg * 4] = k0; sh_idx[sg * 4 + 1] = k1;
+              sh_idx[sg * 4 + 2] = k2; sh_idx[sg * 4 + 3] = k3;
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const bool on = lane < 2;
+              c0 = on ? sh_raw[lane * 4] : -INFINITY; j0 = on ? sh_idx[lane * 4] : V;
+              c1 = on ? sh_raw[lane * 4 + 1] : -INFINITY; j1 = on ? sh_idx[lane * 4 + 1] : V;
+              c2 = on ? sh_raw[lane * 4 + 2] : -INFINITY; j2 = on ? sh_idx[lane * 4 + 2] : V;
+              c3 = on ? sh_raw[lane * 4 + 3] : -INFINITY; j3 = on ? sh_idx[lane * 4 + 3] : V;
+              const float f_sc = on ? sh_sc[lane] : -INFINITY;
+              const float f_sum = on ? sh_sum[lane] : 0.0f;
+              const float f_cc = on ? sh_cc[lane] : -INFINITY;
+              const float f_sumc = on ? sh_sumc[lane] : 0.0f;
+              float t0, t1, t2, t3; int u0, u1, u2, u3;
+              T4_REDUCE(t0, t1, t2, t3, u0, u1, u2, u3)
+              const float row_sc = simd_max(f_sc);
+              const float row_sum = simd_sum(
+                  (f_sum > 0.0f) ? (f_sum * metal::exp(f_sc - row_sc)) : 0.0f);
+              const float row_cc = simd_max(f_cc);
+              const float row_sumc = simd_sum(
+                  (f_sumc > 0.0f) ? (f_sumc * metal::exp(f_cc - row_cc)) : 0.0f);
+              if (lane == 0) {
+                const bfloat16_t b_mult = bfloat16_t(params[0]);
+                const bfloat16_t b_cap = bfloat16_t(params[1]);
+                const float raws[4] = {t0, t1, t2, t3};
+                const int ids[4] = {u0, u1, u2, u3};
+                tokens[row] = u0;
+                confidence[row] = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+                for (int r = 0; r < 4; r++) {
+                  float p = 0.0f;
+                  if (ids[r] < V && row_sumc > 0.0f) {
+                    bfloat16_t s_bf = bfloat16_t(raws[r]) * b_mult;
+                    if (CAP_) {
+                      const bfloat16_t q = s_bf / b_cap;
+                      s_bf = bfloat16_t(metal::precise::tanh(float(q))) * b_cap;
+                    }
+                    p = metal::exp(float(s_bf) - row_cc) / row_sumc;
+                  }
+                  top_ids[row * 4 + r] = ids[r];
+                  top_probs[row * 4 + r] = p;
+                }
+              }
+            }
+            """)
+
+    /// Tokens, confidence, and the four best ids `[rows, 4]` int32 with their
+    /// softcapped probabilities `[rows, 4]` float32, in one pass over the logits.
+    static func fusedArgMaxConfidenceAndTopFour(
+        _ logits: MLXArray, outputMultiplier: Float, softcap: Float
+    ) -> (tokens: MLXArray, confidence: MLXArray, ids: MLXArray, probs: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let params = MLXArray([outputMultiplier, softcap])
+        let template: [(String, any KernelTemplateArg)] = [("V_", vocab), ("CAP_", softcap > 0 ? 1 : 0)]
+        let partials = argMaxConfTopFourStage1(
+            [logits, params],
+            template: template,
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks, 4], [rows, chunks, 4]]
+                + Array(repeating: [rows, chunks], count: 4),
+            outputDTypes: [.float32, .int32, .float32, .float32, .float32, .float32])
+        let out = argMaxConfTopFourStage2(
+            partials + [params],
+            template: template,
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows], [rows, 4], [rows, 4]],
+            outputDTypes: [.int32, .float32, .int32, .float32])
+        return (out[0], out[1], out[2], out[3])
+    }
+
+    /// Block rows that keep a second choice (draft-tree leaf depths).
+    static let alternativeRows = 3
+
+    /// Second choices are kept (draft trees ready) and the fused top-2
+    /// passes apply: bf16 `[rows, vocabulary]` head products.
+    private static func wantsSeconds(_ logits: MLXArray) -> Bool {
+        CBv2VerifyTree.ready && logits.ndim == 2 && logits.dtype == .bfloat16
+            && logits.dim(1) >= 256
+    }
+
+    /// The second-ranked head product at block position `index`: the
+    /// lexicographic second (value descending, id ascending) of the
+    /// proposals' argmax pass, which is the argmax with the proposal's own
+    /// id excluded. No extra pass over the logits.
+    public func alternativeDraft(index: Int, requestState: any CBv2MTPRequestState)
+        -> MLXArray?
+    {
+        let s = state(requestState)
+        guard s.refusal == nil, s.selection == nil, let seconds = s.seconds,
+            index >= 0, index < min(Self.alternativeRows, seconds.dim(0))
+        else { return nil }
+        return seconds[index ..< (index + 1)]
+    }
+
+    /// The round's four best ids and probabilities per block row `[rows, 4]`
+    /// (dynamic draft trees); nil when this round has none.
+    public func rankedCandidates(requestState: any CBv2MTPRequestState)
+        -> (ids: MLXArray, probs: MLXArray)?
+    {
+        let s = state(requestState)
+        guard s.refusal == nil, s.selection == nil, let ranked = s.ranked, s.memo != nil
+        else { return nil }
+        return ranked
+    }
+
+    /// Low-acceptance head products under dynamic trees take the fused
+    /// top-4 pass, which also yields the seconds; every other round is as before.
+    private static func wantsRanked(_ logits: MLXArray, lowAcceptance: Bool) -> Bool {
+        lowAcceptance && CBv2VerifyTree.dynamic && wantsSeconds(logits)
+    }
+
+    public func proposalDraft(index: Int, requestState: any CBv2MTPRequestState) -> MLXArray? {
+        let s = state(requestState)
+        guard s.refusal == nil, let memo = s.memo, index >= 0, index < memo.tokens.dim(0)
+        else { return nil }
+        return memo.tokens[index ..< (index + 1)]
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
-    /// target's readout of them when it gives one per row.
-    private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
+    /// target's readout of them when it gives one per row; with the argmax,
+    /// each row's second choice from the same pass when trees are ready.
+    private func proposalsAndSeconds(
+        _ logits: MLXArray, selection: CBv2MTPProposalSelection?, ranked: Bool = false
+    ) -> (tokens: MLXArray, seconds: MLXArray?, ranked: (ids: MLXArray, probs: MLXArray)?) {
         if let selection, let coupled = selection.propose(target.dflashReadout(logits)),
             coupled.shape == [logits.dim(0)]
         {
-            return coupled.asType(.int32)
+            return (coupled.asType(.int32), nil, nil)
+        }
+        if Self.wantsRanked(logits, lowAcceptance: ranked),
+            let textTarget = target as? MuseGlimmerTextModel
+        {
+            let out = Self.fusedArgMaxConfidenceAndTopFour(
+                logits, outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+            return (out.tokens, out.ids[0..., 1], (out.ids, out.probs))
+        }
+        if Self.wantsSeconds(logits) {
+            let out = Self.fastArgMaxTopTwo(logits)
+            return (out.tokens, out.seconds, nil)
         }
         if logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 {
-            return Self.fastArgMax(logits)
+            return (Self.fastArgMax(logits), nil, nil)
         }
-        return argMax(logits, axis: -1).asType(.int32)
+        return (argMax(logits, axis: -1).asType(.int32), nil, nil)
     }
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
@@ -1485,6 +2206,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private func clearRound(_ s: State) {
         s.memo = nil
+        s.seconds = nil
+        s.ranked = nil
         s.selection = nil
         s.prestarted = false
         s.stagedInputCount = 0

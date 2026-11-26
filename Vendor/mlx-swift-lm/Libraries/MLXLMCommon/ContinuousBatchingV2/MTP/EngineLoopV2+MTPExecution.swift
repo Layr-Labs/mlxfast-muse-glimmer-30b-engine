@@ -862,6 +862,24 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        // A draft tree: one row, a chain plus the drafter's second choices.
+        var tree = batch == 1 ? mtp.treeMark(for: verifyRows[0].rec.id) : nil
+        let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+        var treeLeavesBuilt = tree != nil && treeDrafter != nil
+        if let tree { precondition(tree.drafts == k, "CBv2 MTP: tree width != round depth") }
+        // Dynamic tree: the topology is picked on the host from the block's
+        // top-4 once draft index 0 has run; until then the mark is a chain.
+        let treeWindow = tree == nil ? nil : mtp.treeWindow(for: verifyRows[0].rec.id)
+        var treeTokens: [Int32] = []
+        var treeTopOne: [Int] = []
+        // Zero-sync: the GPU builds the tree from the block's top-4 behind
+        // the drafter (`CBv2VerifyTreeBuilder`); the mark stays a chain of
+        // `k` (every draft index stages its chain proposal), the verify reads
+        // the builder's tokens, depths and holes, and finalize rebuilds the
+        // layout from the acceptance packet. No host read before the verify.
+        let zeroSyncTree = treeWindow != nil && treeDrafter != nil && CBv2VerifyTree.zeroSyncReady
+        var rankedBlock: (ids: MLXArray, probs: MLXArray)?
+        var built: CBv2VerifyTreeBuilder.Built?
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -904,11 +922,32 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
                     }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
+                    let result: (tokens: MLXArray, hidden: MLXArray)
+                    if let tree, let slot = tree.proposalIndex(column: draftIndex + 1) {
+                        // Branch column: the branch's ranked token where it
+                        // starts, then the block's own deeper proposals.
+                        let token: MLXArray?
+                        if treeWindow != nil {
+                            let at = slot.index * 4 + slot.rank
+                            token = at < treeTokens.count ? MLXArray([treeTokens[at]]) : nil
+                        } else if slot.rank == 0 {
+                            token = treeDrafter?.proposalDraft(
+                                index: slot.index, requestState: requestState)
+                        } else {
+                            token = treeDrafter?.alternativeDraft(
+                                index: slot.index, requestState: requestState)
+                        }
+                        if token == nil { treeLeavesBuilt = false }
+                        result = (
+                            token?.asType(.int32) ?? MLXArray([Int32(0)]), currentHidden[index]
+                        )
+                    } else {
+                        result = stateful.draftStep(
+                            tokens: currentTokens[index],
+                            hidden: currentHidden[index],
+                            shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                            requestState: requestState)
+                    }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
@@ -923,6 +962,12 @@ extension EngineLoopV2 {
                     }
                     stepEvalTargets.append(
                         contentsOf: stateful.evaluationTargets(for: requestState))
+                    if draftIndex == 0, treeWindow != nil,
+                        let ranked = treeDrafter?.rankedCandidates(requestState: requestState)
+                    {
+                        stepEvalTargets += [ranked.ids, ranked.probs]
+                        rankedBlock = ranked
+                    }
                 }
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation, and every generation for a
@@ -940,10 +985,35 @@ extension EngineLoopV2 {
                     mtp.recordEarlyDraftSubmission()
                 }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
+                if draftIndex == 0, !zeroSyncTree, let window = treeWindow,
+                    let state = rowMetadata[0].assistantState
+                {
+                    // One host sync: the block's 7 x 4 (token, probability).
+                    let built = mtpDynamicTree(
+                        width: k, window: window, state: state, drafter: treeDrafter)
+                    tree = built?.layout ?? CBv2VerifyTreeLayout(
+                        chain: k, branchDepths: [], branchLengths: [])
+                    treeTokens = built?.tokens ?? []
+                    treeTopOne = built?.topOne ?? []
+                    treeLeavesBuilt = treeLeavesBuilt && built != nil
+                }
                 let stepTokens = concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
+            }
+            if zeroSyncTree {
+                built = rankedBlock.flatMap {
+                    CBv2VerifyTreeBuilder.build(
+                        ids: $0.ids, probs: $0.probs,
+                        chainTokens: concatenated(draftSteps, axis: 0), width: k)
+                }
+                if let built {
+                    draftSteps = (0 ..< k).map { built.tokens[$0 ..< ($0 + 1)] }
+                } else {
+                    // No ranked block: a plain chain of `k`, as the host path.
+                    treeLeavesBuilt = false
+                }
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
@@ -983,8 +1053,28 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        CBv2VerifyTree.begin(
+            treeLeavesBuilt ? tree : nil,
+            device: built.map { (holes: $0.holes, rowOffsets: $0.rowOffsets) })
+        var treeHonored = false
+        var treeClipped = false
+        let target: (
+            scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
+            shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+            policyTopTwo: (ids: MLXArray, values: MLXArray)?,
+            cacheInnerState: [MLXArray],
+            diagnostics: [CBv2LogitDiagnosticPacket],
+            recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+        )
+        do {
+            target = try mtpBuildTargetVerification(
+                columns: targetColumns, rows: verifyRows, driver: mtp)
+            treeHonored = CBv2VerifyTree.end()
+            treeClipped = CBv2VerifyTree.clipped
+        } catch {
+            _ = CBv2VerifyTree.end()
+            throw error
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -998,6 +1088,9 @@ extension EngineLoopV2 {
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
         }
+        // GPU-built tree: its layout and the block's top-1 ride the one
+        // readback the round already has, after every other part.
+        if let built, treeLeavesBuilt { packetParts.append(built.meta) }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
@@ -1013,7 +1106,41 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.tree = tree
+        result.treeLeavesValid = tree != nil && treeHonored
+        result.treeWindow = treeWindow
+        result.treeTopOne = treeTopOne
+        if let built, treeLeavesBuilt {
+            result.treeDeviceMetaCount = built.metaCount
+            result.treeClipped = treeClipped
+        }
         return result
+    }
+
+    /// The dynamic tree of a `width`-draft round: reads the block's top-4 ids
+    /// and probabilities once and picks the best-first caterpillar
+    /// (`CBv2VerifyTreeLayout.bestFirst`). Nil when the drafter has none.
+    private func mtpDynamicTree(
+        width: Int, window: Int, state: any CBv2MTPRequestState,
+        drafter: (any CBv2MTPTreeDrafter)?
+    ) -> (layout: CBv2VerifyTreeLayout, tokens: [Int32], topOne: [Int])? {
+        let start = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        guard let ranked = drafter?.rankedCandidates(requestState: state),
+            ranked.ids.ndim == 2, ranked.ids.dim(1) == 4, ranked.ids.dim(0) >= width
+        else { return nil }
+        eval(ranked.ids, ranked.probs)
+        let ids = ranked.ids.asArray(Int32.self)
+        let p = ranked.probs.asArray(Float.self)
+        let rows = ranked.ids.dim(0)
+        let probs = (0 ..< rows).map { Array(p[($0 * 4) ..< ($0 * 4 + 4)]) }
+        guard let layout = CBv2VerifyTreeLayout.bestFirst(
+            probs: probs, drafts: width, depthLimit: min(rows, width))
+        else { return nil }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.tree.dynamic", seconds: CFAbsoluteTimeGetCurrent() - start)
+        }
+        return (layout, ids, (0 ..< rows).map { Int(ids[$0 * 4]) })
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes
