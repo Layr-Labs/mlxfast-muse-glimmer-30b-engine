@@ -395,6 +395,9 @@ inline void paged_attention_part_cached_impl(
     for (int i = lo + (int)sgitg; i < hi; i += NSG) {
         const int absolute_position = attend_start + i;
         if (uses_visible_range && (absolute_position < info[3] || absolute_position >= info[4])) continue;
+#ifdef CBV2_TREE_HOLES
+        if (absolute_position >= info[6] && absolute_position < info[7]) continue;
+#endif
         if (allowed_mask != nullptr && !allowed_mask[int64_t(qi) * mask_query_stride + int64_t(i) * mask_key_stride]) continue;
         if (HAS_WRITE && i == attend_len - 1) {
             // The newest position: read the step's tile from the INPUTS,
@@ -621,6 +624,7 @@ inline void paged_attention_onepass_impl(
     threadgroup float* q_smem,
     threadgroup float* red_smem,
     threadgroup float* part_smem,
+    threadgroup float* leaf_smem,
     device T* out,
     uint3 tgpig,
     uint3 tpitg,
@@ -644,6 +648,24 @@ inline void paged_attention_onepass_impl(
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+#ifdef CBV2_TREE_HOLES
+    // Draft-tree branch rows skip [hole_lo, hole_hi).
+    const int hole_lo = info[6];
+    const int hole_hi = info[7];
+    // A tree leaf is the row's last key, stored after the skipped span but
+    // logically right at hole_lo. The row must reduce exactly like a plain
+    // decode at that logical position, whose keys are the prefix and the
+    // leaf at index hole_lo - attend_start: the same (partition, strided
+    // state) slot and the same place in that state's order. The main loops
+    // therefore skip the leaf and the leaf's one update is applied below, in
+    // its logical slot, from a threadgroup copy of its K/V.
+    const bool leaf_row = hole_hi > hole_lo && hole_lo >= attend_start
+        && hole_hi == attend_start + attend_len - 1;
+    const int leaf_pos = attend_start + attend_len - 1;
+    const int leaf_index = hole_lo - attend_start;
+    const int leaf_part = leaf_index / PTOK;
+    const int leaf_state = (leaf_index - leaf_part * PTOK) % NSG;
+#endif
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
     const int hi = min(attend_len, lo + PTOK);
@@ -706,7 +728,13 @@ inline void paged_attention_onepass_impl(
             }
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
+#ifdef CBV2_TREE_HOLES
+                const int upos = attend_start + first + (j0 + u) * NSG;
+                if (j0 + u < count && !(upos >= hole_lo && upos < hole_hi)
+                    && !(leaf_row && upos == leaf_pos)) {
+#else
                 if (j0 + u < count) {
+#endif
 #pragma unroll
                     for (int e = 0; e < E4; e++) {
                         kf[e] = float(kr[u][e]);
@@ -742,6 +770,10 @@ inline void paged_attention_onepass_impl(
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
             const int pos = attend_start + i;
+#ifdef CBV2_TREE_HOLES
+            if (pos >= hole_lo && pos < hole_hi) continue;
+            if (leaf_row && pos == leaf_pos) continue;
+#endif
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
@@ -773,6 +805,55 @@ inline void paged_attention_onepass_impl(
             }
         }
     }
+
+#ifdef CBV2_TREE_HOLES
+    if (leaf_row) {
+        // The simdgroup of the last partition holds the leaf's page.
+        if ((int)sgitg == (parts - 1) * NSG) {
+            const int lpage = leaf_pos / S;
+            const int slot = leaf_pos % S;
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                leaf_smem[lane * EPT + e] = kf[e];
+                leaf_smem[D + lane * EPT + e] = vf[e];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active && part == leaf_part && state == leaf_state) {
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                kf[e] = leaf_smem[lane * EPT + e];
+                vf[e] = leaf_smem[D + lane * EPT + e];
+            }
+#pragma unroll
+            for (int g = 0; g < HPT; g++) {
+                float partial = 0.0f;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    partial += q_smem[g * D + lane * EPT + e] * kf[e];
+                }
+                float qk = simd_sum(partial);
+                if (HAS_SOFTCAP) {
+                    qk = softcap * precise::tanh(qk / softcap);
+                }
+                qk *= M_LOG2E_F;
+
+                const float m_new = max(m[g], qk);
+                const float corr = exp2(m[g] - m_new);
+                const float p = exp2(qk - m_new);
+                l[g] = l[g] * corr + p;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    acc[g][e] = acc[g][e] * corr + p * vf[e];
+                }
+                m[g] = m_new;
+            }
+        }
+    }
+#endif
 
     // Publish this (partition, state)'s online-softmax states.
     threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;
