@@ -48,8 +48,19 @@ enum PagedSegmentTransfers {
         outputNames: ["witness"], source: "witness[0] = previous[0] + 1;",
         ensureRowContiguous: true)
 
+    private struct WriteLaunchKey: Hashable {
+        let dtype: DType
+        let kvHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let valueOffset: Int
+        let count: Int
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var writeLaunches:
+        [WriteLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     private static func kernel(
         reading: Bool, dtype: DType,
@@ -166,21 +177,45 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
-            group.writeFence =
-                kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
-                    [k, v, segment.storage, records(triples), group.writeFence] + offset,
-                    template: [
-                        ("T", group.dtype), ("H", group.key.kvHeads),
-                        ("D", group.key.headDim), ("S", group.pageSize),
-                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
-                        + quantizationTemplate(group),
-                    grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                    threadGroup: (
-                        group.key.quantization == nil
-                            ? min(256, group.key.headDim) : group.key.headDim, 1, 1
-                    ),
-                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+            if group.key.quantization == nil {
+                let count = triples.count / 3
+                let launchKey = WriteLaunchKey(
+                    dtype: group.dtype, kvHeads: group.key.kvHeads, headDim: group.key.headDim,
+                    pageSize: group.pageSize, valueOffset: segment.valueOffset, count: count)
+                let launch: MLXFast.MLXFastKernel.Launch
+                if let hit = lock.withLock({ writeLaunches[launchKey] }) {
+                    launch = hit
+                } else {
+                    let kobj = kernel(reading: false, dtype: group.dtype, quantization: nil)
+                    let made = kobj.prepare(
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                            ("VBASE", segment.valueOffset),
+                        ],
+                        grid: (group.key.headDim, group.key.kvHeads, count),
+                        threadGroup: (min(256, group.key.headDim), 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])
+                    lock.withLock { writeLaunches[launchKey] = made }
+                    launch = made
+                }
+                group.writeFence = launch([
+                    k, v, segment.storage, records(triples), group.writeFence,
+                ])[0]
+            } else {
+                let offset = [quantizedValueBase(segment)]
+                group.writeFence =
+                    kernel(
+                        reading: false, dtype: group.dtype, quantization: group.key.quantization)(
+                        [k, v, segment.storage, records(triples), group.writeFence] + offset,
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                        ] + quantizationTemplate(group),
+                        grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
+                        threadGroup: (group.key.headDim, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+            }
         }
     }
 
