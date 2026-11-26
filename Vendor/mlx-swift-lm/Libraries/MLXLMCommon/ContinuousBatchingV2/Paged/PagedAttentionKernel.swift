@@ -573,11 +573,15 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Absolute positions `[holeStart, holeEnd)` this row skips (a draft
+        /// tree's leaf skips the chain past its parent). Empty by default.
+        var holeStart: Int = 0
+        var holeEnd: Int = 0
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), 0, Int32(holeStart), Int32(holeEnd),
             ]
         }
     }

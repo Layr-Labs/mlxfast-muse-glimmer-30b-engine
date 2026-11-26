@@ -930,7 +930,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     let gauges: CBv2EngineGauges
 
     private let engineQueue = DispatchQueue(
-        label: "com.eigen.cbv2.engine", qos: .userInteractive)
+        label: "com.eigen.cbv2.engine", qos: .userInitiated)
     /// Keeps each round's host work on a performance core
     /// (`CBv2EngineWorkInterval`). Engine-queue only.
     let engineWorkInterval = CBv2EngineWorkInterval()
@@ -3252,9 +3252,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         nativeNextIdleReleaseNanos = 0
 
         let planStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // A step with no readback starts its host work here; after a
-        // readback this is a no-op (finalize already started the interval).
-        if joinedWorkInterval { engineWorkInterval.hostWorkBegan() }
         CBv2StepProfiler.time("v2.plan.mtp") { beginMTPPlan() }
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
         // plan moves waiting→running) are distinguishable from continuing
@@ -5204,7 +5201,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 eval(step.evalTargets)
                 CBv2CoreInstrumentation.recordHostSync()
             }
-            engineWorkInterval.hostWorkBegan()
         }
         var pagedAttentionFailure: Error?
         if let work = step.pagedAttentionWork {
