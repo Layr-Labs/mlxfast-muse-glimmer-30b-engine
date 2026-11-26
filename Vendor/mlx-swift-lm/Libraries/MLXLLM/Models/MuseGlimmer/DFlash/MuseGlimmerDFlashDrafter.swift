@@ -949,12 +949,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
     /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
     private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
-        if CBv2DraftRegime.lowAcceptance, index < lowMLP.count {
+        if CBv2DraftRegime.lowAcceptance, index < lowMLP.count,
+            !Self.pinnedLowLayers.contains(index)
+        {
             let low = lowMLP[index]
             return low.down(compiledSiluProduct(low.gate(x), low.up(x)))
         }
         return mlp.down(compiledSiluProduct(mlp.gate(x), mlp.up(x)))
     }
+
+    /// Drafter layers whose MLP stays at the pinned precision in
+    /// low-acceptance rounds (the first and the last: the block's entry and
+    /// the rows the head reads); the middle layers use the low-bit copy.
+    /// `CBV2_DRAFTER_LOW_PINNED_LAYERS` overrides ("" for none).
+    private static let pinnedLowLayers: Set<Int> = Set(
+        (ProcessInfo.processInfo.environment["CBV2_DRAFTER_LOW_PINNED_LAYERS"] ?? "0,4")
+            .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
 
     private static func lowAcceptanceMLP(_ model: MuseGlimmerDFlashDraftModel)
         -> [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
