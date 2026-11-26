@@ -386,12 +386,71 @@ public enum CBv2SmallProjection {
         return true
     }
 
+    private static let sharedCastLock = NSLock()
+    nonisolated(unsafe) private static var sharedCastCache:
+        [[ObjectIdentifier]: (multipliers: MLXArray, overflowBound: MLXArray)?] = [:]
+
+    /// Returns the shared `(multipliers, overflowBound)` when every FP8 layer
+    /// in `layers` has bit-identical activation cast parameters (cached once
+    /// per layer group; zero per-step host sync).
+    public static func sharedFP8CastParams(
+        _ layers: [ModelOptCalibratedLinear], inputs: Int, dtype: DType
+    ) -> (multipliers: MLXArray, overflowBound: MLXArray)? {
+        guard !layers.isEmpty,
+            layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: dtype) })
+        else { return nil }
+        let key = layers.map(ObjectIdentifier.init)
+        if let cached = sharedCastLock.withLock({ sharedCastCache[key] }) {
+            return cached
+        }
+        guard case .fp8(let mu0, let bd0) = layers[0].graphConstants!.storage else { return nil }
+        let refMu = mu0.asArray(Float.self).map(\.bitPattern)
+        let refBd = bd0.asArray(Float.self).map(\.bitPattern)
+        var allSame = true
+        for layer in layers.dropFirst() {
+            guard case .fp8(let mu, let bd) = layer.graphConstants!.storage else {
+                allSame = false
+                break
+            }
+            if mu.asArray(Float.self).map(\.bitPattern) != refMu
+                || bd.asArray(Float.self).map(\.bitPattern) != refBd
+            {
+                allSame = false
+                break
+            }
+        }
+        let result: (multipliers: MLXArray, overflowBound: MLXArray)? = allSame ? (mu0, bd0) : nil
+        sharedCastLock.withLock { sharedCastCache[key] = result }
+        return result
+    }
+
+    private struct FP8LaunchKey: Hashable {
+        let shape: FP8Shape
+        let dtype: DType
+        let inputs: Int
+        let rows: Int
+        let outputs: [Int]
+    }
+
+    private struct CastLaunchKey: Hashable {
+        let segments: Int
+        let dtype: DType
+        let count: Int
+    }
+
+    nonisolated(unsafe) private static var fp8LaunchCache:
+        [FP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var castLaunchCache:
+        [CastLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
     private static func fp8Run(
-        _ layers: [ModelOptCalibratedLinear], _ flat: MLXArray, cast: MLXArray, rows: Int
+        _ layers: [ModelOptCalibratedLinear], _ flat: MLXArray, cast: MLXArray, rows: Int,
+        sharedInput: Bool
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         var segments = [FP8Segment]()
         var arrays = [MLXArray]()
+        arrays.reserveCapacity(layers.count * 2 + 1)
         for (i, layer) in layers.enumerated() {
             arrays += [layer.weight, layer.graphConstants!.outputScale]
             for run in fp8Runs(layer) {
@@ -400,7 +459,7 @@ public enum CBv2SmallProjection {
                 segments.append(
                     FP8Segment(
                         weight: i, row0: run.rows.lowerBound, rows: run.rows.count,
-                        input: layers.count == 1 ? 0 : i, output: i,
+                        input: (layers.count == 1 || sharedInput) ? 0 : i, output: i,
                         column0: run.rows.lowerBound, outputWidth: layer.outputDimensions,
                         split: run.split, tm: tm,
                         prefetch: prefetchOverride ?? prefetchDepth(rows: rows, split: run.split)))
@@ -408,16 +467,61 @@ public enum CBv2SmallProjection {
         }
         arrays.append(cast)
         let shape = FP8Shape(
-            vectorDecode: vectorDecode, rowsOuter: rowsOuter, weights: layers.count, outputs: layers.count,
-            segments: segments)
-        let tiles = segments.reduce(0) { $0 + $1.tiles }
-        return fp8Kernel(shape)(
-            arrays,
-            template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
-            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: layers.map { [rows, $0.outputDimensions] },
-            outputDTypes: Array(repeating: flat.dtype, count: layers.count))
+            vectorDecode: vectorDecode, rowsOuter: rowsOuter, weights: layers.count,
+            outputs: layers.count, segments: segments)
+        let outputDims = layers.map(\.outputDimensions)
+        let launchKey = FP8LaunchKey(
+            shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ fp8LaunchCache[launchKey] }) {
+            launch = hit
+        } else {
+            let tiles = segments.reduce(0) { $0 + $1.tiles }
+            let made = fp8Kernel(shape).prepare(
+                template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: outputDims.map { [rows, $0] },
+                outputDTypes: Array(repeating: flat.dtype, count: outputDims.count))
+            lock.withLock { fp8LaunchCache[launchKey] = made }
+            launch = made
+        }
+        return launch(arrays)
     }
+
+    /// Runs sibling FP8 projections directly on an already-cast `[..., K]`
+    /// buffer shared by all layers in the group (e.g. from
+    /// `VerifyFusedNorms.fusedAddNormNormCastFP8`).
+    public static func fp8ProductsPreCast(
+        _ layers: [ModelOptCalibratedLinear], preCast: MLXArray
+    ) -> [MLXArray]? {
+        let inputs = preCast.dim(-1)
+        guard inputs > 0, !layers.isEmpty else { return nil }
+        let rows = preCast.size / inputs
+        guard (1 ... maximumRows).contains(rows),
+            layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: preCast.dtype) })
+        else { return nil }
+        let flat = preCast.reshaped(rows, inputs)
+        let lead = Array(preCast.shape.dropLast())
+        return zip(fp8Run(layers, flat, cast: flat, rows: rows, sharedInput: true), layers).map {
+            $0.reshaped(lead + [$1.outputDimensions])
+        }
+    }
+
+    /// Dedicated single-segment FP8 activation cast (no integer division).
+    private static let castKernel1 = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_activation_1",
+        inputNames: ["x", "mu0", "bd0"],
+        outputNames: ["out"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const float scaled = static_cast<float>(x[i]) * mu0[0];
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bd0[0];
+            out[i] = static_cast<T>(invalid ? nan_value : decoded * mu0[1]);
+            """,
+        header: ModelOptActivationKernels.header)
 
     /// The activation cast of `ModelOptActivationKernels.fp8` for each layer's
     /// own multipliers and bound, one launch (`CBv2GroupedProjection`'s cast).
@@ -451,8 +555,40 @@ public enum CBv2SmallProjection {
     }
 
     nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
-        2: castKernel(segments: 2), 4: castKernel(segments: 4),
+        1: castKernel1, 2: castKernel(segments: 2), 4: castKernel(segments: 4),
     ]
+
+    private static func preparedFP8Cast(
+        _ layers: [ModelOptCalibratedLinear], flat: MLXArray, count: Int
+    ) -> MLXArray? {
+        guard let kernel = castKernels[layers.count] else { return nil }
+        var castInputs: [MLXArray] = [flat]
+        castInputs.reserveCapacity(1 + layers.count * 2)
+        for layer in layers {
+            guard case .fp8(let mu, let bound) = layer.graphConstants!.storage else {
+                return nil
+            }
+            castInputs += [mu, bound]
+        }
+        let key = CastLaunchKey(segments: layers.count, dtype: flat.dtype, count: count)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ castLaunchCache[key] }) {
+            launch = hit
+        } else {
+            let total = layers.count * count
+            let template: [(String, any KernelTemplateArg)] =
+                layers.count == 1
+                ? [("T", flat.dtype)]
+                : [("T", flat.dtype), ("COUNT", count)]
+            let made = kernel.prepare(
+                template: template,
+                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
+                outputShapes: [[total]], outputDTypes: [flat.dtype])
+            lock.withLock { castLaunchCache[key] = made }
+            launch = made
+        }
+        return launch(castInputs)[0]
+    }
 
     /// The row-exact products of FP8 sibling projections of one activation
     /// (`x`: `[..., K]`, 1 to 8 rows): each equal, bit for bit, to the layer's
@@ -468,29 +604,11 @@ public enum CBv2SmallProjection {
             layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: x.dtype) })
         else { return nil }
         let flat = x.reshaped(rows, inputs)
-        let cast: MLXArray
-        if layers.count == 1 {
-            guard case .fp8(let mu, let bound) = layers[0].graphConstants!.storage else {
-                return nil
-            }
-            cast = ModelOptActivationKernels.fp8(flat, multipliers: mu, overflowBound: bound)
-        } else {
-            guard let castKernel = castKernels[layers.count] else { return nil }
-            var castInputs: [MLXArray] = [flat]
-            for layer in layers {
-                guard case .fp8(let mu, let bound) = layer.graphConstants!.storage else {
-                    return nil
-                }
-                castInputs += [mu, bound]
-            }
-            let total = layers.count * rows * inputs
-            cast = castKernel(
-                castInputs, template: [("T", x.dtype), ("COUNT", rows * inputs)],
-                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
-                outputShapes: [[total]], outputDTypes: [x.dtype])[0]
+        guard let cast = preparedFP8Cast(layers, flat: flat, count: rows * inputs) else {
+            return nil
         }
         let lead = Array(x.shape.dropLast())
-        return zip(fp8Run(layers, flat, cast: cast, rows: rows), layers).map {
+        return zip(fp8Run(layers, flat, cast: cast, rows: rows, sharedInput: false), layers).map {
             $0.reshaped(lead + [$1.outputDimensions])
         }
     }

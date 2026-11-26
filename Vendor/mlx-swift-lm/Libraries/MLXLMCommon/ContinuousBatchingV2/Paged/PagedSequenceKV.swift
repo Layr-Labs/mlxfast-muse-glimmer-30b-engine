@@ -786,14 +786,36 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// MTP rectangular verification attends a column BEHIND the frontier.
     func seqInfoRow(
         attending range: (start: Int, length: Int),
-        writeTarget: (page: Int32, slot: Int)? = nil
+        writeTarget: (page: Int32, slot: Int)? = nil,
+        treeBase: Int32 = 0,
+        treeAncPacked: UInt32 = 0,
+        treeDepth: Int = 0,
+        isDynamicTree: Bool = false
     ) -> PagedAttentionKernel.SeqInfoRow {
         PagedAttentionKernel.SeqInfoRow(
             attendStart: range.start,
             attendLength: range.length,
             tableLength: decodeTableLength,
             writePage: writeTarget?.page ?? 0,
-            writeSlot: writeTarget?.slot ?? 0)
+            writeSlot: writeTarget?.slot ?? 0,
+            treeBase: treeBase,
+            treeAncPacked: treeAncPacked,
+            treeDepth: treeDepth,
+            isDynamicTree: isDynamicTree)
+    }
+
+    /// Copies one written token's K/V from `srcPos` to `dstPos` in place (used
+    /// when a verify-tree branch commits), returning the updated group fence.
+    public func copyTokenSlot(from srcPos: Int, to dstPos: Int) -> MLXArray? {
+        guard srcPos != dstPos, !released, !pool.writeValidation.isFaulted else { return nil }
+        let (k, v) = gatherRange(start: srcPos, count: 1)
+        let s = pool.config.pageSize
+        let physical = ensurePage(logicalPage: dstPos / s)
+        let dstSlot = physical * Int32(s) + Int32(dstPos % s)
+        pool.writeTokens(
+            group: groupKey, slots: [dstSlot],
+            keys: k.squeezed(axis: 0), values: v.squeezed(axis: 0))
+        return pool.group(groupKey).writeFence
     }
 
     /// Kernel-facing row descriptor for decode: the absolute range the

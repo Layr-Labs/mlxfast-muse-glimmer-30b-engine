@@ -1594,20 +1594,45 @@ template <
   }
   }
 
-  threadgroup float Ps[(WK - 1) * 16 * BN];
-  if (simd_gid > 0) {
-    Dtile.template store<float, BN, 1>(Ps + (simd_gid - 1) * 16 * BN);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_gid == 0) {
-    for (int i = 0; i < WK - 1; i++) {
-      NAXTile<float, 1, TN> Ptile;
-      Ptile.template load<float, BN, 1>(Ps + i * 16 * BN);
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < Dtile.kNumFrags; j++) {
-        Dtile.val_frags[j] += Ptile.val_frags[j];
+  const ushort simd_lid = __metal_get_thread_index_in_simdgroup(ushort());
+  threadgroup float4 Ps[(WK / 2) * SIMD_SIZE * TN];
+  for (short half_pass = 0; half_pass < 2; ++half_pass) {
+    if (half_pass == 1 && M <= 8) {
+      break;
+    }
+    const short base_e = half_pass * 4;
+    STEEL_PRAGMA_UNROLL
+    for (int stride = WK / 2; stride > 0; stride >>= 1) {
+      if (simd_gid >= uint(stride) && simd_gid < uint(stride * 2)) {
+        threadgroup float4* dst =
+            Ps + ((simd_gid - stride) * SIMD_SIZE + simd_lid) * TN;
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; ++t) {
+          const auto f = Dtile.frag_at(0, t);
+          dst[t] = float4(
+              f[base_e + 0], f[base_e + 1], f[base_e + 2], f[base_e + 3]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid < uint(stride)) {
+        const threadgroup float4* src =
+            Ps + (simd_gid * SIMD_SIZE + simd_lid) * TN;
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; ++t) {
+          auto& f = Dtile.frag_at(0, t);
+          const float4 p = src[t];
+          f[base_e + 0] += p.x;
+          f[base_e + 1] += p.y;
+          f[base_e + 2] += p.z;
+          f[base_e + 3] += p.w;
+        }
+      }
+      if (stride > 1 || (half_pass == 0 && M > 8)) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
       }
     }
+  }
+  if (simd_gid == 0) {
     Dtile.store_rows(y, N, M);
   }
 }

@@ -632,7 +632,14 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// verify round's cost: shorter rounds need more of them per window.
     /// Low-acceptance requests commit far fewer tokens per round than the
     /// line allows, so it never binds for them.
-    static let ceilingBudgetHundredths = 404
+    static let ceilingBudgetHundredths: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_MTP_CEILING_BUDGET"],
+            let v = Int(raw), v > 0
+        {
+            return v
+        }
+        return 403
+    }()
     static let ceilingBurstTokens = 27
     static let ceilingEnabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
