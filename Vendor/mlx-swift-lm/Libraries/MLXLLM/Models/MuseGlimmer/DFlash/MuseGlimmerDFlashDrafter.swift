@@ -488,7 +488,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: settings.maximumDraftTokens)
+            draftCount: settings.maximumDraftTokens, horizon: Self.lowRoundHorizon)
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -560,7 +560,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 fastDraftBlockRows(
                     embeddings: blocks[0], at: ctx.nextPosition,
                     context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-                    draftCount: k)
+                    draftCount: k, horizon: Self.lowRoundHorizon)
             ]
         } else {
             rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
@@ -956,6 +956,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return mlp.down(compiledSiluProduct(mlp.gate(x), mlp.up(x)))
     }
 
+    /// The denoising block of a low-acceptance round: anchor plus seven mask
+    /// rows (every proposal the round can verify) instead of fifteen; other
+    /// rounds keep the full block. `CBV2_DFLASH_LOW_HORIZON=16` turns it off.
+    private static let lowHorizon: Int =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_LOW_HORIZON"].flatMap { Int($0) } ?? 8
+    private static var lowRoundHorizon: Int? {
+        CBv2DraftRegime.lowAcceptance && lowHorizon < 16 ? lowHorizon : nil
+    }
+
     private static func lowAcceptanceMLP(_ model: MuseGlimmerDFlashDraftModel)
         -> [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
     {
@@ -1038,15 +1047,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// in half with mathematically identical proposals.
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
-        context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        context: (keys: MLXArray, values: MLXArray)?, mask fullMask: MLXArray?,
+        draftCount: Int, horizon: Int? = nil
     ) -> MLXArray {
         let c = model.configuration
-        let block = c.blockSize
+        // A shorter denoising block (anchor + `horizon - 1` mask rows): every
+        // row it keeps sits at the same position as in the full block.
+        let block = min(max(horizon ?? c.blockSize, draftCount + 1), c.blockSize)
+        let mask = fullMask.map {
+            block == c.blockSize ? $0 : $0[0 ..< block, 0 ..< ($0.dim(1) - c.blockSize + block)]
+        }
         let scale = 1 / Float(c.headDimensions).squareRoot()
         let act = embeddings.dtype == model.activationDType
             ? embeddings : embeddings.asType(model.activationDType)
-        var hidden = act.reshaped([1, block, c.hiddenSize])
+        var hidden = act.reshaped([1, c.blockSize, c.hiddenSize])
+        if block < c.blockSize { hidden = hidden[0..., 0 ..< block, 0...] }
         let lastIndex = model.layers.count - 1
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
