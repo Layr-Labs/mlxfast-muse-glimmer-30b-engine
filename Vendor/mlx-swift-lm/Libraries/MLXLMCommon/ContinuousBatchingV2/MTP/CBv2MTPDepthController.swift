@@ -603,7 +603,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// runs, so occasional rejections on a request that accepts nearly every
     /// draft never shrink its window.
     private(set) var roundAcceptanceFraction = 1.0
-    private static let regimeAlpha = 0.15
+    private static let regimeAlpha = 0.10
     static let lowAcceptanceRegimeThreshold = 0.75
 
     var inLowAcceptanceRegime: Bool {
