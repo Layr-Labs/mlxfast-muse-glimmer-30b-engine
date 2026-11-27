@@ -700,10 +700,13 @@ extension EngineLoopV2 {
                     requestID: id.raw, drafted: k,
                     accepted: accepted, committed: confirmed))
             let useOldPol = CBv2DraftRegime.treeOldAcceptancePolicy
+            // A round that left the main chain ended on a branch node. With
+            // leaf-only trees that node is always childless; a multi-hop
+            // branch can end above an unaccepted continuation, which is still
+            // not a chain-depth observation.
             let terminalBranchHit =
                 !useOldPol && verifyTree != nil && outcome.branchHit
                 && outcome.path.count > accepted
-                && verifyTree!.children[outcome.path[accepted]].isEmpty
             let effectiveDraftedDepth: Int
             let rejectionObserved: Bool
             let acceptanceTruncated: Bool

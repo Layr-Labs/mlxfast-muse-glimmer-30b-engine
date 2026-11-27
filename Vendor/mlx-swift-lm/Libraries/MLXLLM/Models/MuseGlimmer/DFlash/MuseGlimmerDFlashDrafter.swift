@@ -969,7 +969,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: settings.maximumDraftTokens)
+            draftCount: settings.maximumDraftTokens,
+            submitsLayers: Self.submitsLowAcceptanceLayersEarly && CBv2DraftRegime.lowAcceptance)
         let dynK = CBv2DraftRegime.activeDynamicTreeK
         if s.selection == nil, CBv2DraftRegime.lowAcceptance,
             CBv2DraftRegime.xnorDraftHeadEligible,
@@ -1717,6 +1718,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private static let drafterLayer4NAX: Bool =
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_L4_NAX"] == "1"
 
+    /// A low-acceptance round's `startRound` submits its block layer by
+    /// layer (`fastDraftBlockRows(submitsLayers:)`). No block is drafted
+    /// behind a low-acceptance verify (the predicted full acceptance is under
+    /// `mtpSpeculativeBlockMinimumFullAcceptance`), so the round builds its
+    /// block on the critical path, and under the DFlash rounds' command-buffer
+    /// limits (100 operations per buffer) the device gets nothing until the
+    /// whole block graph is built and 100 of its operations are encoded.
+    /// High-acceptance rounds keep one submission.
+    /// `CBV2_DFLASH_EARLY_BLOCK_SUBMIT=0` turns it off.
+    private static let submitsLowAcceptanceLayersEarly =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_EARLY_BLOCK_SUBMIT"] != "0"
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -1724,10 +1737,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// slices queries, attention, O-proj, MLP and final norm to only the
     /// `draftCount` active rows (7 instead of 16), cutting final-layer work
     /// in half with mathematically identical proposals.
+    ///
+    /// `submitsLayers` (a low-acceptance round's own block in `startRound`):
+    /// submit each layer before the final one as soon as its graph exists, so
+    /// the device runs it while the host builds and encodes the next. Only
+    /// when the work is submitted changes; every operation, shape and kernel
+    /// is the same, so the proposals are bit for bit the same.
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int, devicePosition: MLXArray? = nil
+        draftCount: Int, devicePosition: MLXArray? = nil, submitsLayers: Bool = false
     ) -> MLXArray {
         func rope(_ x: MLXArray, _ shift: Int) -> MLXArray {
             if let devicePosition {
@@ -1796,6 +1815,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             hidden =
                 hidden
                 + draftMLP(index, layer.mlp, mx)
+            if submitsLayers {
+                // Nonblocking; the round's fence still joins the proposals.
+                asyncEval(hidden)
+            }
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
@@ -2481,50 +2504,90 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               int chain_len = 0;
               int num_nodes = 1;
 
-              if (dp_mode != 0 && max_branch_len == 1) {
+              if (dp_mode != 0) {
+                // Exact max over the main-chain length L; the K - L branch
+                // slots are filled best-first. With max_branch_len > 1 the
+                // frontier also holds continuations: the next row's argmax
+                // under a chosen branch node, at EV parent * p * cont_decay.
+                // A child never outranks its parent, so best-first keeps the
+                // set prefix-closed (every node's parent is chosen first).
                 const int max_L = min(K_, R_);
                 const int min_L = min(max_L, (chain_bonus > 0.0f)
                     ? 1 : max(2, K_ - max(0, max_leaves)));
+                const bool use_cont = max_branch_len > 1 && cont_decay > 0.0f;
                 float best_total = -1.0f;
                 int best_L = max_L;
                 int best_lcnt = 0;
-                int best_lr[6];
-                int best_lc[6];
+                int best_lr[7];
+                int best_lc[7];
+                int best_lp[7];
                 for (int L = max_L; L >= min_L; --L) {
                   float total = 0.0f;
                   for (int r = 0; r < L; ++r) {
                     total += surv[r] * row_probs[r][0] * chain_bonus;
                   }
-                  const int budget = min(K_ - L, max(0, max_leaves));
+                  const int budget = use_cont ? (K_ - L) : min(K_ - L, max(0, max_leaves));
                   const int leaf_limit = min(L, max_leaf_depth);
                   bool used[7][5];
                   for (int r = 0; r < 7; ++r) {
                     for (int c = 0; c < 5; ++c) { used[r][c] = false; }
                   }
                   int cur_lcnt = 0;
-                  int cur_lr[6];
-                  int cur_lc[6];
+                  int cur_leaves = 0;
+                  int cur_lr[7];
+                  int cur_lc[7];
+                  int cur_lp[7];
+                  int cur_bs[7];
+                  float cur_ev[7];
+                  bool cur_cu[7];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
-                    int br = -1, bc = -1;
-                    for (int r = 0; r < leaf_limit; ++r) {
-                      const float base_w = surv[r] * leaf_mult[r];
-                      for (int c = 1; c < top_k_use; ++c) {
-                        if (!used[r][c] && row_ids[r][c] < ivocab) {
-                          const float ev = base_w * row_probs[r][c];
+                    int br = -1, bc = -1, bp = -1;
+                    if (cur_leaves < max_leaves) {
+                      for (int r = 0; r < leaf_limit; ++r) {
+                        const float base_w = surv[r] * leaf_mult[r];
+                        for (int c = 1; c < top_k_use; ++c) {
+                          if (!used[r][c] && row_ids[r][c] < ivocab) {
+                            const float ev = base_w * row_probs[r][c];
+                            if (ev > bev) {
+                              bev = ev;
+                              br = r;
+                              bc = c;
+                            }
+                          }
+                        }
+                      }
+                    }
+                    if (use_cont) {
+                      for (int j = 0; j < cur_lcnt; ++j) {
+                        const int d = cur_lr[j] + 1;
+                        if (!cur_cu[j] && cur_bs[j] < max_branch_len && d < R_
+                            && row_ids[d][0] < ivocab) {
+                          const float ev = cur_ev[j] * row_probs[d][0] * cont_decay;
                           if (ev > bev) {
                             bev = ev;
-                            br = r;
-                            bc = c;
+                            br = d;
+                            bc = 0;
+                            bp = j;
                           }
                         }
                       }
                     }
                     if (br >= 0 && bev > 0.0f) {
-                      used[br][bc] = true;
+                      if (bp < 0) {
+                        used[br][bc] = true;
+                        cur_leaves += 1;
+                        cur_bs[cur_lcnt] = 1;
+                      } else {
+                        cur_cu[bp] = true;
+                        cur_bs[cur_lcnt] = cur_bs[bp] + 1;
+                      }
                       total += bev;
                       cur_lr[cur_lcnt] = br;
                       cur_lc[cur_lcnt] = bc;
+                      cur_lp[cur_lcnt] = bp;
+                      cur_ev[cur_lcnt] = bev;
+                      cur_cu[cur_lcnt] = false;
                       cur_lcnt += 1;
                     } else {
                       break;
@@ -2537,6 +2600,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     for (int b = 0; b < cur_lcnt; ++b) {
                       best_lr[b] = cur_lr[b];
                       best_lc[b] = cur_lc[b];
+                      best_lp[b] = cur_lp[b];
                     }
                   }
                 }
@@ -2551,16 +2615,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   n_cont_used[id] = false;
                   chain_node[r + 1] = id;
                 }
+                int sel_node[7];
                 for (int b = 0; b < best_lcnt && num_nodes <= K_; ++b) {
                   const int r = best_lr[b];
                   const int c = best_lc[b];
+                  const int pj = best_lp[b];
                   const int id = num_nodes++;
-                  n_parent[id] = chain_node[r];
+                  n_parent[id] = (pj < 0) ? chain_node[r] : sel_node[pj];
                   n_depth[id] = r + 1;
                   n_token[id] = row_ids[r][c];
-                  n_ev[id] = surv[r] * leaf_mult[r] * row_probs[r][c];
-                  n_bstep[id] = 1;
+                  n_ev[id] = (pj < 0) ? surv[r] * leaf_mult[r] * row_probs[r][c] : 0.0f;
+                  n_bstep[id] = (pj < 0) ? 1 : (n_bstep[sel_node[pj]] + 1);
                   n_cont_used[id] = false;
+                  sel_node[b] = id;
                 }
               } else {
                 bool chosen[7][5];

@@ -638,9 +638,13 @@ inline void paged_attention_merge_impl(
 // part_smem[MAXPART * HPT * (D + 2)] floats.
 // BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
+// APPEND (linear rows only): the call's new K/V columns arrive as token-major
+// knew/vnew; each row's terminal position is also its write slot, and positions
+// from row 0's terminal position on are read from knew/vnew, not the pages.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
+    bool APPEND = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -657,9 +661,12 @@ inline void paged_attention_onepass_impl(
     uint3 tpitg,
     uint sgitg,
     uint lane,
-    const device int32_t* tree_meta = nullptr
+    const device int32_t* tree_meta = nullptr,
+    const device T* knew = nullptr,
+    const device T* vnew = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    static_assert(!(APPEND && DYN_TREE), "the fused append serves linear rows only");
     constexpr int SPLITS = GQA / HPT;
     constexpr int EPT = D / 32;
     constexpr int TG = 32 * NSG * MAXPART;
@@ -670,7 +677,7 @@ inline void paged_attention_onepass_impl(
     const int b = tgpig.y;
     const int part = (int)sgitg / NSG;
     const int state = (int)sgitg % NSG;
-    const int lin = tpitg.x;
+    const int lin = APPEND ? (int)sgitg * 32 + (int)lane : (int)tpitg.x;
 
     const device int32_t* info = seqinfo + b * 8;
     int attend_start = info[0];
@@ -700,6 +707,16 @@ inline void paged_attention_onepass_impl(
 
     const int q_head0 = kv_head * GQA + hgroup * HPT;
     const int64_t qr = (int64_t)(kvh * GQA) * D;
+    const int pending_start = APPEND ? seqinfo[0] + seqinfo[1] - 1 : 0;
+    if constexpr (APPEND) {
+        if (hgroup == 0 && part == parts - 1) {
+            const int pos = attend_start + attend_len - 1;
+            const auto page = cache.read_page(table, pos / S, table_len);
+            const size_t dst = ((size_t)kv_head * S + pos % S) * D;
+            const size_t src = ((size_t)b * kvh + kv_head) * D;
+            page.template write<D, 32 * NSG>(dst, knew + src, vnew + src, lin % (32 * NSG));
+        }
+    }
     for (int i = lin; i < HPT * D; i += TG) {
         const int64_t offset = (int64_t)b * qr + (q_head0 + i / D) * (int64_t)D + (i % D);
         const float value = float(q[offset]);
@@ -741,17 +758,25 @@ inline void paged_attention_onepass_impl(
                             ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
                             : raw_pos)
                         : raw_pos;
-                    const int lpage = pos / S;
-                    const int slot = pos % S;
-                    if (lpage != cur_lpage) {
-                        const auto page = cache.read_page(table, lpage, table_len);
-                        cur_key = page.key;
-                        cur_value = page.value;
-                        cur_lpage = lpage;
+                    if (APPEND && pos >= pending_start) {
+                        const size_t base =
+                            ((size_t)(pos - pending_start) * kvh + kv_head) * D + lane * EPT;
+                        kr[u] = *reinterpret_cast<const device vec<T, 4>*>(knew + base);
+                        vr[u] = *reinterpret_cast<const device vec<T, 4>*>(vnew + base);
+                    } else {
+                        const int lpage = pos / S;
+                        const int slot = pos % S;
+                        if (lpage != cur_lpage) {
+                            const auto page = cache.read_page(table, lpage, table_len);
+                            cur_key = page.key;
+                            cur_value = page.value;
+                            cur_lpage = lpage;
+                        }
+                        const size_t base =
+                            ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
+                        kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
+                        vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
                     }
-                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
-                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
-                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
                 }
             }
 #pragma unroll
@@ -797,11 +822,17 @@ inline void paged_attention_onepass_impl(
                     ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
                     : raw_pos)
                 : raw_pos;
-            const int lpage = pos / S;
-            const int slot = pos % S;
-            const auto page = cache.read_page(table, lpage, table_len);
-            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
-            page.template load<EPT>(base, lane, kf, vf);
+            if (APPEND && pos >= pending_start) {
+                const size_t base = ((size_t)(pos - pending_start) * kvh + kv_head) * D;
+                load_row<T, EPT>(knew + base, lane, kf);
+                load_row<T, EPT>(vnew + base, lane, vf);
+            } else {
+                const int lpage = pos / S;
+                const int slot = pos % S;
+                const auto page = cache.read_page(table, lpage, table_len);
+                const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+            }
 
 #pragma unroll
             for (int g = 0; g < HPT; g++) {
