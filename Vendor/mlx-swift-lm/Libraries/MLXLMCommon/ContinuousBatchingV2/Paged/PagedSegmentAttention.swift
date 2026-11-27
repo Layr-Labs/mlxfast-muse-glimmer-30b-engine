@@ -123,6 +123,22 @@ enum PagedSegmentAttention {
         }
     }
 
+    static func gatedMergeKernel(key: PagedAttentionKernelKey, source: String)
+        -> MLXFast.MLXFastKernel
+    {
+        return lock.withLock {
+            let name = key.kernelName + "_segments_ordered_gated"
+            if let existing = kernels[name] { return existing }
+            let made = MLXFast.metalKernel(
+                name: name,
+                inputNames: ["partials", "meta", "seqinfo", "sinks", "previous", "gate"],
+                outputNames: ["out"], source: PagedAttentionMSL.mergeBodyGated,
+                header: source, ensureRowContiguous: true)
+            kernels[name] = made
+            return made
+        }
+    }
+
     static func decode(
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
@@ -130,7 +146,8 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        gate: MLXArray? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -180,12 +197,14 @@ enum PagedSegmentAttention {
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
             backing.append(
                 contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
+            let useGate = gate != nil && gate!.dtype == dtype && gate!.shape == [b, qh, d]
+                && PagedOnePassAttention.gatedEpilogueVerified
             let result = PagedOnePassAttention.segments(
                 queries: q, backing: backing, seqinfo: seqinfo, params: params,
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, gate: useGate ? gate : nil)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
@@ -196,6 +215,28 @@ enum PagedSegmentAttention {
                 return reference
             }
             group.writeFence = result.fence
+            if useGate, !PagedOnePassAttention.gatedEpilogueCheckRan {
+                PagedOnePassAttention.gatedEpilogueCheckRan = true
+                let ungated = PagedOnePassAttention.segments(
+                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
+                    records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
+                    pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
+                    softcap: softcap, source: source)
+                group.writeFence = ungated.fence
+                let reference = ungated.out * sigmoid(gate!)
+                let bits: DType = dtype.size == 4 ? .uint32 : .uint16
+                let differing = (
+                    contiguous(result.out).view(dtype: bits) .!= contiguous(reference).view(dtype: bits)
+                ).asType(.int32).sum()
+                eval(differing)
+                if differing.item(Int.self) != 0 {
+                    PagedOnePassAttention.gatedEpilogueVerified = false
+                    FileHandle.standardError.write(
+                        Data("[onepass-gate] bit mismatch; unfused gate kept\n".utf8))
+                }
+                return reference
+            }
             return result.out
         }
         let partialsShape = [b, qh, plan.maxPartitions, d]
@@ -370,7 +411,7 @@ enum PagedMTPBatchedColumns {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         row: PagedSequenceKV, group: PagedKVGroup,
         sinks: MLXArray?, params: MLXArray, softcap: Bool,
-        source: String, dispatchCache: PagedSegmentDispatchCache
+        source: String, dispatchCache: PagedSegmentDispatchCache, gate: MLXArray? = nil
     ) -> MLXArray {
         precondition(eligible(queries: queries, row: row, group: group))
         let count = queries.dim(2)
@@ -386,7 +427,7 @@ enum PagedMTPBatchedColumns {
             let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
             let result = PagedMultiQueryAttention.attend(
                 queries: batch, row: row, group: group, sinks: sinks, params: params,
-                softcap: softcap, source: source, dispatchCache: dispatchCache)
+                softcap: softcap, source: source, dispatchCache: dispatchCache, gate: gate)
             let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
             return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
         }
@@ -434,6 +475,8 @@ enum PagedMultiQueryAttention {
             "DARKBLOOM_PAGED_MTP_MULTI_QUERY"] != "0"
     /// Dispatches issued (test/telemetry hook; process-wide).
     nonisolated(unsafe) private(set) static var dispatches = 0
+    nonisolated(unsafe) static var gatedMergeVerified = true
+    nonisolated(unsafe) static var gatedMergeCheckRan = false
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
@@ -595,7 +638,7 @@ enum PagedMultiQueryAttention {
     static func attend(
         queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup,
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
-        dispatchCache: PagedSegmentDispatchCache
+        dispatchCache: PagedSegmentDispatchCache, gate: MLXArray? = nil
     ) -> MLXArray {
         var q = queries
         let count = q.dim(0)
@@ -674,10 +717,42 @@ enum PagedMultiQueryAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
+        let mergeTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
+        ]
+        let mergeGrid = (qh * 32, count, 1)
+        let mergeThreadGroup = (32, 1, 1)
+        if let gate, gate.dtype == dtype, gate.shape == [count, qh * d],
+            PagedMultiQueryAttention.gatedMergeVerified
+        {
+            let gated = PagedSegmentAttention.gatedMergeKernel(key: mergeKey, source: source)(
+                [partials, meta, seqinfo, zeroSinks, group.writeFence, gate],
+                template: mergeTemplate, grid: mergeGrid, threadGroup: mergeThreadGroup,
+                outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
+            guard PagedMultiQueryAttention.gatedMergeCheckRan else {
+                PagedMultiQueryAttention.gatedMergeCheckRan = true
+                let merged = PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
+                    [partials, meta, seqinfo, zeroSinks, group.writeFence],
+                    template: mergeTemplate, grid: mergeGrid, threadGroup: mergeThreadGroup,
+                    outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
+                let reference = merged * sigmoid(gate.reshaped(count, qh, d))
+                let bits: DType = dtype.size == 4 ? .uint32 : .uint16
+                let differing = (
+                    contiguous(gated).view(dtype: bits) .!= contiguous(reference).view(dtype: bits)
+                ).asType(.int32).sum()
+                eval(differing)
+                if differing.item(Int.self) != 0 {
+                    PagedMultiQueryAttention.gatedMergeVerified = false
+                    FileHandle.standardError.write(
+                        Data("[paged-mq-gate] bit mismatch; unfused gate kept\n".utf8))
+                }
+                return reference
+            }
+            return gated
+        }
         return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
             [partials, meta, seqinfo, zeroSinks, group.writeFence],
-            template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
-            grid: (qh * 32, count, 1), threadGroup: (32, 1, 1),
+            template: mergeTemplate, grid: mergeGrid, threadGroup: mergeThreadGroup,
             outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
     }
 }

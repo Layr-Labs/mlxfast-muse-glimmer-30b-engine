@@ -521,12 +521,13 @@ inline void paged_attention_part_impl(
 // head)'s partition partials with a global softmax merge; sinks fold into
 // the denominator only. The partition count is recomputed from the row's
 // OWN attended length, so slots written for longer batchmates are ignored.
-template <typename T, int D, int PTOK, bool HAS_SINKS>
+template <typename T, int D, int PTOK, bool HAS_SINKS, bool HAS_GATE = false>
 inline void paged_attention_merge_impl(
     const device float* partials,
     const device float* meta,
     const device int32_t* seqinfo,
     const device float* sinks,
+    const device T* gate,
     const int heads,
     const int maxpart,
     device T* out,
@@ -582,9 +583,23 @@ inline void paged_attention_merge_impl(
     device T* orow = output_columns > 0
         ? out + ((size_t)head * output_columns + seqinfo[b * 8 + 5]) * D
         : out + row * D;
+    if (HAS_GATE) {
+        const device T* grow = gate + row * D;
 #pragma unroll
-    for (int e = 0; e < EPT; e++) {
-        orow[lane * EPT + e] = T(acc[e] * inv);
+        for (int e = 0; e < EPT; e++) {
+            const T o = T(acc[e] * inv);
+            const T xg = grow[lane * EPT + e];
+            const T ax = xg < T(0) ? -xg : xg;
+            const T ey = T(metal::precise::exp(float(ax)));
+            const T sy = T(1) / (T(1) + ey);
+            const T sg = (xg < T(0)) ? sy : T(1) - sy;
+            orow[lane * EPT + e] = o * sg;
+        }
+    } else {
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            orow[lane * EPT + e] = T(acc[e] * inv);
+        }
     }
 }
 
@@ -609,7 +624,7 @@ inline void paged_attention_merge_impl(
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool HAS_GATE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -622,6 +637,7 @@ inline void paged_attention_onepass_impl(
     threadgroup float* red_smem,
     threadgroup float* part_smem,
     device T* out,
+    const device T* gate,
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
@@ -846,9 +862,24 @@ inline void paged_attention_onepass_impl(
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
             device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            if (HAS_GATE) {
+                const device T* grow =
+                    gate + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
 #pragma unroll
-            for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                for (int e = 0; e < EPT; e++) {
+                    const T o = T(gacc[e] * inv);
+                    const T xg = grow[lane * EPT + e];
+                    const T ax = xg < T(0) ? -xg : xg;
+                    const T ey = T(metal::precise::exp(float(ax)));
+                    const T sy = T(1) / (T(1) + ey);
+                    const T sg = (xg < T(0)) ? sy : T(1) - sy;
+                    orow[lane * EPT + e] = o * sg;
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    orow[lane * EPT + e] = T(gacc[e] * inv);
+                }
             }
         }
     }

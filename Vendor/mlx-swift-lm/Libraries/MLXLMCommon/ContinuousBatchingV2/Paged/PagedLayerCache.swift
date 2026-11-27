@@ -685,6 +685,65 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return finishAttentionCall(output)
     }
 
+    ///
+    public func updateAndAttendGated(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, gate: MLXArray
+    ) -> MLXArray? {
+        guard gate.dim(0) == queries.dim(0), gate.dim(1) == queries.dim(2),
+            gate.dim(2) == queries.dim(1) * queries.dim(3),
+            gate.dtype == queries.dtype
+        else { return nil }
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            kind.headDim == kind.valueHeadDim, kind.sharesKVWithLayer == nil,
+            pool.groupKey(forLayer: layerIndex).quantization == nil,
+            queries.ndim == 4, queries.dim(2) > 1,
+            (mtpBatchesRectangularAttention && PagedMTPBatchedColumns.enabled)
+                || (mtpSerializesRectangularAttention && mtpBatchesRectangularColumnsAsRows),
+            pagedRows.count == 1, attentionMetadata == nil, attentionPacket == nil,
+            !pool.usesStepOwnedAttention,
+            validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: sinks)
+        else { return nil }
+        let row = pagedRows[0]
+        let group = pool.group(row.groupKey)
+        if mtpBatchesRectangularAttention {
+            guard PagedMTPBatchedColumns.eligible(queries: queries, row: row, group: group),
+                PagedMultiQueryAttention.enabled,
+                PagedMultiQueryAttention.eligible(
+                    columns: queries.dim(2), queryHeads: queries.dim(1), headDim: queries.dim(3),
+                    group: group)
+            else { return nil }
+        }
+        guard beginAttentionWork(queries: queries, rows: pagedRows) else { return nil }
+        defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let count = queries.dim(2)
+        if mtpBatchesRectangularAttention {
+            let columnGate = gate.reshaped(count, gate.dim(2))
+            let output = PagedMTPBatchedColumns.attend(
+                queries: queries, keys: keys, values: values,
+                row: row, group: group, sinks: preparedSinks(effectiveSinks),
+                params: params(scale: scale),
+                softcap: attentionSoftcap != nil, source: pool.kernelSource,
+                dispatchCache: segmentDispatchCache, gate: columnGate)
+            advancePositionOffsets(by: queries.dim(2))
+            return finishAttentionCall(output)
+        }
+        let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+        let rowGate = gate.reshaped(b * l, qh, d)
+        guard let output = attendColumnsAsDecodeRows(
+            queries: queries, keys: keys, values: values,
+            rows: pagedRows, scale: scale, sinks: effectiveSinks, gate: rowGate)
+        else { return nil }
+        advancePositionOffsets(by: queries.dim(2))
+        return finishAttentionCall(output)
+    }
+
     /// Whether `writePromptKVWithoutAttention` may stand in for this layer's
     /// prompt-chunk `updateAndAttend`: plain native K/V whose attention call
     /// carries nothing beyond the write and the offset advance — no quantized
@@ -1271,7 +1330,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// round's writes leave every column's window in place.
     private func attendColumnsAsDecodeRows(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?, gate: MLXArray? = nil
     ) -> MLXArray? {
         let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
         guard (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !rows.isEmpty,
@@ -1315,7 +1374,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            gate: gate)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

@@ -119,7 +119,7 @@ enum PagedQuantizedAttention {
                     const int heads = partials_shape[1];
                     const int maxpart = partials_shape[2];
                     cbv2::paged_attention_merge_impl<T, D, PTOK, HAS_SINKS>(
-                        partials, meta, seqinfo, sinks, heads, maxpart, destination,
+                        partials, meta, seqinfo, sinks, nullptr, heads, maxpart, destination,
                         threadgroup_position_in_grid, thread_index_in_simdgroup, destination_shape[2]);
                     if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) fence[0] = previous[0] + 1;
                     """, header: source, ensureRowContiguous: false, mutableInputs: ["destination"])

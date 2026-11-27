@@ -142,7 +142,16 @@ enum PagedAttentionMSL {
             const int heads = partials_shape[1];
             const int maxpart = partials_shape[2];
             cbv2::paged_attention_merge_impl<T, D, PTOK, HAS_SINKS>(
-                partials, meta, seqinfo, sinks, heads, maxpart, out,
+                partials, meta, seqinfo, sinks, nullptr, heads, maxpart, out,
+                threadgroup_position_in_grid,
+                thread_index_in_simdgroup);
+        """
+
+    static let mergeBodyGated: String = """
+            const int heads = partials_shape[1];
+            const int maxpart = partials_shape[2];
+            cbv2::paged_attention_merge_impl<T, D, PTOK, HAS_SINKS, true>(
+                partials, meta, seqinfo, sinks, gate, heads, maxpart, out,
                 threadgroup_position_in_grid,
                 thread_index_in_simdgroup);
         """
