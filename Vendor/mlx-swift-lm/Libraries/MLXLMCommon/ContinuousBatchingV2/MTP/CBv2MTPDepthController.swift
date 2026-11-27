@@ -603,6 +603,16 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// runs, so occasional rejections on a request that accepts nearly every
     /// draft never shrink its window.
     private(set) var roundAcceptanceFraction = 1.0
+    /// Observed outcomes per position (accept or reject), for the warm-start weight.
+    private(set) var positionObservations: [Int] =
+        Array(repeating: 0, count: CBv2MTPRequestAcceptanceState.maximumDepth)
+    /// Warm start: a position's first outcomes are averaged with this many pseudo-observations
+    /// of its prior, then the update settles at `alpha`.
+    static let warmPriorCount = 2.0
+
+    private func updateWeight(_ position: Int) -> Double {
+        max(Self.alpha, 1.0 / (Double(positionObservations[position]) + Self.warmPriorCount))
+    }
     private static let regimeAlpha = 0.15
     static let lowAcceptanceRegimeThreshold = 0.75
 
@@ -680,7 +690,8 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         let accepted = min(max(acceptedDepth, 0), drafted)
 
         for position in 0 ..< accepted {
-            probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+            positionObservations[position] += 1
+            probabilities[position] += updateWeight(position) * (1.0 - probabilities[position])
         }
         // Regime signal: only rounds whose outcome was fully observed (a
         // rejection, or every draft accepted) count; a truncation does not.
@@ -693,7 +704,8 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                 Self.regimeAlpha * (fraction - roundAcceptanceFraction)
         }
         if rejectionObserved, accepted < drafted {
-            probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
+            positionObservations[accepted] += 1
+            probabilities[accepted] += updateWeight(accepted) * (0.0 - probabilities[accepted])
         } else if !rejectionObserved, !endedByTruncation,
             drafted > 0, accepted == drafted, drafted < Self.maximumDepth,
             probabilities[drafted] < 0.95
