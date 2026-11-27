@@ -862,9 +862,6 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
-        CBv2DraftRegime.xnorDraftHeadEligible =
-            batch == 1 && mtp.inDeepLowAcceptanceRegime(verifyRows[0].rec.id)
-        defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
         let treeEligible =
             batch == 1 && CBv2DraftRegime.verifyTreeMode != 0
             && mtp.shouldUseVerifyTree(for: verifyRows[0].rec.id)

@@ -681,14 +681,6 @@ final class CBv2MTPRoundDriver {
             && (requestAcceptance[id] ?? initialRequestAcceptance).inLowAcceptanceRegime
     }
 
-    /// Stricter low-acceptance check (`observedRegimeRounds >= 3 && fraction < 0.55`)
-    /// so approximate Stage-1 draft-head screening never fires on high-acceptance
-    /// requests after a single early low round.
-    func inDeepLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
-        usesFixedDepthAcceptanceWindow
-            && (requestAcceptance[id] ?? initialRequestAcceptance).isDeepLowAcceptanceRegime
-    }
-
     func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
         inLowAcceptanceRegime(id)
             && (!CBv2DraftRegime.treeCooldownEnabled || !treeCooldownRequests.contains(id))
@@ -1668,8 +1660,6 @@ public struct CBv2VerifyTree: Sendable {
 /// Set by the engine while a low-acceptance round's drafts and verify are built.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
-    /// Stricter deep-low-acceptance flag for approximate Stage-1 draft-head screening.
-    nonisolated(unsafe) public static var xnorDraftHeadEligible = false
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
