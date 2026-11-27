@@ -130,7 +130,8 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        pending: (keys: MLXArray, values: MLXArray)? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -171,12 +172,32 @@ enum PagedSegmentAttention {
         if newKeys != nil {
             precondition(k.shape == [b, kvh, d] && v.shape == k.shape)
         }
+        func scatterPending(_ pending: (keys: MLXArray, values: MLXArray)) {
+            let slots = rows.map {
+                let position = $0.info.attendStart + $0.info.attendLength - 1
+                let page = $0.pages[(position / group.pageSize) % $0.info.tableLength]
+                return page * Int32(group.pageSize) + Int32(position % group.pageSize)
+            }
+            PagedSegmentTransfers.write(
+                group: group, slots: slots, keys: pending.keys, values: pending.values)
+        }
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
-            let heads = PagedOnePassAttention.eligible(
+            let onePass = PagedOnePassAttention.eligible(
                 headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b)
         {
             let bucket = plan.buckets[0]
+            var fusedPending = pending
+            if let pending,
+                !PagedOnePassAttention.supportsAppend(
+                    dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
+                    hpt: onePass.heads, simdgroups: nsg, partitionTokens: ptok,
+                    softcap: softcap, capacity: onePass.capacity, bindings: bucket.bindingClass)
+            {
+                scatterPending(pending)
+                guard !group.writeValidation.isFaulted else { return q }
+                fusedPending = nil
+            }
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
             backing.append(
                 contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
@@ -184,9 +205,14 @@ enum PagedSegmentAttention {
                 queries: q, backing: backing, seqinfo: seqinfo, params: params,
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
-                pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                pageSize: group.pageSize, hpt: onePass.heads, simdgroups: nsg,
+                partitionTokens: ptok, softcap: softcap, source: source,
+                capacity: onePass.capacity,
+                pending: fusedPending.map {
+                    ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
+                })
             if PagedOnePassAttention.checks {
+                if fusedPending != nil { group.writeFence = result.fence }
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
                     queries: q, newKeys: nil, newValues: nil, group: group, rows: rows,
@@ -197,6 +223,10 @@ enum PagedSegmentAttention {
             }
             group.writeFence = result.fence
             return result.out
+        }
+        if let pending {
+            scatterPending(pending)
+            guard !group.writeValidation.isFaulted else { return q }
         }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.

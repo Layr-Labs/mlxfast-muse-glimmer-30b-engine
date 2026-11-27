@@ -571,6 +571,29 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         return (page, slot)
     }
 
+    func prepareDecodeAppend(count: Int) -> Bool {
+        if pool.refuseUnplannedAttentionMutation(
+            "cursor-only fused decode append", dtype: groupKey.dtype)
+        {
+            return false
+        }
+        precondition(count > 0 && !released && groupKey.quantization == nil)
+        precondition(absoluteOffset >= frozenHighWater && count <= maxLength - absoluteOffset)
+        guardSpeculativeSpan(adding: count)
+        do { try prepareImmutableWrite(count: count) } catch {
+            pool.writeValidation.record(error)
+            return false
+        }
+        let size = pool.config.pageSize
+        let end = absoluteOffset + count
+        for logical in (absoluteOffset / size) ... ((end - 1) / size) {
+            _ = ensurePage(logicalPage: logical)
+        }
+        absoluteOffset = end
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
+        return true
+    }
+
     private func ensurePage(logicalPage lp: Int) -> Int32 {
         let slotIndex: Int
         if let ring = ringPages {
