@@ -88,17 +88,22 @@ public enum CBv2VerifyNVFP4 {
             return as_type<half2>(u) * half2(256.0h);
         }
 
-        // One tile of 8 * TN outputs of one projection: the stock matrix
-        // kernel's arithmetic (see CBv2VerifyNVFP4).
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV>
+        // Two paired fragments reuse the activation loads, but keep separate
+        // weight and scale streams and independent ordered K reductions.
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV,
+                  bool PAIRED = false, bool CAST_FP8 = false>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
-            threadgroup float* partials) {
+            threadgroup float* partials,
+            const device uint32_t* up_w = nullptr, const device uint8_t* up_scales = nullptr,
+            float up_tensor_scale = 0.0f, const device float* fp8_mu = nullptr,
+            const device float* fp8_bound = nullptr) {
+            static_assert(!PAIRED || (TN == 2 && SCALED), "paired gate/up tile");
             constexpr int WK = 8;
             constexpr int BK = 128;
             constexpr short TM = (V + 7) / 8;
-            constexpr int ROWS = 8 * TN;
+            constexpr int ROWS = PAIRED ? 8 : 8 * TN;
             constexpr int row_bytes = K / 2;
             constexpr int row_scales = K / 16;
             static_assert(K % BK == 0, "whole chunks only");
@@ -126,10 +131,12 @@ public enum CBv2VerifyNVFP4 {
             const device uint8_t* sl[TN];
             MO_WO_UNROLL
             for (short t = 0; t < TN; t++) {
-                const int row = min(y_col + fm + 8 * t, N - 1);
+                const int row = min(y_col + fm + (PAIRED ? 0 : 8 * t), N - 1);
+                const device uint32_t* wt = PAIRED && t == 1 ? up_w : w;
+                const device uint8_t* st = PAIRED && t == 1 ? up_scales : scales;
                 wl[t] = (const device uint*)(
-                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
-                sl[t] = scales + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
+                    (const device uint8_t*)wt + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = st + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
             }
 
             if constexpr (WC && PF == 0) {
@@ -389,11 +396,28 @@ public enum CBv2VerifyNVFP4 {
                     for (short j = 0; j < 2; j++) {
                         if (8 * mt + fn + j < V) {
                             device T* yr = y + size_t(8 * mt + fn + j) * N;
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                const int out = y_col + fm + 8 * t;
+                            if constexpr (PAIRED) {
+                                const int out = y_col + fm;
                                 if (out < N) {
-                                    yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    const T g = mo_wo_result<T>(C[0][mt][j], true, tensor_scale0);
+                                    const T u = mo_wo_result<T>(C[1][mt][j], true, up_tensor_scale);
+                                    const T silu = g * verify_bf16_sigmoid(g);
+                                    const T act = silu * u;
+                                    if constexpr (CAST_FP8) {
+                                        yr[out] = verify_bf16_cast_fp8(
+                                            act, fp8_mu[0], fp8_mu[1], fp8_bound[0],
+                                            metal::numeric_limits<float>::quiet_NaN());
+                                    } else {
+                                        yr[out] = act;
+                                    }
+                                }
+                            } else {
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const int out = y_col + fm + 8 * t;
+                                    if (out < N) {
+                                        yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    }
                                 }
                             }
                         }
@@ -402,6 +426,9 @@ public enum CBv2VerifyNVFP4 {
             }
         }
         """
+
+    private static let kernelHeader = ModelOptWeightOnlyNVFP4RowExact.header
+        + ModelOptActivationKernels.header + VerifyFusedNorms.elemFP8Header + tileHelper
 
     /// Segment `i` takes tiles `[sum of tiles before, + ceil(N_i / (8 * TN * RG)))`
     /// of the grid's y axis.
@@ -433,12 +460,42 @@ public enum CBv2VerifyNVFP4 {
         return MLXFast.metalKernel(
             name: "cbv2_verify_nvfp4_row_exact_\(segments)", inputNames: inputs,
             outputNames: outputs, source: body,
-            header: ModelOptWeightOnlyNVFP4RowExact.header + tileHelper)
+            header: kernelHeader)
     }
 
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
         1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
+
+    private static func makeSwiGLUKernel(castFP8: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: castFP8 ? "cbv2_verify_nvfp4_swiglu_cast" : "cbv2_verify_nvfp4_swiglu",
+            inputNames: ["w", "scales", "tsg", "wu", "scu", "tsu", "x"]
+                + (castFP8 ? ["fp8_mu", "fp8_bound"] : []),
+            outputNames: ["y"],
+            source: """
+                constexpr int TILE_ELEMS = 4 * ((V + 7) / 8);
+                threadgroup float partials[7 * TILE_ELEMS * 32];
+                cbv2_vn_tile<T, V, K, N, 2, PF, true, WC, SV, true, \(castFP8 ? "true" : "false")>(
+                    w, scales, x, tsg[0], y, int(threadgroup_position_in_grid.y),
+                    simdgroup_index_in_threadgroup, thread_index_in_simdgroup, partials,
+                    wu, scu, tsu[0]\(castFP8 ? ", fp8_mu, fp8_bound" : ""));
+                """,
+            header: kernelHeader)
+    }
+
+    nonisolated(unsafe) private static let swiGLUKernel = makeSwiGLUKernel(castFP8: false)
+    nonisolated(unsafe) private static let swiGLUCastKernel = makeSwiGLUKernel(castFP8: true)
+
+    private struct SwiGLUKey: Hashable {
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+        let prefetch: Int
+        let wholeChunk: Bool
+        let scaleVec: Bool
+        let castFP8: Bool
+    }
 
     private struct LaunchKey: Hashable {
         let segments: Int
@@ -474,6 +531,7 @@ public enum CBv2VerifyNVFP4 {
 
     private final class CacheBox: @unchecked Sendable {
         var launches: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var swiGLULaunches: [SwiGLUKey: MLXFast.MLXFastKernel.Launch] = [:]
         var plans: [PlanKey: Plan] = [:]
     }
 
@@ -528,6 +586,67 @@ public enum CBv2VerifyNVFP4 {
             && weight.size >= 8 && blockScales.dtype == .uint8
             && blockScales.shape == [outputs, inputs / 16] && blockScales.size >= 8
             && (tensorScale.map { $0.dtype == .float32 && $0.size == 1 } ?? true)
+    }
+
+    public static func gateUpSwiGLU(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear,
+        _ x: MLXArray, fp8Down: ModelOptCalibratedLinear?
+    ) -> MLXArray? {
+        guard x.ndim == 3, geometryOverride == nil else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        let outputs = gate.weight.dim(0)
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            up.weight.dim(0) == outputs,
+            takes(weight: gate.weight, blockScales: gate.weightScale,
+                tensorScale: gate.weightScale2, inputs: inputs),
+            takes(weight: up.weight, blockScales: up.weightScale,
+                tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+
+        let fp8Params: (multipliers: MLXArray, bound: MLXArray)?
+        if let fp8Down {
+            guard VerifyFusedNorms.fusedElementwiseFP8Enabled, outputs % 4 == 0,
+                let constants = fp8Down.graphConstants,
+                case .fp8(let multipliers, let bound) = constants.storage
+            else { return nil }
+            fp8Params = (multipliers, bound)
+        } else {
+            fp8Params = nil
+        }
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: true)
+        let castFP8 = fp8Down != nil
+        let key = SwiGLUKey(
+            rows: rows, inputs: inputs, outputs: outputs, prefetch: s.prefetch,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, castFP8: castFP8)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = cacheLock.withLockUnchecked({ $0.swiGLULaunches[key] }) {
+            launch = hit
+        } else {
+            let kernel = castFP8 ? swiGLUCastKernel : swiGLUKernel
+            let made = kernel.prepare(
+                template: [
+                    ("T", DType.bfloat16), ("V", rows), ("K", inputs), ("N", outputs),
+                    ("PF", s.prefetch), ("WC", s.wholeChunk), ("SV", s.scaleVec),
+                ],
+                grid: (32, 8 * ((outputs + 7) / 8), 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [.bfloat16])
+            cacheLock.withLockUnchecked { $0.swiGLULaunches[key] = made }
+            launch = made
+        }
+        let tsg = gate.weightScale2.reshaped(1)
+        let tsu = up.weightScale2.reshaped(1)
+        let input = x.reshaped(rows, inputs)
+        let args: [MLXArray]
+        if let fp8Params {
+            args = [gate.weight, gate.weightScale, tsg, up.weight, up.weightScale, tsu, input,
+                fp8Params.multipliers, fp8Params.bound]
+        } else {
+            args = [gate.weight, gate.weightScale, tsg, up.weight, up.weightScale, tsu, input]
+        }
+        return launch(args)[0].reshaped(x.dim(0), x.dim(1), outputs)
     }
 
     /// `ModelOptWeightOnlyNVFP4RowExact.product(x, weight:, blockScales:,
