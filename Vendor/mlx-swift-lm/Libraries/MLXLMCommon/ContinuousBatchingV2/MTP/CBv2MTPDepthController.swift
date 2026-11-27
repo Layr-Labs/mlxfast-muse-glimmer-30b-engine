@@ -626,15 +626,35 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowEarlyCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+    }()
+    static let deepLowEarlyCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_COMMITTED"].flatMap(Int.init) ?? 305
+    }()
+    static let deepLowCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_MIN_ROUNDS"].flatMap(Int.init) ?? 6
+    }()
+    static let deepLowCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_THRESHOLD"].flatMap(Int.init) ?? 360
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Stricter low-acceptance gate for deep-low drafter & XNOR Stage-1:
+    /// 1) Early cold-start EWMA (`observedRegimeRounds >= 3 && fraction < 0.55`), OR
+    /// 2) Early tree-invariant fast-track for very-low-acc requests (`ceilingRounds >= 3 && avg < 3.05`), OR
+    /// 3) Tree-invariant sticky lock (`inLowAcceptanceRegime && ceilingRounds >= 6 && avg < 3.90`,
+    ///    strictly below Pair 1's `4.04 * n + 27` ceiling line).
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowCommittedHundredths * ceilingRounds)
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
