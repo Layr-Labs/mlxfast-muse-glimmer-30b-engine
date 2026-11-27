@@ -682,25 +682,91 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
     }
 
+    /// The rows a low-acceptance request's post-verify context projection
+    /// runs at: its `k + 1` verify rows, or `contextTileRows` when there are
+    /// 2 to 6 of them.
+    ///
+    /// Why: below 8 rows each of these affine products (`encoder.fc` and every
+    /// layer's `k_proj` / `v_proj`) is MLX's `affine_qmv_wide` kernel, and its
+    /// pipeline is specialized by the row count (`_nv_<rows>` in the kernel
+    /// name). The benchmark's resident worker is sandboxed, so a pipeline it
+    /// builds is not kept in the system shader cache: the first round of a
+    /// decode window that projects a row count not seen before compiles a new
+    /// pipeline inside the timed window. A low-acceptance request's window
+    /// varies `k`, so it meets several such row counts. The 7-row pipeline is
+    /// already built by then (the block's final layer runs `q_proj` and
+    /// `o_proj` on its 7 active rows from the first round on), so 2 to 6 rows
+    /// take it instead and no new pipeline is built.
+    ///
+    /// Exact: `affine_qmv_wide` computes every row with the same operations
+    /// in the same order whatever the tile's row count (`vecs_per_tg`), and
+    /// `activation`, `fc`, `outputNorm`, `k_proj` and `v_proj` are row by row,
+    /// so the real rows are bit for bit the rows the unpadded projection
+    /// gives; the padding rows are dropped before anything reads them.
+    /// Pads with copies of the real rows (one concatenation: no new kernel).
+    /// The high-acceptance regime is untouched. `CBV2_DFLASH_LOW_CONTEXT_TILE=0`
+    /// turns it off.
+    private static let contextTileRows = 7
+    private static let lowAcceptanceContextTile =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_LOW_CONTEXT_TILE"] != "0"
+
+    private static func contextTiledRows(_ rows: Int) -> Int? {
+        guard CBv2DraftRegime.lowAcceptanceSpeculation, lowAcceptanceContextTile,
+            rows >= 2, rows < contextTileRows
+        else { return nil }
+        return contextTileRows
+    }
+
+    /// `x` `[n, width]` followed by copies of its own rows up to `rows` rows.
+    private static func repeatedRows(_ x: MLXArray, to rows: Int) -> MLXArray {
+        let n = x.dim(0)
+        guard n > 0, n < rows else { return x }
+        var parts = [x]
+        var have = n
+        while have < rows {
+            let take = min(n, rows - have)
+            parts.append(take == n ? x : x[0 ..< take, 0...])
+            have += take
+        }
+        return concatenated(parts, axis: 0)
+    }
+
+    /// `model.projectContext(features)` at `contextTiledRows` rows when that
+    /// applies: `[rows or tile, hiddenSize]`, the real rows first.
+    private func speculativeProjectedContext(_ features: MLXArray) -> MLXArray {
+        guard let tile = Self.contextTiledRows(features.dim(0)) else {
+            return model.projectContext(features)
+        }
+        return model.projectContext(Self.repeatedRows(features, to: tile))
+    }
+
+    /// Keys and values of the first `rows` rows of `context`. Rows past them
+    /// are tile padding (`speculativeProjectedContext`): they only widen the
+    /// K/V products, whose results are sliced back to `rows` before the
+    /// epilogue, so every later step sees exactly the unpadded shapes.
     private func speculativeContextKeyValues(
-        _ context: MLXArray, at position: Int
+        _ context: MLXArray, rows: Int, at position: Int
     ) -> (keys: MLXArray, values: MLXArray) {
         let c = model.configuration
-        let rows = context.dim(0)
+        let padded = context.dim(0) > rows
+        let real = padded ? context[0 ..< rows, 0...] : context
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
-        else { return model.contextKeyValues(context, at: position) }
+        else { return model.contextKeyValues(real, at: position) }
         let shape = [1, rows, c.kvHeads, c.headDimensions]
         var keys: [MLXArray] = []
         var values: [MLXArray] = []
         keys.reserveCapacity(model.layers.count)
         values.reserveCapacity(model.layers.count)
         for layer in model.layers {
-            keys.append(layer.attention.kProj(context))
-            values.append(layer.attention.vProj(context).reshaped(shape).transposed(0, 2, 1, 3))
+            let key = layer.attention.kProj(context)
+            let value = layer.attention.vProj(context)
+            keys.append(padded ? key[0 ..< rows, 0...] : key)
+            values.append(
+                (padded ? value[0 ..< rows, 0...] : value).reshaped(shape).transposed(0, 2, 1, 3))
         }
         guard keys.allSatisfy({ $0.dtype == .bfloat16 }) else {
-            return model.contextKeyValues(context, at: position)
+            return model.contextKeyValues(real, at: position)
         }
         return (
             epilogue.apply(keys, rows: rows, position: position),
@@ -750,7 +816,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // all-accepted outcome's entry is all of them.
         let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
-        let projected = speculativeContextKeyValues(model.projectContext(features), at: start)
+        let projected = speculativeContextKeyValues(
+            speculativeProjectedContext(features), rows: n, at: start)
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)

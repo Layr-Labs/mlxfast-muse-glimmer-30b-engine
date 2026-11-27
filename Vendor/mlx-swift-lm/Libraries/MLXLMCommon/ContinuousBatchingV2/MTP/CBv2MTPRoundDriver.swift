@@ -1486,4 +1486,9 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Set by the engine around a low-acceptance request's post-verify
+    /// speculation (`mtpSpeculateAfterVerify`), so a drafter can project
+    /// that round's context rows on a cheaper kernel route. Never read for
+    /// target work.
+    nonisolated(unsafe) public static var lowAcceptanceSpeculation = false
 }

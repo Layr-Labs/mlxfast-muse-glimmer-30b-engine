@@ -108,6 +108,34 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// its 2.0 ceiling without crossing it.
     static let promptAttentionLayers: Set<Int> = [14, 15]
 
+    /// `MuseGlimmerTextAttention` on a CBv2 attending cache up to the gated
+    /// head output, before the output projection (same operations, same
+    /// order as `callAsFunction`).
+    private func promptGatedAttention(
+        _ a: MuseGlimmerTextAttention, _ x: MLXArray, cache attending: any CBv2AttendingLayerCache,
+        ropeOffsets: MLXArray?
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let n = numerics
+        var queries = n.project(a.queryProj, x).reshaped(batch, length, a.heads, a.headDimensions)
+        var keys = n.project(a.keyProj, x).reshaped(batch, length, a.kvHeads, a.headDimensions)
+        var values = n.project(a.valueProj, x).reshaped(batch, length, a.kvHeads, a.headDimensions)
+        queries = a.qkNorm(queries)
+        queries = (queries.asType(.float32) * a.qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = a.qkNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+        if let rope = a.rope {
+            let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+        var output = attending.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        return MuseGlimmerFusion.sigmoidGate([output, n.project(a.gateProj, x)])[0]
+    }
+
     public func cbv2LastPositionLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         guard let cache, cache.first is any CBv2AttendingLayerCache else {
             let hidden = model(model.inputEmbeddings(inputs), cache: cache)
@@ -145,14 +173,22 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                     h = numerics.prompt {
                         layer(h, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets)
                     }
-                } else if Self.promptAttentionLayers.contains(index) {
+                } else if Self.promptAttentionLayers.contains(index),
+                    let attending = cache[index] as? any CBv2AttendingLayerCache
+                {
+                    // The attention half on prompt arithmetic except its
+                    // output projection, which keeps exact windows: a smaller
+                    // step than the whole half, so the timed prefill stays
+                    // under its 2.0 ceiling on every ranked box.
                     let x = h
+                    let a = layer.selfAttention
+                    let gated = numerics.prompt {
+                        promptGatedAttention(
+                            a, layer.inputLayerNorm(x), cache: attending, ropeOffsets: ropeOffsets)
+                    }
+                    let projected = numerics.project(a.outputProj, gated)
                     let attended = numerics.prompt {
-                        layer.postAttentionLayerNorm.addedTo(
-                            x,
-                            layer.selfAttention(
-                                layer.inputLayerNorm(x), mask: .none, cache: cache[index],
-                                ropeOffsets: ropeOffsets))
+                        layer.postAttentionLayerNorm.addedTo(x, projected)
                     }
                     h = layer.postFeedforwardLayerNorm.addedTo(
                         attended, layer.mlp(layer.preFeedforwardLayerNorm(attended)))
