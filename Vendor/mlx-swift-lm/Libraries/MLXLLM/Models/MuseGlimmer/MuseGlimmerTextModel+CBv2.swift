@@ -348,7 +348,8 @@ extension MuseGlimmerTextModel {
             verifyRows(trunk.normed) != nil
         else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+        if lowVerify, CBv2DraftRegime.pastFirstRound || !CBv2DraftRegime.lowOnlyVerifySpeedups,
+            let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
             lmHead, trunk.normed,
             outputMultiplier: configuration.outputMultiplier,
             softcap: configuration.finalLogitSoftcapping)
@@ -420,9 +421,20 @@ extension MuseGlimmerTextModel {
                 posDeltas: treePos,
                 treeMeta: dynTreeMeta,
                 target: target)
+            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+            if x.dtype == .bfloat16, gate.dtype == .bfloat16, verifyRows(p[3]) != nil,
+                a.outputProj is ModelOptWeightOnlyNVFP4Linear,
+                !MuseGlimmerVerifyProjections.selfTest
+            {
+                let gated = paged.attendColumnsPreWritten(
+                    queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil,
+                    outputGate: (gate, { output, gate in
+                        MuseGlimmerFusion.sigmoidGate([output, gate])[0]
+                    }))
+                return verifyOutputProjection(a.outputProj, gated.reshaped(batch, length, -1))
+            }
             let outputBLHD = paged.attendColumnsPreWritten(
                 queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil)
-            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
             if let fp8 = a.outputProj as? ModelOptCalibratedLinear,
                 verifyRows(p[3]) != nil,
                 let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(
@@ -980,7 +992,29 @@ extension MuseGlimmerTextModel {
             return (layer as? Linear)?.weight.dim(1)
         }
         let prevLow = CBv2DraftRegime.lowAcceptance
-        defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let prevDeep = CBv2DraftRegime.xnorDraftHeadEligible
+        let prevPastFirst = CBv2DraftRegime.pastFirstRound
+        defer {
+            CBv2DraftRegime.lowAcceptance = prevLow
+            CBv2DraftRegime.xnorDraftHeadEligible = prevDeep
+            CBv2DraftRegime.pastFirstRound = prevPastFirst
+        }
+        // Batch-verify all frozen FP8 target weight tensors once at boot for
+        // zero NaN bytes (0x7F/0xFF) and normal non-overflowing scale so
+        // branchless half2 FP8 decode needs zero per-step host syncs.
+        var allFP8Layers: [ModelOptCalibratedLinear] = []
+        for layer in model.layers {
+            let a = layer.selfAttention
+            let mlp = layer.mlp
+            for cand in [a.queryProj, a.keyProj, a.valueProj, a.gateProj, a.outputProj, mlp.gateProj, mlp.upProj, mlp.downProj] {
+                if let fp8 = cand as? ModelOptCalibratedLinear {
+                    allFP8Layers.append(fp8)
+                }
+            }
+        }
+        if !allFP8Layers.isEmpty {
+            CBv2SmallProjection.warmFP8BranchlessSafe(allFP8Layers)
+        }
         var seen = Set<String>()
         for layer in model.layers {
             let a = layer.selfAttention
@@ -1009,8 +1043,10 @@ extension MuseGlimmerTextModel {
                     let width = inputs(group[0])
                 else { continue }
                 var outputs = [MLXArray]()
-                for lowAcc in [false, true] {
+                for (lowAcc, deepLow) in [(false, false), (true, false), (true, true)] {
                     CBv2DraftRegime.lowAcceptance = lowAcc
+                    CBv2DraftRegime.xnorDraftHeadEligible = deepLow
+                    CBv2DraftRegime.pastFirstRound = deepLow
                     for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                         let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                         switch site {

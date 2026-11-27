@@ -291,7 +291,7 @@ public enum CBv2SmallProjection {
         // reuse) or one simdgroup per TM rows (stock BN = 1, eight simdgroups
         // per threadgroup). `out_vec` is the output's first column for this
         // segment; NOUT its row stride.
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, bool DV, int PF, bool VO, int RG>
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int DV_MODE, int PF, bool VO, int RG>
         inline void cbv2_sp_fp8(
             const device uint8_t* mat, float weight_scale, const device T* in_vec,
             device T* out_vec, int tile, uint simd_gid, uint simd_lid,
@@ -307,7 +307,7 @@ public enum CBv2SmallProjection {
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
             constexpr uint LOW = (1u << SH) - 1u;
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float dscale = DV ? weight_scale * 256.0f : weight_scale;
+            const float dscale = (DV_MODE != 0) ? weight_scale * 256.0f : weight_scale;
             const uint rg = SPLIT ? (simd_gid / 8u) : 0u;
             const uint g = SPLIT ? (simd_gid % 8u) : 0u;
             const int orig_row = SPLIT ? (tile * RG + int(rg)) * TM : (tile * 8 + int(simd_gid)) * TM;
@@ -342,7 +342,55 @@ public enum CBv2SmallProjection {
                     break;
                 }
                 thread const uint* wq = wblk[d];
-                if constexpr (VO && !DV) {
+                if constexpr (DV_MODE == 2) {
+                    // Branchless vectorized half2 FP8 decode directly into
+                    // `T inter[TM][TN]` (0 extra float dec registers, 0 NaN branches),
+                    // proven bit-exact for frozen NaN-free FP8 weight tensors.
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = wq[tm];
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    if constexpr (VO) {
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += inter[tm][tn] * a;
+                                }
+                            }
+                        }
+                    } else {
+                        ushort4 av[V];
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            av[v] = *(const device ushort4*)(in_vec + v * K + bn);
+                        }
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            CBV2_SP_UNROLL
+                            for (int v = 0; v < V; v++) {
+                                const float a = static_cast<float>(as_type<T>(av[v][tn]));
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += inter[tm][tn] * a;
+                                }
+                            }
+                        }
+                    }
+                } else if constexpr (VO && DV_MODE == 0) {
                     // Decode FP8 weights straight into `T inter[TM][TN]` (skipping
                     // the 16-float `dec` buffer) and load activations one row at a time.
                     T inter[TM][TN];
@@ -380,7 +428,7 @@ public enum CBv2SmallProjection {
                 CBV2_SP_UNROLL
                 for (int tm = 0; tm < TM; tm++) {
                     const uint w = wq[tm];
-                    if (DV) {
+                    if constexpr (DV_MODE == 1) {
                         const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                         const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                         const half2 h02 = as_type<half2>(lo);
@@ -462,7 +510,16 @@ public enum CBv2SmallProjection {
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
                         const uint w = *(const device uint*)(rows + tm * K + bn);
-                        if constexpr (DV) {
+                        if constexpr (DV_MODE == 2) {
+                            const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                            const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                            inter[tm][0] = static_cast<T>(f02.x);
+                            inter[tm][1] = static_cast<T>(f13.x);
+                            inter[tm][2] = static_cast<T>(f02.y);
+                            inter[tm][3] = static_cast<T>(f13.y);
+                        } else if constexpr (DV_MODE == 1) {
                             const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                             const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                             const half2 h02 = as_type<half2>(lo);
@@ -581,7 +638,7 @@ public enum CBv2SmallProjection {
     }
 
     struct FP8Shape: Hashable {
-        var vectorDecode: Bool
+        var decodeMode: Int
         var rowsOuter: Bool
         var rowGroups: Int
         var weights: Int
@@ -616,7 +673,7 @@ public enum CBv2SmallProjection {
                 let end = offset + s.tiles(rowGroups: 1)
                 body += """
                     \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                        cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter)>(
+                        cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.decodeMode != 0), \(s.prefetch), \(shape.rowsOuter)>(
                             m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                             xc + size_t(\(s.input)) * V * K,
                             y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -645,7 +702,7 @@ public enum CBv2SmallProjection {
             let end = offset + s.tiles(rowGroups: rg)
             body += """
                 \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
+                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.decodeMode), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
                         m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                         xc + size_t(\(s.input)) * V * K,
                         y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -682,6 +739,60 @@ public enum CBv2SmallProjection {
     /// `CBV2_FP8_DV=1` enables vectorized two-code E4M3 decode on low-acceptance verify rows.
     private static let vectorDecodeEnv: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_DV"] == "1"
+    /// `CBV2_FP8_BLD=0` disables branchless half2 FP8 decode on deep low-acceptance verify rows.
+    private static let fp8BranchlessEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_BLD"] != "0"
+
+    private final class FP8SafeBox: @unchecked Sendable {
+        var safe: [ObjectIdentifier: Bool] = [:]
+    }
+    private static let fp8SafeLock = OSAllocatedUnfairLock(initialState: FP8SafeBox())
+
+    /// Load-time batched check confirming frozen FP8 weight tensors contain no
+    /// E4M3 NaN codes (`0x7F`/`0xFF`) and have a normal non-overflowing
+    /// `outputScale` (`abs(s) in [1e-30, 1e35]`), enabling branchless `half2`
+    /// decode with zero per-step host synchronization.
+    public static func warmFP8BranchlessSafe(_ layers: [ModelOptCalibratedLinear]) {
+        guard fp8BranchlessEnabled else { return }
+        var pending: [(id: ObjectIdentifier, hasNaN: MLXArray, scale: MLXArray)] = []
+        fp8SafeLock.withLockUnchecked { box in
+            for layer in layers {
+                let id = ObjectIdentifier(layer)
+                guard box.safe[id] == nil,
+                    layer.format == .fp8, layer.weight.dtype == .uint8,
+                    let constants = layer.graphConstants,
+                    constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+                else { continue }
+                let hasNaN = MLX.any(
+                    MLX.equal(MLX.bitwiseAnd(layer.weight, MLXArray(UInt8(0x7F))), MLXArray(UInt8(0x7F))))
+                pending.append((id, hasNaN, constants.outputScale))
+            }
+        }
+        guard !pending.isEmpty else { return }
+        eval(pending.flatMap { [$0.hasNaN, $0.scale] })
+        var results: [(ObjectIdentifier, Bool)] = []
+        results.reserveCapacity(pending.count)
+        for item in pending {
+            let noNaN = !item.hasNaN.item(Bool.self)
+            let s = item.scale.item(Float.self)
+            let ok = noNaN && s.isFinite && abs(s) >= 1e-30 && abs(s) <= 1e35
+            results.append((item.id, ok))
+        }
+        fp8SafeLock.withLockUnchecked { box in
+            for (id, ok) in results {
+                box.safe[id] = ok
+            }
+        }
+    }
+
+    private static func allFP8BranchlessSafe(_ layers: [ModelOptCalibratedLinear]) -> Bool {
+        fp8SafeLock.withLockUnchecked { box in
+            for layer in layers {
+                guard box.safe[ObjectIdentifier(layer)] == true else { return false }
+            }
+            return true
+        }
+    }
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -824,7 +935,7 @@ public enum CBv2SmallProjection {
         let dtype: DType
         let rowsOuter: Bool
         let rowGroups: Int
-        let vectorDecode: Bool
+        let decodeMode: Int
         let lowVerify: Bool
         let sharedInput: Bool
     }
@@ -867,7 +978,12 @@ public enum CBv2SmallProjection {
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
-        let useVectorDecode = vectorDecode || (vectorDecodeEnv && lowVerify)
+        let useBranchless =
+            lowVerify
+            && (CBv2DraftRegime.pastFirstRound || !CBv2DraftRegime.lowOnlyVerifySpeedups)
+            && fp8BranchlessEnabled && allFP8BranchlessSafe(layers)
+        let decodeMode =
+            useBranchless ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         let canUseFastPlan =
             lowVerify && rowsPerThreadOverride == nil && prefetchOverride == nil
@@ -876,7 +992,7 @@ public enum CBv2SmallProjection {
             let planKey = FP8GroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
+                rowsOuter: useRowsOuter, rowGroups: targetRG, decodeMode: decodeMode,
                 lowVerify: lowVerify, sharedInput: sharedInput)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 var args = plan.weightArrays
@@ -904,7 +1020,7 @@ public enum CBv2SmallProjection {
             }
             let rg = segments.allSatisfy(\.split) ? targetRG : 1
             let shape = FP8Shape(
-                vectorDecode: useVectorDecode, rowsOuter: useRowsOuter, rowGroups: rg,
+                decodeMode: decodeMode, rowsOuter: useRowsOuter, rowGroups: rg,
                 weights: layers.count, outputs: layers.count, segments: segments)
             let outputDims = layers.map(\.outputDimensions)
             let launchKey = FP8LaunchKey(
@@ -950,7 +1066,7 @@ public enum CBv2SmallProjection {
         arrays.append(cast)
         let rg = segments.allSatisfy(\.split) ? targetRG : 1
         let shape = FP8Shape(
-            vectorDecode: useVectorDecode, rowsOuter: useRowsOuter, rowGroups: rg,
+            decodeMode: decodeMode, rowsOuter: useRowsOuter, rowGroups: rg,
             weights: layers.count, outputs: layers.count, segments: segments,
             record: !lowVerify)
         let outputDims = layers.map(\.outputDimensions)
@@ -986,7 +1102,12 @@ public enum CBv2SmallProjection {
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
-        let useVectorDecode = vectorDecode || (vectorDecodeEnv && lowVerify)
+        let useBranchless =
+            lowVerify
+            && (CBv2DraftRegime.pastFirstRound || !CBv2DraftRegime.lowOnlyVerifySpeedups)
+            && fp8BranchlessEnabled && allFP8BranchlessSafe(layers)
+        let decodeMode =
+            useBranchless ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         if rowsPerThreadOverride == nil && prefetchOverride == nil
             && ModelOptRowExact.geometryOverride == nil
@@ -994,7 +1115,7 @@ public enum CBv2SmallProjection {
             let planKey = FP8GroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
+                rowsOuter: useRowsOuter, rowGroups: targetRG, decodeMode: decodeMode,
                 lowVerify: lowVerify, sharedInput: true)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 let flat = preCast.reshaped(rows, inputs)
