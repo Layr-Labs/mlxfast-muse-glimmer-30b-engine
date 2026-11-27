@@ -261,7 +261,8 @@ template <typename T, int N, bool NODIV = false> struct PagedSegmentAccessor {
 
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
-    bool HAS_SOFTCAP, typename Cache, typename MaskPointer = const device bool*>
+    bool HAS_SOFTCAP, typename Cache, typename MaskPointer = const device bool*,
+    bool DYN_TREE = false>
 inline void paged_attention_part_cached_impl(
     const device T* q,
     const device T* knew,
@@ -291,7 +292,8 @@ inline void paged_attention_part_cached_impl(
     bool uses_visible_range = false,
     MaskPointer allowed_mask = nullptr,
     int64_t mask_query_stride = 0,
-    int64_t mask_key_stride = 0
+    int64_t mask_key_stride = 0,
+    const device int32_t* tree_meta = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT; // threadgroups per (kv head, partition)
@@ -307,9 +309,22 @@ inline void paged_attention_part_cached_impl(
     const int lin = tpitg.x;
 
     const device int32_t* info = seqinfo + b * 8;
-    const int attend_start = info[0];
-    const int attend_len = info[1];
+    int attend_start = info[0];
+    int attend_len = info[1];
     const int table_len = info[2];
+    int tree_base = 0;
+    uint tree_anc = 0u;
+    if constexpr (DYN_TREE) {
+        tree_base = info[6];
+        const int depth = tree_meta[9 + b];
+        const int q_pos = tree_base + depth;
+        const int win = info[7];
+        if (win > 0) {
+            attend_start = max(attend_start, q_pos - win + 1);
+        }
+        attend_len = q_pos - attend_start + 1;
+        tree_anc = uint(tree_meta[1 + b]);
+    }
 
     // Partitions past this row's attended length: nothing to do, and the
     // output slot is never read by the merge pass.
@@ -403,7 +418,12 @@ inline void paged_attention_part_cached_impl(
             load_row<T, EPT>(knew + tile_src, lane, kf);
             load_row<T, EPT>(vnew + tile_src, lane, vf);
         } else {
-            const int pos = attend_start + i;
+            const int raw_pos = attend_start + i;
+            const int pos = DYN_TREE
+                ? ((tree_anc != 0u && raw_pos >= tree_base)
+                    ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                    : raw_pos)
+                : raw_pos;
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
@@ -521,7 +541,7 @@ inline void paged_attention_part_impl(
 // head)'s partition partials with a global softmax merge; sinks fold into
 // the denominator only. The partition count is recomputed from the row's
 // OWN attended length, so slots written for longer batchmates are ignored.
-template <typename T, int D, int PTOK, bool HAS_SINKS>
+template <typename T, int D, int PTOK, bool HAS_SINKS, bool DYN_TREE = false>
 inline void paged_attention_merge_impl(
     const device float* partials,
     const device float* meta,
@@ -532,13 +552,24 @@ inline void paged_attention_merge_impl(
     device T* out,
     uint3 tgpig,
     uint lane,
-    int output_columns = 0
+    int output_columns = 0,
+    const device int32_t* tree_meta = nullptr
 ) {
     constexpr int EPT = D / 32;
 
     const int head = tgpig.x;
     const int b = tgpig.y;
-    const int attend_len = seqinfo[b * 8 + 1];
+    int attend_len = seqinfo[b * 8 + 1];
+    if constexpr (DYN_TREE) {
+        int attend_start = seqinfo[b * 8 + 0];
+        const int tree_base = seqinfo[b * 8 + 6];
+        const int win = seqinfo[b * 8 + 7];
+        const int q_pos = tree_base + tree_meta[9 + b];
+        if (win > 0) {
+            attend_start = max(attend_start, q_pos - win + 1);
+        }
+        attend_len = q_pos - attend_start + 1;
+    }
     const int parts = (attend_len + PTOK - 1) / PTOK;
 
     const size_t row = (size_t)b * (size_t)heads + (size_t)head;
@@ -609,7 +640,7 @@ inline void paged_attention_merge_impl(
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -625,7 +656,8 @@ inline void paged_attention_onepass_impl(
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
-    uint lane
+    uint lane,
+    const device int32_t* tree_meta = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -641,9 +673,22 @@ inline void paged_attention_onepass_impl(
     const int lin = tpitg.x;
 
     const device int32_t* info = seqinfo + b * 8;
-    const int attend_start = info[0];
-    const int attend_len = info[1];
+    int attend_start = info[0];
+    int attend_len = info[1];
     const int table_len = info[2];
+    int tree_base = 0;
+    uint tree_anc = 0u;
+    if constexpr (DYN_TREE) {
+        tree_base = info[6];
+        const int depth = tree_meta[9 + b];
+        const int q_pos = tree_base + depth;
+        const int win = info[7];
+        if (win > 0) {
+            attend_start = max(attend_start, q_pos - win + 1);
+        }
+        attend_len = q_pos - attend_start + 1;
+        tree_anc = uint(tree_meta[1 + b]);
+    }
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
     const int hi = min(attend_len, lo + PTOK);
@@ -690,7 +735,12 @@ inline void paged_attention_onepass_impl(
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
-                    const int pos = attend_start + first + (j0 + u) * NSG;
+                    const int raw_pos = attend_start + first + (j0 + u) * NSG;
+                    const int pos = DYN_TREE
+                        ? ((tree_anc != 0u && raw_pos >= tree_base)
+                            ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                            : raw_pos)
+                        : raw_pos;
                     const int lpage = pos / S;
                     const int slot = pos % S;
                     if (lpage != cur_lpage) {
@@ -741,7 +791,12 @@ inline void paged_attention_onepass_impl(
         }
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
-            const int pos = attend_start + i;
+            const int raw_pos = attend_start + i;
+            const int pos = DYN_TREE
+                ? ((tree_anc != 0u && raw_pos >= tree_base)
+                    ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                    : raw_pos)
+                : raw_pos;
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
