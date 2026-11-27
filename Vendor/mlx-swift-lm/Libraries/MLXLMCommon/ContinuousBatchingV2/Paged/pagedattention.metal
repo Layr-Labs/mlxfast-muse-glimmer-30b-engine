@@ -642,10 +642,18 @@ inline void paged_attention_merge_impl(
 // APPEND (linear rows only): the call's new K/V columns arrive as token-major
 // knew/vnew; each row's terminal position is also its write slot, and positions
 // from row 0's terminal position on are read from knew/vnew, not the pages.
+inline bfloat paged_bf16_output_gate(bfloat value, bfloat gate) {
+    const bool negative = gate < bfloat(0.0f);
+    const bfloat e = bfloat(metal::precise::exp(float(negative ? -gate : gate)));
+    const bfloat reciprocal = bfloat(1.0f) / (bfloat(1.0f) + e);
+    const bfloat sigmoid = negative ? reciprocal : bfloat(1.0f) - reciprocal;
+    return value * sigmoid;
+}
+
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
     bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
-    bool APPEND = false>
+    bool APPEND = false, bool GATE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -662,7 +670,8 @@ inline void paged_attention_onepass_impl(
     uint lane,
     const device int32_t* tree_meta = nullptr,
     const device T* knew = nullptr,
-    const device T* vnew = nullptr
+    const device T* vnew = nullptr,
+    const device T* gate = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     static_assert(!(APPEND && DYN_TREE), "the fused append serves linear rows only");
@@ -947,10 +956,16 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t base = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                const size_t i = base + lane * EPT + e;
+                const T rounded = T(gacc[e] * inv);
+                if constexpr (GATE) {
+                    out[i] = paged_bf16_output_gate(rounded, gate[i]);
+                } else {
+                    out[i] = rounded;
+                }
             }
         }
     }

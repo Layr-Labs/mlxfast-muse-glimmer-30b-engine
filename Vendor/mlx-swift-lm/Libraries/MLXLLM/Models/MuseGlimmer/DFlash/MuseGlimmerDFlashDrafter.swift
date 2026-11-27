@@ -3833,6 +3833,18 @@ extension MuseGlimmerDFlashDrafter {
                 if (cap > 0.0f) { v = cap * metal::fast::tanh(v / cap); }
                 return v;
             }
+
+            inline float dflash_xnor_madd8(float acc, uint q, float fs, float4 x0, float4 x1) {
+                const float2 a0 = float2(as_type<half2>(((q & 0x00070007u) << 9) | ((q & 0x00080008u) << 12))) * fs;
+                const float2 a1 = float2(as_type<half2>(((q & 0x00700070u) << 5) | ((q & 0x00800080u) << 8))) * fs;
+                const float2 a2 = float2(as_type<half2>(((q & 0x07000700u) << 1) | ((q & 0x08000800u) << 4))) * fs;
+                const float2 a3 = float2(as_type<half2>(((q & 0x70007000u) >> 3) | (q & 0x80008000u))) * fs;
+                acc = fma(a0.x, x0.x, acc); acc = fma(a1.x, x0.y, acc);
+                acc = fma(a2.x, x0.z, acc); acc = fma(a3.x, x0.w, acc);
+                acc = fma(a0.y, x1.x, acc); acc = fma(a1.y, x1.y, acc);
+                acc = fma(a2.y, x1.z, acc); acc = fma(a3.y, x1.w, acc);
+                return acc;
+            }
             """
 
         private static let buildKernel = MLXFast.metalKernel(
@@ -4052,46 +4064,43 @@ extension MuseGlimmerDFlashDrafter {
                 threadgroup float sh_v[16];
                 threadgroup int sh_i[16];
 
-                for (uint sub = 0u; sub < 2u; ++sub) {
-                    const uint local_c = sg * 2u + sub;
-                    const int v = cand_ids[row * 1024u + chunk * 16u + local_c];
-                    float acc = 0.0f;
-                    if (v >= 0 && v < ivocab) {
-                        const device uint2* w2_row = (const device uint2*)(w + size_t(v) * size_t(K_ / 8));
-                        const device uint8_t* sc_row = scales + size_t(v) * size_t(K_ / 16);
-                        for (uint b = lane; b < uint(K_ / 16); b += 32u) {
-                            const uint2 qw = w2_row[b];
-                            const float fs = float(dflash_xnor_e4m3(sc_row[b])) * 16384.0f;
-                            const device bfloat16_t* xb = x_row + b * 16u;
-                            const float4 x0 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 0u))));
-                            const float4 x1 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 4u))));
-                            const uint q0 = qw.x;
-                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs;
-                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs;
-                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs;
-                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs;
-                            acc = fma(a0.x, x0.x, acc); acc = fma(a1.x, x0.y, acc);
-                            acc = fma(a2.x, x0.z, acc); acc = fma(a3.x, x0.w, acc);
-                            acc = fma(a0.y, x1.x, acc); acc = fma(a1.y, x1.y, acc);
-                            acc = fma(a2.y, x1.z, acc); acc = fma(a3.y, x1.w, acc);
-
-                            const float4 x2 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 8u))));
-                            const float4 x3 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 12u))));
-                            const uint q1 = qw.y;
-                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs;
-                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs;
-                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs;
-                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs;
-                            acc = fma(b0.x, x2.x, acc); acc = fma(b1.x, x2.y, acc);
-                            acc = fma(b2.x, x2.z, acc); acc = fma(b3.x, x2.w, acc);
-                            acc = fma(b0.y, x3.x, acc); acc = fma(b1.y, x3.y, acc);
-                            acc = fma(b2.y, x3.z, acc); acc = fma(b3.y, x3.w, acc);
+                // One SIMD group scores the four candidates from two consecutive scan tiles.
+                // Share each activation load without changing any candidate's lane or FMA order.
+                const uint local_c = sg * 4u;
+                const device int* ids = cand_ids + (row * 64u + chunk) * 16u + local_c;
+                const int4 v = *(const device int4*)ids;
+                const bool4 valid = as_type<uint4>(v) < uint4(ivocab);
+                size_t w_offset[4];
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                    w_offset[c] = valid[c] ? size_t(v[c]) * size_t(K_ / 16) : 0u;
+                }
+                const device uint2* weights = (const device uint2*)w;
+                float4 acc = float4(0.0f);
+                if (any(valid)) {
+                    for (uint b = lane; b < uint(K_ / 16); b += 32u) {
+                        const device bfloat16_t* xb = x_row + b * 16u;
+                        const float4 x0 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 0u))));
+                        const float4 x1 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 4u))));
+                        const float4 x2 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 8u))));
+                        const float4 x3 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 12u))));
+                        #pragma unroll
+                        for (uint c = 0u; c < 4u; ++c) {
+                            if (valid[c]) {
+                                const uint2 qw = weights[w_offset[c] + b];
+                                const float fs = float(dflash_xnor_e4m3(scales[w_offset[c] + b])) * 16384.0f;
+                                const float first = dflash_xnor_madd8(acc[c], qw.x, fs, x0, x1);
+                                acc[c] = dflash_xnor_madd8(first, qw.y, fs, x2, x3);
+                            }
                         }
-                        acc = simd_sum(acc);
                     }
+                }
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                    const float raw = valid[c] ? simd_sum(acc[c]) : 0.0f;
                     if (lane == 0u) {
-                        sh_v[local_c] = (v >= 0 && v < ivocab) ? dflash_xnor_scale_logit(acc, eff_scale, cap) : -INFINITY;
-                        sh_i[local_c] = (v >= 0 && v < ivocab) ? v : ivocab;
+                        sh_v[local_c + c] = valid[c] ? dflash_xnor_scale_logit(raw, eff_scale, cap) : -INFINITY;
+                        sh_i[local_c + c] = valid[c] ? v[c] : ivocab;
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4214,8 +4223,8 @@ extension MuseGlimmerDFlashDrafter {
                     outputDTypes: [.int32])
                 let s2 = Self.stage2Kernel.prepare(
                     template: [("V_", vocab), ("K_", hidden)],
-                    grid: (32, 8 * 64, rows),
-                    threadGroup: (32, 8, 1),
+                    grid: (32, 4 * 64, rows),
+                    threadGroup: (32, 4, 1),
                     outputShapes: [[rows, 64, 5], [rows, 64, 5], [rows, 64]],
                     outputDTypes: [.float32, .int32, .float32])
                 let made = (q, s1, s2)
