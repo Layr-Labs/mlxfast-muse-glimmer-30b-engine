@@ -318,6 +318,67 @@ public enum VerifyFusedNorms {
         header: ModelOptActivationKernels.header + elemFP8Header,
         ensureRowContiguous: true)
 
+    private static let stridedGateFP8Kernel = MLXFast.metalKernel(
+        name: "verify_fused_strided_gate_fp8",
+        inputNames: ["a", "b", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i >= uint(N4_)) { return; }
+            const uint d = (4 * i) % D_;
+            const uint h = (4 * i / D_) % H_;
+            const uint t = 4 * i / (D_ * H_);
+            const int64_t ai = t * a_strides[1] + h * a_strides[2] + d * a_strides[3];
+            const int64_t bi = t * b_strides[1] + h * b_strides[2] + d * b_strides[3];
+            const float m0 = fp8_mu[0];
+            const float m1 = fp8_mu[1];
+            const float bound = fp8_bd[0];
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            vec<bfloat16_t, 4> out;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const bfloat16_t gate = b[bi + k * b_strides[3]];
+              const bfloat16_t gated = a[ai + k * a_strides[3]] * verify_bf16_sigmoid(gate);
+              out[k] = verify_bf16_cast_fp8(gated, m0, m1, bound, nan_value);
+            }
+            ((device vec<bfloat16_t, 4>*)y)[i] = out;
+            """,
+        header: ModelOptActivationKernels.header + elemFP8Header,
+        ensureRowContiguous: false)
+
+    private struct StridedGateLaunchKey: Hashable {
+        let rows: Int
+        let heads: Int
+        let headDim: Int
+    }
+    nonisolated(unsafe) private static var stridedGateLaunches:
+        [StridedGateLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+    public static func fusedStridedSigmoidGateCastFP8(
+        output: MLXArray, gate: MLXArray, layer: ModelOptCalibratedLinear
+    ) -> MLXArray? {
+        guard fusedElementwiseFP8Enabled, output.dtype == .bfloat16, gate.dtype == .bfloat16,
+            output.ndim == 4, output.dim(0) == 1, output.shape == gate.shape,
+            output.size > 0, output.dim(3) % 4 == 0,
+            let constants = layer.graphConstants,
+            case .fp8(let multipliers, let overflowBound) = constants.storage
+        else { return nil }
+        let key = StridedGateLaunchKey(
+            rows: output.dim(1), heads: output.dim(2), headDim: output.dim(3))
+        let launch = cacheLock.withLock {
+            if let hit = stridedGateLaunches[key] { return hit }
+            let n4 = output.size / 4
+            let tg = min(256, max(32, ((n4 + 31) / 32) * 32))
+            let made = stridedGateFP8Kernel.prepare(
+                template: [("N4_", n4), ("D_", key.headDim), ("H_", key.heads)],
+                grid: (((n4 + tg - 1) / tg) * tg, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [[1, key.rows, key.heads * key.headDim]], outputDTypes: [.bfloat16])
+            stridedGateLaunches[key] = made
+            return made
+        }
+        return launch([output, gate, multipliers, overflowBound])[0]
+    }
+
     private struct ElemFP8LaunchKey: Hashable {
         let shape: [Int]
         let mode: Int
