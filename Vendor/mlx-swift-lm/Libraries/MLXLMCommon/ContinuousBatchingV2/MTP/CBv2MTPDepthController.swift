@@ -626,15 +626,54 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowEarlyCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+    }()
+    static let deepLowEarlyCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_COMMITTED"].flatMap(Int.init) ?? 305
+    }()
+    static let deepLowCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_MIN_ROUNDS"].flatMap(Int.init) ?? 6
+    }()
+    static let deepLowCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_THRESHOLD"].flatMap(Int.init) ?? 390
+    }()
+    static let strictLowVerifyCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_STRICT_LOW_VERIFY_COMMITTED"].flatMap(Int.init) ?? 360
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Stricter low-acceptance gate for deep-low drafter & XNOR Stage-1:
+    /// 1) Early cold-start EWMA (`observedRegimeRounds >= 3 && fraction < 0.55`), OR
+    /// 2) Early tree-invariant fast-track for very-low-acc requests (`ceilingRounds >= 3 && avg < 3.05`), OR
+    /// 3) Tree-invariant sticky lock (`inLowAcceptanceRegime && ceilingRounds >= 6 && avg < 3.90`,
+    ///    preserving Pair 1's 25-round structure).
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowCommittedHundredths * ceilingRounds)
+    }
+
+    /// Strict low-acceptance gate (`< 3.60 @ 6`) exclusively for verify-only speedups
+    /// (`OUT_GATE_MODE=1/2`, fused NVFP4 `gate_up+SiLU`, deep-low NVFP4 `TN=2` & `lm_head TN=2`),
+    /// pinning Pair 1 safely under the `5.000x` decode ceiling while giving Pair 2 & Pair 3 100% coverage.
+    var isStrictLowVerifyRegime: Bool {
+        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens

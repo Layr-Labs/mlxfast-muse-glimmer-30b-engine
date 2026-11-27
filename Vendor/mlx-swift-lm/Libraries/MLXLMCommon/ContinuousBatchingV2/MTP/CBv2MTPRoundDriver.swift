@@ -685,8 +685,11 @@ final class CBv2MTPRoundDriver {
     /// so approximate Stage-1 draft-head screening never fires on high-acceptance
     /// requests after a single early low round.
     func inDeepLowAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
-        usesFixedDepthAcceptanceWindow
-            && (requestAcceptance[id] ?? initialRequestAcceptance).isDeepLowAcceptanceRegime
+        let acc = requestAcceptance[id] ?? initialRequestAcceptance
+        let deep = usesFixedDepthAcceptanceWindow && acc.isDeepLowAcceptanceRegime
+        CBv2DraftRegime.strictLowVerifyEligible =
+            usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyRegime
+        return deep
     }
 
     func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
@@ -1049,7 +1052,10 @@ final class CBv2MTPRoundDriver {
             shouldUseVerifyTree(for: id)
         {
             let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
-            let target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            let target =
+                (CBv2DraftRegime.treeFullCeilingDeepLow && acceptance.isDeepLowAcceptanceRegime)
+                ? ceiling
+                : max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
             depth = min(ceiling, min(remainingTokens - 1, min(verificationLimit, target)))
         }
         return max(1, depth)
@@ -1669,7 +1675,14 @@ public struct CBv2VerifyTree: Sendable {
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
     /// Stricter deep-low-acceptance flag for approximate Stage-1 draft-head screening.
-    nonisolated(unsafe) public static var xnorDraftHeadEligible = false
+    nonisolated(unsafe) public static var xnorDraftHeadEligible = false {
+        didSet {
+            if !xnorDraftHeadEligible { strictLowVerifyEligible = false }
+        }
+    }
+    /// Strict low-acceptance gate (`< 3.60 @ 6`) for target verify-only speedups so
+    /// Pair 1 keeps its 25-round drafter/window schedule without approaching the 5.000x ceiling.
+    nonisolated(unsafe) public static var strictLowVerifyEligible = false
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1739,23 +1752,23 @@ public enum CBv2DraftRegime {
         }
         return dynamicTreeMaxLeavesAt5
     }()
-    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
+    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 2; 1 = leaves only).
     public static let dynamicTreeMaxBranchLen: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
             let v = Int(raw), (1 ... 4).contains(v)
         {
             return v
         }
-        return 1
+        return 2
     }()
-    /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.75).
+    /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.70).
     public static let dynamicTreeContDecay: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_CONT_DECAY"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 2.0
         {
             return v
         }
-        return 0.75
+        return 0.70
     }()
     /// Maximum parent chain depth allowed to host branch leaves (`CBV2_DYN_TREE_MAX_DEPTH`, default 5).
     public static let dynamicTreeMaxLeafDepth: Int = {
@@ -1766,14 +1779,14 @@ public enum CBv2DraftRegime {
         }
         return 5
     }()
-    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.17).
+    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.15).
     public static let dynamicTreeTemp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TEMP"],
             let v = Float(raw), v.isFinite, v > 0.05, v <= 10.0
         {
             return v
         }
-        return 0.17
+        return 0.15
     }()
     /// Chain EV multiplier (`CBV2_DYN_TREE_BONUS`, default 1.0; `0.0` forces best EV leaf(s)).
     public static let dynamicTreeChainBonus: Float = {
@@ -1843,4 +1856,7 @@ public enum CBv2DraftRegime {
     /// Reserve dynamic-tree leaf slots additively instead of shrinking chain depth (`CBV2_TREE_ADDITIVE != "0"`, default on).
     public static let treeAdditiveSlot: Bool =
         ProcessInfo.processInfo.environment["CBV2_TREE_ADDITIVE"] != "0"
+    /// Use full verify ceiling (`k = 7`) on deep-low dynamic tree rounds (`CBV2_TREE_FULL_CEILING != "0"`, default on).
+    public static let treeFullCeilingDeepLow: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_FULL_CEILING"] != "0"
 }
