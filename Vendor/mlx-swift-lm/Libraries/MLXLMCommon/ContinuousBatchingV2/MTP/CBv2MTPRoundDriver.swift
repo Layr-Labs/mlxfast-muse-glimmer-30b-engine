@@ -1684,14 +1684,14 @@ public enum CBv2DraftRegime {
     /// Default (`false`) uses terminal-branch and chain-depth semantics so tree rounds preserve width.
     public static let treeOldAcceptancePolicy: Bool =
         ProcessInfo.processInfo.environment["CBV2_TREE_OLDPOL"] == "1"
-    /// Minimum verify draft count `k` eligible for dynamic tree (`CBV2_TREE_MIN_WIDTH`, default 4).
+    /// Minimum verify draft count `k` eligible for dynamic tree (`CBV2_TREE_MIN_WIDTH`, default 3).
     public static let dynamicTreeMinWidth: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_TREE_MIN_WIDTH"],
             let v = Int(raw), (2 ... 7).contains(v)
         {
             return v
         }
-        return 4
+        return 3
     }()
     /// Maximum verify draft count `k` eligible for dynamic tree (`CBV2_TREE_MAX_WIDTH`, default 7).
     public static let dynamicTreeMaxWidth: Int = {
