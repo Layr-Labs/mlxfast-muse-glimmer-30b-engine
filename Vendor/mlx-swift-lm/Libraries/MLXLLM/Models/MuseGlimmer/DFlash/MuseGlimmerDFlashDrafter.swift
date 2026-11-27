@@ -3987,8 +3987,8 @@ extension MuseGlimmerDFlashDrafter {
                     }
                 }
 
-                threadgroup float sh_v[8][2];
-                threadgroup int sh_i[8][2];
+                threadgroup float sh_v[R_][8][2];
+                threadgroup int sh_i[R_][8][2];
                 for (uint r = 0u; r < uint(R_); ++r) {
                     float v0 = -INFINITY, v1 = -INFINITY;
                     int i0 = -1, i1 = -1;
@@ -4003,32 +4003,31 @@ extension MuseGlimmerDFlashDrafter {
                         }
                     }
                     if (lane == 0u) {
-                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
-                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                        sh_v[r][sg][0] = v0; sh_i[r][sg][0] = i0;
+                        sh_v[r][sg][1] = v1; sh_i[r][sg][1] = i1;
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (sg == 0u) {
-                        if (lane < 8u) {
-                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
-                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
-                        } else {
-                            v0 = v1 = -INFINITY; i0 = i1 = -1;
-                        }
-                        for (ushort off = 4u; off > 0u; off >>= 1u) {
-                            const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
-                            const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
-                            if (lane < off) {
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
-                            }
-                        }
-                        if (lane == 0u) {
-                            const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
-                            cand_ids[base + 0u] = i0;
-                            cand_ids[base + 1u] = i1;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg < uint(R_)) {
+                    float v0 = -INFINITY, v1 = -INFINITY;
+                    int i0 = -1, i1 = -1;
+                    if (lane < 8u) {
+                        v0 = sh_v[sg][lane][0]; i0 = sh_i[sg][lane][0];
+                        v1 = sh_v[sg][lane][1]; i1 = sh_i[sg][lane][1];
+                    }
+                    for (ushort off = 4u; off > 0u; off >>= 1u) {
+                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                        if (lane < off) {
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0u) {
+                        const uint base = (sg * uint(NUM_TGS_) + tg) * 2u;
+                        cand_ids[base + 0u] = i0;
+                        cand_ids[base + 1u] = i1;
+                    }
                 }
                 """,
             header: header)
