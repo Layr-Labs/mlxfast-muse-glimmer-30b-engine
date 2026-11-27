@@ -391,7 +391,11 @@ extension MuseGlimmerTextModel {
             (dynTreeMeta == nil && batch == 1 && CBv2DraftRegime.activeVerifyTree?.totalSlots == length)
             ? CBv2DraftRegime.activeVerifyTree!.packedPosDeltas : 0x7654_3210
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        if lowVerify, VerifyFusedQK.fusedWriteEnabled, batch == 1,
+        // High-acceptance rounds take the direct-write attention block on the
+        // first `highAcceptanceDirectWriteLayers` layers only (see there).
+        let directWrite =
+            lowVerify || layerIndex < MuseGlimmerVerifyProjections.highAcceptanceDirectWriteLayers
+        if directWrite, VerifyFusedQK.fusedWriteEnabled, batch == 1,
             let paged = attending as? PagedLayerCache,
             let target = paged.prepareSingleRowDirectVerifyWrite(count: length, dtype: x.dtype)
         {
@@ -679,6 +683,24 @@ enum MuseGlimmerVerifyProjections {
         environment["CBV2_NVFP4_LMHEAD"] == "1"
     static let denseGroupedEnabled: Bool =
         environment["CBV2_DENSE_GROUPED"] != "0"
+    /// Layers `0 ..< n` of a high-acceptance verify use the direct-write
+    /// attention block (`VerifyFusedQK.applyAndWrite`, attention over the
+    /// pre-written columns, and the fused sigmoid gate + FP8 cast before an
+    /// FP8 `o_proj`) that low-acceptance rounds use on every layer. It drops
+    /// the key/value copies, the separate paged write and the separate gate
+    /// and cast launches of each such layer; every value is the same (the
+    /// write kernel repeats `VerifyFusedQK.apply`'s norm, scale and RoPE
+    /// arithmetic, attention reads the same paged columns through the same
+    /// decode kernel, and the gate + cast is checked 0-ULP by the verify
+    /// self-test). Bounded so a ceiling-clamped high-acceptance window
+    /// stays clear of the 5.0x decode ceiling; 0 restores the frontier.
+    /// `CBV2_HIGH_DIRECT_WRITE_LAYERS=<n>`.
+    static let highAcceptanceDirectWriteLayers: Int = {
+        if let raw = environment["CBV2_HIGH_DIRECT_WRITE_LAYERS"], let v = Int(raw), v >= 0 {
+            return v
+        }
+        return 28
+    }()
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var checkedOutputs = 0
