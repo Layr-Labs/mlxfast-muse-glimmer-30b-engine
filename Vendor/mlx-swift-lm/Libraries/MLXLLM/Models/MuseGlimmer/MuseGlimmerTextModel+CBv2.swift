@@ -133,7 +133,7 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 if let shared, shared.positions == positions {
                     ropeOffsets = shared.offsets
                 } else {
-                    let offsets = attending.positionOffsets + 0
+                    let offsets = attending.positionOffsets
                     shared = (positions, offsets)
                     ropeOffsets = offsets
                 }
@@ -232,6 +232,14 @@ extension MuseGlimmerTextModel {
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
         var layerInput = layers[0].inputLayerNorm(h)
+        var layerInputPreCastFP8 = false
+        let width = h.dim(-1)
+        let dtype = h.dtype
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let allowPreCastFP8 =
+            lowVerify && routesVerifyProjections && !MuseGlimmerVerifyProjections.selfTest
+            && (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows)
+        let flushLayer = MuseGlimmerVerifyProjections.midTrunkFlushLayer
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -241,30 +249,67 @@ extension MuseGlimmerTextModel {
                 if let shared, shared.positions == positions {
                     ropeOffsets = shared.offsets
                 } else {
-                    let offsets = attending.positionOffsets + 0
+                    let offsets = attending.positionOffsets
                     shared = (positions, offsets)
                     ropeOffsets = offsets
                 }
             }
             let attention = fusedVerifyAttention(
                 layer.selfAttention, layerIndex: index, layerInput,
-                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets)
+                cache: cache[index] as! any CBv2AttendingLayerCache, ropeOffsets: ropeOffsets,
+                preCastFP8: layerInputPreCastFP8)
             let post = layer.postAttentionLayerNorm
             let pre = layer.preFeedforwardLayerNorm
-            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
-                residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                w2: pre.weight, eps2: pre.eps)
-            let feed = groupedVerifyFeed(layer.mlp, feedInput)
+            let feedLayers: [any UnaryLayer] = [layer.mlp.gateProj, layer.mlp.upProj]
+            let mid: MLXArray
+            let feed: MLXArray
+            if allowPreCastFP8, let fp8Feed = feedLayers as? [ModelOptCalibratedLinear],
+                let fp8Params = CBv2SmallProjection.sharedFP8CastParams(
+                    fp8Feed, inputs: width, dtype: dtype)
+            {
+                let (m, feedCast) = VerifyFusedNorms.fusedAddNormNormCastFP8(
+                    residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                    w2: pre.weight, eps2: pre.eps,
+                    multipliers: fp8Params.multipliers, overflowBound: fp8Params.overflowBound)
+                mid = m
+                feed = groupedVerifyFeed(layer.mlp, feedCast, preCastFP8: true)
+            } else {
+                let (m, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                    w2: pre.weight, eps2: pre.eps)
+                mid = m
+                feed = groupedVerifyFeed(layer.mlp, feedInput)
+            }
             if index + 1 < layers.count {
                 let postFF = layer.postFeedforwardLayerNorm
-                let next = layers[index + 1].inputLayerNorm
-                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
-                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                    w2: next.weight, eps2: next.eps)
+                let nextLayer = layers[index + 1]
+                let next = nextLayer.inputLayerNorm
+                let nextAttn = nextLayer.selfAttention
+                let nextAttnLayers: [any UnaryLayer] = [
+                    nextAttn.queryProj, nextAttn.keyProj, nextAttn.valueProj, nextAttn.gateProj,
+                ]
+                if allowPreCastFP8, let fp8Attn = nextAttnLayers as? [ModelOptCalibratedLinear],
+                    let fp8Params = CBv2SmallProjection.sharedFP8CastParams(
+                        fp8Attn, inputs: width, dtype: dtype)
+                {
+                    (h, layerInput) = VerifyFusedNorms.fusedAddNormNormCastFP8(
+                        residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                        w2: next.weight, eps2: next.eps,
+                        multipliers: fp8Params.multipliers, overflowBound: fp8Params.overflowBound)
+                    layerInputPreCastFP8 = true
+                } else {
+                    (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                        w2: next.weight, eps2: next.eps)
+                    layerInputPreCastFP8 = false
+                }
             } else {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
+            if flushLayer > 0 && index + 1 == flushLayer {
+                asyncEval(h, layerInput)
+            }
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
@@ -284,8 +329,33 @@ extension MuseGlimmerTextModel {
     {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
-            verifyRows(trunk.normed) != nil,
-            let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+            verifyRows(trunk.normed) != nil
+        else { return nil }
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+            lmHead, trunk.normed,
+            outputMultiplier: configuration.outputMultiplier,
+            softcap: configuration.finalLogitSoftcapping)
+        {
+            if MuseGlimmerVerifyProjections.selfTest,
+                let product = CBv2VerifyScales.product(lmHead, trunk.normed),
+                product.ndim == 3, product.dtype == .bfloat16
+            {
+                let ref = cbv2FusedReadoutTopTwoAndNonFinite(
+                    product,
+                    outputMultiplier: configuration.outputMultiplier,
+                    softcap: configuration.finalLogitSoftcapping)
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [fused.ids, fused.values, fused.nonFinite],
+                    [ref.ids, ref.values, ref.nonFinite],
+                    kind: "nvfp4.lm_head.fused_top2",
+                    rows: MuseGlimmerNumerics.rows(trunk.normed))
+            }
+            return (fused.ids, fused.values, fused.nonFinite, trunk.hidden)
+        }
+        let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear
+        guard let product = (MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled ? nvHead.flatMap({ CBv2VerifyNVFP4.product($0, trunk.normed) }) : nil)
+            ?? CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
         checkRouted([product], [lmHead], trunk.normed, kind: "nvfp4.lm_head")
@@ -299,7 +369,8 @@ extension MuseGlimmerTextModel {
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
     func fusedVerifyAttention(
         _ a: MuseGlimmerTextAttention, layerIndex: Int, _ x: MLXArray,
-        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
+        cache attending: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?,
+        preCastFP8: Bool = false
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         guard VerifyFusedQK.enabled,
@@ -310,13 +381,61 @@ extension MuseGlimmerTextModel {
         let theta = configuration.layerRopeTheta[layerIndex]
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
-        let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
+        let p = verifyAttentionProjections(
+            [a.queryProj, a.keyProj, a.valueProj, a.gateProj], x, preCastFP8: preCastFP8)
+        let dynTreeMeta: MLXArray? =
+            (batch == 1 && CBv2DraftRegime.activeDynamicTreeK > 0
+                && length == CBv2DraftRegime.activeDynamicTreeK + 1)
+            ? CBv2DraftRegime.activeDynamicTreeMeta : nil
+        let treePos: UInt32 =
+            (dynTreeMeta == nil && batch == 1 && CBv2DraftRegime.activeVerifyTree?.totalSlots == length)
+            ? CBv2DraftRegime.activeVerifyTree!.packedPosDeltas : 0x7654_3210
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, VerifyFusedQK.fusedWriteEnabled, batch == 1,
+            let paged = attending as? PagedLayerCache,
+            let target = paged.prepareSingleRowDirectVerifyWrite(count: length, dtype: x.dtype)
+        {
+            let queriesBLHD = VerifyFusedQK.applyAndWrite(
+                queries: p[0], keys: p[1], values: p[2],
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
+                ropeBase: usesRope ? theta : nil,
+                offsets: usesRope ? (ropeOffsets ?? attending.positionOffsets) : nil,
+                posDeltas: treePos,
+                treeMeta: dynTreeMeta,
+                target: target)
+            let outputBLHD = paged.attendColumnsPreWritten(
+                queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil)
+            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+            if let fp8 = a.outputProj as? ModelOptCalibratedLinear,
+                verifyRows(p[3]) != nil,
+                let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(
+                    output: outputBLHD, gate: gate,
+                    outShape: [batch, length, a.heads * a.headDimensions],
+                    layer: fp8),
+                let projected = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first
+            {
+                if MuseGlimmerVerifyProjections.selfTest {
+                    let refGated = MuseGlimmerFusion.sigmoidGate([outputBLHD, gate])[0]
+                        .reshaped(batch, length, -1)
+                    MuseGlimmerVerifyProjections.requireEqualBits(
+                        [projected], [numerics.project(a.outputProj, refGated)],
+                        kind: "fp8.o.fusedgate", rows: length)
+                }
+                return projected
+            }
+            let gated = MuseGlimmerFusion.sigmoidGate([outputBLHD, gate])[0]
+                .reshaped(batch, length, -1)
+            return verifyOutputProjection(a.outputProj, gated)
+        }
         let (queries, keys) = VerifyFusedQK.apply(
             queries: p[0], keys: p[1],
             heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
             eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
             ropeBase: usesRope ? theta : nil,
-            offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
+            offsets: usesRope ? (ropeOffsets ?? attending.positionOffsets) : nil,
+            posDeltas: treePos,
+            treeMeta: dynTreeMeta)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
         var output = attending.updateAndAttend(
@@ -358,6 +477,13 @@ extension MuseGlimmerTextModel {
             residual: zero, x: zero, w1: post.weight, eps1: post.eps,
             w2: pre.weight, eps2: pre.eps)
         warm += [norms.h, norms.y]
+        let dummyMu = MLXArray([Float(1), Float(1)])
+        let dummyBound = MLXArray([Float(448)])
+        let normsCast = VerifyFusedNorms.fusedAddNormNormCastFP8(
+            residual: zero, x: zero, w1: post.weight, eps1: post.eps,
+            w2: pre.weight, eps2: pre.eps,
+            multipliers: dummyMu, overflowBound: dummyBound)
+        warm += [normsCast.h, normsCast.yCast]
         let a = first.selfAttention
         // One-pass paged verify attention: one variant per binding class.
         PagedOnePassAttention.warm(
@@ -369,6 +495,8 @@ extension MuseGlimmerTextModel {
             var bases = [Float?]()
             if let rope { bases.append(rope) }
             if thetas.contains(0) { bases.append(nil) }
+            // Must have >= 8 elements (`device` address space) to match live 18-element `activeDynamicTreeMeta`.
+            let dynMeta = MLXArray.zeros([18], type: Int32.self)
             for rows in 1 ... 8 {
                 for base in bases {
                     // One request (shared offset) and several (per-request offsets).
@@ -383,9 +511,25 @@ extension MuseGlimmerTextModel {
                             offsets: base == nil
                                 ? nil : MLXArray.zeros([batch], type: Int32.self))
                         warm += [out.queries, out.keys]
+                        if batch == 1 && rows >= 2 && CBv2DraftRegime.verifyTreeMode != 0
+                            && CBv2DraftRegime.dynamicTreeEnabled
+                        {
+                            let dynOut = VerifyFusedQK.apply(
+                                queries: q, keys: k, heads: a.heads, kvHeads: a.kvHeads,
+                                headDim: a.headDimensions, eps: a.qkNorm.eps,
+                                queryScale: a.qkScaleFactor, ropeBase: base,
+                                offsets: base == nil ? nil : MLXArray.zeros([1], type: Int32.self),
+                                treeMeta: dynMeta)
+                            warm += [dynOut.queries, dynOut.keys]
+                        }
                     }
                 }
             }
+            warm += VerifyFusedQK.warmDirectWrite(
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions, pageSize: 16,
+                dtype: dtype, eps: a.qkNorm.eps, queryScale: a.qkScaleFactor, bases: bases,
+                warmDynamicTree: CBv2DraftRegime.verifyTreeMode != 0
+                    && CBv2DraftRegime.dynamicTreeEnabled)
         }
         eval(warm)
         warmVerifyProjections(dtype: dtype)
@@ -408,8 +552,30 @@ extension MuseGlimmerTextModel {
         return layers.map { numerics.project($0, x) }
     }
 
-    func groupedVerifyFeed(_ mlp: MuseGlimmerTextMLP, _ x: MLXArray) -> MLXArray {
-        let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+    func groupedVerifyFeed(
+        _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
+    ) -> MLXArray {
+        let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, let rows = verifyRows(gu[0]),
+            let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
+            let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
+                gate: gu[0], up: gu[1], layer: fp8)
+        {
+            let projected: MLXArray? =
+                rows >= 6
+                ? CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast)
+                : CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first
+            if let projected {
+                if MuseGlimmerVerifyProjections.selfTest {
+                    let refAct = compiledSiluProduct(gu[0], gu[1])
+                    MuseGlimmerVerifyProjections.requireEqualBits(
+                        [projected], [numerics.project(mlp.downProj, refAct)],
+                        kind: "fp8.down.fusedsilu", rows: rows)
+                }
+                return projected
+            }
+        }
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
 
@@ -501,6 +667,18 @@ enum MuseGlimmerVerifyProjections {
     static let enabled = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ"] != "0"
     static let selfTest = environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST"] == "1"
     static let maximumRows = 8
+    static let midTrunkFlushLayer: Int = {
+        if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
+        return 16
+    }()
+    static let nvfp4GroupedQKVGMode: Int =
+        environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
+    static let nvfp4AllEnabled: Bool =
+        environment["CBV2_NVFP4_ALL"] != "0"
+    static let nvfp4LMHeadEnabled: Bool =
+        environment["CBV2_NVFP4_LMHEAD"] == "1"
+    static let denseGroupedEnabled: Bool =
+        environment["CBV2_DENSE_GROUPED"] != "0"
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var checkedOutputs = 0
@@ -563,21 +741,48 @@ extension MuseGlimmerTextModel {
     }
 
     /// Attention q, k, v and gate of one layer: all FP8 through
-    /// `CBv2SmallProjection`, all NVFP4 through `CBv2VerifyScales`; otherwise
-    /// the frontier's grouped or per-layer products.
-    func verifyAttentionProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
+    /// `CBv2SmallProjection`, all NVFP4 through `CBv2VerifyNVFP4` (4-segment)
+    /// or `CBv2VerifyScales`; otherwise the frontier's grouped or per-layer products.
+    func verifyAttentionProjections(
+        _ layers: [any UnaryLayer], _ x: MLXArray, preCastFP8: Bool = false
+    ) -> [MLXArray] {
         if verifyRows(x) != nil {
             var routed: [MLXArray]?
             var kind = ""
             if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                routed =
+                    preCastFP8
+                    ? CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
+                    : CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.qkvg"
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
-                routed = CBv2VerifyScales.products(layers, x)
+                let allowNVFP4All =
+                    MuseGlimmerVerifyProjections.nvfp4AllEnabled
+                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+                if allowNVFP4All,
+                    MuseGlimmerVerifyProjections.nvfp4GroupedQKVGMode != 2,
+                    let grouped = CBv2VerifyNVFP4.products(layers, x)
+                {
+                    routed = grouped
+                } else if MuseGlimmerVerifyProjections.nvfp4GroupedQKVGMode == 2,
+                    let nv = layers as? [ModelOptWeightOnlyNVFP4Linear],
+                    let grouped = CBv2SmallProjection.nvfp4Products(nv, x)
+                {
+                    routed = grouped
+                } else {
+                    routed = CBv2VerifyScales.products(layers, x)
+                }
                 kind = "nvfp4.qkvg"
+            } else if (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance),
+                MuseGlimmerVerifyProjections.denseGroupedEnabled,
+                let linear = layers as? [Linear],
+                let grouped = CBv2SmallProjection.denseProducts(linear, x)
+            {
+                routed = grouped
+                kind = "dense.qkvg"
             }
             if let routed {
-                checkRouted(routed, layers, x, kind: kind)
+                if !preCastFP8 { checkRouted(routed, layers, x, kind: kind) }
                 return routed
             }
         }
@@ -585,7 +790,7 @@ extension MuseGlimmerTextModel {
     }
 
     /// The attention output projection: FP8 through `CBv2SmallProjection`
-    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyScales`.
+    /// (all eager tiles in one launch), NVFP4 through `CBv2VerifyNVFP4` or `CBv2VerifyScales`.
     func verifyOutputProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
         if verifyRows(x) != nil {
             var routed: MLXArray?
@@ -593,8 +798,14 @@ extension MuseGlimmerTextModel {
             if let fp8 = layer as? ModelOptCalibratedLinear {
                 routed = CBv2SmallProjection.fp8Products([fp8], x)?.first
                 kind = "fp8.o"
-            } else if layer is ModelOptWeightOnlyNVFP4Linear {
-                routed = CBv2VerifyScales.product(layer, x)
+            } else if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
+                let allowNVFP4All =
+                    MuseGlimmerVerifyProjections.nvfp4AllEnabled
+                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+                routed =
+                    allowNVFP4All
+                    ? (CBv2VerifyNVFP4.product(nv, x) ?? CBv2VerifyScales.product(layer, x))
+                    : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.o"
             }
             if let routed {
@@ -608,37 +819,46 @@ extension MuseGlimmerTextModel {
     /// The feed-forward gate and up: an NVFP4 pair in one `CBv2VerifyNVFP4`
     /// launch; an FP8 pair through `CBv2SmallProjection` (one cast and one
     /// product launch).
-    func verifyFeedInputProjections(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray] {
+    func verifyFeedInputProjections(
+        _ layers: [any UnaryLayer], _ x: MLXArray, preCastFP8: Bool = false
+    ) -> [MLXArray] {
         if verifyRows(x) != nil {
             var routed: [MLXArray]?
             var kind = ""
-            if let pair = CBv2VerifyNVFP4.products(layers, x) {
+            if !preCastFP8, let pair = CBv2VerifyNVFP4.products(layers, x) {
                 routed = pair
                 kind = "nvfp4.gate_up"
             } else if let fp8 = layers as? [ModelOptCalibratedLinear] {
-                routed = CBv2SmallProjection.fp8Products(fp8, x)
+                routed =
+                    preCastFP8
+                    ? CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
+                    : CBv2SmallProjection.fp8Products(fp8, x)
                 kind = "fp8.gate_up"
             }
             if let routed {
-                checkRouted(routed, layers, x, kind: kind)
+                if !preCastFP8 { checkRouted(routed, layers, x, kind: kind) }
                 return routed
             }
         }
         return groupedProjections(layers, x)
     }
 
-    /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4` at 7
-    /// and 8 rows (16-row tiles with prefetch) and `CBv2VerifyScales` below;
-    /// FP8 through `CBv2SmallProjection` up to 5 rows and `CBv2VerifyScales`
-    /// at 6 to 8 rows (four row groups).
+    /// The feed-forward down projection: NVFP4 through `CBv2VerifyNVFP4`
+    /// across all verify rows when coalesced routing is active (or 7..8 rows
+    /// otherwise); FP8 through `CBv2SmallProjection` up to 5 rows and
+    /// `CBv2VerifyScales` at 6 to 8 rows (four row groups).
     func verifyDownProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
         if let rows = verifyRows(x) {
             var routed: MLXArray?
             var kind = ""
             if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
+                let allowNVFP4All =
+                    MuseGlimmerVerifyProjections.nvfp4AllEnabled
+                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
                 routed =
-                    rows >= 7
-                    ? CBv2VerifyNVFP4.product(nv, x) : CBv2VerifyScales.product(layer, x)
+                    (allowNVFP4All || rows >= 7)
+                    ? (CBv2VerifyNVFP4.product(nv, x) ?? CBv2VerifyScales.product(layer, x))
+                    : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.down"
             } else if let fp8 = layer as? ModelOptCalibratedLinear {
                 routed =
@@ -712,18 +932,40 @@ extension MuseGlimmerTextModel {
         guard routesVerifyProjections, numerics.exactWindows else { return }
         func key(_ layers: [any UnaryLayer]) -> String {
             layers.map { layer -> String in
-                guard let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape
-                else { return "other" }
-                return "\(shape.format):\(shape.inputs)x\(shape.outputs)"
+                if let shape = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape {
+                    return "\(shape.format):\(shape.inputs)x\(shape.outputs)"
+                }
+                if let linear = layer as? Linear {
+                    return "dense:\(linear.weight.dim(1))x\(linear.weight.dim(0))"
+                }
+                return "other"
             }.joined(separator: ",")
         }
         func inputs(_ layer: any UnaryLayer) -> Int? {
-            (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape.inputs
+            if let w = (layer as? any MuseGlimmerRowExactProjection)?.rowExactShape.inputs {
+                return w
+            }
+            return (layer as? Linear)?.weight.dim(1)
         }
+        let prevLow = CBv2DraftRegime.lowAcceptance
+        defer { CBv2DraftRegime.lowAcceptance = prevLow }
         var seen = Set<String>()
         for layer in model.layers {
             let a = layer.selfAttention
             let mlp = layer.mlp
+            // Pre-populate shared FP8 activation cast parameter cache at boot so no host sync
+            // (`asArray(Float.self)`) runs during the first timed verify step.
+            if let fp8Attn = [a.queryProj, a.keyProj, a.valueProj, a.gateProj]
+                as? [ModelOptCalibratedLinear],
+                let w = inputs(a.queryProj)
+            {
+                _ = CBv2SmallProjection.sharedFP8CastParams(fp8Attn, inputs: w, dtype: dtype)
+            }
+            if let fp8Feed = [mlp.gateProj, mlp.upProj] as? [ModelOptCalibratedLinear],
+                let w = inputs(mlp.gateProj)
+            {
+                _ = CBv2SmallProjection.sharedFP8CastParams(fp8Feed, inputs: w, dtype: dtype)
+            }
             let sites: [(String, [any UnaryLayer])] = [
                 ("qkvg", [a.queryProj, a.keyProj, a.valueProj, a.gateProj]),
                 ("o", [a.outputProj]),
@@ -735,13 +977,48 @@ extension MuseGlimmerTextModel {
                     let width = inputs(group[0])
                 else { continue }
                 var outputs = [MLXArray]()
-                for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-                    let x = MLXArray.zeros([1, rows, width], dtype: dtype)
-                    switch site {
-                    case "qkvg": outputs += verifyAttentionProjections(group, x)
-                    case "o": outputs.append(verifyOutputProjection(group[0], x))
-                    case "gate_up": outputs += verifyFeedInputProjections(group, x)
-                    default: outputs.append(verifyDownProjection(group[0], x))
+                for lowAcc in [false, true] {
+                    CBv2DraftRegime.lowAcceptance = lowAcc
+                    for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                        let x = MLXArray.zeros([1, rows, width], dtype: dtype)
+                        switch site {
+                        case "qkvg":
+                            outputs += verifyAttentionProjections(group, x)
+                            if lowAcc, let fp8 = group as? [ModelOptCalibratedLinear],
+                                let pre = CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
+                            {
+                                outputs += pre
+                            }
+                        case "o":
+                            outputs.append(verifyOutputProjection(group[0], x))
+                            if lowAcc, let fp8 = group[0] as? ModelOptCalibratedLinear,
+                                let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(
+                                    output: x, gate: x, outShape: x.shape, layer: fp8),
+                                let pre = CBv2SmallProjection.fp8ProductsPreCast(
+                                    [fp8], preCast: preCast)
+                            {
+                                outputs += pre
+                            }
+                        case "gate_up":
+                            outputs += verifyFeedInputProjections(group, x)
+                            if lowAcc, let fp8 = group as? [ModelOptCalibratedLinear],
+                                let pre = CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
+                            {
+                                outputs += pre
+                            }
+                        default:
+                            outputs.append(verifyDownProjection(group[0], x))
+                            if lowAcc, let fp8 = group[0] as? ModelOptCalibratedLinear,
+                                let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
+                                    gate: x, up: x, layer: fp8)
+                            {
+                                if rows >= 6, let y = CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast) {
+                                    outputs.append(y)
+                                } else if rows < 6, let y = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first {
+                                    outputs.append(y)
+                                }
+                            }
+                        }
                     }
                 }
                 eval(outputs)
@@ -752,6 +1029,19 @@ extension MuseGlimmerTextModel {
                 (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
                     verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
                 })
+            if CBv2VerifyScales.fusedLMHeadEnabled {
+                var fusedWarm = [MLXArray]()
+                for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                    if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+                        lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
+                        outputMultiplier: configuration.outputMultiplier,
+                        softcap: configuration.finalLogitSoftcapping)
+                    {
+                        fusedWarm += [res.ids, res.values, res.nonFinite]
+                    }
+                }
+                if !fusedWarm.isEmpty { eval(fusedWarm) }
+            }
             let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
                 MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
                 outputMultiplier: configuration.outputMultiplier,

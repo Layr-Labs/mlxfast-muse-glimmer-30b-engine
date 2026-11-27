@@ -603,11 +603,21 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// runs, so occasional rejections on a request that accepts nearly every
     /// draft never shrink its window.
     private(set) var roundAcceptanceFraction = 1.0
+    private(set) var observedRegimeRounds = 0
+    private(set) var enteredLowAcceptanceRegime = false
     private static let regimeAlpha = 0.15
     static let lowAcceptanceRegimeThreshold = 0.75
+    static let lowAcceptanceExitThreshold = 0.85
+    static let fastRegimeEntryV2: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FAST_REGIME_V2"] != "0"
+    static let regimeHysteresisEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_REGIME_HYST"] != "0"
 
     var inLowAcceptanceRegime: Bool {
-        roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
+        if Self.regimeHysteresisEnabled && enteredLowAcceptanceRegime {
+            return roundAcceptanceFraction < Self.lowAcceptanceExitThreshold
+        }
+        return roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
@@ -632,7 +642,16 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// verify round's cost: shorter rounds need more of them per window.
     /// Low-acceptance requests commit far fewer tokens per round than the
     /// line allows, so it never binds for them.
-    static let ceilingBudgetHundredths = 404
+    static let ceilingBudgetHundredths: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_MTP_CEILING_BUDGET"],
+            let v = Int(raw), v > 0
+        {
+            return v
+        }
+        return 404
+    }()
+    static let fastRegimeEntry: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FAST_REGIME"] != "0"
     static let ceilingBurstTokens = 27
     static let ceilingEnabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
@@ -689,8 +708,21 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                 || (!rejectionObserved && !endedByTruncation && accepted == drafted)
         {
             let fraction = Double(accepted) / Double(drafted)
+            let regimeWeight: Double
+            if Self.fastRegimeEntry {
+                let denom = Double(observedRegimeRounds + (Self.fastRegimeEntryV2 ? 1 : 2))
+                regimeWeight = max(Self.regimeAlpha, 1.0 / denom)
+            } else {
+                regimeWeight = Self.regimeAlpha
+            }
             roundAcceptanceFraction +=
-                Self.regimeAlpha * (fraction - roundAcceptanceFraction)
+                regimeWeight * (fraction - roundAcceptanceFraction)
+            if observedRegimeRounds < Int.max { observedRegimeRounds += 1 }
+            if roundAcceptanceFraction < Self.lowAcceptanceRegimeThreshold {
+                enteredLowAcceptanceRegime = true
+            } else if roundAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
+                enteredLowAcceptanceRegime = false
+            }
         }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
@@ -911,7 +943,14 @@ enum CBv2MTPMarginalDepthPolicy {
     /// slope near 0.11-0.12 of the serial step; 0.15 is deliberately a little
     /// conservative so estimator noise does not open windows that pay for
     /// rejected rows.
-    static let fixedWindowHeadStepCostRatio = 0.065
+    static let fixedWindowHeadStepCostRatio: Double = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_HEAD_STEP_COST"],
+            let v = Double(raw), v.isFinite, v >= 0.0, v <= 0.5
+        {
+            return v
+        }
+        return 0.065
+    }()
 
     static func fixedWindowDepth(
         offeredDepth: Int,

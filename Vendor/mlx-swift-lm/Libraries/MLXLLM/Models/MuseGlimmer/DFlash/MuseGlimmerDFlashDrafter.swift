@@ -182,6 +182,31 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
+        let headScale2: Float = draftHead.map { $0.weightScale2.asType(.float32).item(Float.self) } ?? 1.0
+        let outMult: Float = (target as? MuseGlimmerTextModel)?.configuration.outputMultiplier ?? 1.0
+        let softcap: Float = (target as? MuseGlimmerTextModel)?.configuration.finalLogitSoftcapping ?? 0.0
+        let effScale = headScale2 * outMult
+        let dtParams = MLXArray([
+            effScale,
+            softcap,
+            CBv2DraftRegime.dynamicTreeTemp,
+            CBv2DraftRegime.dynamicTreeChainBonus,
+            CBv2DraftRegime.dynamicTreeDecay,
+            Float(CBv2DraftRegime.dynamicTreeMaxLeaves),
+            Float(CBv2DraftRegime.dynamicTreeMaxLeafDepth),
+            Float(CBv2DraftRegime.dynamicTreeMaxLeavesAt5),
+            Float(CBv2DraftRegime.dynamicTreeMaxBranchLen),
+            CBv2DraftRegime.dynamicTreeContDecay,
+            Float(CBv2DraftRegime.dynamicTreeMaxLeavesAt6),
+            Float(CBv2DraftRegime.dynamicTreePurityMode),
+            Float(CBv2DraftRegime.dynamicTreeDPMode),
+            Float(CBv2DraftRegime.dynamicTreeTopK),
+            CBv2DraftRegime.dynamicTreeTempSlope,
+            CBv2DraftRegime.dynamicTreeLeafDecay,
+            CBv2DraftRegime.dynamicTreePurityExp,
+        ])
+        eval(dtParams)
+        self.dynTreeParams = dtParams
         contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
@@ -195,10 +220,136 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     outputMultiplier: textTarget.configuration.outputMultiplier,
                     softcap: textTarget.configuration.finalLogitSoftcapping)
                 warm += [t, conf, Self.fastArgMax(dummyLogits)]
+                if CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled {
+                    let dummyRows = MLXArray.zeros(
+                        [settings.maximumDraftTokens, target.dflashVocabularySize],
+                        dtype: .bfloat16)
+                    let p = Self.fastDynamicTreeStage1(dummyRows, params: dtParams)
+                    warm += [
+                        p.val, p.idx, p.sum,
+                        Self.fastDynamicTreeArgMax(
+                            p.val, p.idx, vocab: target.dflashVocabularySize),
+                    ]
+                    let maxDk = min(7, settings.maximumDraftTokens)
+                    if maxDk >= 2 {
+                        for dk in 2 ... maxDk {
+                            let dyn = Self.fastDynamicTreeStage2(
+                                p.val, p.idx, p.sum, k: dk,
+                                vocab: target.dflashVocabularySize, params: dtParams)
+                            let dummyDrafts = MLXArray.zeros([1, dk], type: Int32.self)
+                            let dummyTargets = MLXArray.zeros([1, dk + 1], type: Int32.self)
+                            let out = Self.fastTreeOutcome(
+                                drafts: dummyDrafts, targets: dummyTargets,
+                                treeMeta: dyn.treeMeta, k: dk)
+                            warm += [
+                                dyn.tokens, dyn.treeMeta,
+                                out.carrySlot, out.accepted, out.visible,
+                            ]
+                        }
+                    }
+                }
             }
             if let epilogue = contextKeyEpilogue {
                 let key = MLXArray.zeros([1, c.kvHeads * c.headDimensions], dtype: .bfloat16)
                 warm.append(epilogue.apply(Array(repeating: key, count: 5), rows: 1, position: 0))
+                if CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled {
+                    let dummyMeta = MLXArray.zeros([18], type: Int32.self)
+                    warm.append(
+                        epilogue.apply(
+                            Array(repeating: key, count: 5), rows: 1, position: 0,
+                            treeMeta: dummyMeta))
+                }
+            }
+            let dummyRopeIn = MLXArray.zeros(
+                [1, c.kvHeads, c.blockSize, c.headDimensions], dtype: model.activationDType)
+            warm.append(
+                MLXFast.RoPE(
+                    dummyRopeIn, dimensions: c.headDimensions, traditional: false,
+                    base: c.ropeTheta, scale: 1, offset: MLXArray(Int32(0))))
+            if Device.defaultDevice().deviceType == .gpu {
+                if Self.inPlaceRingEnabled {
+                    warm.append(
+                        FastInPlaceContext.warmRingWriteKernel(
+                            layers: c.hiddenLayers, kvHeads: c.kvHeads, window: c.slidingWindow,
+                            headDimensions: c.headDimensions, dtype: model.activationDType))
+                }
+                // Warm branch-hit gather (`take(idx, axis: 2)` for 4D KV and `take(idx, axis: 1)`
+                // for 3D target hidden) and device-outcome scalar ops.
+                let dummyKV = MLXArray.zeros(
+                    [c.hiddenLayers, c.kvHeads, 8, c.headDimensions], dtype: model.activationDType)
+                let dummyIdx = MLXArray([Int32(0), Int32(2)])
+                warm.append(dummyKV.take(dummyIdx, axis: 2))
+                let dummyTargetH = MLXArray.zeros(
+                    [1, 8, c.contextWidth], dtype: model.activationDType)
+                warm.append(dummyTargetH.take(dummyIdx, axis: 1))
+                let dummyDrafts = MLXArray.zeros([1, 7], type: Int32.self)
+                let dummyTargets = MLXArray.zeros([1, 8], type: Int32.self)
+                let dummyMatch = equal(dummyDrafts, dummyTargets[0..., 0 ..< 7]).asType(.int32)
+                let dummyAcc = cumprod(dummyMatch, axis: 1).sum()
+                let dummyVis = lessEqual(MLXArray(Array(Int32(0) ..< Int32(8))), dummyAcc)
+                let dummySeed = maximum(
+                    takeAlong(dummyTargets, dummyAcc.reshaped([1, 1]), axis: 1),
+                    MLXArray(Int32(0)))
+                warm += [dummyVis, dummySeed]
+                // Warm 4-bit context projection, K/V projections, drafter MLP (normal + low-bit),
+                // and draft head across every reachable row count `1 ... (maximumDraftTokens + 1)`
+                // so MLX's quantized matvec (`affine_qmv_wide` / `fp_qmv`) never compiles inside
+                // a timed decode window.
+                let prevLow = CBv2DraftRegime.lowAcceptance
+                for rows in 1 ... (settings.maximumDraftTokens + 1) {
+                    let dummyFeat = MLXArray.zeros(
+                        [rows, c.contextWidth], dtype: model.activationDType)
+                    let projCtx = model.projectContext(dummyFeat)
+                    let kv = speculativeContextKeyValues(projCtx, at: 0)
+                    warm += [kv.keys, kv.values]
+                    if rows <= settings.maximumDraftTokens {
+                        let dummyH = MLXArray.zeros(
+                            [1, rows, c.hiddenSize], dtype: model.activationDType)
+                        if let firstLayer = model.layers.first {
+                            CBv2DraftRegime.lowAcceptance = false
+                            warm.append(draftMLP(0, firstLayer.mlp, dummyH))
+                            CBv2DraftRegime.lowAcceptance = true
+                            warm.append(draftMLP(0, firstLayer.mlp, dummyH))
+                        }
+                        let dummyHeadIn = MLXArray.zeros(
+                            [rows, c.hiddenSize], dtype: model.activationDType)
+                        warm.append(draftHeadProduct(dummyHeadIn, readout: false))
+                    }
+                }
+                warm.append(
+                    concatenated(
+                        [
+                            MLXArray.ones([4], type: Bool.self),
+                            MLXArray.ones([4], type: Bool.self),
+                        ],
+                        axis: 0))
+                // Warm masked AND unmasked drafter SDPA for both `kL % 32 == 0` (544) and
+                // `kL % 32 != 0` (536) so neither `align_K_t` nor `align_K_n` compiles inside
+                // a timed decode window.
+                let dummyEmb = model.blockEmbeddings(anchor: maskEmbedding, mask: maskEmbedding)
+                let devPos = MLXArray(Int32(512))
+                for ctxLen in [520, 528] {
+                    let ck = MLXArray.zeros(
+                        [c.hiddenLayers, c.kvHeads, ctxLen, c.headDimensions],
+                        dtype: model.activationDType)
+                    let cv = MLXArray.zeros(
+                        [c.hiddenLayers, c.kvHeads, ctxLen, c.headDimensions],
+                        dtype: model.activationDType)
+                    let cols = MLXArray.ones([ctxLen + c.blockSize], type: Bool.self)
+                    let mask2d = broadcast(
+                        cols.reshaped([1, ctxLen + c.blockSize]),
+                        to: [c.blockSize, ctxLen + c.blockSize])
+                    CBv2DraftRegime.lowAcceptance = true
+                    let maskedRows = fastDraftBlockRows(
+                        embeddings: dummyEmb, at: ctxLen, context: (ck, cv), mask: mask2d,
+                        draftCount: settings.maximumDraftTokens, devicePosition: devPos)
+                    CBv2DraftRegime.lowAcceptance = false
+                    let unmaskedRows = fastDraftBlockRows(
+                        embeddings: dummyEmb, at: ctxLen, context: (ck, cv), mask: nil,
+                        draftCount: settings.maximumDraftTokens)
+                    eval(maskedRows, unmaskedRows)
+                }
+                CBv2DraftRegime.lowAcceptance = prevLow
             }
             eval(warm)
             try errors.check()
@@ -240,9 +391,309 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     // MARK: Request state
 
+    private static let inPlaceRingEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_INPLACE_RING"] != "0"
+
+    /// Request-owned zero-copy in-place DFlash ring context (eliminates ~84 MB/round
+    /// failed-donation `SliceUpdate` copies while keeping exact `[L, H, W, D]` storage
+    /// and dependency ordering via `writeFence` + `depends`).
+    final class FastInPlaceContext {
+        let layers: Int
+        let kvHeads: Int
+        let headDimensions: Int
+        let window: Int
+        let blockSize: Int
+        let dtype: DType
+        let inPlaceRing: Bool
+
+        private static let ospecZeroCopyEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_OSPEC_ZEROCOPY"] != "0"
+
+        private var keys: MLXArray?
+        private var values: MLXArray?
+        private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
+        private var speculativeReadDeps: [MLXArray] = []
+        private var basePosition = 0
+        private(set) var firstPosition = 0
+        private(set) var nextPosition = 0
+
+        private static let ringWriteKernel = MLXFast.metalKernel(
+            name: "dflash_ring_write_inplace",
+            inputNames: ["new_keys", "new_values", "ring_keys", "ring_values", "params", "previous"],
+            outputNames: ["fence"],
+            source: """
+                const uint d = thread_position_in_grid.x;
+                const uint r = thread_position_in_grid.y;
+                const uint lh = thread_position_in_grid.z;
+                const uint rows = uint(params[1]);
+                if (d < uint(D_) && r < rows) {
+                    const uint l = lh / uint(H_);
+                    const uint h = lh % uint(H_);
+                    const uint dst_slot = (uint(params[0]) + r) % uint(W_);
+                    const size_t k_src =
+                        size_t(l) * size_t(new_keys_strides[0])
+                        + size_t(h) * size_t(new_keys_strides[1])
+                        + size_t(r) * size_t(new_keys_strides[2])
+                        + size_t(d) * size_t(new_keys_strides[3]);
+                    const size_t v_src =
+                        size_t(l) * size_t(new_values_strides[0])
+                        + size_t(h) * size_t(new_values_strides[1])
+                        + size_t(r) * size_t(new_values_strides[2])
+                        + size_t(d) * size_t(new_values_strides[3]);
+                    const size_t dst =
+                        (size_t(lh) * size_t(W_) + size_t(dst_slot)) * size_t(D_) + size_t(d);
+                    device T* rk = ring_keys;
+                    device T* rv = ring_values;
+                    rk[dst] = new_keys[k_src];
+                    rv[dst] = new_values[v_src];
+                }
+                if (d == 0u && r == 0u && lh == 0u) {
+                    fence[0] = previous[0] + 1;
+                }
+                """,
+            ensureRowContiguous: false,
+            mutableInputs: ["ring_keys", "ring_values"])
+
+        static func warmRingWriteKernel(
+            layers: Int, kvHeads: Int, window: Int, headDimensions: Int, dtype: DType
+        ) -> MLXArray {
+            let nk = MLXArray.zeros([1, 1, 1, headDimensions], dtype: dtype)
+            let nv = MLXArray.zeros([1, 1, 1, headDimensions], dtype: dtype)
+            let rk = MLXArray.zeros([1, 1, 1, headDimensions], dtype: dtype)
+            let rv = MLXArray.zeros([1, 1, 1, headDimensions], dtype: dtype)
+            let params = MLXArray([Int32(0), Int32(1)])
+            let prev = MLXArray.zeros([1], dtype: .int32)
+            let tgX = min(256, max(32, headDimensions))
+            let gridX = ((headDimensions + tgX - 1) / tgX) * tgX
+            return ringWriteKernel(
+                [nk, nv, rk, rv, params, prev],
+                template: [("T", dtype), ("H_", kvHeads), ("W_", window), ("D_", headDimensions)],
+                grid: (gridX, 1, 1),
+                threadGroup: (tgX, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32])[0]
+        }
+
+        init(configuration c: MuseGlimmerDFlashConfiguration, dtype: DType, inPlaceRing: Bool) {
+            layers = c.hiddenLayers
+            kvHeads = c.kvHeads
+            headDimensions = c.headDimensions
+            window = c.slidingWindow
+            blockSize = c.blockSize
+            self.dtype = dtype
+            self.inPlaceRing = inPlaceRing
+        }
+
+        var count: Int { nextPosition - firstPosition }
+
+        var arrays: [MLXArray] {
+            guard let keys, let values else { return [] }
+            return inPlaceRing
+                ? depends(inputs: [keys, values], dependencies: [writeFence]) : [keys, values]
+        }
+
+        func restart(at position: Int) {
+            precondition(position >= 0, "DFlash context position must not be negative")
+            basePosition = position
+            firstPosition = position
+            nextPosition = position
+        }
+
+        func release() {
+            keys = nil
+            values = nil
+            writeFence = MLXArray.zeros([1], dtype: .int32)
+            speculativeReadDeps.removeAll(keepingCapacity: false)
+            restart(at: 0)
+        }
+
+        private func consumeReadBarriers() {
+            guard !speculativeReadDeps.isEmpty else { return }
+            writeFence = depends(inputs: [writeFence], dependencies: speculativeReadDeps)[0]
+            speculativeReadDeps.removeAll(keepingCapacity: true)
+        }
+
+        /// Writes unconfirmed verify rows directly into the contiguous unused tail
+        /// `[count ..< count + rows)` of the ring without advancing `nextPosition`,
+        /// avoiding a full ring copy inside `speculateOutcomeBlock`.
+        func writeSpeculativeTail(
+            keys newKeys: MLXArray, values newValues: MLXArray
+        ) -> (keys: MLXArray, values: MLXArray)? {
+            let rows = newKeys.dim(2)
+            guard Self.ospecZeroCopyEnabled, inPlaceRing, let keys, let values,
+                rows > 0, firstPosition == basePosition, count + rows <= window
+            else { return nil }
+            consumeReadBarriers()
+            let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
+            let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
+            let params = MLXArray([Int32(count), Int32(rows)])
+            let tgX = min(256, max(32, headDimensions))
+            let gridX = ((headDimensions + tgX - 1) / tgX) * tgX
+            writeFence = Self.ringWriteKernel(
+                [nk, nv, keys, values, params, writeFence],
+                template: [
+                    ("T", dtype), ("H_", kvHeads), ("W_", window), ("D_", headDimensions),
+                ],
+                grid: (gridX, rows, layers * kvHeads),
+                threadGroup: (tgX, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32])[0]
+            let pair = depends(inputs: [keys, values], dependencies: [writeFence])
+            let total = count + rows
+            return (
+                pair[0][0..., 0..., 0 ..< total, 0...],
+                pair[1][0..., 0..., 0 ..< total, 0...]
+            )
+        }
+
+        func recordSpeculativeRead(_ dep: MLXArray) {
+            speculativeReadDeps.append(dep)
+        }
+
+        func append(keys newKeys: MLXArray, values newValues: MLXArray, skipping: Int = 0) {
+            let rows = newKeys.dim(2)
+            precondition(
+                newKeys.shape == [layers, kvHeads, rows, headDimensions]
+                    && newValues.shape == newKeys.shape && rows > 0 && rows <= window
+                    && skipping >= 0 && (skipping == 0 || rows == window),
+                "DFlash context append does not match the ring")
+            if keys == nil {
+                let shape = [layers, kvHeads, window, headDimensions]
+                keys = MLXArray.zeros(shape, dtype: dtype)
+                values = MLXArray.zeros(shape, dtype: dtype)
+            }
+            consumeReadBarriers()
+            let start = nextPosition + skipping
+            if skipping > 0 {
+                basePosition = start
+                firstPosition = start
+            }
+            if inPlaceRing && (start - basePosition) + rows <= window {
+                let startSlot = (start - basePosition) % window
+                let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
+                let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
+                let params = MLXArray([Int32(startSlot), Int32(rows)])
+                let tgX = min(256, max(32, headDimensions))
+                let gridX = ((headDimensions + tgX - 1) / tgX) * tgX
+                writeFence = Self.ringWriteKernel(
+                    [nk, nv, keys!, values!, params, writeFence],
+                    template: [
+                        ("T", dtype), ("H_", kvHeads), ("W_", window), ("D_", headDimensions),
+                    ],
+                    grid: (gridX, rows, layers * kvHeads),
+                    threadGroup: (tgX, 1, 1),
+                    outputShapes: [[1]],
+                    outputDTypes: [.int32])[0]
+            } else {
+                var written = 0
+                while written < rows {
+                    let slot = (start + written - basePosition) % window
+                    let run = min(rows - written, window - slot)
+                    let source = written ..< (written + run)
+                    keys![0..., 0..., slot ..< (slot + run), 0...] =
+                        newKeys[0..., 0..., source, 0...].asType(dtype)
+                    values![0..., 0..., slot ..< (slot + run), 0...] =
+                        newValues[0..., 0..., source, 0...].asType(dtype)
+                    written += run
+                }
+            }
+            nextPosition = start + rows
+            firstPosition = max(firstPosition, nextPosition - window)
+        }
+
+        var heldPositions: [Int] {
+            guard count == window else { return Array(firstPosition ..< nextPosition) }
+            let oldestSlot = (firstPosition - basePosition) % window
+            return (0 ..< window).map { slot in
+                firstPosition + (slot - oldestSlot + window) % window
+            }
+        }
+
+        func visibleContext() -> (keys: MLXArray, values: MLXArray, mask: MLXArray?)? {
+            guard count > 0, let keys, let values else { return nil }
+            let pair =
+                inPlaceRing
+                ? depends(inputs: [keys, values], dependencies: [writeFence]) : [keys, values]
+            let rows = 0 ..< count
+            let visibleKeys = pair[0][0..., 0..., rows, 0...]
+            let visibleValues = pair[1][0..., 0..., rows, 0...]
+            let mask = MuseGlimmerDFlashContextState.visibility(
+                anchor: nextPosition, blockSize: blockSize, window: window,
+                contextPositions: heldPositions
+            ).map { MLXArray($0, [blockSize, count + blockSize]) }
+            return (visibleKeys, visibleValues, mask)
+        }
+    }
+
+    private struct FastContextCommit {
+        let features: MLXArray
+        let position: Int?
+        let state: FastInPlaceContext
+    }
+
+    private func commitToContext(
+        features: MLXArray, at position: Int, to context: FastInPlaceContext
+    ) {
+        let rows = features.dim(0)
+        let duplicates = max(0, context.nextPosition - position)
+        guard rows > duplicates else { return }
+        if position > context.nextPosition { context.restart(at: position) }
+        let fresh = rows - duplicates
+        let unread = max(0, fresh - context.window)
+        let used = features[(duplicates + unread)..., 0...]
+        let projected = model.contextKeyValues(
+            model.projectContext(used), at: context.nextPosition + unread)
+        context.append(keys: projected.keys, values: projected.values, skipping: unread)
+    }
+
+    private func commitBatchToContext(_ commits: [FastContextCommit]) {
+        struct Planned {
+            let state: FastInPlaceContext
+            let rows: Range<Int>
+            let keyPosition: Int
+            let restart: Int?
+            let skipping: Int
+        }
+        var next: [ObjectIdentifier: Int] = [:]
+        var planned: [Planned] = []
+        var used: [MLXArray] = []
+        var total = 0
+        for entry in commits {
+            let features = entry.features
+            let id = ObjectIdentifier(entry.state)
+            let held = next[id] ?? entry.state.nextPosition
+            let position = entry.position ?? held
+            precondition(position >= 0, "DFlash context position must not be negative")
+            let rows = features.dim(0)
+            let duplicates = max(0, held - position)
+            guard rows > duplicates else { continue }
+            let restart = position > held ? position : nil
+            let start = restart ?? held
+            let fresh = rows - duplicates
+            let unread = max(0, fresh - entry.state.window)
+            used.append(features[(duplicates + unread)..., 0...])
+            planned.append(
+                Planned(
+                    state: entry.state, rows: total ..< (total + fresh - unread),
+                    keyPosition: start + unread, restart: restart, skipping: unread))
+            total += fresh - unread
+            next[id] = start + fresh
+        }
+        guard !planned.isEmpty else { return }
+        let context = model.projectContext(
+            used.count == 1 ? used[0] : concatenated(used, axis: 0))
+        let projected = model.contextKeyValues(
+            context, segments: planned.map { ($0.rows, $0.keyPosition) })
+        for (entry, keyValues) in zip(planned, projected) {
+            if let restart = entry.restart { entry.state.restart(at: restart) }
+            entry.state.append(
+                keys: keyValues.keys, values: keyValues.values, skipping: entry.skipping)
+        }
+    }
+
     final class State: CBv2MTPRequestState {
         let owner: ObjectIdentifier
-        let context: MuseGlimmerDFlashContextState
+        let context: FastInPlaceContext
         var released = false
         /// The last committed position's row has not arrived yet: a verify
         /// round hands it over as the next carry.
@@ -270,7 +721,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The last finalized round accepted every draft.
         var lastRoundFullyAccepted = false
 
-        init(owner: ObjectIdentifier, context: MuseGlimmerDFlashContextState) {
+        init(owner: ObjectIdentifier, context: FastInPlaceContext) {
             self.owner = owner
             self.context = context
         }
@@ -294,6 +745,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// The next block for the all-accepted outcome, when built; dropped
         /// at confirmation for any other outcome.
         var memo: (tokens: MLXArray, hidden: MLXArray)? = nil
+        /// Stage-1 top-3 + softmax partials built by `speculateOutcomeBlock` so
+        /// `takeSpeculation` can run 3 us Stage-2 tree or argmax reduction for
+        /// whichever `k` the next round chooses.
+        var dynPartials: (val: MLXArray, idx: MLXArray, sum: MLXArray, hidden: MLXArray)? = nil
+        /// The block was drafted for the outcome the verify itself decided
+        /// (its accept count read on the device), not for all-accepted.
+        var deviceOutcome = false
         /// `[maximumDraftTokens]` float32: each block row's top-1
         /// probability under the target's readout, evaluated with the
         /// speculation (`speculatedDraftConfidence`). Set with `memo`.
@@ -304,6 +762,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var pending: MLXArray? = nil
         /// The carry the engine stored for that outcome.
         var carry: MLXArray? = nil
+        /// Verify slot path `[0, ..., carrySlot]` committed for this outcome
+        /// (length `accepted + 1`; nil falls back to linear `0...accepted`).
+        var acceptedPath: [Int]? = nil
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -325,7 +786,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     }
 
     public func makeRequestState() -> any CBv2MTPRequestState {
-        State(owner: ObjectIdentifier(self), context: model.makeContextState())
+        let inPlace = Device.defaultDevice().deviceType == .gpu && Self.inPlaceRingEnabled
+        return State(
+            owner: ObjectIdentifier(self),
+            context: FastInPlaceContext(
+                configuration: model.configuration, dtype: model.activationDType,
+                inPlaceRing: inPlace))
     }
 
     /// The engine's rule for this round's proposals. Ignored unless
@@ -384,9 +850,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return
         }
         if s.pending == nil {
-            model.commit(features: rows, at: position, to: s.context)
+            commitToContext(features: rows, at: position, to: s.context)
         } else {
-            model.commit(takePending(s) + [.init(features: rows, at: position, to: s.context)])
+            commitBatchToContext(
+                takePending(s) + [.init(features: rows, position: position, state: s.context)])
         }
         // Whatever arrived, the context now ends at its newest row.
         s.awaitsCarry = false
@@ -394,15 +861,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     }
 
     /// The state's pending rows as the first commit, at its next position.
-    private func takePending(_ s: State) -> [MuseGlimmerDFlashDraftModel.ContextCommit] {
+    private func takePending(_ s: State) -> [FastContextCommit] {
         defer { s.pending = nil }
-        return s.pending.map { [.init(features: $0, at: nil, to: s.context)] } ?? []
+        return s.pending.map { [.init(features: $0, position: nil, state: s.context)] } ?? []
     }
 
     /// Every entry as `observeCommittedTarget` would take it, with one
     /// context commit for all of them.
     public func observeCommittedTargets(_ observations: [CBv2MTPRequestObservation]) {
-        var commits: [MuseGlimmerDFlashDraftModel.ContextCommit] = []
+        var commits: [FastContextCommit] = []
         var observed: [(state: State, rows: Int)] = []
         for entry in observations {
             let s = state(entry.requestState)
@@ -415,10 +882,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 continue
             }
             commits += takePending(s)
-            commits.append(.init(features: rows, at: entry.position, to: s.context))
+            commits.append(.init(features: rows, position: entry.position, state: s.context))
             observed.append((s, rows.dim(0)))
         }
-        model.commit(commits)
+        commitBatchToContext(commits)
         for (s, rows) in observed {
             s.awaitsCarry = false
             s.committedInputCount += rows
@@ -474,10 +941,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             // The pending rows and the carry are in the ring: draft the block.
         } else if settings.batchesRequests {
             guard let carry = commitCarry(s, hidden: hidden) else { return "carry" }
-            if !carry.isEmpty { model.commit(carry) }
+            if !carry.isEmpty { commitBatchToContext(carry) }
         } else if s.awaitsCarry {
             guard let row = features(hidden), row.dim(0) == 1 else { return "carry" }
-            model.commit(features: row, at: s.context.nextPosition, to: s.context)
+            commitToContext(features: row, at: s.context.nextPosition, to: s.context)
             s.awaitsCarry = false
             s.committedInputCount += 1
         }
@@ -500,9 +967,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// A round's commit before its block: the pending rows and the carry row
     /// still missing, as one entry at the next position. Nil when the carry
     /// is not one feature row.
-    private func commitCarry(_ s: State, hidden: MLXArray)
-        -> [MuseGlimmerDFlashDraftModel.ContextCommit]?
-    {
+    private func commitCarry(_ s: State, hidden: MLXArray) -> [FastContextCommit]? {
         var rows = s.pending.map { [$0] } ?? []
         s.pending = nil
         if s.awaitsCarry {
@@ -513,7 +978,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         guard !rows.isEmpty else { return [] }
         let features = rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
-        return [.init(features: features, at: s.context.nextPosition, to: s.context)]
+        return [.init(features: features, position: s.context.nextPosition, state: s.context)]
     }
 
     /// Draft index 0 of every seed's round in one pass: one context commit
@@ -524,7 +989,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard settings.batchesRequests else { return }
         let c = model.configuration
         var started: [(state: State, tokens: MLXArray)] = []
-        var commits: [MuseGlimmerDFlashDraftModel.ContextCommit] = []
+        var commits: [FastContextCommit] = []
         for seed in seeds {
             let s = state(seed.requestState)
             s.speculation = nil
@@ -539,7 +1004,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             started.append((s, seed.tokens))
         }
         guard !started.isEmpty else { return }
-        model.commit(commits)
+        commitBatchToContext(commits)
         var blocks: [MLXArray] = []
         for (s, tokens) in started {
             let anchor = target.dflashTokenEmbeddings(tokens.asType(.int32))
@@ -563,9 +1028,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     draftCount: k)
             ]
         } else {
-            rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
-                $0[1 ..< (1 + k), 0...]
-            }
+            let visibles = states.map { $0.context.visibleContext() }
+            rows = model.blockForwards(
+                embeddings: blocks, at: states.map(\.context.nextPosition),
+                contexts: visibles.map { $0.map { ($0.keys, $0.values) } },
+                masks: visibles.map { $0?.mask }
+            ).map { $0[1 ..< (1 + k), 0...] }
         }
         let logits = draftHeadProduct(
             rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
@@ -592,11 +1060,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     }
 
     private let contextKeyEpilogue: ContextKeyEpilogue?
+    private let dynTreeParams: MLXArray
 
     private static let contextKeysKernel = MLXFast.metalKernel(
         name: "dflash_context_keys",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "w0", "w1", "w2", "w3", "w4", "dims", "params",
+            "tree_meta",
         ],
         outputNames: ["keys"],
         source: """
@@ -630,7 +1100,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             sum = simd_sum(lane == 0 ? sum : 0.0f);
             const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
             const bool low = lane < 16;
-            const float pos = float(dims[1] + int(row));
+            const int row_delta = DYN_TREE_ ? tree_meta[9 + row] : int(row);
+            const float pos = float(dims[1] + row_delta);
             for (uint i = 0; i < 4; ++i) {
                 const bfloat16_t norm = weight[i] * static_cast<bfloat16_t>(x[i] * inv);
                 const float v = static_cast<float>(norm);
@@ -649,6 +1120,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let kvHeads: Int
         let weights: [MLXArray]
         let coefficients: MLXArray
+        let dummyTreeMeta: MLXArray
 
         init?(_ model: MuseGlimmerDFlashDraftModel) {
             let c = model.configuration
@@ -667,23 +1139,29 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             self.kvHeads = c.kvHeads
             self.weights = weights
             self.coefficients = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+            let dm = MLXArray.zeros([18], type: Int32.self)
+            eval(dm)
+            self.dummyTreeMeta = dm
         }
 
-        func apply(_ projections: [MLXArray], rows: Int, position: Int) -> MLXArray {
+        func apply(
+            _ projections: [MLXArray], rows: Int, position: Int, treeMeta: MLXArray? = nil
+        ) -> MLXArray {
             var inputs = projections
-            inputs.reserveCapacity(12)
+            inputs.reserveCapacity(13)
             inputs.append(contentsOf: weights)
             inputs.append(MLXArray([Int32(rows), Int32(position)]))
             inputs.append(coefficients)
+            inputs.append(treeMeta ?? dummyTreeMeta)
             return MuseGlimmerDFlashDrafter.contextKeysKernel(
-                inputs, template: [("HEADS_", kvHeads)],
+                inputs, template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil)],
                 grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
                 outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
         }
     }
 
     private func speculativeContextKeyValues(
-        _ context: MLXArray, at position: Int
+        _ context: MLXArray, at position: Int, treeMeta: MLXArray? = nil
     ) -> (keys: MLXArray, values: MLXArray) {
         let c = model.configuration
         let rows = context.dim(0)
@@ -703,7 +1181,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return model.contextKeyValues(context, at: position)
         }
         return (
-            epilogue.apply(keys, rows: rows, position: position),
+            epilogue.apply(keys, rows: rows, position: position, treeMeta: treeMeta),
             concatenated(values, axis: 0))
     }
 
@@ -729,7 +1207,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Only for the served one-row batched argmax round.
     public func speculateNextRound(
         targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int, draftsBlock: Bool,
-        requestState: any CBv2MTPRequestState
+        draftTokens: MLXArray?, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        speculateNextRound(
+            targetTokens: targetTokens, targetHidden: targetHidden, depth: k,
+            draftsBlock: draftsBlock, draftTokens: draftTokens, dynTreeMeta: nil,
+            requestState: requestState)
+    }
+
+    public func speculateNextRound(
+        targetTokens: MLXArray, targetHidden: MLXArray, depth k: Int, draftsBlock: Bool,
+        draftTokens: MLXArray?, dynTreeMeta: MLXArray?, requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let s = state(requestState)
         s.speculation = nil
@@ -750,10 +1238,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // all-accepted outcome's entry is all of them.
         let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
-        let projected = speculativeContextKeyValues(model.projectContext(features), at: start)
+        let projected = speculativeContextKeyValues(
+            model.projectContext(features), at: start, treeMeta: dynTreeMeta)
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)
+        if let draftTokens, draftTokens.shape == [1, k],
+            context.count + n + context.blockSize <= window
+        {
+            return speculateOutcomeBlock(
+                s, speculation: speculation, targetTokens: targetTokens,
+                draftTokens: draftTokens, depth: k, start: start, projected: projected,
+                dynTreeMeta: dynTreeMeta)
+        }
         guard draftsBlock, s.lastRoundFullyAccepted else {
             s.speculation = speculation
             return [projected.keys, projected.values]
@@ -856,12 +1353,115 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
     }
 
+    /// Drafts the next block on the GPU for whichever acceptance count `0...k`
+    /// the current verify round decides, masking rejected context rows `> a`
+    /// and advancing block RoPE on the device with zero host synchronization.
+    private func speculateOutcomeBlock(
+        _ s: State, speculation inProgress: Speculation, targetTokens: MLXArray,
+        draftTokens: MLXArray, depth k: Int, start: Int,
+        projected: (keys: MLXArray, values: MLXArray),
+        dynTreeMeta: MLXArray? = nil
+    ) -> [MLXArray] {
+        var speculation = inProgress
+        let c = model.configuration
+        let context = s.context
+        let n = k + 1
+        let ring = context.arrays
+        let existingCount = context.count
+        let block = context.blockSize
+        let targets = targetTokens.asType(.int32)
+        let accepted: MLXArray
+        let carrySlot: MLXArray
+        let projectedVisible: MLXArray
+        if let dynTreeMeta {
+            let res = Self.fastTreeOutcome(
+                drafts: draftTokens.asType(.int32), targets: targets,
+                treeMeta: dynTreeMeta, k: k)
+            carrySlot = res.carrySlot
+            accepted = res.accepted
+            projectedVisible = res.visible
+        } else {
+            let slotIndices = MLXArray(Array(Int32(0) ..< Int32(n)))
+            let match = equal(draftTokens.asType(.int32), targets[0..., 0 ..< k]).asType(.int32)
+            let chainAccepted = cumprod(match, axis: 1).sum()
+            accepted = chainAccepted
+            carrySlot = chainAccepted.reshaped([1, 1])
+            projectedVisible = lessEqual(slotIndices, chainAccepted)
+        }
+        let seed = maximum(
+            takeAlong(targets, carrySlot, axis: 1), MLXArray(Int32(0)))
+        let anchor = target.dflashTokenEmbeddings(seed)
+        guard anchor.size == c.hiddenSize else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
+        let ctxKeys: MLXArray
+        let ctxValues: MLXArray
+        let usedZeroCopyTail: Bool
+        if let tail = context.writeSpeculativeTail(keys: projected.keys, values: projected.values) {
+            ctxKeys = tail.keys
+            ctxValues = tail.values
+            usedZeroCopyTail = true
+        } else {
+            ctxKeys = concatenated([
+                ring[0][0..., 0..., 0 ..< existingCount, 0...],
+                projected.keys.asType(context.dtype),
+            ], axis: 2)
+            ctxValues = concatenated([
+                ring[1][0..., 0..., 0 ..< existingCount, 0...],
+                projected.values.asType(context.dtype),
+            ], axis: 2)
+            usedZeroCopyTail = false
+        }
+        let next = start + n
+        let count = existingCount + n
+        let columns = concatenated([
+            MLXArray.ones([existingCount], type: Bool.self), projectedVisible,
+            MLXArray.ones([block], type: Bool.self),
+        ], axis: 0)
+        let mask = broadcast(columns.reshaped([1, count + block]), to: [block, count + block])
+        let position = MLXArray(Int32(start + 1)) + accepted
+        let prevLow = CBv2DraftRegime.lowAcceptance
+        CBv2DraftRegime.lowAcceptance = true
+        defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let rows = fastDraftBlockRows(
+            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
+            context: (ctxKeys, ctxValues), mask: mask,
+            draftCount: settings.maximumDraftTokens, devicePosition: position)
+        if usedZeroCopyTail {
+            context.recordSpeculativeRead(rows)
+        }
+        let logits = draftHeadProduct(rows, readout: false)
+        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+            s.speculation = speculation
+            return [projected.keys, projected.values]
+        }
+        if CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
+            logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256
+        {
+            let p = Self.fastDynamicTreeStage1(logits, params: dynTreeParams)
+            speculation.dynPartials = (val: p.val, idx: p.idx, sum: p.sum, hidden: rows)
+            speculation.memo = nil
+            speculation.confidence = nil
+            speculation.deviceOutcome = true
+            s.speculation = speculation
+            return [p.val, p.idx, p.sum, rows, projected.keys, projected.values]
+        }
+        let memo = (tokens: proposals(logits, selection: nil), hidden: rows)
+        speculation.memo = memo
+        speculation.confidence = nil
+        speculation.deviceOutcome = true
+        s.speculation = speculation
+        return [memo.tokens, memo.hidden, projected.keys, projected.values]
+    }
+
     /// The confirmed speculation's per-row draft confidence, still lazy (the
     /// caller reads it only once it is available); nil otherwise.
     public func speculatedDraftConfidence(requestState: any CBv2MTPRequestState) -> MLXArray? {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released,
             let speculation = s.speculation, speculation.carry != nil, speculation.memo != nil,
-            speculation.accepted == speculation.depth, speculation.pending != nil
+            (speculation.deviceOutcome || speculation.accepted == speculation.depth),
+            (speculation.accepted == 0 || speculation.pending != nil)
         else { return nil }
         return speculation.confidence
     }
@@ -874,21 +1474,38 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         carryHidden: MLXArray, acceptedDrafts: Int, carryTokenIsTarget: Bool,
         requestState: any CBv2MTPRequestState
     ) {
+        confirmSpeculation(
+            carryHidden: carryHidden, acceptedDrafts: acceptedDrafts,
+            acceptedPath: Array(0 ... acceptedDrafts),
+            carryTokenIsTarget: carryTokenIsTarget, requestState: requestState)
+    }
+
+    public func confirmSpeculation(
+        carryHidden: MLXArray, acceptedDrafts: Int, acceptedPath: [Int], carryTokenIsTarget: Bool,
+        requestState: any CBv2MTPRequestState
+    ) {
         let s = state(requestState)
         guard var speculation = s.speculation, speculation.carry == nil,
             let accepted = speculation.accepted, accepted == acceptedDrafts,
-            (accepted == 0) == (speculation.pending == nil)
+            (accepted == 0) == (speculation.pending == nil),
+            acceptedPath.count == accepted + 1,
+            acceptedPath.allSatisfy({ $0 >= 0 && $0 <= speculation.depth })
         else {
             s.speculation = nil
             return
         }
+        let isLinear = acceptedPath.elementsEqual(0 ... accepted)
         // The block assumed every draft accepted and the bonus target as the
-        // seed; any other outcome keeps the commit only.
-        if accepted != speculation.depth || !carryTokenIsTarget {
+        // seed unless `deviceOutcome` drafted for the verified accept path.
+        if (!speculation.deviceOutcome && (accepted != speculation.depth || !isLinear))
+            || !carryTokenIsTarget
+        {
             speculation.memo = nil
+            speculation.dynPartials = nil
             speculation.confidence = nil
         }
         speculation.carry = carryHidden
+        speculation.acceptedPath = acceptedPath
         s.speculation = speculation
     }
 
@@ -916,17 +1533,45 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         } else {
             guard accepted == 0, s.pending == nil else { return .normal }
         }
-        let memo = s.selection == nil ? speculation.memo : nil
+        let memo =
+            (s.selection == nil && CBv2DraftRegime.activeVerifyTree == nil
+                && CBv2DraftRegime.activeDynamicTreeK == 0) ? speculation.memo : nil
+        let dynPartials =
+            (s.selection == nil && CBv2DraftRegime.activeVerifyTree == nil)
+            ? speculation.dynPartials : nil
         s.pending = nil
         s.awaitsCarry = false
         s.committedInputCount += 1
-        if accepted == speculation.depth {
+        let path = speculation.acceptedPath ?? Array(0 ... accepted)
+        if !path.elementsEqual(0 ... accepted) {
+            let idx = MLXArray(path.map { Int32($0) })
+            s.context.append(
+                keys: speculation.keys.take(idx, axis: 2),
+                values: speculation.values.take(idx, axis: 2))
+        } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {
             let rows = 0 ..< (accepted + 1)
             s.context.append(
                 keys: speculation.keys[0..., 0..., rows, 0...],
                 values: speculation.values[0..., 0..., rows, 0...])
+        }
+        if let dp = dynPartials {
+            let dynK = CBv2DraftRegime.activeDynamicTreeK
+            let rows = dp.hidden.dim(0)
+            if dynK >= 2, dynK <= rows, rows <= 7 {
+                let dyn = Self.fastDynamicTreeStage2(
+                    dp.val, dp.idx, dp.sum, k: dynK, vocab: target.dflashVocabularySize,
+                    params: dynTreeParams)
+                CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
+                s.memo = (dyn.tokens, dp.hidden)
+                return .drafted
+            } else {
+                let tokens = Self.fastDynamicTreeArgMax(
+                    dp.val, dp.idx, vocab: target.dflashVocabularySize)
+                s.memo = (tokens, dp.hidden)
+                return .drafted
+            }
         }
         guard let memo else { return .committed }
         s.memo = memo
@@ -982,11 +1627,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             copies.append((gate, up, down))
         }
         // Compile the copies' kernels at load for the block's row counts
-        // (16 rows; 7 active rows in the last layer), not in a timed round.
+        // (16 rows and all active draft counts 1...7), not in a timed round.
         if let first = copies.first {
             let width = model.configuration.hiddenSize
             var warm = [MLXArray]()
-            for rows in [model.configuration.blockSize, 7] {
+            for rows in [model.configuration.blockSize, 1, 2, 3, 4, 5, 6, 7] {
                 let x = MLXArray.zeros([1, rows, width], dtype: model.activationDType)
                 warm.append(first.down(compiledSiluProduct(first.gate(x), first.up(x))))
             }
@@ -1029,6 +1674,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    private static let drafterLayer4NAX: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DRAFTER_L4_NAX"] == "1"
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -1039,8 +1687,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        draftCount: Int, devicePosition: MLXArray? = nil
     ) -> MLXArray {
+        func rope(_ x: MLXArray, _ shift: Int) -> MLXArray {
+            if let devicePosition {
+                return MLXFast.RoPE(
+                    x, dimensions: model.configuration.headDimensions, traditional: false,
+                    base: model.configuration.ropeTheta, scale: 1,
+                    offset: shift == 0 ? devicePosition : devicePosition + Int32(shift))
+            }
+            return MLXFast.RoPE(
+                x, dimensions: model.configuration.headDimensions, traditional: false,
+                base: model.configuration.ropeTheta, scale: 1, offset: position + shift)
+        }
         let c = model.configuration
         let block = c.blockSize
         let scale = 1 / Float(c.headDimensions).squareRoot()
@@ -1051,28 +1710,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)
-            var keys = MLXFast.RoPE(
+            var keys = rope(
                 attention.kNorm(
                     attention.kProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+                        .transposed(0, 2, 1, 3)), 0)
             var values = attention.vProj(x).reshaped([1, block, c.kvHeads, c.headDimensions])
                 .transposed(0, 2, 1, 3)
             if let context {
                 keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
                 values = concatenated([context.values[index ..< index + 1], values], axis: 2)
             }
-            if index == lastIndex {
+            if index == lastIndex && !(Self.drafterLayer4NAX && CBv2DraftRegime.lowAcceptance) {
                 let active = 1 ..< (1 + draftCount)
                 let xActive = x[0..., active, 0...]
-                let queries = MLXFast.RoPE(
+                let queries = rope(
                     attention.qNorm(
                         attention.qProj(xActive).reshaped([
                             1, draftCount, c.attentionHeads, c.headDimensions,
-                        ]).transposed(0, 2, 1, 3)),
-                    dimensions: c.headDimensions, traditional: false,
-                    base: c.ropeTheta, scale: 1, offset: position + 1)
+                        ]).transposed(0, 2, 1, 3)), 1)
                 let activeMask = mask.map { $0[active, 0...] }
                 let attended = MLXFast.scaledDotProductAttention(
                     queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
@@ -1085,12 +1740,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 h = h + draftMLP(index, layer.mlp, mx)
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
-            let queries = MLXFast.RoPE(
+            let queries = rope(
                 attention.qNorm(
                     attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
-                        .transposed(0, 2, 1, 3)),
-                dimensions: c.headDimensions, traditional: false,
-                base: c.ropeTheta, scale: 1, offset: position)
+                        .transposed(0, 2, 1, 3)), 0)
             let attended = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
             hidden =
@@ -1403,6 +2056,811 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputDTypes: [.int32])[0]
     }
 
+    private static let fastDynTreeHeader = """
+        inline void dflash_insert_top5(
+            thread float& v0, thread int& i0,
+            thread float& v1, thread int& i1,
+            thread float& v2, thread int& i2,
+            thread float& v3, thread int& i3,
+            thread float& v4, thread int& i4,
+            float v, int idx, int ivocab
+        ) {
+            if (idx >= ivocab) { return; }
+            if (!(v > v4 || (v == v4 && idx < i4))) { return; }
+            if (v > v0 || (v == v0 && idx < i0)) {
+                v4 = v3; i4 = i3;
+                v3 = v2; i3 = i2;
+                v2 = v1; i2 = i1;
+                v1 = v0; i1 = i0;
+                v0 = v;  i0 = idx;
+            } else if (v > v1 || (v == v1 && idx < i1)) {
+                v4 = v3; i4 = i3;
+                v3 = v2; i3 = i2;
+                v2 = v1; i2 = i1;
+                v1 = v;  i1 = idx;
+            } else if (v > v2 || (v == v2 && idx < i2)) {
+                v4 = v3; i4 = i3;
+                v3 = v2; i3 = i2;
+                v2 = v;  i2 = idx;
+            } else if (v > v3 || (v == v3 && idx < i3)) {
+                v4 = v3; i4 = i3;
+                v3 = v;  i3 = idx;
+            } else {
+                v4 = v;  i4 = idx;
+            }
+        }
+        inline float dflash_scale_logit(float raw, float eff_scale, float cap) {
+            float v = raw * eff_scale;
+            if (cap > 0.0f) {
+                v = cap * metal::fast::tanh(v / cap);
+            }
+            return v;
+        }
+        inline void dflash_accum_softmax(
+            thread float& m, thread float& s, float v, float inv_t_log2e
+        ) {
+            if (v > m) {
+                s = (m == -INFINITY) ? 1.0f : (s * metal::fast::exp2((m - v) * inv_t_log2e) + 1.0f);
+                m = v;
+            } else {
+                const float diff = (m - v) * inv_t_log2e;
+                if (diff < 24.0f) {
+                    s += metal::fast::exp2(-diff);
+                }
+            }
+        }
+        """
+
+    private static let fastDynTreeStage1Kernel = MLXFast.metalKernel(
+        name: "dflash_fast_dyntree_s1",
+        inputNames: ["logits", "tparams"],
+        outputNames: ["p_val", "p_idx", "p_sum"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const int ivocab = int(vocab);
+            const float eff_scale = tparams[0];
+            const float cap = tparams[1];
+            const float row_T = max(0.05f, tparams[2] + float(row) * tparams[14]);
+            const float inv_t_log2e = 1.44269504f / row_T;
+            const uint chunk_size = (vocab + CHUNKS - 1) / CHUNKS;
+            const uint start = chunk * chunk_size;
+            const uint end = min(vocab, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + ulong(row) * ulong(vocab);
+
+            float v0 = -INFINITY, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY, v4 = -INFINITY;
+            int i0 = ivocab, i1 = ivocab, i2 = ivocab, i3 = ivocab, i4 = ivocab;
+            float sm_m = -INFINITY, sm_s = 0.0f;
+            const uint start4 = (start + 3u) & ~3u;
+            const uint end4 = end & ~3u;
+            if (lid == 0) {
+              for (uint i = start; i < min(start4, end); i++) {
+                const float v = dflash_scale_logit(float(row_ptr[i]), eff_scale, cap);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, v, int(i), ivocab);
+                dflash_accum_softmax(sm_m, sm_s, v, inv_t_log2e);
+              }
+            }
+            if (end4 > start4) {
+              const device vec<bfloat16_t, 4>* src4 =
+                  (const device vec<bfloat16_t, 4>*)(row_ptr + start4);
+              const uint count4 = (end4 - start4) >> 2;
+              const uint fast_limit = min(count4, 1024u);
+              vec<bfloat16_t, 4> buf[4];
+              uint n_it = 0u;
+              float rv0 = -INFINITY, rv1 = -INFINITY, rv2 = -INFINITY, rv3 = -INFINITY, rv4 = -INFINITY;
+              int ri0 = ivocab, ri1 = ivocab, ri2 = ivocab, ri3 = ivocab, ri4 = ivocab;
+              for (uint j = lid; j < fast_limit; j += 256u) {
+                const vec<bfloat16_t, 4> vv = src4[j];
+                buf[n_it++] = vv;
+                const uint base_i = start4 + (j << 2);
+                #pragma unroll
+                for (uint k = 0; k < 4; k++) {
+                  const float raw = float(vv[k]);
+                  dflash_insert_top5(rv0, ri0, rv1, ri1, rv2, ri2, rv3, ri3, rv4, ri4, raw, int(base_i + k), ivocab);
+                }
+              }
+              if (n_it > 0u) {
+                if (ri0 < ivocab) { dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, dflash_scale_logit(rv0, eff_scale, cap), ri0, ivocab); }
+                if (ri1 < ivocab) { dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, dflash_scale_logit(rv1, eff_scale, cap), ri1, ivocab); }
+                if (ri2 < ivocab) { dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, dflash_scale_logit(rv2, eff_scale, cap), ri2, ivocab); }
+                if (ri3 < ivocab) { dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, dflash_scale_logit(rv3, eff_scale, cap), ri3, ivocab); }
+                if (ri4 < ivocab) { dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, dflash_scale_logit(rv4, eff_scale, cap), ri4, ivocab); }
+                const float buf_m = dflash_scale_logit(rv0, eff_scale, cap);
+                float raw_cutoff = -INFINITY;
+                if (eff_scale > 0.0f) {
+                  const float sc_cut = max(sm_m, buf_m) - 24.0f / inv_t_log2e;
+                  if (cap > 0.0f) {
+                    const float u = sc_cut / cap;
+                    if (u > -0.9999f && u < 0.9999f) {
+                      raw_cutoff = (cap / eff_scale) * (0.5f * metal::fast::log((1.0f + u) / (1.0f - u)));
+                    } else if (u >= 0.9999f) {
+                      raw_cutoff = rv0;
+                    }
+                  } else {
+                    raw_cutoff = sc_cut / eff_scale;
+                  }
+                }
+                for (uint it = 0u; it < n_it; ++it) {
+                  const vec<bfloat16_t, 4> vv = buf[it];
+                  #pragma unroll
+                  for (uint k = 0; k < 4; k++) {
+                    const float raw = float(vv[k]);
+                    if (raw >= raw_cutoff) {
+                      const float v = dflash_scale_logit(raw, eff_scale, cap);
+                      dflash_accum_softmax(sm_m, sm_s, v, inv_t_log2e);
+                    }
+                  }
+                }
+              }
+              for (uint j = lid + 1024u; j < count4; j += 256u) {
+                const vec<bfloat16_t, 4> vv = src4[j];
+                const uint base_i = start4 + (j << 2);
+                #pragma unroll
+                for (uint k = 0; k < 4; k++) {
+                  const float v = dflash_scale_logit(float(vv[k]), eff_scale, cap);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, v, int(base_i + k), ivocab);
+                  dflash_accum_softmax(sm_m, sm_s, v, inv_t_log2e);
+                }
+              }
+            }
+            if (lid == 0) {
+              const uint tail_start = max(start4, end4);
+              for (uint i = tail_start; i < end; i++) {
+                const float v = dflash_scale_logit(float(row_ptr[i]), eff_scale, cap);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, v, int(i), ivocab);
+                dflash_accum_softmax(sm_m, sm_s, v, inv_t_log2e);
+              }
+            }
+
+            const float sg_m = simd_max(sm_m);
+            const float scaled_s = (sm_m == -INFINITY)
+                ? 0.0f : sm_s * metal::fast::exp2((sm_m - sg_m) * inv_t_log2e);
+            const float sg_s = simd_sum(scaled_s);
+
+            for (ushort off = 16; off > 0; off >>= 1) {
+              const float ov0 = simd_shuffle_down(v0, off);
+              const int   oi0 = simd_shuffle_down(i0, off);
+              const float ov1 = simd_shuffle_down(v1, off);
+              const int   oi1 = simd_shuffle_down(i1, off);
+              const float ov2 = simd_shuffle_down(v2, off);
+              const int   oi2 = simd_shuffle_down(i2, off);
+              const float ov3 = simd_shuffle_down(v3, off);
+              const int   oi3 = simd_shuffle_down(i3, off);
+              const float ov4 = simd_shuffle_down(v4, off);
+              const int   oi4 = simd_shuffle_down(i4, off);
+              if (lane < off) {
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov0, oi0, ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov1, oi1, ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov2, oi2, ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov3, oi3, ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov4, oi4, ivocab);
+              }
+            }
+            threadgroup float sh_v[8][5];
+            threadgroup int sh_i[8][5];
+            threadgroup float sh_m[8];
+            threadgroup float sh_s[8];
+            if (lane == 0) {
+              sh_v[sg][0] = v0; sh_i[sg][0] = i0;
+              sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+              sh_v[sg][2] = v2; sh_i[sg][2] = i2;
+              sh_v[sg][3] = v3; sh_i[sg][3] = i3;
+              sh_v[sg][4] = v4; sh_i[sg][4] = i4;
+              sh_m[sg] = sg_m;
+              sh_s[sg] = sg_s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              float lm = (lane < 8) ? sh_m[lane] : -INFINITY;
+              float ls = (lane < 8) ? sh_s[lane] : 0.0f;
+              const float tg_m = simd_max(lm);
+              const float tg_s = simd_sum(
+                  (lm == -INFINITY) ? 0.0f : ls * metal::fast::exp2((lm - tg_m) * inv_t_log2e));
+              if (lane < 8) {
+                v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
+                v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
+                v2 = sh_v[lane][2]; i2 = sh_i[lane][2];
+                v3 = sh_v[lane][3]; i3 = sh_i[lane][3];
+                v4 = sh_v[lane][4]; i4 = sh_i[lane][4];
+              } else {
+                v0 = -INFINITY; v1 = -INFINITY; v2 = -INFINITY; v3 = -INFINITY; v4 = -INFINITY;
+                i0 = ivocab; i1 = ivocab; i2 = ivocab; i3 = ivocab; i4 = ivocab;
+              }
+              for (ushort off = 4; off > 0; off >>= 1) {
+                const float ov0 = simd_shuffle_down(v0, off);
+                const int   oi0 = simd_shuffle_down(i0, off);
+                const float ov1 = simd_shuffle_down(v1, off);
+                const int   oi1 = simd_shuffle_down(i1, off);
+                const float ov2 = simd_shuffle_down(v2, off);
+                const int   oi2 = simd_shuffle_down(i2, off);
+                const float ov3 = simd_shuffle_down(v3, off);
+                const int   oi3 = simd_shuffle_down(i3, off);
+                const float ov4 = simd_shuffle_down(v4, off);
+                const int   oi4 = simd_shuffle_down(i4, off);
+                if (lane < off) {
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov0, oi0, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov1, oi1, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov2, oi2, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov3, oi3, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov4, oi4, ivocab);
+                }
+              }
+              if (lane == 0) {
+                const uint out_base = (row * CHUNKS + chunk) * 5u;
+                p_val[out_base + 0] = v0; p_idx[out_base + 0] = i0;
+                p_val[out_base + 1] = v1; p_idx[out_base + 1] = i1;
+                p_val[out_base + 2] = v2; p_idx[out_base + 2] = i2;
+                p_val[out_base + 3] = v3; p_idx[out_base + 3] = i3;
+                p_val[out_base + 4] = v4; p_idx[out_base + 4] = i4;
+                p_sum[row * CHUNKS + chunk] = tg_s;
+              }
+            }
+            """,
+        header: fastDynTreeHeader)
+
+    private static let fastDynTreeStage2Kernel = MLXFast.metalKernel(
+        name: "dflash_fast_dyntree_s2",
+        inputNames: ["p_val", "p_idx", "p_sum", "tparams"],
+        outputNames: ["tokens", "tree_meta"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int ivocab = int(V_);
+            const float t0 = tparams[2];
+            const float chain_bonus = tparams[3];
+            const float decay = tparams[4];
+            const int max_leaves = (K_ >= 6) ? int(tparams[10]) : ((K_ >= 5) ? int(tparams[7]) : int(tparams[5]));
+            const int max_leaf_depth = max(1, int(tparams[6]));
+            const int max_branch_len = max(1, int(tparams[8]));
+            const float cont_decay = tparams[9];
+            const int purity_mode = int(tparams[11]);
+            const int dp_mode = int(tparams[12]);
+            const int top_k_use = min(5, max(3, int(tparams[13])));
+            const float t_slope = tparams[14];
+            const float leaf_decay = tparams[15];
+            const float purity_exp = tparams[16];
+
+            threadgroup float sh_v[2][5];
+            threadgroup int sh_i[2][5];
+            threadgroup float sh_chunk_v0[64];
+            threadgroup float sh_chunk_s[64];
+            threadgroup float sh_sg_s[2];
+
+            int row_ids[7][5];
+            float row_probs[7][5];
+
+            for (uint r = 0; r < uint(R_); ++r) {
+              const float row_T = max(0.05f, t0 + float(r) * t_slope);
+              const float inv_t_log2e = 1.44269504f / row_T;
+              const uint base = (r * CHUNKS + lid) * 5u;
+              float v0 = p_val[base + 0], v1 = p_val[base + 1], v2 = p_val[base + 2], v3 = p_val[base + 3], v4 = p_val[base + 4];
+              int   i0 = p_idx[base + 0], i1 = p_idx[base + 1], i2 = p_idx[base + 2], i3 = p_idx[base + 3], i4 = p_idx[base + 4];
+              sh_chunk_v0[lid] = v0;
+              sh_chunk_s[lid] = p_sum[r * CHUNKS + lid];
+
+              for (ushort off = 16; off > 0; off >>= 1) {
+                const float ov0 = simd_shuffle_down(v0, off);
+                const int   oi0 = simd_shuffle_down(i0, off);
+                const float ov1 = simd_shuffle_down(v1, off);
+                const int   oi1 = simd_shuffle_down(i1, off);
+                const float ov2 = simd_shuffle_down(v2, off);
+                const int   oi2 = simd_shuffle_down(i2, off);
+                const float ov3 = simd_shuffle_down(v3, off);
+                const int   oi3 = simd_shuffle_down(i3, off);
+                const float ov4 = simd_shuffle_down(v4, off);
+                const int   oi4 = simd_shuffle_down(i4, off);
+                if (lane < off) {
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov0, oi0, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov1, oi1, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov2, oi2, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov3, oi3, ivocab);
+                  dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov4, oi4, ivocab);
+                }
+              }
+              if (lane == 0) {
+                sh_v[sg][0] = v0; sh_i[sg][0] = i0;
+                sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                sh_v[sg][2] = v2; sh_i[sg][2] = i2;
+                sh_v[sg][3] = v3; sh_i[sg][3] = i3;
+                sh_v[sg][4] = v4; sh_i[sg][4] = i4;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (lid == 0) {
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, sh_v[1][0], sh_i[1][0], ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, sh_v[1][1], sh_i[1][1], ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, sh_v[1][2], sh_i[1][2], ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, sh_v[1][3], sh_i[1][3], ivocab);
+                dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, sh_v[1][4], sh_i[1][4], ivocab);
+                sh_v[0][0] = v0; sh_v[0][1] = v1; sh_v[0][2] = v2; sh_v[0][3] = v3; sh_v[0][4] = v4;
+                sh_i[0][0] = i0; sh_i[0][1] = i1; sh_i[0][2] = i2; sh_i[0][3] = i3; sh_i[0][4] = i4;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              const float row_max = sh_v[0][0];
+              const float c_v0 = sh_chunk_v0[lid];
+              const float c_s = (c_v0 == -INFINITY)
+                  ? 0.0f : sh_chunk_s[lid] * metal::fast::exp2((c_v0 - row_max) * inv_t_log2e);
+              const float sg_sum = simd_sum(c_s);
+              if (lane == 0) { sh_sg_s[sg] = sg_sum; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (lid == 0) {
+                const float total_s = max(1e-20f, sh_sg_s[0] + sh_sg_s[1]);
+                const float inv_s = 1.0f / total_s;
+                row_ids[r][0] = sh_i[0][0];
+                row_ids[r][1] = sh_i[0][1];
+                row_ids[r][2] = sh_i[0][2];
+                row_ids[r][3] = sh_i[0][3];
+                row_ids[r][4] = sh_i[0][4];
+                row_probs[r][0] = inv_s;
+                for (int c = 1; c < 5; ++c) {
+                  row_probs[r][c] = (sh_v[0][c] == -INFINITY)
+                      ? 0.0f : metal::fast::exp2((sh_v[0][c] - row_max) * inv_t_log2e) * inv_s;
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (lid == 0) {
+              for (int s = 0; s < R_; ++s) {
+                tokens[s] = row_ids[s][0];
+              }
+              float surv[7];
+              float leaf_mult[7];
+              surv[0] = 1.0f;
+              leaf_mult[0] = 1.0f;
+              float ld_pow = 1.0f;
+              for (int r = 1; r < R_; ++r) {
+                surv[r] = surv[r - 1] * row_probs[r - 1][0] * decay;
+                ld_pow *= leaf_decay;
+                const float pm = (purity_exp > 0.0f)
+                    ? metal::pow(max(surv[r], 1e-6f), purity_exp)
+                    : ((purity_mode != 0) ? surv[r] : 1.0f);
+                leaf_mult[r] = ld_pow * pm;
+              }
+              int   n_parent[8];
+              int   n_depth[8];
+              int   n_token[8];
+              float n_ev[8];
+              int   n_bstep[8];
+              bool  n_cont_used[8];
+              int   chain_node[8];
+              n_parent[0] = -1;
+              n_depth[0] = 0;
+              n_token[0] = 0;
+              n_ev[0] = 1.0f;
+              n_bstep[0] = 0;
+              n_cont_used[0] = false;
+              chain_node[0] = 0;
+
+              int chain_len = 0;
+              int num_nodes = 1;
+
+              if (dp_mode != 0 && max_branch_len == 1) {
+                const int max_L = min(K_, R_);
+                const int min_L = min(max_L, (chain_bonus > 0.0f)
+                    ? 1 : max(2, K_ - max(0, max_leaves)));
+                float best_total = -1.0f;
+                int best_L = max_L;
+                int best_lcnt = 0;
+                int best_lr[6];
+                int best_lc[6];
+                for (int L = max_L; L >= min_L; --L) {
+                  float total = 0.0f;
+                  for (int r = 0; r < L; ++r) {
+                    total += surv[r] * row_probs[r][0] * chain_bonus;
+                  }
+                  const int budget = min(K_ - L, max(0, max_leaves));
+                  const int leaf_limit = min(L, max_leaf_depth);
+                  bool used[7][5];
+                  for (int r = 0; r < 7; ++r) {
+                    for (int c = 0; c < 5; ++c) { used[r][c] = false; }
+                  }
+                  int cur_lcnt = 0;
+                  int cur_lr[6];
+                  int cur_lc[6];
+                  for (int b = 0; b < budget; ++b) {
+                    float bev = -1.0f;
+                    int br = -1, bc = -1;
+                    for (int r = 0; r < leaf_limit; ++r) {
+                      const float base_w = surv[r] * leaf_mult[r];
+                      for (int c = 1; c < top_k_use; ++c) {
+                        if (!used[r][c] && row_ids[r][c] < ivocab) {
+                          const float ev = base_w * row_probs[r][c];
+                          if (ev > bev) {
+                            bev = ev;
+                            br = r;
+                            bc = c;
+                          }
+                        }
+                      }
+                    }
+                    if (br >= 0 && bev > 0.0f) {
+                      used[br][bc] = true;
+                      total += bev;
+                      cur_lr[cur_lcnt] = br;
+                      cur_lc[cur_lcnt] = bc;
+                      cur_lcnt += 1;
+                    } else {
+                      break;
+                    }
+                  }
+                  if (total > best_total) {
+                    best_total = total;
+                    best_L = L;
+                    best_lcnt = cur_lcnt;
+                    for (int b = 0; b < cur_lcnt; ++b) {
+                      best_lr[b] = cur_lr[b];
+                      best_lc[b] = cur_lc[b];
+                    }
+                  }
+                }
+                chain_len = best_L;
+                for (int r = 0; r < chain_len; ++r) {
+                  const int id = num_nodes++;
+                  n_parent[id] = chain_node[r];
+                  n_depth[id] = r + 1;
+                  n_token[id] = row_ids[r][0];
+                  n_ev[id] = surv[r] * row_probs[r][0];
+                  n_bstep[id] = 0;
+                  n_cont_used[id] = false;
+                  chain_node[r + 1] = id;
+                }
+                for (int b = 0; b < best_lcnt && num_nodes <= K_; ++b) {
+                  const int r = best_lr[b];
+                  const int c = best_lc[b];
+                  const int id = num_nodes++;
+                  n_parent[id] = chain_node[r];
+                  n_depth[id] = r + 1;
+                  n_token[id] = row_ids[r][c];
+                  n_ev[id] = surv[r] * leaf_mult[r] * row_probs[r][c];
+                  n_bstep[id] = 1;
+                  n_cont_used[id] = false;
+                }
+              } else {
+                bool chosen[7][5];
+                for (int r = 0; r < 7; ++r) {
+                  for (int c = 0; c < 5; ++c) { chosen[r][c] = false; }
+                }
+                const int min_chain = (chain_bonus > 0.0f)
+                    ? 1 : min(K_, max(2, K_ - max(0, max_leaves)));
+                chain_len = min(min_chain, R_);
+                int leaves_used = 0;
+                for (int r = 0; r < chain_len; ++r) {
+                  const int id = num_nodes++;
+                  n_parent[id] = chain_node[r];
+                  n_depth[id] = r + 1;
+                  n_token[id] = row_ids[r][0];
+                  n_ev[id] = surv[r] * row_probs[r][0];
+                  n_bstep[id] = 0;
+                  n_cont_used[id] = false;
+                  chain_node[r + 1] = id;
+                  chosen[r][0] = true;
+                }
+                for (int step = chain_len; step < K_; ++step) {
+                  float best_ev = -1.0f;
+                  int best_kind = -1;
+                  int best_a = -1;
+                  int best_b = -1;
+                  if (chain_len < R_ && row_ids[chain_len][0] < ivocab) {
+                    const float ev_chain = surv[chain_len] * row_probs[chain_len][0] * chain_bonus;
+                    best_ev = ev_chain;
+                    best_kind = 0;
+                    best_a = chain_len;
+                  }
+                  if (leaves_used < max_leaves) {
+                    const int leaf_limit = min(chain_len, max_leaf_depth);
+                    for (int r = 0; r < leaf_limit; ++r) {
+                      const float base_w = surv[r] * leaf_mult[r];
+                      for (int c = 1; c < top_k_use; ++c) {
+                        if (!chosen[r][c] && row_ids[r][c] < ivocab) {
+                          const float ev = base_w * row_probs[r][c];
+                          if (ev > best_ev) {
+                            best_ev = ev;
+                            best_kind = 1;
+                            best_a = r;
+                            best_b = c;
+                          }
+                        }
+                      }
+                    }
+                    if (max_branch_len > 1 && cont_decay > 0.0f) {
+                      for (int u = 1; u < num_nodes; ++u) {
+                        if (n_bstep[u] >= 1 && n_bstep[u] < max_branch_len
+                            && !n_cont_used[u] && n_depth[u] < R_) {
+                          const int d = n_depth[u];
+                          if (row_ids[d][0] < ivocab) {
+                            const float ev = n_ev[u] * row_probs[d][0] * cont_decay;
+                            if (ev > best_ev) {
+                              best_ev = ev;
+                              best_kind = 2;
+                              best_a = u;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  if (best_kind == 0 && num_nodes <= K_) {
+                    const int id = num_nodes++;
+                    n_parent[id] = chain_node[chain_len];
+                    n_depth[id] = chain_len + 1;
+                    n_token[id] = row_ids[chain_len][0];
+                    n_ev[id] = surv[chain_len] * row_probs[chain_len][0];
+                    n_bstep[id] = 0;
+                    n_cont_used[id] = false;
+                    chosen[chain_len][0] = true;
+                    chain_len += 1;
+                    chain_node[chain_len] = id;
+                  } else if (best_kind == 1 && num_nodes <= K_) {
+                    const int id = num_nodes++;
+                    n_parent[id] = chain_node[best_a];
+                    n_depth[id] = best_a + 1;
+                    n_token[id] = row_ids[best_a][best_b];
+                    n_ev[id] = best_ev;
+                    n_bstep[id] = 1;
+                    n_cont_used[id] = false;
+                    chosen[best_a][best_b] = true;
+                    leaves_used += 1;
+                  } else if (best_kind == 2 && num_nodes <= K_) {
+                    const int id = num_nodes++;
+                    const int d = n_depth[best_a];
+                    n_parent[id] = best_a;
+                    n_depth[id] = d + 1;
+                    n_token[id] = row_ids[d][0];
+                    n_ev[id] = best_ev;
+                    n_bstep[id] = n_bstep[best_a] + 1;
+                    n_cont_used[id] = false;
+                    n_cont_used[best_a] = true;
+                    leaves_used += 1;
+                  }
+                }
+              }
+
+              int old_to_new[8];
+              int parent[8];
+              int depth[8];
+              uint full_anc[8];
+              uint anc[8];
+              for (int s = 0; s < 8; ++s) {
+                old_to_new[s] = s;
+                parent[s] = s - 1;
+                depth[s] = s;
+                full_anc[s] = 0u;
+                anc[s] = 0u;
+              }
+              old_to_new[0] = 0;
+              parent[0] = -1;
+              depth[0] = 0;
+              full_anc[0] = 0u;
+              anc[0] = 0u;
+              for (int s = 1; s <= chain_len; ++s) {
+                const int u = chain_node[s];
+                old_to_new[u] = s;
+                tokens[s - 1] = n_token[u];
+                parent[s] = s - 1;
+                depth[s] = s;
+                full_anc[s] = full_anc[s - 1] | (uint(s) << (s * 4));
+                anc[s] = 0u;
+              }
+              int next_slot = chain_len + 1;
+              for (int u = 1; u < num_nodes; ++u) {
+                if (n_bstep[u] > 0 && next_slot <= K_) {
+                  const int s = next_slot++;
+                  const int p = old_to_new[n_parent[u]];
+                  const int d = depth[p] + 1;
+                  old_to_new[u] = s;
+                  tokens[s - 1] = n_token[u];
+                  parent[s] = p;
+                  depth[s] = d;
+                  full_anc[s] = full_anc[p] | (uint(s) << (d * 4));
+                  anc[s] = full_anc[s];
+                }
+              }
+              uint packed_pos = 0u;
+              for (int s = 0; s < 8; ++s) {
+                packed_pos |= (uint(depth[s] & 0xF) << (s * 4));
+              }
+              uint packed_parents = uint(chain_len & 0xF) << 28;
+              for (int s = 1; s <= K_; ++s) {
+                packed_parents |= (uint(parent[s] & 0xF) << ((s - 1) * 4));
+              }
+              tree_meta[0] = int(packed_pos);
+              for (int s = 0; s < 8; ++s) {
+                tree_meta[1 + s] = int(anc[s]);
+                tree_meta[9 + s] = depth[s];
+              }
+              tree_meta[17] = int(packed_parents);
+            }
+            """,
+        header: fastDynTreeHeader)
+
+    private static let fastDynTreeArgMaxKernel = MLXFast.metalKernel(
+        name: "dflash_fast_dyntree_argmax",
+        inputNames: ["p_val", "p_idx"],
+        outputNames: ["tokens"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int ivocab = int(V_);
+            const uint base = (row * CHUNKS + lid) * 5u;
+            const float v = p_val[base];
+            const int id = p_idx[base];
+            const float sg_val = simd_max(v);
+            const int sg_idx = simd_min((v == sg_val) ? id : ivocab);
+            threadgroup float sh_val[2];
+            threadgroup int sh_idx[2];
+            if (lane == 0) {
+              sh_val[sg] = sg_val;
+              sh_idx[sg] = sg_idx;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float fv = (lane < 2) ? sh_val[lane] : -INFINITY;
+              const int fid = (lane < 2) ? sh_idx[lane] : ivocab;
+              const float rv = simd_max(fv);
+              const int rid = simd_min((fv == rv) ? fid : ivocab);
+              if (lane == 0) {
+                tokens[row] = rid;
+              }
+            }
+            """)
+
+    private static let treeOutcomeKernel = MLXFast.metalKernel(
+        name: "dflash_tree_outcome",
+        inputNames: ["drafts", "targets", "tree_meta"],
+        outputNames: ["carry_slot", "accepted", "visible"],
+        source: """
+            const uint packed = uint(tree_meta[17]);
+            int parent[8];
+            parent[0] = -1;
+            for (int s = 1; s <= K_; ++s) {
+              const int p = int((packed >> ((s - 1) * 4)) & 0xFu);
+              parent[s] = min(p, s - 1);
+            }
+            bool vis[8];
+            for (int s = 0; s <= K_; ++s) { vis[s] = false; }
+            int cur = 0;
+            int acc = 0;
+            vis[0] = true;
+            for (int step = 0; step < K_; ++step) {
+              const int want = targets[cur];
+              int next_slot = -1;
+              for (int s = cur + 1; s <= K_; ++s) {
+                if (parent[s] == cur && drafts[s - 1] == want) {
+                  next_slot = s;
+                  break;
+                }
+              }
+              if (next_slot < 0) { break; }
+              cur = next_slot;
+              vis[cur] = true;
+              acc += 1;
+            }
+            carry_slot[0] = cur;
+            accepted[0] = acc;
+            for (int s = 0; s <= K_; ++s) {
+              visible[s] = vis[s];
+            }
+            """)
+
+    private struct DynTreeS1Key: Hashable {
+        let rows: Int
+        let vocab: Int
+    }
+    private struct DynTreeS2Key: Hashable {
+        let rows: Int
+        let vocab: Int
+        let k: Int
+    }
+    private static let dynTreeLock = NSLock()
+    nonisolated(unsafe) private static var dynTreeS1Cache: [DynTreeS1Key: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var dynTreeS2Cache: [DynTreeS2Key: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var dynTreeArgMaxCache: [DynTreeS1Key: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var treeOutcomeCache: [Int: MLXFast.MLXFastKernel.Launch] = [:]
+
+    private static func fastTreeOutcome(
+        drafts: MLXArray, targets: MLXArray, treeMeta: MLXArray, k: Int
+    ) -> (carrySlot: MLXArray, accepted: MLXArray, visible: MLXArray) {
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = dynTreeLock.withLock({ treeOutcomeCache[k] }) {
+            launch = hit
+        } else {
+            let made = treeOutcomeKernel.prepare(
+                template: [("K_", k)],
+                grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                outputShapes: [[1, 1], [1], [k + 1]],
+                outputDTypes: [.int32, .int32, .bool])
+            dynTreeLock.withLock { treeOutcomeCache[k] = made }
+            launch = made
+        }
+        let out = launch([drafts, targets, treeMeta])
+        return (out[0], out[1].squeezed(), out[2])
+    }
+
+    private static func fastDynamicTreeStage1(
+        _ logits: MLXArray, params: MLXArray
+    ) -> (val: MLXArray, idx: MLXArray, sum: MLXArray) {
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let key = DynTreeS1Key(rows: rows, vocab: vocab)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = dynTreeLock.withLock({ dynTreeS1Cache[key] }) {
+            launch = hit
+        } else {
+            let made = fastDynTreeStage1Kernel.prepare(
+                template: [("V_", vocab)],
+                grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, chunks, 5], [rows, chunks, 5], [rows, chunks]],
+                outputDTypes: [.float32, .int32, .float32])
+            dynTreeLock.withLock { dynTreeS1Cache[key] = made }
+            launch = made
+        }
+        let partials = launch([logits, params])
+        return (partials[0], partials[1], partials[2])
+    }
+
+    private static func fastDynamicTreeStage2(
+        _ pVal: MLXArray, _ pIdx: MLXArray, _ pSum: MLXArray,
+        k: Int, vocab: Int, params: MLXArray
+    ) -> (tokens: MLXArray, treeMeta: MLXArray) {
+        let rows = pVal.dim(0)
+        let chunks = 64
+        let key = DynTreeS2Key(rows: rows, vocab: vocab, k: k)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = dynTreeLock.withLock({ dynTreeS2Cache[key] }) {
+            launch = hit
+        } else {
+            let made = fastDynTreeStage2Kernel.prepare(
+                template: [("V_", vocab), ("R_", rows), ("K_", k)],
+                grid: (chunks, 1, 1), threadGroup: (chunks, 1, 1),
+                outputShapes: [[rows], [18]],
+                outputDTypes: [.int32, .int32])
+            dynTreeLock.withLock { dynTreeS2Cache[key] = made }
+            launch = made
+        }
+        let out = launch([pVal, pIdx, pSum, params])
+        return (out[0], out[1])
+    }
+
+    private static func fastDynamicTreeArgMax(
+        _ pVal: MLXArray, _ pIdx: MLXArray, vocab: Int
+    ) -> MLXArray {
+        let rows = pVal.dim(0)
+        let chunks = 64
+        let key = DynTreeS1Key(rows: rows, vocab: vocab)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = dynTreeLock.withLock({ dynTreeArgMaxCache[key] }) {
+            launch = hit
+        } else {
+            let made = fastDynTreeArgMaxKernel.prepare(
+                template: [("V_", vocab)],
+                grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+                outputShapes: [[rows]],
+                outputDTypes: [.int32])
+            dynTreeLock.withLock { dynTreeArgMaxCache[key] = made }
+            launch = made
+        }
+        return launch([pVal, pIdx])[0]
+    }
+
+    private static func fastDynamicTree(
+        _ logits: MLXArray, k: Int, params: MLXArray
+    ) -> (tokens: MLXArray, treeMeta: MLXArray) {
+        let p = fastDynamicTreeStage1(logits, params: params)
+        return fastDynamicTreeStage2(
+            p.val, p.idx, p.sum, k: k, vocab: logits.dim(1), params: params)
+    }
+
     /// The argmax of the head products, or a selection's proposals over the
     /// target's readout of them when it gives one per row.
     private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
@@ -1412,6 +2870,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return coupled.asType(.int32)
         }
         if logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 {
+            let dynK = CBv2DraftRegime.activeDynamicTreeK
+            if dynK >= 2, dynK <= logits.dim(0), logits.dim(0) <= 7 {
+                let dyn = Self.fastDynamicTree(logits, k: dynK, params: dynTreeParams)
+                CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
+                return dyn.tokens
+            }
             return Self.fastArgMax(logits)
         }
         return argMax(logits, axis: -1).asType(.int32)
@@ -1458,7 +2922,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 // Committed with the next round's carry, in its pass.
                 s.pending = s.pending.map { concatenated([$0, accepted], axis: 0) } ?? accepted
             } else {
-                model.commit(features: accepted, at: s.context.nextPosition, to: s.context)
+                commitToContext(features: accepted, at: s.context.nextPosition, to: s.context)
             }
         }
         s.awaitsCarry = true

@@ -48,8 +48,19 @@ enum PagedSegmentTransfers {
         outputNames: ["witness"], source: "witness[0] = previous[0] + 1;",
         ensureRowContiguous: true)
 
+    private struct WriteLaunchKey: Hashable {
+        let dtype: DType
+        let kvHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let valueOffset: Int
+        let count: Int
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var writeLaunches:
+        [WriteLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     private static func kernel(
         reading: Bool, dtype: DType,
@@ -166,21 +177,230 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
-            group.writeFence =
-                kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
-                    [k, v, segment.storage, records(triples), group.writeFence] + offset,
+            if group.key.quantization == nil {
+                let count = triples.count / 3
+                let launchKey = WriteLaunchKey(
+                    dtype: group.dtype, kvHeads: group.key.kvHeads, headDim: group.key.headDim,
+                    pageSize: group.pageSize, valueOffset: segment.valueOffset, count: count)
+                let launch: MLXFast.MLXFastKernel.Launch
+                if let hit = lock.withLock({ writeLaunches[launchKey] }) {
+                    launch = hit
+                } else {
+                    let kobj = kernel(reading: false, dtype: group.dtype, quantization: nil)
+                    let made = kobj.prepare(
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                            ("VBASE", segment.valueOffset),
+                        ],
+                        grid: (group.key.headDim, group.key.kvHeads, count),
+                        threadGroup: (min(256, group.key.headDim), 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])
+                    lock.withLock { writeLaunches[launchKey] = made }
+                    launch = made
+                }
+                group.writeFence = launch([
+                    k, v, segment.storage, records(triples), group.writeFence,
+                ])[0]
+            } else {
+                let offset = [quantizedValueBase(segment)]
+                group.writeFence =
+                    kernel(
+                        reading: false, dtype: group.dtype, quantization: group.key.quantization)(
+                        [k, v, segment.storage, records(triples), group.writeFence] + offset,
+                        template: [
+                            ("T", group.dtype), ("H", group.key.kvHeads),
+                            ("D", group.key.headDim), ("S", group.pageSize),
+                        ] + quantizationTemplate(group),
+                        grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
+                        threadGroup: (group.key.headDim, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+            }
+        }
+    }
+
+    private static let copySameSegmentBody = """
+        const int h = int(thread_position_in_grid.y);
+        const int d = int(thread_position_in_grid.x);
+        const int r = int(thread_position_in_grid.z);
+        const int sp = records[r * 4];
+        const int ss = records[r * 4 + 1];
+        const int dp = records[r * 4 + 2];
+        const int ds = records[r * 4 + 3];
+        if (sp > 0 && dp > 0) {
+            const size_t src = (((size_t)sp * H + h) * S + ss) * D + d;
+            const size_t dst = (((size_t)dp * H + h) * S + ds) * D + d;
+            const size_t vbase = size_t(vbase_arr[0]);
+            device T* buf = storage;
+            buf[dst] = buf[src];
+            buf[vbase + dst] = buf[vbase + src];
+        }
+        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+        """
+
+    private static let copyCrossSegmentBody = """
+        const int h = int(thread_position_in_grid.y);
+        const int d = int(thread_position_in_grid.x);
+        const int r = int(thread_position_in_grid.z);
+        const int sp = records[r * 4];
+        const int ss = records[r * 4 + 1];
+        const int dp = records[r * 4 + 2];
+        const int ds = records[r * 4 + 3];
+        if (sp > 0 && dp > 0) {
+            const size_t src = (((size_t)sp * H + h) * S + ss) * D + d;
+            const size_t dst = (((size_t)dp * H + h) * S + ds) * D + d;
+            const size_t svbase = size_t(vbase_arr[0]);
+            const size_t dvbase = size_t(vbase_arr[1]);
+            device T* out = dst_storage;
+            out[dst] = src_storage[src];
+            out[dvbase + dst] = src_storage[svbase + src];
+        }
+        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+        """
+
+    private struct CopyLaunchKey: Hashable {
+        let cross: Bool
+        let dtype: DType
+        let kvHeads: Int
+        let headDim: Int
+        let pageSize: Int
+        let count: Int
+    }
+
+    nonisolated(unsafe) private static var copyLaunches:
+        [CopyLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var copyVBaseCache: [[Int]: MLXArray] = [:]
+
+    private static func cachedCopyVBase(_ offsets: [Int]) -> MLXArray {
+        lock.withLock {
+            if let hit = copyVBaseCache[offsets] { return hit }
+            let arr = MLXArray(offsets.map { Int64($0) })
+            eval(arr)
+            copyVBaseCache[offsets] = arr
+            return arr
+        }
+    }
+
+    private static func copyKernel(cross: Bool, dtype: DType) -> MLXFast.MLXFastKernel {
+        let key = "cbv2_segment_copy_\(cross ? "cross" : "same")_\(dtype)"
+        return lock.withLock {
+            if let existing = kernels[key] { return existing }
+            let made = MLXFast.metalKernel(
+                name: key,
+                inputNames: cross
+                    ? ["src_storage", "dst_storage", "records", "vbase_arr", "previous"]
+                    : ["storage", "records", "vbase_arr", "previous"],
+                outputNames: ["fence"],
+                source: cross ? copyCrossSegmentBody : copySameSegmentBody,
+                ensureRowContiguous: true,
+                mutableInputs: [cross ? "dst_storage" : "storage"])
+            kernels[key] = made
+            return made
+        }
+    }
+
+    /// Pre-compiles same-segment and cross-segment branch-hit KV copy kernels
+    /// on zero-page no-op records so the first branch hit pays zero Metal JIT cost.
+    public static func warmCopyKernels(
+        dtype: DType, kvHeads: Int, headDim: Int, pageSize: Int
+    ) -> [MLXArray] {
+        let dummyStorage = MLXArray.zeros([2 * kvHeads * pageSize * headDim], dtype: dtype)
+        let dummyRec = MLXArray([Int32](repeating: 0, count: 16))
+        let dummyFence = MLXArray([Int32(0)])
+        let v1 = cachedCopyVBase([kvHeads * pageSize * headDim])
+        let v2 = cachedCopyVBase([kvHeads * pageSize * headDim, kvHeads * pageSize * headDim])
+        var outs = [MLXArray]()
+        for cross in [false, true] {
+            let launchKey = CopyLaunchKey(
+                cross: cross, dtype: dtype, kvHeads: kvHeads, headDim: headDim,
+                pageSize: pageSize, count: 1)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = lock.withLock({ copyLaunches[launchKey] }) {
+                launch = hit
+            } else {
+                let kobj = copyKernel(cross: cross, dtype: dtype)
+                let made = kobj.prepare(
+                    template: [
+                        ("T", dtype), ("H", kvHeads), ("D", headDim), ("S", pageSize),
+                    ],
+                    grid: (headDim, kvHeads, 1),
+                    threadGroup: (min(256, headDim), 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])
+                lock.withLock { copyLaunches[launchKey] = made }
+                launch = made
+            }
+            if cross {
+                outs += launch([dummyStorage, dummyStorage, dummyRec, v2, dummyFence])
+            } else {
+                outs += launch([dummyStorage, dummyRec, v1, dummyFence])
+            }
+        }
+        outs += completionKernel(
+            [dummyFence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[1]], outputDTypes: [.int32])
+        return outs
+    }
+
+    /// Batched in-place token K/V copy across layers sharing one unquantized KV group.
+    static func copySlotsInPlace(group: PagedKVGroup, pairs: [(Int32, Int32)]) {
+        guard !pairs.isEmpty, let layout = group.segmentLayout,
+            !group.key.isAsymmetric, group.key.quantization == nil
+        else { return }
+        let pageSize = Int32(group.pageSize)
+        struct SegPair: Hashable {
+            let srcSeg: Int
+            let dstSeg: Int
+        }
+        var grouped: [SegPair: [Int32]] = [:]
+        for (srcSlot, dstSlot) in pairs {
+            let sp = srcSlot / pageSize
+            let dp = dstSlot / pageSize
+            let sSeg = layout.segmentIndex(page: sp)
+            let dSeg = layout.segmentIndex(page: dp)
+            let spLocal = Int32(layout.localPage(sp))
+            let dpLocal = Int32(layout.localPage(dp))
+            grouped[SegPair(srcSeg: sSeg, dstSeg: dSeg), default: []] += [
+                spLocal, srcSlot % pageSize, dpLocal, dstSlot % pageSize,
+            ]
+        }
+        for (segPair, quads) in grouped {
+            let count = quads.count / 4
+            guard count > 0,
+                let srcSegment = group.segments[segPair.srcSeg],
+                let dstSegment = group.segments[segPair.dstSeg]
+            else { continue }
+            let cross = segPair.srcSeg != segPair.dstSeg
+            let recArr = MLXArray(quads + Array(repeating: 0, count: max(0, 16 - quads.count)))
+            let launchKey = CopyLaunchKey(
+                cross: cross, dtype: group.dtype, kvHeads: group.key.kvHeads,
+                headDim: group.key.headDim, pageSize: group.pageSize, count: count)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = lock.withLock({ copyLaunches[launchKey] }) {
+                launch = hit
+            } else {
+                let kobj = copyKernel(cross: cross, dtype: group.dtype)
+                let made = kobj.prepare(
                     template: [
                         ("T", group.dtype), ("H", group.key.kvHeads),
                         ("D", group.key.headDim), ("S", group.pageSize),
-                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
-                        + quantizationTemplate(group),
-                    grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                    threadGroup: (
-                        group.key.quantization == nil
-                            ? min(256, group.key.headDim) : group.key.headDim, 1, 1
-                    ),
-                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+                    ],
+                    grid: (group.key.headDim, group.key.kvHeads, count),
+                    threadGroup: (min(256, group.key.headDim), 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])
+                lock.withLock { copyLaunches[launchKey] = made }
+                launch = made
+            }
+            if cross {
+                let vbase = cachedCopyVBase([srcSegment.valueOffset, dstSegment.valueOffset])
+                group.writeFence = launch([
+                    srcSegment.storage, dstSegment.storage, recArr, vbase, group.writeFence,
+                ])[0]
+            } else {
+                let vbase = cachedCopyVBase([srcSegment.valueOffset])
+                group.writeFence = launch([
+                    srcSegment.storage, recArr, vbase, group.writeFence,
+                ])[0]
+            }
         }
     }
 
