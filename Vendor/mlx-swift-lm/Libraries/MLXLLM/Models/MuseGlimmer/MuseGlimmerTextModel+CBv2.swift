@@ -420,8 +420,37 @@ extension MuseGlimmerTextModel {
                 posDeltas: treePos,
                 treeMeta: dynTreeMeta,
                 target: target)
-            let outputBLHD = paged.attendColumnsPreWritten(
-                queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil)
+            let deepGateEligible =
+                PagedOnePassAttention.outputGateEnabled
+                && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible)
+                && x.dtype == .bfloat16
+            var fp8Layer: ModelOptCalibratedLinear? = nil
+            var fp8CastPair: (multipliers: MLXArray, overflowBound: MLXArray)? = nil
+            if deepGateEligible, let fp8 = a.outputProj as? ModelOptCalibratedLinear,
+                verifyRows(p[3]) != nil,
+                let fp8Params = CBv2SmallProjection.sharedFP8CastParams(
+                    [fp8], inputs: a.heads * a.headDimensions, dtype: x.dtype)
+            {
+                fp8Layer = fp8
+                fp8CastPair = (fp8Params.multipliers, fp8Params.overflowBound)
+            }
+            let useFusedOutGate =
+                deepGateEligible
+                && (fp8CastPair != nil || !(a.outputProj is ModelOptCalibratedLinear))
+            let gate3D: MLXArray? =
+                useFusedOutGate ? p[3].reshaped(batch * length, a.heads, a.headDimensions) : nil
+            let (outputBLHD, gateApplied) = paged.attendColumnsPreWrittenWithGate(
+                queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil,
+                outputGate: gate3D, fp8Cast: fp8CastPair)
+            if gateApplied {
+                let flat = outputBLHD.reshaped(batch, length, -1)
+                if let fp8 = fp8Layer,
+                    let projected = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: flat)?.first
+                {
+                    return projected
+                }
+                return verifyOutputProjection(a.outputProj, flat)
+            }
             let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
             if let fp8 = a.outputProj as? ModelOptCalibratedLinear,
                 verifyRows(p[3]) != nil,
