@@ -949,7 +949,7 @@ enum CBv2MTPMarginalDepthPolicy {
         {
             return v
         }
-        return 0.065
+        return 0.05
     }()
 
     static func fixedWindowDepth(
