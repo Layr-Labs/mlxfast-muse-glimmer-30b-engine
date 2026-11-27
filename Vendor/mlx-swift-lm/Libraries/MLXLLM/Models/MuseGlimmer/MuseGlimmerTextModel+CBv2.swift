@@ -581,6 +581,11 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, !preCastFP8, mlp.downProj is ModelOptWeightOnlyNVFP4Linear,
+            let activated = verifyFusedNVFP4GateUp(mlp.gateProj, mlp.upProj, x)
+        {
+            return verifyDownProjection(mlp.downProj, activated)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -603,6 +608,21 @@ extension MuseGlimmerTextModel {
             }
         }
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
+    }
+
+    private func verifyFusedNVFP4GateUp(
+        _ gate: any UnaryLayer, _ up: any UnaryLayer, _ x: MLXArray
+    ) -> MLXArray? {
+        guard let rows = verifyRows(x), let gate = gate as? ModelOptWeightOnlyNVFP4Linear,
+            let up = up as? ModelOptWeightOnlyNVFP4Linear,
+            let activated = CBv2VerifyNVFP4.gateUpSilu(gate: gate, up: up, x)
+        else { return nil }
+        if MuseGlimmerVerifyProjections.selfTest {
+            let reference = compiledSiluProduct(numerics.project(gate, x), numerics.project(up, x))
+            MuseGlimmerVerifyProjections.requireEqualBits(
+                [activated], [reference], kind: "nvfp4.fusedgateup", rows: rows)
+        }
+        return activated
     }
 
     nonisolated(unsafe) private static var groupedWarmed = Set<ObjectIdentifier>()
@@ -1033,6 +1053,9 @@ extension MuseGlimmerTextModel {
                             }
                         case "gate_up":
                             outputs += verifyFeedInputProjections(group, x)
+                            if let activated = verifyFusedNVFP4GateUp(group[0], group[1], x) {
+                                outputs.append(activated)
+                            }
                             if lowAcc, let fp8 = group as? [ModelOptCalibratedLinear],
                                 let pre = CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
                             {

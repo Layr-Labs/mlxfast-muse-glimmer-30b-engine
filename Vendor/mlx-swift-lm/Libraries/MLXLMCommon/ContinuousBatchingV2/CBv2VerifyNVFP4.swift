@@ -88,17 +88,20 @@ public enum CBv2VerifyNVFP4 {
             return as_type<half2>(u) * half2(256.0h);
         }
 
-        // One tile of 8 * TN outputs of one projection: the stock matrix
-        // kernel's arithmetic (see CBv2VerifyNVFP4).
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV>
+        // In the paired specialization, consecutive fragments are gate and
+        // up for the same outputs, so both reuse the same activation loads.
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV,
+                  bool PAIRED = false>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
-            threadgroup float* partials) {
+            threadgroup float* partials, const device uint32_t* up_w = nullptr,
+            const device uint8_t* up_scales = nullptr, float up_tensor_scale = 1.0f) {
             constexpr int WK = 8;
             constexpr int BK = 128;
             constexpr short TM = (V + 7) / 8;
-            constexpr int ROWS = 8 * TN;
+            static_assert(!PAIRED || (SCALED && TN % 2 == 0), "paired scaled fragments");
+            constexpr int ROWS = PAIRED ? 4 * TN : 8 * TN;
             constexpr int row_bytes = K / 2;
             constexpr int row_scales = K / 16;
             static_assert(K % BK == 0, "whole chunks only");
@@ -126,10 +129,11 @@ public enum CBv2VerifyNVFP4 {
             const device uint8_t* sl[TN];
             MO_WO_UNROLL
             for (short t = 0; t < TN; t++) {
-                const int row = min(y_col + fm + 8 * t, N - 1);
+                const bool up = PAIRED && (t & 1);
+                const int row = min(y_col + fm + 8 * (PAIRED ? t / 2 : t), N - 1);
                 wl[t] = (const device uint*)(
-                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
-                sl[t] = scales + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
+                    (const device uint8_t*)(up ? up_w : w) + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = (up ? up_scales : scales) + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
             }
 
             if constexpr (WC && PF == 0) {
@@ -390,10 +394,21 @@ public enum CBv2VerifyNVFP4 {
                         if (8 * mt + fn + j < V) {
                             device T* yr = y + size_t(8 * mt + fn + j) * N;
                             MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                const int out = y_col + fm + 8 * t;
+                            for (short t = 0; t < TN; t += (PAIRED ? 2 : 1)) {
+                                const int out = y_col + fm + 8 * (PAIRED ? t / 2 : t);
                                 if (out < N) {
-                                    yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    const T g = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    if constexpr (PAIRED) {
+                                        const T up = mo_wo_result<T>(C[t + 1][mt][j], true, up_tensor_scale);
+                                        const bool neg = g < T(0);
+                                        const T e = T(metal::precise::exp(float(neg ? -g : g)));
+                                        const T reciprocal = T(1) / (T(1) + e);
+                                        const T sigmoid = neg ? reciprocal : (T(1) - reciprocal);
+                                        const T silu = g * sigmoid;
+                                        yr[out] = silu * up;
+                                    } else {
+                                        yr[out] = g;
+                                    }
                                 }
                             }
                         }
@@ -440,8 +455,23 @@ public enum CBv2VerifyNVFP4 {
         1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
 
+    nonisolated(unsafe) private static let gateUpKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_gate_up_silu",
+        inputNames: ["w", "scales", "ts", "up_w", "up_scales", "up_ts", "x"],
+        outputNames: ["y"],
+        source: """
+            constexpr int TILE_ELEMS = TN * ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            cbv2_vn_tile<T, V, K, N0, TN, PF, true, WC, SV, true>(
+                w, scales, x, ts[0], y, int(threadgroup_position_in_grid.y),
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup,
+                partials, up_w, up_scales, up_ts[0]);
+            """,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + tileHelper)
+
     private struct LaunchKey: Hashable {
         let segments: Int
+        let paired: Bool
         let dtype: DType
         let rows: Int
         let inputs: Int
@@ -457,6 +487,7 @@ public enum CBv2VerifyNVFP4 {
         let id0: ObjectIdentifier
         let idLast: ObjectIdentifier
         let count: Int
+        let paired: Bool
         let inputs: Int
         let rows: Int
         let dtype: DType
@@ -481,14 +512,15 @@ public enum CBv2VerifyNVFP4 {
 
     private static func preparedLaunch(
         segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
-        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int]
+        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int], paired: Bool = false
     ) -> MLXFast.MLXFastKernel.Launch {
         let key = LaunchKey(
-            segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
-            prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk, scaleVec: scaleVec,
+            segments: segments, paired: paired, dtype: dtype, rows: rows, inputs: inputs,
+            fragments: fragments, prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk,
+            scaleVec: scaleVec,
             outputs: outputs)
         if let hit = cacheLock.withLockUnchecked({ $0.launches[key] }) { return hit }
-        let tile = 8 * fragments
+        let tile = (paired ? 4 : 8) * fragments
         var template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
             ("SCALED", scaled), ("WC", wholeChunk), ("SV", scaleVec),
@@ -501,7 +533,8 @@ public enum CBv2VerifyNVFP4 {
             shapes.append([rows, n])
             tiles += (n + tile - 1) / tile
         }
-        let made = kernels[segments]!.prepare(
+        let kernel = paired ? gateUpKernel : kernels[segments]!
+        let made = kernel.prepare(
             template: template,
             grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
             outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
@@ -626,7 +659,7 @@ public enum CBv2VerifyNVFP4 {
         let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let pkey = PlanKey(
             id0: ObjectIdentifier(nv[0]), idLast: ObjectIdentifier(nv[nv.count - 1]),
-            count: nv.count, inputs: inputs, rows: rows, dtype: x.dtype,
+            count: nv.count, paired: false, inputs: inputs, rows: rows, dtype: x.dtype,
             fragments: s.fragments, prefetch: s.prefetch,
             wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
         if lowVerify && geometryOverride == nil, let plan = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
@@ -673,6 +706,57 @@ public enum CBv2VerifyNVFP4 {
         }
         let lead = Array(x.shape.dropLast())
         return zip(results, outputDims).map { $0.reshaped(lead + [$1]) }
+    }
+
+    public static func gateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray
+    ) -> MLXArray? {
+        guard !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance,
+            geometryOverride == nil
+        else { return nil }
+        let inputs = x.dim(-1)
+        let outputs = gate.outputDimensions
+        guard inputs > 0, gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            up.outputDimensions == outputs
+        else { return nil }
+        let rows = x.size / inputs
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: true)
+        let pkey = PlanKey(
+            id0: ObjectIdentifier(gate), idLast: ObjectIdentifier(up), count: 2,
+            paired: true, inputs: inputs, rows: rows, dtype: x.dtype,
+            fragments: s.fragments, prefetch: s.prefetch,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
+        let plan: Plan
+        if let hit = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
+            plan = hit
+        } else {
+            guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+                takes(weight: gate.weight, blockScales: gate.weightScale,
+                    tensorScale: gate.weightScale2, inputs: inputs),
+                takes(weight: up.weight, blockScales: up.weightScale,
+                    tensorScale: up.weightScale2, inputs: inputs)
+            else { return nil }
+            let launch = preparedLaunch(
+                segments: 2, dtype: x.dtype, rows: rows, inputs: inputs,
+                fragments: 2 * s.fragments, prefetch: s.prefetch, scaled: true,
+                wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: [outputs], paired: true)
+            plan = Plan(
+                launch: launch,
+                weightArrays: [
+                    gate.weight, gate.weightScale, gate.weightScale2.reshaped(1),
+                    up.weight, up.weightScale, up.weightScale2.reshaped(1),
+                ],
+                outputDims: [outputs])
+            cacheLock.withLockUnchecked { $0.plans[pkey] = plan }
+        }
+        var args = plan.weightArrays
+        args.append(x.reshaped(rows, inputs))
+        let y = plan.launch(args)[0]
+        if x.ndim == 3 {
+            return y.reshaped(x.dim(0), x.dim(1), outputs)
+        }
+        if x.ndim == 2 { return y }
+        return y.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
     /// Compiles the kernels for rows 1 to 8 of these MLP layers (gate and up
