@@ -138,6 +138,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// gate, up and down (`CBV2_DRAFTER_LOW_MLP_BITS`, 5 disables). Empty
     /// when disabled or when a projection is not the pinned affine form.
     private let lowMLP: [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
+    /// `CBV2_DRAFTER_FUSED_W8=0`: disables fused deep-low-acceptance drafter projections
+    /// (`fusedContextKV`, `fusedBlockQKV`, `fusedLastKV`, `lowGateUp`) and epilogues.
+    private static let drafterFusedW8Enabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_W8"] != "0"
+    private let fusedDrafter: FusedDrafterState?
     /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
     /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
     /// than the target's row-exact verify kernel: the same E2M1 x E4M3
@@ -185,6 +190,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
+        fusedDrafter = Self.drafterFusedW8Enabled
+            ? FusedDrafterState(model: model, lowMLP: lowMLP) : nil
         compressedDraftHead =
             (Device.defaultDevice().deviceType == .gpu && model.activationDType == .bfloat16)
             ? draftHead.flatMap { CompressedDraftHead(head: $0) }
@@ -273,6 +280,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             Array(repeating: key, count: 5), rows: 1, position: 0,
                             treeMeta: dummyMeta))
                 }
+            }
+            if let fd = fusedDrafter {
+                warm += fd.warmArrays(
+                    model: model, blockSize: c.blockSize,
+                    maxDraft: settings.maximumDraftTokens,
+                    warmDynTree: CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled)
             }
             let dummyRopeIn = MLXArray.zeros(
                 [1, c.kvHeads, c.blockSize, c.headDimensions], dtype: model.activationDType)
@@ -1188,11 +1201,636 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
     }
 
+    /// Low-acceptance fused DFlash drafter projections (`fusedContextKV`, `fusedBlockQKV`,
+    /// `fusedLastKV`, 3-bit `lowGateUp`) and custom epilogue kernels (`dflash_context_kv_fused_w8`,
+    /// `dflash_block_qkv_epi_w8`, `dflash_block_kv_epi_w8`, `dflash_split_silu_mul_w8`,
+    /// `dflash_add_rmsnorm_w8`). Strictly gated on `CBv2DraftRegime.lowAcceptance`.
+    private final class FusedDrafterState: @unchecked Sendable {
+        let hiddenSize: Int
+        let intermediateSize: Int
+        let attentionHeads: Int
+        let kvHeads: Int
+        let contextKV: QuantizedLinear?
+        let contextKNorms: MLXArray
+        let blockQKV: [QuantizedLinear]
+        let lastKV: QuantizedLinear?
+        let lowGateUp: [QuantizedLinear]
+        let lowDown: [QuantizedLinear]
+        let normParams: MLXArray
+        let ropeParams: MLXArray
+        let dummyTreeMeta: MLXArray
+
+        private let cacheLock = NSLock()
+        nonisolated(unsafe) private var ctxLaunchCache: [String: MLXFast.MLXFastKernel.Launch] = [:]
+        nonisolated(unsafe) private var qkvLaunchCache: [Int: MLXFast.MLXFastKernel.Launch] = [:]
+        nonisolated(unsafe) private var kvLaunchCache: [Int: MLXFast.MLXFastKernel.Launch] = [:]
+        nonisolated(unsafe) private var siluLaunchCache: [Int: MLXFast.MLXFastKernel.Launch] = [:]
+        nonisolated(unsafe) private var addNormLaunchCache: [Int: MLXFast.MLXFastKernel.Launch] = [:]
+
+        private static let contextKVKernel = MLXFast.metalKernel(
+            name: "dflash_context_kv_fused_w8",
+            inputNames: ["kv", "weights", "dims", "params", "tree_meta"],
+            outputNames: ["keys", "vals"],
+            source: """
+                const uint lane = thread_index_in_simdgroup;
+                const uint group = threadgroup_position_in_grid.y;
+                const uint rows = uint(dims[0]);
+                const uint row = group % rows;
+                const uint head = (group / rows) % HEADS_;
+                const uint layer = group / (rows * HEADS_);
+                const size_t stride = size_t(10) * size_t(HEADS_) * 128;
+                const device bfloat16_t* ksrc = kv + size_t(row) * stride
+                    + size_t(2 * layer) * size_t(HEADS_) * 128 + size_t(head) * 128 + lane * 4;
+                const device bfloat16_t* vsrc = kv + size_t(row) * stride
+                    + size_t(2 * layer + 1) * size_t(HEADS_) * 128 + size_t(head) * 128 + lane * 4;
+                const device bfloat16_t* w = weights + size_t(layer) * 128 + lane * 4;
+                device bfloat16_t* kdst = keys + size_t(group) * 128 + lane * 4;
+                device bfloat16_t* vdst = vals + size_t(group) * 128 + lane * 4;
+                *reinterpret_cast<device vec<bfloat16_t, 4>*>(vdst) =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(vsrc);
+                const vec<bfloat16_t, 4> kv4 =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(ksrc);
+                const vec<bfloat16_t, 4> wv4 =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(w);
+                float xv[4];
+                float sum = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    xv[i] = float(kv4[i]);
+                    sum += xv[i] * xv[i];
+                }
+                sum = simd_sum(sum);
+                sum = simd_sum(lane == 0 ? sum : 0.0f);
+                const float inv = metal::precise::rsqrt(sum / 128.0f + params[0]);
+                const bool low = lane < 16;
+                const int row_delta = DYN_TREE_ ? tree_meta[9 + row] : int(row);
+                const float pos = float(dims[1] + row_delta);
+                vec<bfloat16_t, 4> out4;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    const bfloat16_t norm = wv4[i] * static_cast<bfloat16_t>(xv[i] * inv);
+                    const float v = static_cast<float>(norm);
+                    const float other = simd_shuffle_xor(v, ushort(16));
+                    const float d = float((lane % 16) * 4 + i) / 64.0f;
+                    const float theta = pos * metal::exp2(-d * params[1]);
+                    const float c = metal::fast::cos(theta);
+                    const float s = metal::fast::sin(theta);
+                    const float x1 = low ? v : other;
+                    const float x2 = low ? other : v;
+                    out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+                }
+                *reinterpret_cast<device vec<bfloat16_t, 4>*>(kdst) = out4;
+                """,
+            ensureRowContiguous: true)
+
+        private static let blockQKVKernel = MLXFast.metalKernel(
+            name: "dflash_block_qkv_epi_w8",
+            inputNames: ["qkv", "qw", "kw", "pos_arr", "params"],
+            outputNames: ["qo", "ko", "vo"],
+            source: """
+                const uint lane = thread_index_in_simdgroup;
+                const uint g = threadgroup_position_in_grid.y;
+                constexpr uint TOTAL_H = AH_ + 2 * KVH_;
+                const uint row = g % M_;
+                const uint h = g / M_;
+                const size_t row_stride = size_t(TOTAL_H) * 128;
+                const device bfloat16_t* src = qkv + size_t(row) * row_stride + size_t(h) * 128 + lane * 4;
+                if (h >= AH_ + KVH_) {
+                    const uint vh = h - (AH_ + KVH_);
+                    device bfloat16_t* dst = vo + (size_t(vh) * M_ + row) * 128 + lane * 4;
+                    *reinterpret_cast<device vec<bfloat16_t, 4>*>(dst) =
+                        *reinterpret_cast<const device vec<bfloat16_t, 4>*>(src);
+                    return;
+                }
+                const bool isq = h < AH_;
+                const device bfloat16_t* w = (isq ? qw : kw) + lane * 4;
+                const vec<bfloat16_t, 4> sv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(src);
+                const vec<bfloat16_t, 4> wv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(w);
+                float xv[4];
+                float sum = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) { xv[i] = float(sv[i]); sum += xv[i] * xv[i]; }
+                sum = simd_sum(sum);
+                sum = simd_sum(lane == 0 ? sum : 0.0f);
+                const float inv = metal::precise::rsqrt(sum / 128.0f + params[0]);
+                const bool low = lane < 16;
+                const float p = float(pos_arr[0] + int(row));
+                vec<bfloat16_t, 4> out4;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    const bfloat16_t norm = wv[i] * static_cast<bfloat16_t>(xv[i] * inv);
+                    const float v = static_cast<float>(norm);
+                    const float other = simd_shuffle_xor(v, ushort(16));
+                    const float d = float((lane % 16) * 4 + i) / 64.0f;
+                    const float theta = p * metal::exp2(-d * params[1]);
+                    const float c = metal::fast::cos(theta);
+                    const float s = metal::fast::sin(theta);
+                    const float x1 = low ? v : other;
+                    const float x2 = low ? other : v;
+                    out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+                }
+                device bfloat16_t* dst = isq
+                    ? qo + (size_t(h) * M_ + row) * 128 + lane * 4
+                    : ko + (size_t(h - AH_) * M_ + row) * 128 + lane * 4;
+                *reinterpret_cast<device vec<bfloat16_t, 4>*>(dst) = out4;
+                """,
+            ensureRowContiguous: true)
+
+        private static let blockKVKernel = MLXFast.metalKernel(
+            name: "dflash_block_kv_epi_w8",
+            inputNames: ["kv", "kw", "pos_arr", "params"],
+            outputNames: ["ko", "vo"],
+            source: """
+                const uint lane = thread_index_in_simdgroup;
+                const uint g = threadgroup_position_in_grid.y;
+                const uint row = g % M_;
+                const uint h = g / M_;
+                const size_t row_stride = size_t(2 * KVH_) * 128;
+                const device bfloat16_t* ksrc = kv + size_t(row) * row_stride + size_t(h) * 128 + lane * 4;
+                const device bfloat16_t* vsrc = kv + size_t(row) * row_stride + size_t(KVH_ + h) * 128 + lane * 4;
+                device bfloat16_t* kdst = ko + (size_t(h) * M_ + row) * 128 + lane * 4;
+                device bfloat16_t* vdst = vo + (size_t(h) * M_ + row) * 128 + lane * 4;
+                *reinterpret_cast<device vec<bfloat16_t, 4>*>(vdst) =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(vsrc);
+                const vec<bfloat16_t, 4> sv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(ksrc);
+                const vec<bfloat16_t, 4> wv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(kw + lane * 4);
+                float xv[4];
+                float sum = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) { xv[i] = float(sv[i]); sum += xv[i] * xv[i]; }
+                sum = simd_sum(sum);
+                sum = simd_sum(lane == 0 ? sum : 0.0f);
+                const float inv = metal::precise::rsqrt(sum / 128.0f + params[0]);
+                const bool low = lane < 16;
+                const float p = float(pos_arr[0] + int(row));
+                vec<bfloat16_t, 4> out4;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    const bfloat16_t norm = wv[i] * static_cast<bfloat16_t>(xv[i] * inv);
+                    const float v = static_cast<float>(norm);
+                    const float other = simd_shuffle_xor(v, ushort(16));
+                    const float d = float((lane % 16) * 4 + i) / 64.0f;
+                    const float theta = p * metal::exp2(-d * params[1]);
+                    const float c = metal::fast::cos(theta);
+                    const float s = metal::fast::sin(theta);
+                    const float x1 = low ? v : other;
+                    const float x2 = low ? other : v;
+                    out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+                }
+                *reinterpret_cast<device vec<bfloat16_t, 4>*>(kdst) = out4;
+                """,
+            ensureRowContiguous: true)
+
+        private static let splitSiluKernel = MLXFast.metalKernel(
+            name: "dflash_split_silu_mul_w8",
+            inputNames: ["gu"],
+            outputNames: ["out"],
+            source: """
+                const uint idx4 = thread_position_in_grid.x;
+                constexpr uint F4 = F_ / 4;
+                const uint row = idx4 / F4;
+                const uint col4 = idx4 % F4;
+                if (row >= M_) { return; }
+                const device vec<bfloat16_t, 4>* base =
+                    reinterpret_cast<const device vec<bfloat16_t, 4>*>(gu) + size_t(row) * (2 * F4);
+                const vec<bfloat16_t, 4> g = base[col4];
+                const vec<bfloat16_t, 4> u = base[F4 + col4];
+                vec<bfloat16_t, 4> r;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float gf = float(g[i]);
+                    const float s = gf / (1.0f + metal::fast::exp(-gf));
+                    r[i] = bfloat16_t(s * float(u[i]));
+                }
+                reinterpret_cast<device vec<bfloat16_t, 4>*>(out)[size_t(row) * F4 + col4] = r;
+                """,
+            ensureRowContiguous: true)
+
+        private static let addRmsNormKernel = MLXFast.metalKernel(
+            name: "dflash_add_rmsnorm_w8",
+            inputNames: ["h", "p", "w", "params"],
+            outputNames: ["h_out", "y_out"],
+            source: """
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint row = threadgroup_position_in_grid.y;
+                constexpr uint D4 = D_ / 4;
+                constexpr uint ITERS = (D4 + 1023u) / 1024u;
+                const device vec<bfloat16_t, 4>* h4 =
+                    reinterpret_cast<const device vec<bfloat16_t, 4>*>(h) + size_t(row) * D4;
+                const device vec<bfloat16_t, 4>* p4 =
+                    reinterpret_cast<const device vec<bfloat16_t, 4>*>(p) + size_t(row) * D4;
+                const device vec<bfloat16_t, 4>* w4 =
+                    reinterpret_cast<const device vec<bfloat16_t, 4>*>(w);
+                device vec<bfloat16_t, 4>* ho4 =
+                    reinterpret_cast<device vec<bfloat16_t, 4>*>(h_out) + size_t(row) * D4;
+                device vec<bfloat16_t, 4>* yo4 =
+                    reinterpret_cast<device vec<bfloat16_t, 4>*>(y_out) + size_t(row) * D4;
+                float fv[ITERS * 4];
+                float sum = 0.0f;
+                for (uint b = 0; b < ITERS; ++b) {
+                    const uint idx = b * 1024u + lid;
+                    if (idx < D4) {
+                        const vec<bfloat16_t, 4> s = h4[idx] + p4[idx];
+                        ho4[idx] = s;
+                        #pragma unroll
+                        for (uint j = 0; j < 4; ++j) {
+                            const float v = float(s[j]);
+                            fv[b * 4 + j] = v;
+                            sum += v * v;
+                        }
+                    }
+                }
+                sum = simd_sum(sum);
+                threadgroup float sh[32];
+                if (lane == 0) { sh[sg] = sum; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float tot = simd_sum(lid < 32 ? sh[lid] : 0.0f);
+                threadgroup float bcast[1];
+                if (lid == 0) { bcast[0] = metal::precise::rsqrt(tot * params[0] + params[1]); }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float r = bcast[0];
+                for (uint b = 0; b < ITERS; ++b) {
+                    const uint idx = b * 1024u + lid;
+                    if (idx < D4) {
+                        const vec<bfloat16_t, 4> wv = w4[idx];
+                        vec<bfloat16_t, 4> yv;
+                        #pragma unroll
+                        for (uint j = 0; j < 4; ++j) {
+                            yv[j] = bfloat16_t(fv[b * 4 + j] * r) * wv[j];
+                        }
+                        yo4[idx] = yv;
+                    }
+                }
+                """,
+            ensureRowContiguous: true)
+
+        private static func concatQuantized(_ layers: [Linear]) -> QuantizedLinear? {
+            guard !layers.isEmpty else { return nil }
+            var qls = [QuantizedLinear]()
+            qls.reserveCapacity(layers.count)
+            for l in layers {
+                guard let q = l as? QuantizedLinear, q.mode == .affine, q.bias == nil else {
+                    return nil
+                }
+                qls.append(q)
+            }
+            let bits = qls[0].bits
+            let gs = qls[0].groupSize
+            let hasBiases = qls[0].biases != nil
+            guard qls.allSatisfy({ $0.bits == bits && $0.groupSize == gs && ($0.biases != nil) == hasBiases })
+            else { return nil }
+            let w = concatenated(qls.map(\.weight), axis: 0)
+            let s = concatenated(qls.map(\.scales), axis: 0)
+            let b: MLXArray? = hasBiases ? concatenated(qls.compactMap(\.biases), axis: 0) : nil
+            if let b { eval(w, s, b) } else { eval(w, s) }
+            return QuantizedLinear(
+                weight: w, bias: nil, scales: s, biases: b,
+                groupSize: gs, bits: bits, mode: .affine)
+        }
+
+        init?(
+            model: MuseGlimmerDFlashDraftModel,
+            lowMLP: [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
+        ) {
+            let c = model.configuration
+            guard model.layers.count == 5, c.headDimensions == 128,
+                c.hiddenSize % 4 == 0, c.intermediateSize % 4 == 0,
+                model.activationDType == .bfloat16, Device.defaultDevice().deviceType == .gpu
+            else { return nil }
+            var kNorms = [MLXArray]()
+            var ctxList = [Linear]()
+            for layer in model.layers {
+                guard layer.attention.kNorm.weight.dtype == .bfloat16,
+                    layer.attention.qNorm.weight.dtype == .bfloat16,
+                    layer.attention.kNorm.weight.shape == [128],
+                    layer.attention.qNorm.weight.shape == [128],
+                    layer.inputNorm.weight.dtype == .bfloat16,
+                    layer.postAttentionNorm.weight.dtype == .bfloat16
+                else { return nil }
+                kNorms.append(layer.attention.kNorm.weight)
+                ctxList.append(layer.attention.kProj)
+                ctxList.append(layer.attention.vProj)
+            }
+            let stackedKNorms = stacked(kNorms, axis: 0)
+            let nParams = MLXArray([Float(1.0 / Double(c.hiddenSize)), c.rmsNormEps])
+            let rParams = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+            let dm = MLXArray.zeros([18], type: Int32.self)
+            eval(stackedKNorms, nParams, rParams, dm)
+
+            var qkvs = [QuantizedLinear]()
+            for i in 0 ..< (model.layers.count - 1) {
+                let a = model.layers[i].attention
+                guard let qkv = Self.concatQuantized([a.qProj, a.kProj, a.vProj]) else {
+                    qkvs.removeAll(); break
+                }
+                qkvs.append(qkv)
+            }
+            let lastAttn = model.layers[model.layers.count - 1].attention
+            let lastKV = Self.concatQuantized([lastAttn.kProj, lastAttn.vProj])
+
+            var gu = [QuantizedLinear]()
+            var dn = [QuantizedLinear]()
+            if lowMLP.count == model.layers.count {
+                for entry in lowMLP {
+                    guard let fusedGU = Self.concatQuantized([entry.gate, entry.up]) else {
+                        gu.removeAll(); dn.removeAll(); break
+                    }
+                    gu.append(fusedGU)
+                    dn.append(entry.down)
+                }
+            }
+
+            self.hiddenSize = c.hiddenSize
+            self.intermediateSize = c.intermediateSize
+            self.attentionHeads = c.attentionHeads
+            self.kvHeads = c.kvHeads
+            self.contextKV = Self.concatQuantized(ctxList)
+            self.contextKNorms = stackedKNorms
+            self.blockQKV = qkvs
+            self.lastKV = lastKV
+            self.lowGateUp = gu
+            self.lowDown = dn
+            self.normParams = nParams
+            self.ropeParams = rParams
+            self.dummyTreeMeta = dm
+        }
+
+        func contextKeyValues(
+            _ context: MLXArray, rows: Int, position: Int, treeMeta: MLXArray?
+        ) -> (keys: MLXArray, values: MLXArray)? {
+            guard let contextKV else { return nil }
+            let kv = contextKV(context)
+            guard kv.dtype == .bfloat16 else { return nil }
+            let dyn = treeMeta != nil
+            let key = "\(rows)_\(dyn)"
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = cacheLock.withLock({ ctxLaunchCache[key] }) {
+                launch = hit
+            } else {
+                let made = Self.contextKVKernel.prepare(
+                    template: [("HEADS_", kvHeads), ("DYN_TREE_", dyn)],
+                    grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[5, kvHeads, rows, 128], [5, kvHeads, rows, 128]],
+                    outputDTypes: [.bfloat16, .bfloat16])
+                cacheLock.withLock { ctxLaunchCache[key] = made }
+                launch = made
+            }
+            let dims = MLXArray([Int32(rows), Int32(position)])
+            let out = launch([kv, contextKNorms, dims, ropeParams, treeMeta ?? dummyTreeMeta])
+            return (out[0], out[1])
+        }
+
+        func applyMLP(layerIndex: Int, x: MLXArray) -> MLXArray? {
+            guard layerIndex < lowGateUp.count, x.dtype == .bfloat16, x.ndim == 3, x.dim(0) == 1 else {
+                return nil
+            }
+            let rows = x.dim(1)
+            let gu = lowGateUp[layerIndex](x)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = cacheLock.withLock({ siluLaunchCache[rows] }) {
+                launch = hit
+            } else {
+                let n4 = rows * (intermediateSize / 4)
+                let gridX = ((n4 + 255) / 256) * 256
+                let made = Self.splitSiluKernel.prepare(
+                    template: [("F_", intermediateSize), ("M_", rows)],
+                    grid: (gridX, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, rows, intermediateSize]], outputDTypes: [.bfloat16])
+                cacheLock.withLock { siluLaunchCache[rows] = made }
+                launch = made
+            }
+            return lowDown[layerIndex](launch([gu])[0])
+        }
+
+        private func addRmsNorm(_ h: MLXArray, _ p: MLXArray, weight: MLXArray) -> (MLXArray, MLXArray) {
+            let rows = h.dim(1)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = cacheLock.withLock({ addNormLaunchCache[rows] }) {
+                launch = hit
+            } else {
+                let made = Self.addRmsNormKernel.prepare(
+                    template: [("D_", hiddenSize)],
+                    grid: (1024, rows, 1), threadGroup: (1024, 1, 1),
+                    outputShapes: [[1, rows, hiddenSize], [1, rows, hiddenSize]],
+                    outputDTypes: [.bfloat16, .bfloat16])
+                cacheLock.withLock { addNormLaunchCache[rows] = made }
+                launch = made
+            }
+            let out = launch([h, p, weight, normParams])
+            return (out[0], out[1])
+        }
+
+        private func blockQKVEpilogue(
+            _ qkv: MLXArray, qw: MLXArray, kw: MLXArray, posArr: MLXArray, rows: Int
+        ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = cacheLock.withLock({ qkvLaunchCache[rows] }) {
+                launch = hit
+            } else {
+                let made = Self.blockQKVKernel.prepare(
+                    template: [("AH_", attentionHeads), ("KVH_", kvHeads), ("M_", rows)],
+                    grid: (32, rows * (attentionHeads + 2 * kvHeads), 1), threadGroup: (32, 1, 1),
+                    outputShapes: [
+                        [1, attentionHeads, rows, 128],
+                        [1, kvHeads, rows, 128],
+                        [1, kvHeads, rows, 128],
+                    ],
+                    outputDTypes: [.bfloat16, .bfloat16, .bfloat16])
+                cacheLock.withLock { qkvLaunchCache[rows] = made }
+                launch = made
+            }
+            let out = launch([qkv, qw, kw, posArr, ropeParams])
+            return (out[0], out[1], out[2])
+        }
+
+        private func blockKVEpilogue(
+            _ kv: MLXArray, kw: MLXArray, posArr: MLXArray, rows: Int
+        ) -> (k: MLXArray, v: MLXArray) {
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = cacheLock.withLock({ kvLaunchCache[rows] }) {
+                launch = hit
+            } else {
+                let made = Self.blockKVKernel.prepare(
+                    template: [("KVH_", kvHeads), ("M_", rows)],
+                    grid: (32, rows * kvHeads, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[1, kvHeads, rows, 128], [1, kvHeads, rows, 128]],
+                    outputDTypes: [.bfloat16, .bfloat16])
+                cacheLock.withLock { kvLaunchCache[rows] = made }
+                launch = made
+            }
+            let out = launch([kv, kw, posArr, ropeParams])
+            return (out[0], out[1])
+        }
+
+        func fastBlockRows(
+            model: MuseGlimmerDFlashDraftModel, hidden initialHidden: MLXArray, at position: Int,
+            context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
+            draftCount: Int, devicePosition: MLXArray?, layer4NAX: Bool,
+            draftMLP: (Int, MuseGlimmerDFlashMLP, MLXArray) -> MLXArray
+        ) -> MLXArray? {
+            let lastIndex = model.layers.count - 1
+            guard blockQKV.count == lastIndex, let lastKV else { return nil }
+            let c = model.configuration
+            let block = c.blockSize
+            let scale = 1 / Float(c.headDimensions).squareRoot()
+            let posArr: MLXArray =
+                devicePosition.map { $0.reshaped([1]).asType(.int32) } ?? MLXArray([Int32(position)])
+            var hidden = initialHidden
+            var x = model.layers[0].inputNorm(hidden)
+            for (index, layer) in model.layers.enumerated() {
+                let attention = layer.attention
+                if index < lastIndex {
+                    let qkv = blockQKV[index](x)
+                    var (queries, keys, values) = blockQKVEpilogue(
+                        qkv, qw: attention.qNorm.weight, kw: attention.kNorm.weight,
+                        posArr: posArr, rows: block)
+                    if let context {
+                        keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                        values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+                    }
+                    let attended = MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+                    let oProj = attention.oProj(
+                        attended.transposed(0, 2, 1, 3).reshaped([
+                            1, block, c.attentionHeads * c.headDimensions,
+                        ]))
+                    let (hMid, mx) = addRmsNorm(hidden, oProj, weight: layer.postAttentionNorm.weight)
+                    let mlpOut = draftMLP(index, layer.mlp, mx)
+                    let (hNext, xNext) = addRmsNorm(
+                        hMid, mlpOut, weight: model.layers[index + 1].inputNorm.weight)
+                    hidden = hNext
+                    x = xNext
+                } else {
+                    let kv = lastKV(x)
+                    var (keys, values) = blockKVEpilogue(
+                        kv, kw: attention.kNorm.weight, posArr: posArr, rows: block)
+                    if let context {
+                        keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                        values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+                    }
+                    if !layer4NAX {
+                        let active = 1 ..< (1 + draftCount)
+                        let xActive = x[0..., active, 0...]
+                        let qRaw = attention.qProj(xActive).reshaped([
+                            1, draftCount, c.attentionHeads, c.headDimensions,
+                        ]).transposed(0, 2, 1, 3)
+                        let queries: MLXArray
+                        if let devicePosition {
+                            queries = MLXFast.RoPE(
+                                attention.qNorm(qRaw), dimensions: c.headDimensions,
+                                traditional: false, base: c.ropeTheta, scale: 1,
+                                offset: devicePosition + Int32(1))
+                        } else {
+                            queries = MLXFast.RoPE(
+                                attention.qNorm(qRaw), dimensions: c.headDimensions,
+                                traditional: false, base: c.ropeTheta, scale: 1,
+                                offset: position + 1)
+                        }
+                        let activeMask = mask.map { $0[active, 0...] }
+                        let attended = MLXFast.scaledDotProductAttention(
+                            queries: queries, keys: keys, values: values, scale: scale,
+                            mask: activeMask)
+                        let oProj = attention.oProj(
+                            attended.transposed(0, 2, 1, 3).reshaped([
+                                1, draftCount, c.attentionHeads * c.headDimensions,
+                            ]))
+                        let (hMid, mx) = addRmsNorm(
+                            hidden[0..., active, 0...], oProj,
+                            weight: layer.postAttentionNorm.weight)
+                        let mlpOut = draftMLP(index, layer.mlp, mx)
+                        let (_, normed) = addRmsNorm(hMid, mlpOut, weight: model.norm.weight)
+                        return normed.reshaped([draftCount, c.hiddenSize])
+                    } else {
+                        let qRaw = attention.qProj(x).reshaped([
+                            1, block, c.attentionHeads, c.headDimensions,
+                        ]).transposed(0, 2, 1, 3)
+                        let queries: MLXArray
+                        if let devicePosition {
+                            queries = MLXFast.RoPE(
+                                attention.qNorm(qRaw), dimensions: c.headDimensions,
+                                traditional: false, base: c.ropeTheta, scale: 1,
+                                offset: devicePosition)
+                        } else {
+                            queries = MLXFast.RoPE(
+                                attention.qNorm(qRaw), dimensions: c.headDimensions,
+                                traditional: false, base: c.ropeTheta, scale: 1,
+                                offset: position)
+                        }
+                        let attended = MLXFast.scaledDotProductAttention(
+                            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+                        let oProj = attention.oProj(
+                            attended.transposed(0, 2, 1, 3).reshaped([
+                                1, block, c.attentionHeads * c.headDimensions,
+                            ]))
+                        let (hMid, mx) = addRmsNorm(
+                            hidden, oProj, weight: layer.postAttentionNorm.weight)
+                        let mlpOut = draftMLP(index, layer.mlp, mx)
+                        let (_, normed) = addRmsNorm(hMid, mlpOut, weight: model.norm.weight)
+                        return normed.reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
+                    }
+                }
+            }
+            return nil
+        }
+
+        func warmArrays(
+            model: MuseGlimmerDFlashDraftModel, blockSize: Int, maxDraft: Int, warmDynTree: Bool
+        ) -> [MLXArray] {
+            var out = [MLXArray]()
+            if contextKV != nil {
+                for r in 1 ... (maxDraft + 1) {
+                    let x = MLXArray.zeros([r, hiddenSize], dtype: .bfloat16)
+                    if let kv = contextKeyValues(x, rows: r, position: 0, treeMeta: nil) {
+                        out += [kv.keys, kv.values]
+                    }
+                    if warmDynTree,
+                        let kv = contextKeyValues(x, rows: r, position: 0, treeMeta: dummyTreeMeta)
+                    {
+                        out += [kv.keys, kv.values]
+                    }
+                }
+            }
+            let pos0 = MLXArray([Int32(0)])
+            if let firstQKV = blockQKV.first {
+                let x = MLXArray.zeros([1, blockSize, hiddenSize], dtype: .bfloat16)
+                let a = model.layers[0].attention
+                let res = blockQKVEpilogue(
+                    firstQKV(x), qw: a.qNorm.weight, kw: a.kNorm.weight, posArr: pos0,
+                    rows: blockSize)
+                out += [res.q, res.k, res.v]
+            }
+            if let lastKV {
+                let x = MLXArray.zeros([1, blockSize, hiddenSize], dtype: .bfloat16)
+                let a = model.layers[model.layers.count - 1].attention
+                let res = blockKVEpilogue(
+                    lastKV(x), kw: a.kNorm.weight, posArr: pos0, rows: blockSize)
+                out += [res.k, res.v]
+            }
+            for rows in [blockSize] + Array(1 ... maxDraft) {
+                let h = MLXArray.zeros([1, rows, hiddenSize], dtype: .bfloat16)
+                let an = addRmsNorm(h, h, weight: model.norm.weight)
+                out += [an.0, an.1]
+                if !lowGateUp.isEmpty, let m = applyMLP(layerIndex: 0, x: h) {
+                    out.append(m)
+                }
+            }
+            return out
+        }
+    }
+
     private func speculativeContextKeyValues(
         _ context: MLXArray, at position: Int, treeMeta: MLXArray? = nil
     ) -> (keys: MLXArray, values: MLXArray) {
         let c = model.configuration
         let rows = context.dim(0)
+        if CBv2DraftRegime.xnorDraftHeadEligible, let fd = fusedDrafter, context.dtype == .bfloat16,
+            rows > 0, position >= 0, position <= Int(Int32.max) - rows,
+            let fused = fd.contextKeyValues(context, rows: rows, position: position, treeMeta: treeMeta)
+        {
+            return fused
+        }
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
         else { return model.contextKeyValues(context, at: position) }
@@ -1634,6 +2272,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
     /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
     private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
+        if CBv2DraftRegime.xnorDraftHeadEligible, let fd = fusedDrafter,
+            let fused = fd.applyMLP(layerIndex: index, x: x)
+        {
+            return fused
+        }
         if CBv2DraftRegime.lowAcceptance, index < lowMLP.count {
             let low = lowMLP[index]
             return low.down(compiledSiluProduct(low.gate(x), low.up(x)))
@@ -1747,6 +2390,14 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ? embeddings : embeddings.asType(model.activationDType)
         var hidden = act.reshaped([1, block, c.hiddenSize])
         let lastIndex = model.layers.count - 1
+        if CBv2DraftRegime.xnorDraftHeadEligible, let fd = fusedDrafter, act.dtype == .bfloat16,
+            let fusedRows = fd.fastBlockRows(
+                model: model, hidden: hidden, at: position, context: context, mask: mask,
+                draftCount: draftCount, devicePosition: devicePosition,
+                layer4NAX: Self.drafterLayer4NAX, draftMLP: draftMLP)
+        {
+            return fusedRows
+        }
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)

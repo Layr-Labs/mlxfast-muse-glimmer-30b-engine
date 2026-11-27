@@ -59,6 +59,37 @@ public enum PagedOnePassAttention {
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
+    /// `CBV2_PAGED_FUSED_GATE=0`: disables the low-acceptance 0-ULP fused
+    /// `output * sigmoid(gate)` (+ optional FP8 cast) epilogue inside one-pass
+    /// paged attention (default enabled after load-time 0-ULP self-check).
+    public static let fusedGateEnvEnabled: Bool = environment["CBV2_PAGED_FUSED_GATE"] != "0"
+    /// `CBV2_PAGED_LOWTGEM=0`: disables the low-TGEM (12.5 KB at MAXPART=2, 25.0 KB at MAXPART=4,
+    /// HPT=NSG=4) register-resident-Q one-pass fused gate kernel.
+    public static let lowTgemEnvEnabled: Bool = environment["CBV2_PAGED_LOWTGEM"] != "0"
+    nonisolated(unsafe) private static var fusedGateVerified = false
+    nonisolated(unsafe) private static var lowTgemVerified = false
+    nonisolated(unsafe) static var fusedGateSuspended = false
+
+    public static var fusedGateActive: Bool {
+        enabled && fusedGateEnvEnabled && !fusedGateSuspended
+            && !threadgroupProbeFailed
+            && lock.withLock { fusedGateVerified }
+            && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible)
+    }
+
+    static var lowTgemActive: Bool {
+        fusedGateActive && lowTgemEnvEnabled && lock.withLock { lowTgemVerified }
+    }
+
+    /// Eligible `HPT` (`== simdgroups`, e.g. `4` for Muse Glimmer 30B `GQA=16, D=128`) for
+    /// `paged_attention_onepass_lowtgem_impl` whose `red_smem` fits inside Metal's 32 KB cap.
+    static func lowTgemHeads(headDim: Int, gqa: Int, simdgroups: Int, maxPart: Int) -> Int? {
+        guard headDim == 128, simdgroups >= 2, gqa % simdgroups == 0 else { return nil }
+        let floats = maxPart * simdgroups * (simdgroups - 1) * (headDim + 2)
+        guard floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit else { return nil }
+        return simdgroups
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var checked = 0
@@ -186,6 +217,211 @@ public enum PagedOnePassAttention {
                 }
             }
         }
+        if dtype == .bfloat16 && fusedGateEnvEnabled && !threadgroupProbeFailed {
+            verifyAndWarmFusedGate(
+                queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim, pageSize: pageSize,
+                hpt: hpt, nsg: nsg, ptok: ptok, softcap: softcap, source: source)
+        }
+    }
+
+    /// Load-time 0-ULP parity check and warmup for the fused `sigmoid(gate)` (+ FP8 cast)
+    /// epilogue across `CAST_FP8 = false` and `CAST_FP8 = true`. Fail-closed on any bit
+    /// mismatch or Metal threadgroup/compile error.
+    private static func verifyAndWarmFusedGate(
+        queryHeads: Int, kvHeads: Int, headDim: Int, pageSize: Int,
+        hpt: Int, nsg: Int, ptok: Int, softcap: Bool, source: String
+    ) {
+        let pageElements = kvHeads * pageSize * headDim
+        var kvVals = [Float]()
+        kvVals.reserveCapacity(2 * pageElements)
+        for i in 0 ..< (2 * pageElements) {
+            kvVals.append(Float(((i * 11 + 3) % 29) - 14) * 0.0625)
+        }
+        let storage = MLXArray(kvVals, [2 * pageElements]).asType(.bfloat16)
+        let qElems = queryHeads * headDim
+        var qVals = [Float](), gVals = [Float]()
+        qVals.reserveCapacity(qElems); gVals.reserveCapacity(qElems)
+        for i in 0 ..< qElems {
+            qVals.append(Float(((i * 7 + 5) % 23) - 11) * 0.0625)
+            gVals.append(Float(((i * 13 + 1) % 31) - 15) * 0.125)
+        }
+        let q = MLXArray(qVals, [1, queryHeads, headDim]).asType(.bfloat16)
+        let gate = MLXArray(gVals, [1, queryHeads, headDim]).asType(.bfloat16)
+        let seqinfo = MLXArray([Int32(0), Int32(min(pageSize, 4)), 1, 0, 0, 0, 0, 0], [1, 8])
+        let params = MLXArray([Float(1), Float(1.0 / Double(headDim).squareRoot()), 0, 0, 0, 0, 0, 0])
+        let previous = MLXArray.zeros([1], type: Int32.self)
+        var record = [Int32](repeating: 0, count: PagedSegmentDispatchPlan.recordStride)
+        record[3] = 1
+        record[6] = 1
+        let offsets = [Int64](repeating: Int64(pageElements), count: 8)
+        let testMu = MLXArray([Float(1.7), Float(1.0 / 1.7)])
+        let testBd = MLXArray([Float(448.0)])
+
+        let passed: Bool =
+            (try? withError { () -> Bool in
+                let ref = segments(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true)
+                let refGated = ref.out * sigmoid(gate)
+                let refCast = ModelOptActivationKernels.fp8(
+                    refGated, multipliers: testMu, overflowBound: testBd)
+                let gotGated = segmentsFusedGate(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: ref.fence, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    gate: gate, fp8Multipliers: nil, fp8OverflowBound: nil,
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true)
+                let gotCast = segmentsFusedGate(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: gotGated.fence, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    gate: gate, fp8Multipliers: testMu, fp8OverflowBound: testBd,
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true)
+                let diff0 = (contiguous(gotGated.out).view(dtype: .uint16)
+                    .!= contiguous(refGated).view(dtype: .uint16)).asType(.int32).sum()
+                let diff1 = (contiguous(gotCast.out).view(dtype: .uint16)
+                    .!= contiguous(refCast).view(dtype: .uint16)).asType(.int32).sum()
+                let total = diff0 + diff1
+                eval(total)
+                guard total.item(Int.self) == 0 else { return false }
+                let warmDynTree = CBv2DraftRegime.verifyTreeMode != 0
+                    && CBv2DraftRegime.dynamicTreeEnabled && !dynTreeProbeFailed
+                let partRange = dynamicMaxPartitions ? (1 ... maxPartitions) : (maxPartitions ... maxPartitions)
+                var warmOut = [MLXArray]()
+                var fence = gotCast.fence
+                for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                    let bOffsets = MLXArray([Int64](repeating: Int64(pageElements), count: max(8, bindings)))
+                    let backing = [MLXArray](repeating: storage, count: bindings)
+                    for castFP8 in [false, true] {
+                        let mu: MLXArray? = castFP8 ? testMu : nil
+                        let bd: MLXArray? = castFP8 ? testBd : nil
+                        let probed = segmentsFusedGate(
+                            queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                            previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                            gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                            dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, probe: true)
+                        eval(probed.fence, probed.out)
+                        fence = probed.fence
+                        for mp in partRange {
+                            let r = segmentsFusedGate(
+                                queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                                previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                                gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                                dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, maxPart: mp, forceMaxPart: true)
+                            fence = r.fence
+                            warmOut += [r.fence, r.out]
+                            if warmDynTree {
+                                let rd = segmentsFusedGate(
+                                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                                    previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                                    gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                    source: source, treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true)
+                                fence = rd.fence
+                                warmOut += [rd.fence, rd.out]
+                            }
+                        }
+                    }
+                }
+                if !warmOut.isEmpty { eval(warmOut) }
+                return true
+            }) ?? false
+        lock.withLock { fusedGateVerified = passed }
+        guard passed, lowTgemEnvEnabled,
+            let ltHpt = lowTgemHeads(
+                headDim: headDim, gqa: queryHeads / kvHeads, simdgroups: nsg, maxPart: maxPartitions)
+        else { return }
+        let ltPassed: Bool =
+            (try? withError { () -> Bool in
+                let ref = segments(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true)
+                let refGated = ref.out * sigmoid(gate)
+                let refCast = ModelOptActivationKernels.fp8(
+                    refGated, multipliers: testMu, overflowBound: testBd)
+                let gotGated = segmentsFusedGate(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: ref.fence, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    gate: gate, fp8Multipliers: nil, fp8OverflowBound: nil,
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: ltHpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true, forceLowTgem: true)
+                let gotCast = segmentsFusedGate(
+                    queries: q, backing: [storage], seqinfo: seqinfo, params: params,
+                    previous: gotGated.fence, valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                    gate: gate, fp8Multipliers: testMu, fp8OverflowBound: testBd,
+                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: ltHpt,
+                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap, source: source,
+                    maxPart: 1, forceMaxPart: true, forceLowTgem: true)
+                let diff0 = (contiguous(gotGated.out).view(dtype: .uint16)
+                    .!= contiguous(refGated).view(dtype: .uint16)).asType(.int32).sum()
+                let diff1 = (contiguous(gotCast.out).view(dtype: .uint16)
+                    .!= contiguous(refCast).view(dtype: .uint16)).asType(.int32).sum()
+                let total = diff0 + diff1
+                eval(total)
+                guard total.item(Int.self) == 0 else { return false }
+                let warmDynTree = CBv2DraftRegime.verifyTreeMode != 0
+                    && CBv2DraftRegime.dynamicTreeEnabled && !dynTreeProbeFailed
+                let partRange = dynamicMaxPartitions ? (1 ... maxPartitions) : (maxPartitions ... maxPartitions)
+                var warmOut = [MLXArray]()
+                var fence = gotCast.fence
+                for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                    let bOffsets = MLXArray([Int64](repeating: Int64(pageElements), count: max(8, bindings)))
+                    let backing = [MLXArray](repeating: storage, count: bindings)
+                    for castFP8 in [false, true] {
+                        let mu: MLXArray? = castFP8 ? testMu : nil
+                        let bd: MLXArray? = castFP8 ? testBd : nil
+                        let probed = segmentsFusedGate(
+                            queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                            previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                            gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                            dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: ltHpt,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, probe: true, forceLowTgem: true)
+                        eval(probed.fence, probed.out)
+                        fence = probed.fence
+                        for mp in partRange {
+                            let r = segmentsFusedGate(
+                                queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                                previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                                gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                                dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: ltHpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, maxPart: mp, forceMaxPart: true, forceLowTgem: true)
+                            fence = r.fence
+                            warmOut += [r.fence, r.out]
+                            if warmDynTree {
+                                let rd = segmentsFusedGate(
+                                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                                    previous: fence, valueOffsets: bOffsets, records: MLXArray(record),
+                                    gate: gate, fp8Multipliers: mu, fp8OverflowBound: bd,
+                                    dtype: .bfloat16, kvHeads: kvHeads, pageSize: pageSize, hpt: ltHpt,
+                                    simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                    source: source, treeMeta: dummyTreeMeta, maxPart: mp,
+                                    forceMaxPart: true, forceLowTgem: true)
+                                fence = rd.fence
+                                warmOut += [rd.fence, rd.out]
+                            }
+                        }
+                    }
+                }
+                if !warmOut.isEmpty { eval(warmOut) }
+                return true
+            }) ?? false
+        lock.withLock { lowTgemVerified = ltPassed }
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
@@ -420,6 +656,202 @@ public enum PagedOnePassAttention {
             // The probe asks for the same thread count as one (tg / 2, 2, 1)
             // threadgroup: MLX accepts that shape only when the pipeline
             // holds `tg` threads as compiled, and throws otherwise.
+            grid: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+            threadGroup: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
+            outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    nonisolated(unsafe) private static let dummyFP8Mu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummyFP8Bound: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    private static func segmentBodyFusedGate(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const int row = threadgroup_position_in_grid.y;
+            int first = 0;
+            for (int r = 0; r < row; r++) {
+                first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own = (seqinfo[row * 8 + 1] + PTOK - 1) / PTOK;
+            const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
+            const device int32_t* record =
+                records + (first + min(wanted, own - 1)) * STRIDE;
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            const float fp8_m0 = fp8_mu[0];
+            const float fp8_m1 = fp8_mu[1];
+            const float fp8_bound = fp8_bd[0];
+            \(scratch)
+            cbv2::paged_attention_onepass_impl<
+                T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE,
+                true, CAST_FP8>(
+                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta,
+                gate, fp8_m0, fp8_m1, fp8_bound);
+            """
+    }
+
+    private static func segmentBodyFusedGateLowTgem(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const int row = threadgroup_position_in_grid.y;
+            int first = 0;
+            for (int r = 0; r < row; r++) {
+                first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own = (seqinfo[row * 8 + 1] + PTOK - 1) / PTOK;
+            const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
+            const device int32_t* record =
+                records + (first + min(wanted, own - 1)) * STRIDE;
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            const float fp8_m0 = fp8_mu[0];
+            const float fp8_m1 = fp8_mu[1];
+            const float fp8_bound = fp8_bd[0];
+            threadgroup float red_smem[MAXPART * HPT * (NSG - 1) * (D + 2)];
+            cbv2::paged_attention_onepass_lowtgem_impl<
+                T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE,
+                true, CAST_FP8>(
+                q, cache, seqinfo, seqinfo, params, KVH, 0, red_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta,
+                gate, fp8_m0, fp8_m1, fp8_bound);
+            """
+    }
+
+    private struct SegGateLaunchKey: Hashable {
+        let dtype: DType
+        let b: Int
+        let qh: Int
+        let d: Int
+        let kvHeads: Int
+        let pageSize: Int
+        let hpt: Int
+        let simdgroups: Int
+        let partitionTokens: Int
+        let maxPart: Int
+        let softcap: Bool
+        let bindings: Int
+        let dynTree: Bool
+        let castFP8: Bool
+        let lowTgem: Bool
+    }
+
+    nonisolated(unsafe) private static var segGateLaunchCache:
+        [SegGateLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+    /// Segmented one-pass attention with fused 0-ULP `output * sigmoid(gate)`
+    /// (+ optional ModelOpt FP8 activation cast when `fp8Multipliers != nil`).
+    static func segmentsFusedGate(
+        queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
+        previous: MLXArray, valueOffsets: MLXArray, records: MLXArray,
+        gate: MLXArray, fp8Multipliers: MLXArray?, fp8OverflowBound: MLXArray?,
+        dtype: DType, kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int,
+        partitionTokens: Int, softcap: Bool, source: String, probe: Bool = false,
+        treeMeta: MLXArray? = nil, maxPart: Int? = nil, forceMaxPart: Bool = false,
+        forceLowTgem: Bool = false
+    ) -> (fence: MLXArray, out: MLXArray) {
+        let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        let gqa = qh / kvHeads
+        let bindings = backing.count
+        let allowDynPart =
+            dynamicMaxPartitions
+            && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+        let mp =
+            (!probe && allowDynPart)
+            ? min(maxPartitions, max(1, maxPart ?? maxPartitions))
+            : maxPartitions
+        let dynTree = treeMeta != nil
+        let castFP8 = fp8Multipliers != nil && fp8OverflowBound != nil
+        let ltHpt =
+            (forceLowTgem || lowTgemActive)
+            ? lowTgemHeads(headDim: d, gqa: gqa, simdgroups: simdgroups, maxPart: mp)
+            : nil
+        let useLowTgem = ltHpt != nil
+        let effHpt = ltHpt ?? hpt
+        let inputs =
+            [queries] + backing + [
+                seqinfo, params, previous, valueOffsets, records, treeMeta ?? dummyTreeMeta,
+                gate, fp8Multipliers ?? dummyFP8Mu, fp8OverflowBound ?? dummyFP8Bound,
+            ]
+        if !probe {
+            let lkey = SegGateLaunchKey(
+                dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
+                hpt: effHpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
+                castFP8: castFP8, lowTgem: useLowTgem)
+            if let hit = lock.withLock({ segGateLaunchCache[lkey] }) {
+                let outputs = hit(inputs)
+                return (outputs[0], outputs[1])
+            }
+        }
+        let kindTag = useLowTgem ? "segments\(bindings)_kvh\(kvHeads)_fgate_lt" : "segments\(bindings)_kvh\(kvHeads)_fgate"
+        let kernelName =
+            name(
+                kindTag, dtype: dtype, headDim: d,
+                pageSize: pageSize, gqa: gqa, hpt: effHpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap, maxPart: mp)
+        let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
+            if let existing = kernels[kernelName] { return existing }
+            let made = MLXFast.metalKernel(
+                name: kernelName,
+                inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
+                    + [
+                        "seqinfo", "params", "previous", "value_offsets", "records", "tree_meta",
+                        "gate", "fp8_mu", "fp8_bd",
+                    ],
+                outputNames: ["fence", "out"],
+                source: useLowTgem
+                    ? segmentBodyFusedGateLowTgem(bindings: bindings)
+                    : segmentBodyFusedGate(bindings: bindings),
+                header: source, ensureRowContiguous: true)
+            kernels[kernelName] = made
+            return made
+        }
+        let tg = 32 * simdgroups * mp
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
+            ("HPT", effHpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
+            ("MAXPART", mp), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+            ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
+            ("DYN_TREE", dynTree), ("CAST_FP8", castFP8),
+        ]
+        if !probe {
+            let lkey = SegGateLaunchKey(
+                dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
+                hpt: effHpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
+                castFP8: castFP8, lowTgem: useLowTgem)
+            let launch = kernel.prepare(
+                template: template,
+                grid: (kvHeads * (gqa / effHpt) * tg, b, 1),
+                threadGroup: (tg, 1, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
+            lock.withLock { segGateLaunchCache[lkey] = launch }
+            let outputs = launch(inputs)
+            return (outputs[0], outputs[1])
+        }
+        let outputs = kernel(
+            inputs,
+            template: template,
             grid: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
             threadGroup: (forceProbeFailure ? 2 * tg : tg / 2, 2, 1),
             outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])

@@ -343,6 +343,500 @@ public enum CBv2SmallProjection {
     /// One segment of a dispatch: `rows` output rows of weight `weight`
     /// starting at weight row `row0`, read from input `input`, written to
     /// output `output` from column `column0`.
+
+    /// `CBV2_FP8_ROWGROUPS=0`: disables Wave-6 `RG=4` + branchless half2 SIMD + streamAV
+    /// on pure-SPLIT FP8 `qkvg` (28L) and FP8 `SwiGLU` (7L), strictly `xnorDraftHeadEligible`-gated.
+    public static let fp8RowGroupsEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_ROWGROUPS"] != "0"
+
+    static let fp8W6Helper = """
+
+        inline half2 cbv2_sp_e4m3_lo(uint w) {
+            const uint v = w & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((w & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        inline half2 cbv2_sp_e4m3_hi(uint w) {
+            const uint v = (w >> 1) & 0x3F803F80u;
+            const uint u = v | ((v + 0x00800080u) & 0x40004000u) | (w & 0x80008000u);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        template <typename T>
+        inline void cbv2_sp_decode4_bld(uint w, float scale, thread T* out) {
+            const half2 h02 = cbv2_sp_e4m3_lo(w);
+            const half2 h13 = cbv2_sp_e4m3_hi(w);
+            out[0] = static_cast<T>(static_cast<float>(h02.x) * scale);
+            out[1] = static_cast<T>(static_cast<float>(h13.x) * scale);
+            out[2] = static_cast<T>(static_cast<float>(h02.y) * scale);
+            out[3] = static_cast<T>(static_cast<float>(h13.y) * scale);
+        }
+
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int PF>
+        inline void cbv2_sp_fp8_w6(
+            const device uint8_t* mat, float weight_scale, const device T* in_vec,
+            device T* out_vec, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* tgp) {
+            constexpr int BN = SPLIT ? 8 : 1;
+            constexpr int TN = 4;
+            constexpr int blockN = BN * 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            static_assert(P <= 32, "at most 32 values per lane");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr uint LOW = (1u << SH) - 1u;
+            int out_row = SPLIT ? tile * TM : (tile * 8 + int(simd_gid)) * TM;
+            if (!SPLIT && out_row >= N) {
+                return;
+            }
+            out_row = out_row + TM <= N ? out_row : N - TM;
+            const int g = SPLIT ? int(simd_gid) : 0;
+            int bn = (32 * g + int(simd_lid)) * TN;
+            const device uint8_t* rows = mat + size_t(out_row) * K;
+            float r[P2];
+            CBV2_SP_UNROLL
+            for (int i = 0; i < P2; i++) {
+                r[i] = 0.0f;
+            }
+            constexpr int PD = PF <= 1 ? 1 : (PF >= n_iter ? (n_iter > 0 ? n_iter : 1) : PF);
+            for (int i0 = 0; i0 < n_iter; i0 += PD) {
+                uint wblk[PD][TM];
+                CBV2_SP_UNROLL
+                for (int d = 0; d < PD; d++) {
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wblk[d][tm] = i0 + d < n_iter
+                            ? *(const device uint*)(rows + size_t(tm) * K + bn + d * blockN) : 0u;
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int d = 0; d < PD; d++) {
+                    if (i0 + d >= n_iter) {
+                        break;
+                    }
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        cbv2_sp_decode4_bld<T>(wblk[d][tm], weight_scale, inter[tm]);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += inter[tm][tn] * a;
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+            }
+            if (leftover > 0 && bn < K) {
+                T inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const uint w = *(const device uint*)(rows + size_t(tm) * K + bn);
+                    cbv2_sp_decode4_bld<T>(w, weight_scale, inter[tm]);
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av[tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                    }
+                }
+            }
+            const ushort lid = ushort(simd_lid);
+            cbv2_sp_tree_step<P2, 16>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int i = int(simd_lid >> SH);
+            if (SPLIT) {
+                if (holds) {
+                    tgp[g * 32 + i] = r[0];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (g == 0 && holds && i < P) {
+                    float result = r[0];
+                    for (int s = 1; s < BN; s++) {
+                        result += tgp[s * 32 + i];
+                    }
+                    out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
+                }
+            } else if (holds && i < P) {
+                out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
+            }
+        }
+        """
+
+    static let fp8SwiGLURowGroupHelper = """
+
+        template <typename T, int V, int RPS, int P2>
+        inline void cbv2_rg_swiglu_step_w6(
+            const device T* xc, int K, int bn, thread const uint* wg, thread const uint* wu,
+            float scale_g, float scale_u, thread float* rg, thread float* ru) {
+            T ig[RPS][4];
+            T iu[RPS][4];
+            CBV2_SP_UNROLL
+            for (int r = 0; r < RPS; r++) {
+                cbv2_sp_decode4_bld<T>(wg[r], scale_g, ig[r]);
+                cbv2_sp_decode4_bld<T>(wu[r], scale_u, iu[r]);
+            }
+            CBV2_SP_UNROLL
+            for (int v = 0; v < V; v++) {
+                const ushort4 av = ushort4(*(const device packed_ushort4*)(xc + size_t(v) * K + bn));
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < 4; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av[tn]));
+                    CBV2_SP_UNROLL
+                    for (int r = 0; r < RPS; r++) {
+                        rg[r * P2 + v] += ig[r][tn] * a;
+                        ru[r * P2 + v] += iu[r][tn] * a;
+                    }
+                }
+            }
+        }
+        """
+
+    private static let fp8SwiGLURowGroupSource = """
+        constexpr int TN = 4;
+        constexpr int blockN = 8 * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        constexpr int P = V;
+        static_assert(P <= 8, "at most 8 verify rows");
+        static_assert(K % 4 == 0, "whole 4-code words");
+        constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : 8;
+        constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : 2;
+        constexpr uint LOW = (1u << SH) - 1u;
+        const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+        const float scale_g = wsg[0];
+        const float scale_u = wsu[0];
+        const uint sid = simdgroup_index_in_threadgroup;
+        const int g = int(sid & 7u);
+        const int grp = int(sid >> 3);
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int row0 = (int(threadgroup_position_in_grid.y) * BM + grp) * RPS;
+        int bn = (32 * g + int(simd_lid)) * TN;
+        const device uint8_t* row_g[RPS];
+        const device uint8_t* row_u[RPS];
+        float rg[RPS * P2];
+        float ru[RPS * P2];
+        CBV2_SP_UNROLL
+        for (int r = 0; r < RPS; r++) {
+            const int row = min(row0 + r, N - 1);
+            row_g[r] = mg + size_t(row) * K;
+            row_u[r] = mu + size_t(row) * K;
+        }
+        CBV2_SP_UNROLL
+        for (int i = 0; i < RPS * P2; i++) {
+            rg[i] = 0.0f;
+            ru[i] = 0.0f;
+        }
+        for (int i0 = 0; i0 < n_iter; i0 += PF) {
+            uint wgb[PF][RPS];
+            uint wub[PF][RPS];
+            CBV2_SP_UNROLL
+            for (int d = 0; d < PF; d++) {
+                CBV2_SP_UNROLL
+                for (int r = 0; r < RPS; r++) {
+                    const bool ok = (PF == 1) || (i0 + d < n_iter);
+                    wgb[d][r] = ok ? *(const device uint*)(row_g[r] + bn + d * blockN) : 0u;
+                    wub[d][r] = ok ? *(const device uint*)(row_u[r] + bn + d * blockN) : 0u;
+                }
+            }
+            CBV2_SP_UNROLL
+            for (int d = 0; d < PF; d++) {
+                if (PF > 1 && i0 + d >= n_iter) {
+                    break;
+                }
+                cbv2_rg_swiglu_step_w6<T, V, RPS, P2>(xc, K, bn, wgb[d], wub[d], scale_g, scale_u, rg, ru);
+                bn += blockN;
+            }
+        }
+        if (leftover > 0 && bn < K) {
+            uint wg1[RPS];
+            uint wu1[RPS];
+            CBV2_SP_UNROLL
+            for (int r = 0; r < RPS; r++) {
+                wg1[r] = *(const device uint*)(row_g[r] + bn);
+                wu1[r] = *(const device uint*)(row_u[r] + bn);
+            }
+            cbv2_rg_swiglu_step_w6<T, V, RPS, P2>(xc, K, bn, wg1, wu1, scale_g, scale_u, rg, ru);
+        }
+        const ushort lid = ushort(simd_lid);
+        threadgroup float tgp_g[BM * RPS * 64];
+        threadgroup float tgp_u[BM * RPS * 64];
+        const bool holds = (simd_lid & LOW) == 0;
+        const int i = int(simd_lid >> SH);
+        CBV2_SP_UNROLL
+        for (int r = 0; r < RPS; r++) {
+            thread float* xg = rg + r * P2;
+            thread float* xu = ru + r * P2;
+            cbv2_sp_tree_step<P2, 16>(xg, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(xg, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(xg, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(xg, lid);
+            cbv2_sp_tree_step<1, 1>(xg, lid);
+            cbv2_sp_tree_step<P2, 16>(xu, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(xu, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(xu, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(xu, lid);
+            cbv2_sp_tree_step<1, 1>(xu, lid);
+            if (holds && i < 8) {
+                tgp_g[((grp * RPS + r) * 8 + g) * 8 + i] = xg[0];
+                tgp_u[((grp * RPS + r) * 8 + g) * 8 + i] = xu[0];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g < RPS && simd_lid < uint(P)) {
+            const int r = g;
+            const int v = int(simd_lid);
+            const int out_row = row0 + r;
+            const int base = (grp * RPS + r) * 64;
+            float res_g = tgp_g[base + v];
+            float res_u = tgp_u[base + v];
+            for (int s = 1; s < 8; s++) {
+                res_g += tgp_g[base + s * 8 + v];
+                res_u += tgp_u[base + s * 8 + v];
+            }
+            if (out_row < N) {
+                const bfloat16_t gv = static_cast<bfloat16_t>(res_g);
+                const bfloat16_t uv = static_cast<bfloat16_t>(res_u);
+                const bfloat16_t zero_bf = bfloat16_t(0.0f);
+                const bfloat16_t one_bf = bfloat16_t(1.0f);
+                const bfloat16_t ax = (gv < zero_bf) ? -gv : gv;
+                const bfloat16_t ey = static_cast<bfloat16_t>(
+                    metal::precise::exp(static_cast<float>(ax)));
+                const bfloat16_t sy = one_bf / (one_bf + ey);
+                const bfloat16_t sig = (gv < zero_bf) ? sy : (one_bf - sy);
+                bfloat16_t act = (gv * sig) * uv;
+                if constexpr (CAST_FP8) {
+                    const float scaled = static_cast<float>(act) * fp8_mu[0];
+                    const uint8_t bits = modelopt_e4m3_bits(scaled);
+                    const float decoded =
+                        (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                    const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > fp8_bd[0];
+                    act = static_cast<bfloat16_t>(invalid ? nan_value : decoded * fp8_mu[1]);
+                }
+                y[size_t(v) * N + out_row] = static_cast<T>(act);
+            }
+        }
+        """
+
+    private static let fp8SwiGLURowGroupKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_swiglu_rg_w6",
+        inputNames: ["mg", "wsg", "mu", "wsu", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8SwiGLURowGroupSource,
+        header: ModelOptActivationKernels.header + fp8Helper + fp8W6Helper + fp8SwiGLURowGroupHelper)
+
+    private struct FP8RGLaunchKey: Hashable {
+        let shape: FP8Shape
+        let dtype: DType
+        let inputs: Int
+        let rows: Int
+        let outputs: [Int]
+        let rowGroups: Int
+    }
+
+    private struct FP8SwiGLURGLaunchKey: Hashable {
+        let dtype: DType
+        let inputs: Int
+        let outputs: Int
+        let rows: Int
+        let castFP8: Bool
+        let rowGroups: Int
+    }
+
+    nonisolated(unsafe) private static var fp8RGKernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var fp8RGLaunchCache:
+        [FP8RGLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var fp8SwiGLURGLaunchCache:
+        [FP8SwiGLURGLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var fp8RGChecked = false
+    nonisolated(unsafe) private static var fp8RGVerified = false
+    nonisolated(unsafe) private static var fp8SwiGLURGChecked = false
+    nonisolated(unsafe) private static var fp8SwiGLURGVerified = false
+
+    private static func fp8W6RowGroupKernel(_ shape: FP8Shape, rowGroups rg: Int) -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = "w6rg\(rg)_" + shape.segments.map {
+            "\($0.weight)_\($0.row0)_\($0.rows)_\($0.tm)_\($0.prefetch)"
+        }.joined(separator: "_")
+        if let existing = fp8RGKernels[key] { return existing }
+        var inputs = [String]()
+        for i in 0 ..< shape.weights {
+            inputs += ["m\(i)", "s\(i)"]
+        }
+        inputs.append("xc")
+        let outputs = (0 ..< shape.outputs).map { "y\($0)" }
+        var body = """
+            threadgroup float sp_tgp_all[\(rg) * 8 * 32];
+            const uint rg_idx = simdgroup_index_in_threadgroup / 8;
+            const uint sg = simdgroup_index_in_threadgroup % 8;
+            const uint sl = thread_index_in_simdgroup;
+            const int tg = int(threadgroup_position_in_grid.y) * \(rg) + int(rg_idx);
+            threadgroup float* sp_tgp = sp_tgp_all + rg_idx * 256;
+
+            """
+        var offset = 0
+        for (i, s) in shape.segments.enumerated() {
+            let end = offset + s.tiles
+            body += """
+                \(i == 0 ? "" : "else ")if (tg < \(end)) {
+                    cbv2_sp_fp8_w6<T, K, V, \(s.tm), true, \(s.rows), \(s.outputWidth), \(s.prefetch)>(
+                        m\(s.weight) + size_t(\(s.row0)) * K, s\(s.weight)[0], xc,
+                        y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
+                }
+
+                """
+            offset = end
+        }
+        let name = "cbv2_small_fp8_w6_rg\(rg)_" + stableName(body)
+        let made = MLXFast.metalKernel(
+            name: name, inputNames: inputs, outputNames: outputs, source: body,
+            header: ModelOptActivationKernels.header + fp8Helper + fp8W6Helper)
+        fp8RGKernels[key] = made
+        return made
+    }
+
+    private static func fp8RGLaunch(
+        shape: FP8Shape, dtype: DType, inputs: Int, rows: Int, outputDims: [Int], rowGroups rg: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = FP8RGLaunchKey(
+            shape: shape, dtype: dtype, inputs: inputs, rows: rows, outputs: outputDims,
+            rowGroups: rg)
+        if let hit = lock.withLock({ fp8RGLaunchCache[key] }) { return hit }
+        let tiles = shape.segments.reduce(0) { $0 + $1.tiles }
+        let groups = (tiles + rg - 1) / rg
+        let made = fp8W6RowGroupKernel(shape, rowGroups: rg).prepare(
+            template: [("T", dtype), ("K", inputs), ("V", rows)],
+            grid: (32, 8 * rg * groups, 1), threadGroup: (32, 8 * rg, 1),
+            outputShapes: outputDims.map { [rows, $0] },
+            outputDTypes: Array(repeating: dtype, count: outputDims.count))
+        lock.withLock { fp8RGLaunchCache[key] = made }
+        return made
+    }
+
+    private static func ensureFP8RowGroupsVerified(
+        shape: FP8Shape, arrays: [MLXArray], dtype: DType, inputs: Int, rows: Int,
+        outputDims: [Int], rowGroups rg: Int
+    ) -> Bool {
+        let (checked, verified) = lock.withLock { (fp8RGChecked, fp8RGVerified) }
+        if checked { return verified }
+        var vals = [Float]()
+        vals.reserveCapacity(rows * inputs)
+        for i in 0 ..< (rows * inputs) {
+            vals.append(Float(((i * 11 + 5) % 29) - 14) * 0.0625)
+        }
+        var testArrays = Array(arrays.dropLast())
+        testArrays.append(MLXArray(vals, [rows, inputs]).asType(dtype))
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                let tiles = shape.segments.reduce(0) { $0 + $1.tiles }
+                let refLaunch = fp8Kernel(shape).prepare(
+                    template: [("T", dtype), ("K", inputs), ("V", rows)],
+                    grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                    outputShapes: outputDims.map { [rows, $0] },
+                    outputDTypes: Array(repeating: dtype, count: outputDims.count))
+                let ref = refLaunch(testArrays)
+                let got = fp8RGLaunch(
+                    shape: shape, dtype: dtype, inputs: inputs, rows: rows,
+                    outputDims: outputDims, rowGroups: rg)(testArrays)
+                var totalDiff = MLXArray(Int32(0))
+                for (a, b) in zip(got, ref) {
+                    totalDiff = totalDiff
+                        + (a.view(dtype: .uint16) .!= b.view(dtype: .uint16)).asType(.int32).sum()
+                }
+                eval(totalDiff)
+                return totalDiff.item(Int.self) == 0
+            }) ?? false
+        lock.withLock {
+            fp8RGChecked = true
+            fp8RGVerified = ok
+        }
+        return ok
+    }
+
+    private static func fp8SwiGLURGLaunch(
+        dtype: DType, inputs: Int, outputs: Int, rows: Int, castFP8: Bool, rowGroups rg: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = FP8SwiGLURGLaunchKey(
+            dtype: dtype, inputs: inputs, outputs: outputs, rows: rows, castFP8: castFP8,
+            rowGroups: rg)
+        if let hit = lock.withLock({ fp8SwiGLURGLaunchCache[key] }) { return hit }
+        let threadgroups = (outputs + rg - 1) / rg
+        let made = fp8SwiGLURowGroupKernel.prepare(
+            template: [
+                ("T", dtype), ("K", inputs), ("V", rows), ("N", outputs),
+                ("BM", rg), ("RPS", 1), ("PF", 1), ("CAST_FP8", castFP8),
+            ],
+            grid: (32, 8 * rg * threadgroups, 1), threadGroup: (32, 8 * rg, 1),
+            outputShapes: [[rows, outputs]], outputDTypes: [dtype])
+        lock.withLock { fp8SwiGLURGLaunchCache[key] = made }
+        return made
+    }
+
+    private static func ensureFP8SwiGLURowGroupsVerified(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear,
+        muArr: MLXArray, bdArr: MLXArray, castFP8: Bool,
+        dtype: DType, inputs: Int, outputs: Int, rows: Int, rowGroups rg: Int
+    ) -> Bool {
+        let (checked, verified) = lock.withLock { (fp8SwiGLURGChecked, fp8SwiGLURGVerified) }
+        if checked { return verified }
+        var vals = [Float]()
+        vals.reserveCapacity(rows * inputs)
+        for i in 0 ..< (rows * inputs) {
+            vals.append(Float(((i * 7 + 3) % 29) - 14) * 0.0625)
+        }
+        let testX = MLXArray(vals, [rows, inputs]).asType(dtype)
+        let args = [
+            gate.weight, gate.graphConstants!.outputScale,
+            up.weight, up.graphConstants!.outputScale,
+            testX, muArr, bdArr,
+        ]
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                let refLaunch = fp8GateUpSiluKernel.prepare(
+                    template: [
+                        ("T", dtype), ("K", inputs), ("V", rows), ("N", outputs),
+                        ("DV_MODE", 0), ("VO", false), ("CAST_FP8", castFP8),
+                    ],
+                    grid: (32, 8 * outputs, 1), threadGroup: (32, 8, 1),
+                    outputShapes: [[rows, outputs]], outputDTypes: [dtype])
+                let ref = refLaunch(args)[0]
+                let got = fp8SwiGLURGLaunch(
+                    dtype: dtype, inputs: inputs, outputs: outputs, rows: rows,
+                    castFP8: castFP8, rowGroups: rg)(args)[0]
+                let diff = (got.view(dtype: .uint16) .!= ref.view(dtype: .uint16))
+                    .asType(.int32).sum()
+                eval(diff)
+                return diff.item(Int.self) == 0
+            }) ?? false
+        lock.withLock {
+            fp8SwiGLURGChecked = true
+            fp8SwiGLURGVerified = ok
+        }
+        return ok
+    }
+
     struct FP8Segment: Hashable {
         var weight: Int
         var row0: Int
@@ -651,6 +1145,19 @@ public enum CBv2SmallProjection {
             vectorDecodeMode: dvMode, rowsOuter: useRowsOuter, weights: layers.count,
             outputs: layers.count, segments: segments)
         let outputDims = layers.map(\.outputDimensions)
+        let deepLow = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
+        let allSplit = segments.allSatisfy(\.split)
+        let totalTiles = segments.reduce(0) { $0 + $1.tiles }
+        if deepLow && fp8RowGroupsEnvEnabled && sharedInput && layers.count >= 2 && rows >= 2
+            && allSplit && totalTiles >= 4 && totalTiles % 4 == 0
+            && ensureFP8RowGroupsVerified(
+                shape: shape, arrays: arrays, dtype: flat.dtype, inputs: inputs, rows: rows,
+                outputDims: outputDims, rowGroups: 4)
+        {
+            return fp8RGLaunch(
+                shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows,
+                outputDims: outputDims, rowGroups: 4)(arrays)
+        }
         let launchKey = FP8LaunchKey(
             shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
         let launch: MLXFast.MLXFastKernel.Launch
@@ -915,6 +1422,116 @@ public enum CBv2SmallProjection {
         }
         """
 
+    /// `CBV2_DENSE_ROWGROUPS=0`: disables `RG=4` multi-row-group dense BF16/FP16 verify projections
+    /// (`V >= 6`, low-acceptance only, 0-ULP verified at first eligible call).
+    public static let denseRowGroupsEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DENSE_ROWGROUPS"] != "0"
+
+    nonisolated(unsafe) private static var denseRowGroupsChecked = false
+    nonisolated(unsafe) private static var denseRowGroupsVerified = false
+
+    static let denseRowGroupHelper = """
+
+        template <typename T, int K, int V, int TM, int N, int NOUT, int PF>
+        inline void cbv2_sp_dense_rg(
+            const device T* mat, const device T* in_vec, device T* out_vec,
+            int tile, uint g, uint simd_lid, threadgroup float* tgp) {
+            constexpr int BN = 8;
+            constexpr int TN = 4;
+            constexpr int blockN = BN * 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            static_assert(P <= 32, "at most 32 values per lane");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr uint LOW = (1u << SH) - 1u;
+            int out_row = tile * TM;
+            if (out_row >= N) { return; }
+            out_row = out_row + TM <= N ? out_row : N - TM;
+            int bn = (32 * int(g) + int(simd_lid)) * TN;
+            const device T* rows = mat + size_t(out_row) * K;
+            float r[P2];
+            CBV2_SP_UNROLL
+            for (int i = 0; i < P2; i++) { r[i] = 0; }
+            constexpr int PD = PF <= 1 ? 1 : (PF >= n_iter ? (n_iter > 0 ? n_iter : 1) : PF);
+            for (int i0 = 0; i0 < n_iter; i0 += PD) {
+              ushort4 wblk[PD][TM];
+              CBV2_SP_UNROLL
+              for (int d = 0; d < PD; d++) {
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                  wblk[d][tm] = i0 + d < n_iter
+                      ? ushort4(*(const device packed_ushort4*)(rows + tm * K + bn + d * blockN))
+                      : ushort4(0);
+                }
+              }
+              CBV2_SP_UNROLL
+              for (int d = 0; d < PD; d++) {
+                if (i0 + d >= n_iter) { break; }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                  const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn));
+                  CBV2_SP_UNROLL
+                  for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av[tn]));
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                      r[v * TM + tm] += as_type<T>(wblk[d][tm][tn]) * a;
+                    }
+                  }
+                }
+                bn += blockN;
+              }
+            }
+            if (leftover > 0) {
+              if (bn + TN <= K) {
+                ushort4 wtail[TM];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                  wtail[tm] = ushort4(*(const device packed_ushort4*)(rows + tm * K + bn));
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                  const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn));
+                  CBV2_SP_UNROLL
+                  for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av[tn]));
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                      r[v * TM + tm] += as_type<T>(wtail[tm][tn]) * a;
+                    }
+                  }
+                }
+              } else if (bn < K) {
+                for (int v = 0; v < V; v++) {
+                  for (int tn = 0; tn < TN && bn + tn < K; tn++) {
+                    const float a = static_cast<float>(in_vec[v * K + bn + tn]);
+                    for (int tm = 0; tm < TM; tm++) {
+                      r[v * TM + tm] += static_cast<T>(rows[tm * K + bn + tn]) * a;
+                    }
+                  }
+                }
+              }
+            }
+            const ushort lid = ushort(simd_lid);
+            cbv2_sp_tree_step<P2, 16>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int i = int(simd_lid >> SH);
+            if (holds) { tgp[g * 32 + i] = r[0]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (g == 0 && holds && i < P) {
+              float result = r[0];
+              for (int s = 1; s < BN; s++) { result += tgp[s * 32 + i]; }
+              out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
+            }
+        }
+        """
+
     struct DenseSegment: Hashable {
         var rows: Int
         var split: Bool
@@ -933,11 +1550,109 @@ public enum CBv2SmallProjection {
         let dtype: DType
         let inputs: Int
         let rows: Int
+        let rowGroups: Int
     }
 
     nonisolated(unsafe) private static var denseKernels: [DenseShape: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var denseRGKernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var denseLaunchCache:
         [DenseLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+    private static func denseRowGroupKernel(_ shape: DenseShape, rowGroups rg: Int) -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        let cacheKey = "\(rg)_" + shape.segments.map { "\($0.rows)_\($0.tm)_\($0.prefetch)" }.joined(separator: "_")
+        if let existing = denseRGKernels[cacheKey] { return existing }
+        var inputs = (0 ..< shape.segments.count).map { "m\($0)" }
+        inputs.append("xc")
+        let outputs = (0 ..< shape.segments.count).map { "y\($0)" }
+        var body = """
+            threadgroup float sp_tgp_all[\(rg) * 8 * 32];
+            const uint rg_idx = simdgroup_index_in_threadgroup / 8;
+            const uint sg = simdgroup_index_in_threadgroup % 8;
+            const uint sl = thread_index_in_simdgroup;
+            const int tg = int(threadgroup_position_in_grid.y) * \(rg) + int(rg_idx);
+            threadgroup float* sp_tgp = sp_tgp_all + rg_idx * 256;
+
+            """
+        var offset = 0
+        for (i, s) in shape.segments.enumerated() {
+            let end = offset + s.tiles
+            body += """
+                \(i == 0 ? "" : "else ")if (tg < \(end)) {
+                    cbv2_sp_dense_rg<T, K, V, \(s.tm), \(s.rows), \(s.rows), \(s.prefetch)>(
+                        m\(i), xc, y\(i), tg - \(offset), sg, sl, sp_tgp);
+                }
+
+                """
+            offset = end
+        }
+        let name = "cbv2_small_dense_rg\(rg)_" + stableName(body)
+        let made = MLXFast.metalKernel(
+            name: name, inputNames: inputs, outputNames: outputs, source: body,
+            header: ModelOptActivationKernels.header + fp8Helper + denseHelper + denseRowGroupHelper)
+        denseRGKernels[cacheKey] = made
+        return made
+    }
+
+    private static func denseLaunch(
+        shape: DenseShape, dtype: DType, inputs: Int, rows: Int, rowGroups rg: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let launchKey = DenseLaunchKey(
+            shape: shape, dtype: dtype, inputs: inputs, rows: rows, rowGroups: rg)
+        if let hit = lock.withLock({ denseLaunchCache[launchKey] }) { return hit }
+        let tiles = shape.segments.reduce(0) { $0 + $1.tiles }
+        let made: MLXFast.MLXFastKernel.Launch
+        if rg > 1 {
+            let groups = (tiles + rg - 1) / rg
+            made = denseRowGroupKernel(shape, rowGroups: rg).prepare(
+                template: [("T", dtype), ("K", inputs), ("V", rows)],
+                grid: (32, 8 * rg * groups, 1), threadGroup: (32, 8 * rg, 1),
+                outputShapes: shape.segments.map { [rows, $0.rows] },
+                outputDTypes: Array(repeating: dtype, count: shape.segments.count))
+        } else {
+            made = denseKernel(shape).prepare(
+                template: [("T", dtype), ("K", inputs), ("V", rows)],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: shape.segments.map { [rows, $0.rows] },
+                outputDTypes: Array(repeating: dtype, count: shape.segments.count))
+        }
+        lock.withLock { denseLaunchCache[launchKey] = made }
+        return made
+    }
+
+    private static func ensureDenseRowGroupsVerified(
+        shape: DenseShape, arrays: [MLXArray], dtype: DType, inputs: Int, rows: Int, rowGroups rg: Int
+    ) -> Bool {
+        let (checked, verified) = lock.withLock { (denseRowGroupsChecked, denseRowGroupsVerified) }
+        if checked { return verified }
+        var vals = [Float]()
+        vals.reserveCapacity(rows * inputs)
+        for i in 0 ..< (rows * inputs) {
+            vals.append(Float(((i * 13 + 5) % 29) - 14) * 0.0625)
+        }
+        let testX = MLXArray(vals, [rows, inputs]).asType(dtype)
+        var testArrays = Array(arrays.dropLast())
+        testArrays.append(testX)
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                let ref = denseLaunch(
+                    shape: shape, dtype: dtype, inputs: inputs, rows: rows, rowGroups: 1)(testArrays)
+                let got = denseLaunch(
+                    shape: shape, dtype: dtype, inputs: inputs, rows: rows, rowGroups: rg)(testArrays)
+                var totalDiff = MLXArray(Int32(0))
+                for (a, b) in zip(got, ref) {
+                    totalDiff = totalDiff + (a.view(dtype: .uint16) .!= b.view(dtype: .uint16)).asType(.int32).sum()
+                }
+                eval(totalDiff)
+                return totalDiff.item(Int.self) == 0
+            }) ?? false
+        lock.withLock {
+            denseRowGroupsChecked = true
+            denseRowGroupsVerified = ok
+        }
+        return ok
+    }
 
     private static func denseKernel(_ shape: DenseShape) -> MLXFast.MLXFastKernel {
         lock.lock()
@@ -1002,25 +1717,25 @@ public enum CBv2SmallProjection {
         }
         let flat = x.reshaped(rows, inputs)
         arrays.append(flat)
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let deepLow = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
-            || (fp8RowsOuterMode == 1 && rows >= 5
-                && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance))
+            || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
         let shape = DenseShape(rowsOuter: useRowsOuter, segments: segments)
-        let launchKey = DenseLaunchKey(shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows)
-        let launch: MLXFast.MLXFastKernel.Launch
-        if let hit = lock.withLock({ denseLaunchCache[launchKey] }) {
-            launch = hit
-        } else {
-            let tiles = segments.reduce(0) { $0 + $1.tiles }
-            let made = denseKernel(shape).prepare(
-                template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
-                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-                outputShapes: segments.map { [rows, $0.rows] },
-                outputDTypes: Array(repeating: flat.dtype, count: segments.count))
-            lock.withLock { denseLaunchCache[launchKey] = made }
-            launch = made
+        let tiles = segments.reduce(0) { $0 + $1.tiles }
+        let allSplit = segments.allSatisfy(\.split)
+        var rg = 1
+        if deepLow && denseRowGroupsEnvEnabled && rows >= 6 && allSplit && tiles >= 4 && tiles % 4 == 0 {
+            if ensureDenseRowGroupsVerified(
+                shape: shape, arrays: arrays, dtype: flat.dtype, inputs: inputs, rows: rows,
+                rowGroups: 4)
+            {
+                rg = 4
+            }
         }
+        let launch = denseLaunch(
+            shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, rowGroups: rg)
         let lead = Array(x.shape.dropLast())
         return zip(launch(arrays), segments).map { $0.reshaped(lead + [$1.rows]) }
     }
@@ -1672,6 +2387,21 @@ public enum CBv2SmallProjection {
             muArr = dummyFP8Mu
             bdArr = dummyFP8Bound
             castFP8 = false
+        }
+        let deepLow = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
+        if deepLow && fp8RowGroupsEnvEnabled && rows >= 2 && outputs % 8 == 0
+            && ensureFP8SwiGLURowGroupsVerified(
+                gate: gate, up: up, muArr: muArr, bdArr: bdArr, castFP8: castFP8,
+                dtype: preCast.dtype, inputs: inputs, outputs: outputs, rows: rows, rowGroups: 4)
+        {
+            let res = fp8SwiGLURGLaunch(
+                dtype: preCast.dtype, inputs: inputs, outputs: outputs, rows: rows,
+                castFP8: castFP8, rowGroups: 4)([
+                    gate.weight, gate.graphConstants!.outputScale,
+                    up.weight, up.graphConstants!.outputScale,
+                    preCast.reshaped(rows, inputs), muArr, bdArr,
+                ])[0]
+            return res.reshaped(Array(preCast.shape.dropLast()) + [outputs])
         }
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2

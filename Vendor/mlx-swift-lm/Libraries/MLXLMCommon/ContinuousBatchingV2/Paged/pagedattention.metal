@@ -637,10 +637,59 @@ inline void paged_attention_merge_impl(
 // Threadgroup memory: q_smem[HPT * D], red_smem[MAXPART * NSG * HPT * (D + 2)],
 // part_smem[MAXPART * HPT * (D + 2)] floats.
 // BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
+// Bit-exact ModelOpt E4M3 activation cast + BF16 sigmoid helpers for fused
+// one-pass paged attention epilogue (`FUSED_GATE = true`, 0-ULP).
+inline uint8_t w7_e4m3_bits(float value) {
+    uint32_t fp8_max = 543 << 21;
+    uint32_t denorm_mask = 141 << 23;
+    uint32_t f_bits = as_type<uint32_t>(value);
+    uint32_t sign = f_bits & 0x80000000;
+    f_bits ^= sign;
+    uint8_t bits;
+    if (f_bits >= fp8_max) {
+        bits = 0x7E;
+    } else if (f_bits < (121 << 23)) {
+        f_bits = as_type<uint32_t>(
+            as_type<float>(f_bits) + as_type<float>(denorm_mask));
+        bits = static_cast<uint8_t>(f_bits - denorm_mask);
+    } else {
+        uint8_t mant_odd = (f_bits >> 20) & 1;
+        f_bits += ((uint32_t)(7 - 127) << 23) + 0x7FFFF;
+        f_bits += mant_odd;
+        bits = static_cast<uint8_t>(f_bits >> 20);
+    }
+    return bits | static_cast<uint8_t>(sign >> 24);
+}
+
+inline float w7_e4m3_value(uint8_t bits) {
+    half converted = as_type<half>(static_cast<uint16_t>((bits & 127) << 7));
+    converted *= 256.0;
+    return static_cast<float>((bits & 128) ? -converted : converted);
+}
+
+inline bfloat16_t w7_bf16_sigmoid(bfloat16_t x) {
+    bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+    bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+    bfloat16_t one = bfloat16_t(1.0f);
+    bfloat16_t y = one / (one + ey);
+    return (x < bfloat16_t(0.0f)) ? y : (one - y);
+}
+
+inline bfloat16_t w7_bf16_cast_fp8(
+    bfloat16_t yb, float m0, float m1, float bound, float nan_value
+) {
+    float scaled = static_cast<float>(yb) * m0;
+    uint8_t bits = w7_e4m3_bits(scaled);
+    float decoded = (bits & 0x7F) == 0x7F ? nan_value : w7_e4m3_value(bits);
+    bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+    return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+}
+
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
+    bool FUSED_GATE = false, bool CAST_FP8 = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -657,7 +706,11 @@ inline void paged_attention_onepass_impl(
     uint3 tpitg,
     uint sgitg,
     uint lane,
-    const device int32_t* tree_meta = nullptr
+    const device int32_t* tree_meta = nullptr,
+    const device bfloat16_t* gate = nullptr,
+    float fp8_m0 = 1.0f,
+    float fp8_m1 = 1.0f,
+    float fp8_bound = 448.0f
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -900,11 +953,407 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t row_off = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + row_off;
+            if constexpr (FUSED_GATE) {
+                const device bfloat16_t* grow = gate + row_off;
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    const bfloat16_t ob = static_cast<bfloat16_t>(gacc[e] * inv);
+                    const bfloat16_t gb = grow[lane * EPT + e];
+                    const bfloat16_t yb = ob * w7_bf16_sigmoid(gb);
+                    if constexpr (CAST_FP8) {
+                        orow[lane * EPT + e] = static_cast<T>(
+                            w7_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value));
+                    } else {
+                        orow[lane * EPT + e] = static_cast<T>(yb);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    orow[lane * EPT + e] = T(gacc[e] * inv);
+                }
+            }
+        }
+    }
+}
+
+// Low-TGEM (12.5 KB at MAXPART=2, 25.0 KB at MAXPART=4, HPT=NSG=4, D=128)
+// register-resident-Q one-pass paged decode attention with fused 0-ULP
+// `output * sigmoid(gate)` (+ optional ModelOpt FP8 activation cast).
+// Eliminates `q_smem`, `part_smem`, and the initial barrier by holding
+// scaled queries in per-lane registers `qv[HPT][EPT]` and keeping each
+// simdgroup's own head `g == state` in registers while publishing only
+// `g != state` to `red_smem[MAXPART * HPT * (NSG - 1) * (D + 2)]`.
+// Preserves exact `s = 0..NSG-1` and `p = 0..parts-1` reduction order (0-ULP).
+template <
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
+    bool FUSED_GATE = false, bool CAST_FP8 = false>
+inline void paged_attention_onepass_lowtgem_impl(
+    const device T* q,
+    thread const Cache& cache,
+    const device int32_t* tables,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int maxp,
+    threadgroup float* red_smem, // [MAXPART * HPT * (NSG - 1) * (D + 2)]
+    device T* out,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane,
+    const device int32_t* tree_meta = nullptr,
+    const device bfloat16_t* gate = nullptr,
+    float fp8_m0 = 1.0f,
+    float fp8_m1 = 1.0f,
+    float fp8_bound = 448.0f
+) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    static_assert(NSG == HPT, "1-to-1 head-to-simdgroup register owner");
+    static_assert(D / 32 == 4, "vec4 EPT == 4");
+    constexpr int SPLITS = GQA / HPT;
+    constexpr int EPT = D / 32;
+    constexpr int RSTRIDE = D + 2;
+    constexpr int SLOTS = NSG - 1;
+
+    const int kv_head = int(tgpig.x) / SPLITS;
+    const int hgroup = int(tgpig.x) % SPLITS;
+    const int b = int(tgpig.y);
+    const int part = int(sgitg) / NSG;
+    const int state = int(sgitg) % NSG;
+
+    const device int32_t* info = seqinfo + b * 8;
+    int attend_start = info[0];
+    int attend_len = info[1];
+    const int table_len = info[2];
+    int tree_base = 0;
+    uint tree_anc = 0u;
+    if constexpr (DYN_TREE) {
+        tree_base = info[6];
+        const int depth = tree_meta[9 + b];
+        const int q_pos = tree_base + depth;
+        const int win = info[7];
+        if (win > 0) {
+            attend_start = max(attend_start, q_pos - win + 1);
+        }
+        attend_len = q_pos - attend_start + 1;
+        tree_anc = uint(tree_meta[1 + b]);
+    }
+    const int parts = (attend_len + PTOK - 1) / PTOK;
+    const int lo = part * PTOK;
+    const int hi = min(attend_len, lo + PTOK);
+    const bool active = lo < attend_len;
+
+    const device int32_t* table = tables + (size_t)b * (size_t)maxp;
+    const float softcap = params[0];
+    const float scale = params[1];
+
+    const int q_head0 = kv_head * GQA + hgroup * HPT;
+    const size_t q_base = (size_t)b * (size_t)(kvh * GQA) * D + (size_t)q_head0 * D + lane * EPT;
+
+    float qv[HPT][EPT];
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        const vec<T, 4> q4 = *reinterpret_cast<const device vec<T, 4>*>(q + q_base + (size_t)g * D);
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            qv[g][e] = float(q4[e]) * scale;
+        }
+    }
+
+    float m[HPT];
+    float l[HPT];
+    float acc[HPT][EPT];
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        m[g] = -FLT_MAX;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            acc[g][e] = 0.0f;
+        }
+    }
+
+    float kf[EPT];
+    float vf[EPT];
+    if (active && BLOCK > 1) {
+        const int first = lo + state;
+        const int count = first < hi ? (hi - first + NSG - 1) / NSG : 0;
+        int cur_lpage = -1;
+        const device T* cur_key = nullptr;
+        const device T* cur_value = nullptr;
+        for (int j0 = 0; j0 < count; j0 += BLOCK) {
+            vec<T, 4> kr[BLOCK];
+            vec<T, 4> vr[BLOCK];
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+                    const int raw_pos = attend_start + first + (j0 + u) * NSG;
+                    const int pos = DYN_TREE
+                        ? ((tree_anc != 0u && raw_pos >= tree_base)
+                            ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                            : raw_pos)
+                        : raw_pos;
+                    const int lpage = int(uint(pos) / uint(S));
+                    const int slot = int(uint(pos) % uint(S));
+                    if (lpage != cur_lpage) {
+                        const auto page = cache.read_page(table, lpage, table_len);
+                        cur_key = page.key;
+                        cur_value = page.value;
+                        cur_lpage = lpage;
+                    }
+                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
+                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
+                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        kf[e] = float(kr[u][e]);
+                        vf[e] = float(vr[u][e]);
+                    }
+#pragma unroll
+                    for (int g = 0; g < HPT; g++) {
+                        float partial = 0.0f;
+#pragma unroll
+                        for (int e = 0; e < EPT; e++) {
+                            partial += qv[g][e] * kf[e];
+                        }
+                        float qk = simd_sum(partial);
+                        if (HAS_SOFTCAP) {
+                            qk = softcap * precise::tanh(qk / softcap);
+                        }
+                        qk *= M_LOG2E_F;
+
+                        const float m_new = max(m[g], qk);
+                        const float corr = exp2(m[g] - m_new);
+                        const float p = exp2(qk - m_new);
+                        l[g] = l[g] * corr + p;
+#pragma unroll
+                        for (int e = 0; e < EPT; e++) {
+                            acc[g][e] = acc[g][e] * corr + p * vf[e];
+                        }
+                        m[g] = m_new;
+                    }
+                }
+            }
+        }
+    } else if (active) {
+        for (int i = lo + state; i < hi; i += NSG) {
+            const int raw_pos = attend_start + i;
+            const int pos = DYN_TREE
+                ? ((tree_anc != 0u && raw_pos >= tree_base)
+                    ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
+                    : raw_pos)
+                : raw_pos;
+            const int lpage = int(uint(pos) / uint(S));
+            const int slot = int(uint(pos) % uint(S));
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+#pragma unroll
+            for (int g = 0; g < HPT; g++) {
+                float partial = 0.0f;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    partial += qv[g][e] * kf[e];
+                }
+                float qk = simd_sum(partial);
+                if (HAS_SOFTCAP) {
+                    qk = softcap * precise::tanh(qk / softcap);
+                }
+                qk *= M_LOG2E_F;
+
+                const float m_new = max(m[g], qk);
+                const float corr = exp2(m[g] - m_new);
+                const float p = exp2(qk - m_new);
+                l[g] = l[g] * corr + p;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    acc[g][e] = acc[g][e] * corr + p * vf[e];
+                }
+                m[g] = m_new;
+            }
+        }
+    }
+
+    // Publish only g != state into red_smem[part][g][slot] (NSG - 1 slots/head).
+    threadgroup float* part_red = red_smem + (size_t)(part * HPT * SLOTS) * RSTRIDE;
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        if (g != state) {
+            const int slot = (state > g) ? (state - 1) : state;
+            threadgroup float* dst = part_red + (size_t)(g * SLOTS + slot) * RSTRIDE;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                dst[lane * EPT + e] = acc[g][e];
             }
+            if (lane == 0) {
+                dst[D] = m[g];
+                dst[D + 1] = l[g];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Simdgroup `state` merges head `g = state` in exact s = 0..NSG-1 order.
+    const int g = state;
+    float pm = -FLT_MAX;
+    float pl = 0.0f;
+    float pv[EPT];
+#pragma unroll
+    for (int e = 0; e < EPT; e++) {
+        pv[e] = 0.0f;
+    }
+
+    if (active) {
+        threadgroup float* head_red = part_red + (size_t)(g * SLOTS) * RSTRIDE;
+        float ms_arr[NSG];
+        float ls_arr[NSG];
+#pragma unroll
+        for (int s = 0; s < NSG; s++) {
+            if (s == state) {
+                ms_arr[s] = m[g];
+                ls_arr[s] = l[g];
+            } else {
+                const int slot = (s > g) ? (s - 1) : s;
+                ms_arr[s] = head_red[(size_t)slot * RSTRIDE + D];
+                ls_arr[s] = head_red[(size_t)slot * RSTRIDE + D + 1];
+            }
+            pm = max(pm, ms_arr[s]);
+        }
+        float w_arr[NSG];
+#pragma unroll
+        for (int s = 0; s < NSG; s++) {
+            w_arr[s] = exp2(ms_arr[s] - pm);
+            pl += ls_arr[s] * w_arr[s];
+        }
+#pragma unroll
+        for (int s = 0; s < NSG; s++) {
+            if (s == state) {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    pv[e] += acc[g][e] * w_arr[s];
+                }
+            } else {
+                const int slot = (s > g) ? (s - 1) : s;
+                const threadgroup float* src = head_red + (size_t)slot * RSTRIDE + lane * EPT;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    pv[e] += src[e] * w_arr[s];
+                }
+            }
+        }
+    }
+
+    // Fast path for single-partition sequences: zero 2nd barrier, zero TGEM write.
+    if (parts == 1) {
+        if (part == 0) {
+            const float inv = pl > 0.0f ? 1.0f / pl : 0.0f;
+            const size_t row_off =
+                ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D + lane * EPT;
+            if constexpr (FUSED_GATE) {
+                const vec<bfloat16_t, 4> g4 =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(gate + row_off);
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                vec<T, 4> o4;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    const bfloat16_t ob = static_cast<bfloat16_t>(pv[e] * inv);
+                    const bfloat16_t yb = ob * w7_bf16_sigmoid(g4[e]);
+                    if constexpr (CAST_FP8) {
+                        o4[e] = static_cast<T>(
+                            w7_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value));
+                    } else {
+                        o4[e] = static_cast<T>(yb);
+                    }
+                }
+                *reinterpret_cast<device vec<T, 4>*>(out + row_off) = o4;
+            } else {
+                vec<T, 4> o4;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    o4[e] = T(pv[e] * inv);
+                }
+                *reinterpret_cast<device vec<T, 4>*>(out + row_off) = o4;
+            }
+        }
+        return;
+    }
+
+    // Multi-partition: wait for all reads of red_smem before in-place overwrite.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (part > 0 && active) {
+        threadgroup float* prow = red_smem + (size_t)(part * HPT * SLOTS + g * SLOTS) * RSTRIDE;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            prow[lane * EPT + e] = pv[e];
+        }
+        if (lane == 0) {
+            prow[D] = pm;
+            prow[D + 1] = pl;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (part == 0) {
+        float gm = pm;
+        for (int p = 1; p < parts; p++) {
+            gm = max(gm, red_smem[(size_t)(p * HPT * SLOTS + g * SLOTS) * RSTRIDE + D]);
+        }
+        const float w0 = exp2(pm - gm);
+        float gl = pl * w0;
+        float gacc[EPT];
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            gacc[e] = pv[e] * w0;
+        }
+        for (int p = 1; p < parts; p++) {
+            const threadgroup float* pp =
+                red_smem + (size_t)(p * HPT * SLOTS + g * SLOTS) * RSTRIDE;
+            const float ms = pp[D];
+            const float ls = pp[D + 1];
+            const float w = exp2(ms - gm);
+            gl += ls * w;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                gacc[e] += pp[lane * EPT + e] * w;
+            }
+        }
+        const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+        const size_t row_off =
+            ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D + lane * EPT;
+        if constexpr (FUSED_GATE) {
+            const vec<bfloat16_t, 4> g4 =
+                *reinterpret_cast<const device vec<bfloat16_t, 4>*>(gate + row_off);
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            vec<T, 4> o4;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                const bfloat16_t ob = static_cast<bfloat16_t>(gacc[e] * inv);
+                const bfloat16_t yb = ob * w7_bf16_sigmoid(g4[e]);
+                if constexpr (CAST_FP8) {
+                    o4[e] = static_cast<T>(
+                        w7_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value));
+                } else {
+                    o4[e] = static_cast<T>(yb);
+                }
+            }
+            *reinterpret_cast<device vec<T, 4>*>(out + row_off) = o4;
+        } else {
+            vec<T, 4> o4;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                o4[e] = T(gacc[e] * inv);
+            }
+            *reinterpret_cast<device vec<T, 4>*>(out + row_off) = o4;
         }
     }
 }

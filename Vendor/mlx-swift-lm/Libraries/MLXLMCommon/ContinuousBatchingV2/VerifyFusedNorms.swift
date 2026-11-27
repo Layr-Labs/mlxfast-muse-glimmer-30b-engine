@@ -190,6 +190,188 @@ public enum VerifyFusedNorms {
         outputNames: ["h", "y"],
         source: source, header: ModelOptActivationKernels.header + header)
 
+    /// `CBV2_NORM_VEC4=0`: disables vectorized `vec<bfloat16_t, 4>` `verify_add_norm_norm`
+    /// under low-acceptance verify (strictly `#pragma clang fp contract(off)`, 0-ULP).
+    public static let vec4EnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_NORM_VEC4"] != "0"
+
+    static let vec4Header = """
+        #pragma clang fp contract(off)
+        template <int BLOCKS, int NR>
+        METAL_FUNC float verify_row_sum_vec4(
+            thread const float* f, int blocks, int extra, uint lid, uint lane, uint sg,
+            uint nsg, threadgroup float* shared_vals, threadgroup float* bcast) {
+          float total = 0.0f;
+          for (int i = 0; i < blocks; i++) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+              const float v = f[i * NR + j];
+              total = (v * v) + total;
+            }
+          }
+          const int index = int(lid) * NR;
+          if (index + NR <= extra) {
+            #pragma unroll
+            for (int j = 0; j < NR; j++) {
+              const float v = f[blocks * NR + j];
+              total = (v * v) + total;
+            }
+          } else {
+            for (int j = 0; index + j < extra; j++) {
+              const float v = f[blocks * NR + j];
+              total = (v * v) + total;
+            }
+          }
+          total = simd_sum(total);
+          if (nsg > 1) {
+            if (lane == 0) {
+              shared_vals[sg] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float v = (lid < nsg) ? shared_vals[lid] : 0.0f;
+            total = simd_sum(v);
+          }
+          if (lid == 0) {
+            bcast[0] = total;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          return bcast[0];
+        }
+        """
+
+    static let vec4Source = """
+        #pragma clang fp contract(off)
+        constexpr int NR = 4;
+        constexpr int MAXV = (BLOCKS_ + 1) * NR;
+        static_assert(D_ % 4 == 0, "vec4 aligned");
+        threadgroup float shared_a[32];
+        threadgroup float shared_b[32];
+        threadgroup float bcast_a[1];
+        threadgroup float bcast_b[1];
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lsize = threads_per_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint nsg = simdgroups_per_threadgroup;
+        const uint row = threadgroup_position_in_grid.y;
+        constexpr int D = D_;
+        constexpr int D4 = D / 4;
+        const int blocks = D / int(lsize * NR);
+        const int extra = D - blocks * int(lsize * NR);
+        const int extra4 = extra / 4;
+        const float inv = params[0];
+        const float eps1 = params[1];
+        const float eps2 = params[2];
+
+        const device vec<bfloat16_t, 4>* xr4 =
+            reinterpret_cast<const device vec<bfloat16_t, 4>*>(x) + size_t(row) * D4;
+        const device vec<bfloat16_t, 4>* rr4 =
+            reinterpret_cast<const device vec<bfloat16_t, 4>*>(residual) + size_t(row) * D4;
+        const device vec<bfloat16_t, 4>* w1_4 =
+            reinterpret_cast<const device vec<bfloat16_t, 4>*>(w1);
+        const device vec<bfloat16_t, 4>* w2_4 =
+            reinterpret_cast<const device vec<bfloat16_t, 4>*>(w2);
+        device vec<bfloat16_t, 4>* hr4 =
+            reinterpret_cast<device vec<bfloat16_t, 4>*>(h) + size_t(row) * D4;
+        device vec<bfloat16_t, 4>* yr4 =
+            reinterpret_cast<device vec<bfloat16_t, 4>*>(y) + size_t(row) * D4;
+
+        float f[MAXV];
+        #pragma unroll
+        for (int i = 0; i <= BLOCKS_; i++) {
+          const bool ok = (i < BLOCKS_) || (int(lid) < extra4);
+          if (ok) {
+            const vec<bfloat16_t, 4> xv = xr4[i * int(lsize) + int(lid)];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { f[i * 4 + j] = static_cast<float>(xv[j]); }
+          } else {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { f[i * 4 + j] = 0.0f; }
+          }
+        }
+        const float total1 = verify_row_sum_vec4<BLOCKS_, NR>(
+            f, blocks, extra, lid, lane, sg, nsg, shared_a, bcast_a);
+        const float r1 = metal::precise::rsqrt(total1 * inv + eps1);
+
+        #pragma unroll
+        for (int i = 0; i <= BLOCKS_; i++) {
+          const bool ok = (i < BLOCKS_) || (int(lid) < extra4);
+          if (ok) {
+            const int e4 = i * int(lsize) + int(lid);
+            const vec<bfloat16_t, 4> wv = w1_4[e4];
+            const vec<bfloat16_t, 4> rv = rr4[e4];
+            vec<bfloat16_t, 4> hv;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+              float o = f[i * 4 + j] * r1;
+              o = o * (1.0f + static_cast<float>(wv[j]));
+              bfloat16_t hb = rv[j] + static_cast<bfloat16_t>(o);
+              hv[j] = hb;
+              f[i * 4 + j] = static_cast<float>(hb);
+            }
+            hr4[e4] = hv;
+          } else {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { f[i * 4 + j] = 0.0f; }
+          }
+        }
+        const float total2 = verify_row_sum_vec4<BLOCKS_, NR>(
+            f, blocks, extra, lid, lane, sg, nsg, shared_b, bcast_b);
+        const float r2 = metal::precise::rsqrt(total2 * inv + eps2);
+
+        if constexpr (CAST_FP8_) {
+          const float m0 = fp8_mu[0];
+          const float m1 = fp8_mu[1];
+          const float bound = fp8_bd[0];
+          const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+          #pragma unroll
+          for (int i = 0; i <= BLOCKS_; i++) {
+            const bool ok = (i < BLOCKS_) || (int(lid) < extra4);
+            if (ok) {
+              const int e4 = i * int(lsize) + int(lid);
+              const vec<bfloat16_t, 4> wv = w2_4[e4];
+              vec<bfloat16_t, 4> yv;
+              #pragma unroll
+              for (int j = 0; j < 4; j++) {
+                float o = f[i * 4 + j] * r2;
+                o = o * (1.0f + static_cast<float>(wv[j]));
+                bfloat16_t yb = static_cast<bfloat16_t>(o);
+                float scaled = static_cast<float>(yb) * m0;
+                uint8_t bits = modelopt_e4m3_bits(scaled);
+                float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+                yv[j] = static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+              }
+              yr4[e4] = yv;
+            }
+          }
+        } else {
+          #pragma unroll
+          for (int i = 0; i <= BLOCKS_; i++) {
+            const bool ok = (i < BLOCKS_) || (int(lid) < extra4);
+            if (ok) {
+              const int e4 = i * int(lsize) + int(lid);
+              const vec<bfloat16_t, 4> wv = w2_4[e4];
+              vec<bfloat16_t, 4> yv;
+              #pragma unroll
+              for (int j = 0; j < 4; j++) {
+                float o = f[i * 4 + j] * r2;
+                o = o * (1.0f + static_cast<float>(wv[j]));
+                yv[j] = static_cast<bfloat16_t>(o);
+              }
+              yr4[e4] = yv;
+            }
+          }
+        }
+        """
+
+    static let vec4Kernel = MLXFast.metalKernel(
+        name: "verify_add_norm_norm_vec4",
+        inputNames: ["residual", "x", "w1", "w2", "params", "fp8_mu", "fp8_bd"],
+        outputNames: ["h", "y"],
+        source: vec4Source, header: ModelOptActivationKernels.header + vec4Header,
+        ensureRowContiguous: true)
+
     private struct ParamsKey: Hashable {
         let width: Int
         let eps1Bits: UInt32
@@ -202,11 +384,14 @@ public enum VerifyFusedNorms {
         let width: Int
         let blocks: Int
         let castFP8: Bool
+        let vec4: Bool
     }
 
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var paramsCache: [ParamsKey: MLXArray] = [:]
     nonisolated(unsafe) private static var launchCache: [NormLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var vec4Checked = false
+    nonisolated(unsafe) private static var vec4Verified = false
     nonisolated(unsafe) private static let dummyFP8Mu: MLXArray = {
         let a = MLXArray([Float(1), Float(1)])
         eval(a)
@@ -219,17 +404,69 @@ public enum VerifyFusedNorms {
     }()
 
     private static func cachedLaunch(
-        shape: [Int], dtype: DType, width: Int, rows: Int, tg: Int, blocks: Int, castFP8: Bool
+        shape: [Int], dtype: DType, width: Int, rows: Int, tg: Int, blocks: Int,
+        castFP8: Bool, vec4: Bool
     ) -> MLXFast.MLXFastKernel.Launch {
         let key = NormLaunchKey(
-            shape: shape, dtype: dtype, width: width, blocks: blocks, castFP8: castFP8)
+            shape: shape, dtype: dtype, width: width, blocks: blocks, castFP8: castFP8, vec4: vec4)
         if let hit = cacheLock.withLock({ launchCache[key] }) { return hit }
-        let made = kernel.prepare(
+        let kern = vec4 ? vec4Kernel : kernel
+        let made = kern.prepare(
             template: [("D_", width), ("BLOCKS_", blocks), ("CAST_FP8_", castFP8)],
             grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
             outputShapes: [shape, shape], outputDTypes: [dtype, dtype])
         cacheLock.withLock { launchCache[key] = made }
         return made
+    }
+
+    private static func useVec4(width: Int, dtype: DType) -> Bool {
+        guard vec4EnvEnabled, dtype == .bfloat16, width % 4 == 0,
+            (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible)
+        else { return false }
+        let (checked, verified) = cacheLock.withLock { (vec4Checked, vec4Verified) }
+        if checked { return verified }
+        let tg = threadgroupSize(width: width)
+        let blocks = width / (tg * readsPerThread)
+        var rVals = [Float](), xVals = [Float](), w1Vals = [Float](), w2Vals = [Float]()
+        rVals.reserveCapacity(width); xVals.reserveCapacity(width)
+        w1Vals.reserveCapacity(width); w2Vals.reserveCapacity(width)
+        for i in 0 ..< width {
+            rVals.append(Float(((i * 7 + 3) % 29) - 14) * 0.0625)
+            xVals.append(Float(((i * 11 + 5) % 23) - 11) * 0.0625)
+            w1Vals.append(Float(((i * 5 + 1) % 19) - 9) * 0.03125)
+            w2Vals.append(Float(((i * 13 + 7) % 17) - 8) * 0.03125)
+        }
+        let res = MLXArray(rVals, [1, 1, width]).asType(.bfloat16)
+        let x = MLXArray(xVals, [1, 1, width]).asType(.bfloat16)
+        let w1 = MLXArray(w1Vals, [width]).asType(.bfloat16)
+        let w2 = MLXArray(w2Vals, [width]).asType(.bfloat16)
+        let params = cachedParams(width: width, eps1: 1e-6, eps2: 1e-6)
+        let mu = MLXArray([Float(1.7), Float(1.0 / 1.7)])
+        let bd = MLXArray([Float(448.0)])
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                var totalDiff = MLXArray(Int32(0))
+                for cast in [false, true] {
+                    let ref = cachedLaunch(
+                        shape: [1, 1, width], dtype: .bfloat16, width: width, rows: 1,
+                        tg: tg, blocks: blocks, castFP8: cast, vec4: false)(
+                        [res, x, w1, w2, params, cast ? mu : dummyFP8Mu, cast ? bd : dummyFP8Bound])
+                    let got = cachedLaunch(
+                        shape: [1, 1, width], dtype: .bfloat16, width: width, rows: 1,
+                        tg: tg, blocks: blocks, castFP8: cast, vec4: true)(
+                        [res, x, w1, w2, params, cast ? mu : dummyFP8Mu, cast ? bd : dummyFP8Bound])
+                    totalDiff = totalDiff
+                        + (got[0].view(dtype: .uint16) .!= ref[0].view(dtype: .uint16)).asType(.int32).sum()
+                        + (got[1].view(dtype: .uint16) .!= ref[1].view(dtype: .uint16)).asType(.int32).sum()
+                }
+                eval(totalDiff)
+                return totalDiff.item(Int.self) == 0
+            }) ?? false
+        cacheLock.withLock {
+            vec4Checked = true
+            vec4Verified = ok
+        }
+        return ok
     }
 
     private static func cachedParams(width: Int, eps1: Float, eps2: Float) -> MLXArray {
@@ -255,7 +492,7 @@ public enum VerifyFusedNorms {
         let params = cachedParams(width: width, eps1: eps1, eps2: eps2)
         let launch = cachedLaunch(
             shape: x.shape, dtype: x.dtype, width: width, rows: rows, tg: tg, blocks: blocks,
-            castFP8: false)
+            castFP8: false, vec4: useVec4(width: width, dtype: x.dtype))
         let out = launch([residual, x, w1, w2, params, dummyFP8Mu, dummyFP8Bound])
         return (out[0], out[1])
     }
@@ -390,7 +627,7 @@ public enum VerifyFusedNorms {
         let params = cachedParams(width: width, eps1: eps1, eps2: eps2)
         let launch = cachedLaunch(
             shape: x.shape, dtype: x.dtype, width: width, rows: rows, tg: tg, blocks: blocks,
-            castFP8: true)
+            castFP8: true, vec4: useVec4(width: width, dtype: x.dtype))
         let out = launch([residual, x, w1, w2, params, multipliers, overflowBound])
         return (out[0], out[1])
     }
