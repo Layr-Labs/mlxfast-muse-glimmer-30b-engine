@@ -228,7 +228,7 @@ public enum PagedOnePassAttention {
                         treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec)
                     outputs += [dynResult.fence, dynResult.out]
                 }
-                if appendEnabled {
+                if appendEnabled && !useRec {
                     outputs += warmAppend(
                         q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
                         params: params, previous: previous, valueOffsets: MLXArray(offsets),
@@ -498,7 +498,7 @@ public enum PagedOnePassAttention {
         simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int?, bindings: Int,
         record: Bool = useRecordKernel
     ) -> Bool {
-        guard appendEnabled else { return false }
+        guard appendEnabled, !record else { return false }
         let key = AppendKey(
             dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
             hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,

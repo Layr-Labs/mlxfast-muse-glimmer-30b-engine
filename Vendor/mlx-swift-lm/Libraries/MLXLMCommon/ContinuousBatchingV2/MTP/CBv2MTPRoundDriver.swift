@@ -1049,7 +1049,9 @@ final class CBv2MTPRoundDriver {
             shouldUseVerifyTree(for: id)
         {
             let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
-            let target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            let target =
+                (CBv2DraftRegime.treeFullCeilingDeepLow && acceptance.isDeepLowAcceptanceRegime)
+                ? ceiling : max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
             depth = min(ceiling, min(remainingTokens - 1, min(verificationLimit, target)))
         }
         return max(1, depth)
@@ -1690,6 +1692,10 @@ public enum CBv2DraftRegime {
     /// baseline latency below the decode speedup ceiling.
     public static let lowOnlyVerifySpeedups: Bool =
         ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] != "0"
+    /// `CBV2_TREE_FULL_CEILING=0` disables pinning deep-low dynamic-tree width to `ceiling` (7).
+    /// Post-GLOOP `V=7 -> V=8` costs ~+0.9% while `k=6 -> k=7` adds ~+3.45% accepted tokens/round.
+    public static let treeFullCeilingDeepLow: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_FULL_CEILING"] != "0"
     /// `CBV2_TREE_OLDPOL=1` forces k-wide accept/reject updates on tree rounds.
     /// Default (`false`) uses terminal-branch and chain-depth semantics so tree rounds preserve width.
     public static let treeOldAcceptancePolicy: Bool =
