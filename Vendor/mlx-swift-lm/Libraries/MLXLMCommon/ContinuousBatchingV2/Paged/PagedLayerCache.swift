@@ -1418,9 +1418,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             })
         else { return nil }
         // Fused append (one-pass kernel writes the columns): single-row LINEAR
-        // rounds only; tree rounds keep the separate write.
+        // rounds only (and never on high-acc record rounds); tree rounds keep
+        // the separate write.
         let canAppend: Bool
         if b == 1, sinks == nil, !segmentDecodeReference, PagedOnePassAttention.enabled,
+            !PagedOnePassAttention.useRecordKernel,
             !PagedOnePassAttention.threadgroupProbeFailed,
             !columnsAsRowsUseTree(b: b, l: l)
         {

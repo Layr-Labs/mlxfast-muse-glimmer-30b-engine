@@ -542,7 +542,9 @@ public enum CBv2VerifyNVFP4 {
             takes(weight: weight, blockScales: blockScales, tensorScale: tensorScale, inputs: inputs)
         else { return nil }
         let outputs = weight.dim(0)
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (CBv2DraftRegime.lowAcceptance && CBv2DraftRegime.xnorDraftHeadEligible)
         if !lowVerify {
             return Record.product(
                 x, weight: weight, blockScales: blockScales, tensorScale: tensorScale)
@@ -567,7 +569,9 @@ public enum CBv2VerifyNVFP4 {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (CBv2DraftRegime.lowAcceptance && CBv2DraftRegime.xnorDraftHeadEligible)
         if !lowVerify { return Record.product(layer, x) }
         let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let id = ObjectIdentifier(layer)
@@ -621,7 +625,9 @@ public enum CBv2VerifyNVFP4 {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (CBv2DraftRegime.lowAcceptance && CBv2DraftRegime.xnorDraftHeadEligible)
         if !lowVerify { return Record.products(nv, x) }
         let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let pkey = PlanKey(
