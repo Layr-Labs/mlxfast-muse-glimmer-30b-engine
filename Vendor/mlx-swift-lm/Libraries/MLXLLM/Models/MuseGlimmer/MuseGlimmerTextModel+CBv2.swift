@@ -231,6 +231,13 @@ extension MuseGlimmerTextModel {
         let capture = mtpHiddenLayerIDs
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
+        // Draft tree round: every attention must take the remap variant and
+        // every RoPE layer the per-column positions, or the round commits its
+        // chain only (`CBv2VerifyTree.Build.valid`).
+        if let tree = CBv2VerifyTree.active(batch: h.dim(0), columns: h.dim(1)) {
+            tree.expectedAttention = layers.count
+            tree.expectedRope = layers.filter { $0.selfAttention.rope != nil }.count
+        }
         var layerInput = layers[0].inputLayerNorm(h)
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
@@ -311,12 +318,27 @@ extension MuseGlimmerTextModel {
         let usesRope = a.rope != nil
         precondition(usesRope == (theta != 0))
         let p = verifyAttentionProjections([a.queryProj, a.keyProj, a.valueProj, a.gateProj], x)
-        let (queries, keys) = VerifyFusedQK.apply(
-            queries: p[0], keys: p[1],
-            heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
-            eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
-            ropeBase: usesRope ? theta : nil,
-            offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
+        let qk: (queries: MLXArray, keys: MLXArray)
+        if usesRope, let tree = CBv2VerifyTree.active(batch: batch, columns: length) {
+            // Leaf columns rotate at their logical positions; chain columns
+            // get the record kernel's bytes.
+            qk = VerifyFusedQK.applyTree(
+                queries: p[0], keys: p[1],
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                eps: a.qkNorm.eps, queryScale: a.qkScaleFactor, ropeBase: theta,
+                offsets: ropeOffsets ?? (attending.positionOffsets + 0),
+                rowPositions: tree.rowPositions)
+            tree.ropeCalls += 1
+        } else {
+            qk = VerifyFusedQK.apply(
+                queries: p[0], keys: p[1],
+                heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                eps: a.qkNorm.eps, queryScale: a.qkScaleFactor,
+                ropeBase: usesRope ? theta : nil,
+                offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
+        }
+        let queries = qk.queries
+        let keys = qk.keys
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
         var output = attending.updateAndAttend(
@@ -386,6 +408,76 @@ extension MuseGlimmerTextModel {
                     }
                 }
             }
+            // Draft tree (CBV2_VERIFY_TREE): the per-column-position RoPE at
+            // every one-row width, and its load-time bit check against the
+            // record kernel; a failed check turns leaves off for the process.
+            if CBv2VerifyTree.enabled, let rope {
+                // Compiled and checked under `withError`: a tree kernel that
+                // fails to build turns leaves off instead of stopping the load.
+                let held =
+                    (try? MLX.withError { () -> Bool in
+                        var tree = [MLXArray]()
+                        for rows in 2 ... 8 {
+                            let q = MLXArray.zeros(
+                                [1, rows, a.heads * a.headDimensions], dtype: dtype)
+                            let k = MLXArray.zeros(
+                                [1, rows, a.kvHeads * a.headDimensions], dtype: dtype)
+                            let out = VerifyFusedQK.applyTree(
+                                queries: q, keys: k, heads: a.heads, kvHeads: a.kvHeads,
+                                headDim: a.headDimensions, eps: a.qkNorm.eps,
+                                queryScale: a.qkScaleFactor, ropeBase: rope,
+                                offsets: MLXArray.zeros([1], type: Int32.self),
+                                rowPositions: MLXArray((0 ..< rows).map { Int32($0) }))
+                            tree += [out.queries, out.keys]
+                        }
+                        eval(tree)
+                        return VerifyFusedQK.treeSelfTest(
+                            heads: a.heads, kvHeads: a.kvHeads, headDim: a.headDimensions)
+                            && CBv2VerifyTree.warmCopyKernel(
+                                dtype: dtype, kvHeads: a.kvHeads, headDim: a.headDimensions,
+                                pageSize: 16)
+                    }) ?? false
+                if !held {
+                    CBv2VerifyTree.kernelSelfTestFailed = true
+                    FileHandle.standardError.write(
+                        Data("[cbv2-tree] tree RoPE/copy self-test failed; leaves off\n".utf8))
+                }
+            }
+        }
+        if CBv2SameWidthTree.enabled, !CBv2VerifyTree.kernelSelfTestFailed {
+            // Same-width tree: tree_select at every window width (and its probe
+            // form), checked against valid layouts at load.
+            let held =
+                (try? MLX.withError { () -> Bool in
+                    var selects = [MLXArray]()
+                    let ids = MLXArray((0 ..< 28).map { Int32($0) }, [7, 4])
+                    let raw = MLXArray((0 ..< 28).map { Float(28 - $0) }, [7, 4])
+                    for drafts in 2 ... 7 {
+                        for probe in [false, true] {
+                            let out = CBv2SameWidthTree.select(
+                                topIDs: ids, topRaw: raw, drafts: drafts, probe: probe)
+                            selects += [out.tokens, out.rowPositions, out.meta]
+                        }
+                    }
+                    eval(selects)
+                    let check = CBv2SameWidthTree.selectSelfTest()
+                    if check.mismatches > 0 {
+                        FileHandle.standardError.write(
+                            Data("[cbv2-tree] tree_select: \(check.mismatches)/24 layouts differ from the host mirror (speed only)\n".utf8))
+                    }
+                    return check.valid
+                }) ?? false
+            if !held {
+                CBv2VerifyTree.kernelSelfTestFailed = true
+                FileHandle.standardError.write(
+                    Data("[cbv2-tree] tree_select self-test failed; tree off\n".utf8))
+            }
+        }
+        if CBv2VerifyTree.enabled, !(VerifyFusedQK.enabled
+            && VerifyFusedQK.supports(headDim: a.headDimensions, dtype: dtype))
+        {
+            // No tree RoPE without the fused q/k kernel.
+            CBv2VerifyTree.kernelSelfTestFailed = true
         }
         eval(warm)
         warmVerifyProjections(dtype: dtype)

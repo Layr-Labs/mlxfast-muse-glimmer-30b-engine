@@ -573,11 +573,18 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Draft tree (`CBV2_VERIFY_TREE`) only: the last attended key
+        /// (index `attendLength - 1`) is read from absolute position
+        /// `remapPosition` instead of `attendStart + attendLength - 1`. Only
+        /// the `CBV2_TREE_REMAP` one-pass variant reads `info[6]`/`info[7]`;
+        /// a record row packs zeros there, as before.
+        var remapPosition: Int = 0
+        var remaps: Bool = false
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), 0, remaps ? Int32(remapPosition) : 0, remaps ? 1 : 0,
             ]
         }
     }

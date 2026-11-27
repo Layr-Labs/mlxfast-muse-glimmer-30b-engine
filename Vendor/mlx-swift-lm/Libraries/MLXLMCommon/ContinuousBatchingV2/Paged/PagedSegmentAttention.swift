@@ -130,8 +130,11 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        remap: Bool = false,
+        depthRows: MLXArray? = nil
     ) -> MLXArray {
+        let treeVariant = remap || depthRows != nil
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
         if let newKeys, let newValues {
@@ -185,7 +188,16 @@ enum PagedSegmentAttention {
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, remap: remap, depthRows: depthRows)
+            if treeVariant {
+                // The check mode returns the two-pass reference, which has no
+                // remap: such a round commits its chain only.
+                if PagedOnePassAttention.checks {
+                    CBv2VerifyTree.current?.fail("onepass_checks")
+                } else {
+                    CBv2VerifyTree.current?.attentionCalls += 1
+                }
+            }
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
@@ -198,6 +210,9 @@ enum PagedSegmentAttention {
             group.writeFence = result.fence
             return result.out
         }
+        // Only the one-pass kernel has the draft-tree remap: a tree round that
+        // lands here commits its chain only.
+        if treeVariant { CBv2VerifyTree.current?.fail("two_pass_attention") }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
         let metaCount = max(8, b * qh * plan.maxPartitions * 2)

@@ -157,6 +157,11 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// `CBV2_VERIFY_TREE`: this round's tree (nil for a record round).
+        var tree: CBv2VerifyTree.RoundTree? = nil
+        /// Same-width round: the verify columns' depths (device), for the
+        /// post-verify speculation's tree-positioned context keys.
+        var treeRowPositions: MLXArray? = nil
 
     }
 
@@ -1013,6 +1018,202 @@ final class CBv2MTPRoundDriver {
             acceptanceProbabilities: acceptance.probabilities)
     }
 
+    /// `CBV2_TREE_TRACE` only: the request's window inputs as the round's
+    /// plan saw them. Pure host reads of finalized history (call before the
+    /// round's own `observeRequestAcceptance`); no device work, no mutation.
+    struct TraceWindow {
+        var low: Bool
+        var fraction: Double
+        var window: Int
+        var ceiling: Int
+        var probabilities: [Double]
+    }
+
+    func traceWindow(for id: CBv2RequestID, remainingTokens: Int) -> TraceWindow {
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        let offered = min(max(config.fixedDraftTokens ?? config.maxDraftTokens, 0), config.maxDraftTokens)
+        let low = usesFixedDepthAcceptanceWindow && acceptance.inLowAcceptanceRegime
+        let window =
+            low && offered > 0
+            ? CBv2MTPMarginalDepthPolicy.fixedWindowDepth(
+                offeredDepth: offered, remainingTokens: remainingTokens,
+                verificationLimit: maximumAutomaticDepth(plannedDecodeRows: 1),
+                acceptanceProbabilities: acceptance.probabilities)
+            : offered
+        let ceiling =
+            usesFixedDepthAcceptanceWindow
+            ? acceptance.acceptanceCeilingDepth(offeredDepth: offered) : offered
+        return TraceWindow(
+            low: low, fraction: acceptance.roundAcceptanceFraction, window: window,
+            ceiling: ceiling, probabilities: acceptance.probabilities)
+    }
+
+    // MARK: Draft tree (CBV2_VERIFY_TREE)
+
+    /// This plan's tree decision for one request.
+    struct TreePlan {
+        /// The chain (the record window) and, when armed, its leaves.
+        var layout: CBv2VerifyTree.Layout
+        /// The request may carry leaves this round (top-3 is kept and sibling
+        /// hit rates learn from its rejections even when no leaf cleared the
+        /// threshold).
+        var eligible: Bool
+        /// Why no leaf is armed; empty when armed.
+        var why: String
+        /// Same-width round: the device chooses the layout inside the window
+        /// (`cbv2_tree_select`); `probe` runs its exactness-probe form.
+        var sameWidth = false
+        var probe = false
+    }
+    /// Cleared at every plan; read once at the round's build.
+    private(set) var treePlans: [CBv2RequestID: TreePlan] = [:]
+    private var treeStates: [CBv2RequestID: CBv2VerifyTree.RequestState] = [:]
+
+    func clearTreePlans() {
+        if !treePlans.isEmpty { treePlans.removeAll(keepingCapacity: true) }
+    }
+
+    /// Why `id` cannot carry leaves this round, or nil when it can. Host
+    /// reads of finalized history only. Deliberately no latch: every input is
+    /// a running statistic, so a request that clamps or bursts once can arm
+    /// again when it is back in the hard regime.
+    func treeIneligibility(for id: CBv2RequestID, offeredDepth: Int) -> String? {
+        guard CBv2VerifyTree.enabled else { return "off" }
+        if CBv2VerifyTree.kernelSelfTestFailed { return "self_test_failed" }
+        if CBv2VerifyTree.probeFailed { return "probe_failed" }
+        guard usesFixedDepthAcceptanceWindow, offeredDepth > 1 else { return "no_window" }
+        let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+        // Pair-1-like (high-acceptance) requests keep the record path.
+        guard acceptance.inLowAcceptanceRegime else { return "high_regime" }
+        guard acceptance.ceilingRounds >= CBv2VerifyTree.minimumRounds else { return "warmup" }
+        let mean =
+            Double(acceptance.ceilingCommittedTokens) / Double(max(acceptance.ceilingRounds, 1))
+        guard mean <= CBv2VerifyTree.maximumMeanCommitted else { return "mean_high" }
+        // Never while the acceptance ceiling binds.
+        guard acceptance.acceptanceCeilingDepth(offeredDepth: offeredDepth) >= offeredDepth else {
+            return "ceiling"
+        }
+        return nil
+    }
+
+    /// Plans `id`'s tree for a round whose window chose `chain` drafts under a
+    /// plan of `offeredDepth`; recorded for the build. The chain is never
+    /// changed; leaves only add rows (`chain + leaves <= offeredDepth`).
+    @discardableResult
+    func planTree(for id: CBv2RequestID, chain: Int, offeredDepth: Int) -> TreePlan {
+        var plan = TreePlan(
+            layout: CBv2VerifyTree.Layout(chain: chain, leaves: [], probe: nil),
+            eligible: false, why: "")
+        if let why = treeIneligibility(for: id, offeredDepth: offeredDepth) {
+            plan.why = why
+        } else if CBv2SameWidthTree.enabled {
+            // Same width: the window's rows only; the layout is chosen on device
+            // from this round's drafter top-4. Needs two drafts.
+            plan.sameWidth = true
+            if chain >= CBv2SameWidthTree.minimumDrafts, chain <= offeredDepth {
+                plan.eligible = true
+                plan.probe =
+                    !CBv2VerifyTree.probePassed && CBv2VerifyTree.probeRounds > 0
+                    && CBv2VerifyTree.probesRun < CBv2VerifyTree.probeRounds
+            } else {
+                plan.why = "sw_short"
+            }
+        } else if chain < 1 || chain >= offeredDepth {
+            plan.why = "no_room"
+        } else {
+            plan.eligible = true
+            let acceptance = requestAcceptance[id] ?? initialRequestAcceptance
+            let state = treeStates[id] ?? CBv2VerifyTree.RequestState()
+            plan.layout = CBv2VerifyTree.plan(
+                chain: chain, probabilities: acceptance.probabilities,
+                siblingRates: state.siblingRates, maximumDrafts: offeredDepth)
+            if !CBv2VerifyTree.probePassed, CBv2VerifyTree.probeRounds > 0,
+                CBv2VerifyTree.probesRun < CBv2VerifyTree.probeRounds
+            {
+                // Exactness probe: a copy of chain node d(row+1) at its own
+                // position. Leaves commit only once a probe has passed.
+                if plan.layout.drafts >= offeredDepth { plan.layout.leaves.removeLast() }
+                let row = CBv2VerifyTree.probesRun % chain
+                plan.layout.probe = plan.layout.leaves.count
+                plan.layout.leaves.append(CBv2VerifyTree.Leaf(row: row, rank: 1))
+            }
+            if plan.layout.leaves.isEmpty { plan.why = "below_threshold" }
+        }
+        CBv2VerifyTree.counters.notArmed[plan.why.isEmpty ? "armed" : plan.why, default: 0] += 1
+        treeStates[id, default: CBv2VerifyTree.RequestState()]
+            .notArmed[plan.why.isEmpty ? "armed" : plan.why, default: 0] += 1
+        treePlans[id] = plan
+        return plan
+    }
+
+    /// A row whose drafter top-1 the target rejected, with that row's top-3
+    /// known: the row's sibling hit-rate EWMAs learn from every such round,
+    /// armed or not, so the estimate can never starve itself shut.
+    func treeObserveRejection(_ id: CBv2RequestID, row: Int, rank2: Bool, rank3: Bool) {
+        var state = treeStates[id] ?? CBv2VerifyTree.RequestState()
+        guard row >= 0, row < state.siblingRates.rank2.count, row < state.siblingRates.rank3.count
+        else { return }
+        let alpha = CBv2VerifyTree.siblingAlpha
+        state.siblingRates.rank2[row] += alpha * ((rank2 ? 1 : 0) - state.siblingRates.rank2[row])
+        if !rank2 {
+            state.siblingRates.rank3[row] +=
+                alpha * ((rank3 ? 1 : 0) - state.siblingRates.rank3[row])
+        }
+        treeStates[id] = state
+    }
+
+    func treeRecord(
+        _ id: CBv2RequestID, armed: Bool, leaves: Int, hit: Bool, invalid: Bool, generated: Int
+    ) {
+        var state = treeStates[id] ?? CBv2VerifyTree.RequestState()
+        state.rounds += 1
+        state.generated = generated
+        if armed { state.armedRounds += 1 }
+        state.leaves += leaves
+        if hit { state.hits += 1 }
+        if invalid { state.invalid += 1 }
+        treeStates[id] = state
+    }
+
+    func treeSiblingRates(_ id: CBv2RequestID) -> CBv2VerifyTree.SiblingRates {
+        treeStates[id]?.siblingRates ?? CBv2VerifyTree.SiblingRates.priors
+    }
+
+    /// The per-request summary line, then the request's tree state goes.
+    private func treeRequestDidFinish(_ id: CBv2RequestID) {
+        guard let state = treeStates.removeValue(forKey: id) else { return }
+        treePlans.removeValue(forKey: id)
+        guard CBv2VerifyTree.printsSummary else { return }
+        let reasons = state.notArmed.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+        let line =
+            "CBV2TREE-SUMMARY req=\(id.raw) rounds=\(state.rounds) gen=\(state.generated)"
+            + " armed=\(state.armedRounds) leaves=\(state.leaves)"
+            + " hits=\(state.hits) invalid=\(state.invalid)"
+            + " s2=\(state.siblingRates.rank2.map { String(format: "%.2f", $0) }.joined(separator: "/"))"
+            + " s3=\(state.siblingRates.rank3.map { String(format: "%.2f", $0) }.joined(separator: "/"))"
+            + " plans={\(reasons)}\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    /// `CBV2_TREE_TRACE` only: the plan reason each verify row was built
+    /// under, and each request's round count.
+    private var traceBuildReasons: [CBv2RequestID: String] = [:]
+    private var traceRoundCounts: [CBv2RequestID: Int] = [:]
+
+    func traceNoteBuild(_ id: CBv2RequestID) {
+        guard CBv2TreeTrace.enabled else { return }
+        traceBuildReasons[id] = planDecision.reason
+    }
+
+    /// The build's plan reason and this round's 0-based index for `id`.
+    func traceTakeRound(_ id: CBv2RequestID) -> (reason: String, index: Int) {
+        let reason = traceBuildReasons.removeValue(forKey: id) ?? ""
+        let index = traceRoundCounts[id] ?? 0
+        traceRoundCounts[id] = index + 1
+        return (reason, index)
+    }
+
     /// The acceptance ceiling's draft count for one row (see
     /// `CBv2MTPRequestAcceptanceState.acceptanceCeilingDepth`). Same scope
     /// as the fixed-depth acceptance window; host arithmetic over the
@@ -1179,6 +1380,11 @@ final class CBv2MTPRoundDriver {
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
+        if CBv2TreeTrace.enabled {
+            traceBuildReasons.removeValue(forKey: id)
+            traceRoundCounts.removeValue(forKey: id)
+        }
+        if CBv2VerifyTree.enabled { treeRequestDidFinish(id) }
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1217,6 +1423,14 @@ final class CBv2MTPRoundDriver {
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
+        if CBv2TreeTrace.enabled {
+            traceBuildReasons.removeAll(keepingCapacity: false)
+            traceRoundCounts.removeAll(keepingCapacity: false)
+        }
+        if CBv2VerifyTree.enabled {
+            treePlans.removeAll(keepingCapacity: false)
+            treeStates.removeAll(keepingCapacity: false)
+        }
     }
 
     var requestStateCountForTesting: Int {
@@ -1486,4 +1700,7 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// Set by the engine while a draft-tree-eligible request's block is
+    /// drafted (`CBV2_VERIFY_TREE`), so the drafter also keeps its top-3.
+    nonisolated(unsafe) public static var treeProposals = false
 }

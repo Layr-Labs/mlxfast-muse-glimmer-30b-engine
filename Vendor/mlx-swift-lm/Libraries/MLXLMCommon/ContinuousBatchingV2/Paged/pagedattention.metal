@@ -257,7 +257,55 @@ template <typename T, int N, bool NODIV = false> struct PagedSegmentAccessor {
         if (index < 0 || index >= record[3]) return page(0, 0);
         return page(record[8 + 2 * index], record[9 + 2 * index]);
     }
+#ifdef CBV2_TREE_REMAP
+    // Draft-tree leaf rows: the page of the remapped last key, from header
+    // slot 7 of the row's last-partition record ((binding << 26 | local) + 1).
+    PagedKVPage<T> remap_page() const {
+        const int code = record[7] - 1;
+        if (code < 0) return page(0, 0);
+        return page(code >> 26, code & ((1 << 26) - 1));
+    }
+#endif
 };
+
+#ifdef CBV2_TREE_DEPTH
+// Same-width tree rows: row b runs the serial row `info_row` (its depth: that
+// row's seqinfo and partition records, `record`) and reads its own last key
+// from its own slot `remap_pos`, resolved through its own last-partition
+// record `own_record`. info_row == b is the record row.
+template <typename T, int N, bool NODIV = false> struct PagedSegmentDepthAccessor {
+    const device T* buffers[N];
+    const device int64_t* value_offsets;
+    const device int32_t* record;
+    size_t page_elements;
+    const device int32_t* own_record;
+    int info_row;
+    int remap_pos;
+    int remap_lpage;
+
+    bool is_native_position(int) const { return false; }
+    PagedKVPage<T> page(int binding, int local) const {
+        if (binding < 0 || binding >= N || local < 0
+            || (NODIV ? (size_t)(local + 1) * page_elements > (size_t)value_offsets[binding]
+                      : (size_t)local >= (size_t)value_offsets[binding] / page_elements)) {
+            binding = 0; local = 0;
+        }
+        const device T* base = buffers[binding] + (size_t)local * page_elements;
+        return {base, base + value_offsets[binding]};
+    }
+    PagedKVPage<T> write_page(int ignored) const { return page(record[4], record[5]); }
+    PagedKVPage<T> read_page(const device int32_t* ignored, int logical, int length) const {
+        const int index = logical - record[2];
+        if (index < 0 || index >= record[3]) return page(0, 0);
+        return page(record[8 + 2 * index], record[9 + 2 * index]);
+    }
+    PagedKVPage<T> remap_page() const {
+        const int index = remap_lpage - own_record[2];
+        if (index < 0 || index >= own_record[3]) return page(0, 0);
+        return page(own_record[8 + 2 * index], own_record[9 + 2 * index]);
+    }
+};
+#endif
 
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
@@ -640,13 +688,36 @@ inline void paged_attention_onepass_impl(
     const int state = (int)sgitg % NSG;
     const int lin = tpitg.x;
 
+#ifdef CBV2_TREE_DEPTH
+    // Same-width tree: the serial row at this row's depth.
+    const device int32_t* info = seqinfo + cache.info_row * 8;
+#else
     const device int32_t* info = seqinfo + b * 8;
+#endif
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+#ifdef CBV2_TREE_DEPTH
+    // Its own K/V (its own column's slot) is the last attended key.
+    const bool remap_on = cache.info_row != b;
+    const int remap_pos = cache.remap_pos;
+#elif defined(CBV2_TREE_REMAP)
+    // Draft-tree leaf rows: the last attended key (index attend_len - 1) is
+    // read from absolute position info[6]; every other index, partition and
+    // the merge order are the serial row's.
+    const bool remap_on = info[7] != 0;
+    const int remap_pos = info[6];
+#endif
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
+#ifdef CBV2_TREE_DEPTH
+    // A tree row's own last key (index attend_len - 1) is left out of the loop
+    // and added once after it, by the state that owns it (below); the loop body
+    // is the record's. A chain row keeps the record bound.
+    const int hi = min(remap_on ? attend_len - 1 : attend_len, lo + PTOK);
+#else
     const int hi = min(attend_len, lo + PTOK);
+#endif
     const bool active = lo < attend_len;
 
     const device int32_t* table = tables + (size_t)b * (size_t)maxp;
@@ -691,6 +762,16 @@ inline void paged_attention_onepass_impl(
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
                     const int pos = attend_start + first + (j0 + u) * NSG;
+#ifdef CBV2_TREE_REMAP
+                    if (remap_on && first + (j0 + u) * NSG == attend_len - 1) {
+                        const auto rpage = cache.remap_page();
+                        const size_t rbase =
+                            ((size_t)kv_head * S + (size_t)(remap_pos % S)) * D + lane * EPT;
+                        kr[u] = *reinterpret_cast<const device vec<T, 4>*>(rpage.key + rbase);
+                        vr[u] = *reinterpret_cast<const device vec<T, 4>*>(rpage.value + rbase);
+                        continue;
+                    }
+#endif
                     const int lpage = pos / S;
                     const int slot = pos % S;
                     if (lpage != cur_lpage) {
@@ -741,10 +822,20 @@ inline void paged_attention_onepass_impl(
         }
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
+#ifdef CBV2_TREE_REMAP
+            const bool remapped = remap_on && i == attend_len - 1;
+            const int pos = remapped ? remap_pos : attend_start + i;
+#else
             const int pos = attend_start + i;
+#endif
             const int lpage = pos / S;
             const int slot = pos % S;
+#ifdef CBV2_TREE_REMAP
+            const auto page =
+                remapped ? cache.remap_page() : cache.read_page(table, lpage, table_len);
+#else
             const auto page = cache.read_page(table, lpage, table_len);
+#endif
             const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
             page.template load<EPT>(base, lane, kf, vf);
 
@@ -773,6 +864,54 @@ inline void paged_attention_onepass_impl(
             }
         }
     }
+
+#ifdef CBV2_TREE_DEPTH
+    // The own last key: the last element of exactly one state's strided
+    // sequence in the last partition, so adding it here, after that state's
+    // loop, is the record's update order. Same loads, same expressions.
+    if (remap_on && active && part == (attend_len - 1) / PTOK
+        && state == ((attend_len - 1) - lo) % NSG) {
+        const auto rpage = cache.remap_page();
+        const int rslot = remap_pos % S;
+        if (BLOCK > 1 && EPT == 4) {
+            constexpr int E4 = EPT < 4 ? EPT : 4;
+            const size_t rbase = ((size_t)kv_head * S + (size_t)rslot) * D + lane * EPT;
+            const vec<T, 4> rk = *reinterpret_cast<const device vec<T, 4>*>(rpage.key + rbase);
+            const vec<T, 4> rv = *reinterpret_cast<const device vec<T, 4>*>(rpage.value + rbase);
+#pragma unroll
+            for (int e = 0; e < E4; e++) {
+                kf[e] = float(rk[e]);
+                vf[e] = float(rv[e]);
+            }
+        } else {
+            const size_t rbase = ((size_t)kv_head * S + (size_t)rslot) * D;
+            rpage.template load<EPT>(rbase, lane, kf, vf);
+        }
+#pragma unroll
+        for (int g = 0; g < HPT; g++) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                partial += q_smem[g * D + lane * EPT + e] * kf[e];
+            }
+            float qk = simd_sum(partial);
+            if (HAS_SOFTCAP) {
+                qk = softcap * precise::tanh(qk / softcap);
+            }
+            qk *= M_LOG2E_F;
+
+            const float m_new = max(m[g], qk);
+            const float corr = exp2(m[g] - m_new);
+            const float p = exp2(qk - m_new);
+            l[g] = l[g] * corr + p;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                acc[g][e] = acc[g][e] * corr + p * vf[e];
+            }
+            m[g] = m_new;
+        }
+    }
+#endif
 
     // Publish this (partition, state)'s online-softmax states.
     threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;

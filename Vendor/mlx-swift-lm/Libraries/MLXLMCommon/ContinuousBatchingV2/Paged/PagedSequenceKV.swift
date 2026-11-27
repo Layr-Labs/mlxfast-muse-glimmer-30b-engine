@@ -777,6 +777,33 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// exceeds every logical page a full row can reach).
     var decodeTableLength: Int { ringPages ?? table.count }
 
+    /// Draft tree (`CBV2_VERIFY_TREE`): the physical page holding written
+    /// absolute position `position`, resolved as a decode dispatch resolves
+    /// it (`table[(position / pageSize) % decodeTableLength]`). Nil outside
+    /// the written range or past the table.
+    func physicalPage(position: Int) -> Int32? {
+        guard !released, position >= baseOffset, position < absoluteOffset,
+            position >= oldestValidPosition
+        else { return nil }
+        let index = (position / pool.config.pageSize) % decodeTableLength
+        guard index >= 0, index < table.count else { return nil }
+        return table[index]
+    }
+
+    /// The pool slot (`page * pageSize + position % pageSize`) of `position`.
+    func physicalSlot(position: Int) -> Int32? {
+        physicalPage(position: position).map {
+            $0 * Int32(pool.config.pageSize) + Int32(position % pool.config.pageSize)
+        }
+    }
+
+    /// Whether a draft-tree leaf commit can copy K/V inside this row's
+    /// storage: plain native K/V in segmented storage, no step-owned work.
+    var canCopyTreeLeaf: Bool {
+        !released && !pool.usesStepOwnedAttention && groupKey.quantization == nil
+            && !groupKey.isAsymmetric && pool.group(groupKey).segmentLayout != nil
+    }
+
     /// This row's `seqinfo` entry for a decode dispatch attending `range`.
     ///
     /// The only supported way to build one from a row: it is what stops a
@@ -1068,5 +1095,52 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         tableVersion += 1
         pool.unreserve([groupKey: reservedPages])
         immutableCopyScratch = nil
+    }
+}
+
+// MARK: - Draft tree leaf commit (CBV2_VERIFY_TREE)
+
+extension PagedSequenceKV {
+    /// The copy that moves a committed leaf's K/V from its column slot
+    /// `source` onto its logical position `destination`, in every layer row of
+    /// the request: per group, the per-segment copy records. Nil when any row
+    /// cannot express it (the round then commits its chain only). Host only.
+    static func treeLeafCopyPlan(rows: [PagedSequenceKV], source: Int, destination: Int)
+        -> [(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])])]?
+    {
+        guard !rows.isEmpty else { return nil }
+        // A leaf already at its logical slot (the first leaf column after a
+        // fully accepted chain): nothing to move.
+        if source == destination {
+            return rows.allSatisfy({
+                $0.canCopyTreeLeaf && $0.physicalSlot(position: source) != nil
+            }) ? [] : nil
+        }
+        var order: [PagedKVGroupKey] = []
+        var pairs: [PagedKVGroupKey: [(source: Int32, destination: Int32)]] = [:]
+        var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
+        for row in rows {
+            guard row.canCopyTreeLeaf, let s = row.physicalSlot(position: source),
+                let d = row.physicalSlot(position: destination)
+            else { return nil }
+            if groups[row.groupKey] == nil {
+                groups[row.groupKey] = row.pool.group(row.groupKey)
+                order.append(row.groupKey)
+            }
+            pairs[row.groupKey, default: []].append((s, d))
+        }
+        var result: [(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])])] = []
+        for key in order {
+            guard let group = groups[key], let list = pairs[key],
+                let plan = PagedSegmentTransfers.copyPlan(group: group, pairs: list)
+            else { return nil }
+            result.append((group, plan))
+        }
+        return result
+    }
+
+    /// Dispatches a `treeLeafCopyPlan` (before the round's rollback).
+    static func runTreeLeafCopy(_ plan: [(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])])]) {
+        for entry in plan { PagedSegmentTransfers.copy(group: entry.group, plan: entry.plan) }
     }
 }

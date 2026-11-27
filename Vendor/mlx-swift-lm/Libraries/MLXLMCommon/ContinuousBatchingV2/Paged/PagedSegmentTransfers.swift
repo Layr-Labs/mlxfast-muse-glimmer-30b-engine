@@ -184,6 +184,110 @@ enum PagedSegmentTransfers {
         }
     }
 
+    // MARK: Draft tree (CBV2_VERIFY_TREE)
+
+    /// In-segment slot copy: record `r` = (source local page, source slot,
+    /// destination local page, destination slot); every head, every lane of
+    /// key and value. Sources and destinations are distinct slots.
+    private static let copyBody = """
+        const int h = int(thread_position_in_grid.y);
+        const int d = int(thread_position_in_grid.x);
+        const int r = int(thread_position_in_grid.z);
+        const size_t source =
+            (((size_t)records[r * 4] * H + h) * S + records[r * 4 + 1]) * D + d;
+        const size_t target =
+            (((size_t)records[r * 4 + 2] * H + h) * S + records[r * 4 + 3]) * D + d;
+        device T* destination = storage;
+        destination[target] = storage[source];
+        destination[VBASE + target] = storage[VBASE + source];
+        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+        """
+
+    private static func copyKernel(dtype: DType) -> MLXFast.MLXFastKernel {
+        let key = "cbv2_segment_tree_copy_\(dtype)"
+        return lock.withLock {
+            if let existing = kernels[key] { return existing }
+            let made = MLXFast.metalKernel(
+                name: key, inputNames: ["storage", "records", "previous"],
+                outputNames: ["fence"], source: copyBody, ensureRowContiguous: true,
+                mutableInputs: ["storage"])
+            kernels[key] = made
+            return made
+        }
+    }
+
+    /// Per segment, the (source, destination) pool slot pairs of one group,
+    /// as copy records; nil when a pair's two pages sit in different segments
+    /// (the copy is then not expressible here and the caller commits no leaf).
+    static func copyPlan(group: PagedKVGroup, pairs: [(source: Int32, destination: Int32)])
+        -> [(PagedKVSegment, [Int32])]?
+    {
+        guard let layout = group.segmentLayout, group.key.quantization == nil,
+            !group.key.isAsymmetric
+        else { return nil }
+        let pageSize = Int32(group.pageSize)
+        var records: [Int: [Int32]] = [:]
+        for pair in pairs {
+            let sourcePage = pair.source / pageSize
+            let destinationPage = pair.destination / pageSize
+            guard pair.source >= 0, pair.destination >= 0, pair.source != pair.destination,
+                layout.isUsable(sourcePage), layout.isUsable(destinationPage)
+            else { return nil }
+            let segment = layout.segmentIndex(page: sourcePage)
+            guard layout.segmentIndex(page: destinationPage) == segment,
+                group.segments[segment] != nil
+            else { return nil }
+            records[segment, default: []].append(contentsOf: [
+                Int32(layout.localPage(sourcePage)), pair.source % pageSize,
+                Int32(layout.localPage(destinationPage)), pair.destination % pageSize,
+            ])
+        }
+        return records.keys.sorted().map { (group.segments[$0]!, records[$0]!) }
+    }
+
+    /// Load time: compiles the copy kernel and checks one in-place slot copy
+    /// on a scratch page (slot 3 onto slot 5, keys and values, every head).
+    static func warmTreeCopy(dtype: DType, kvHeads: Int, headDim: Int, pageSize: Int) -> Bool {
+        guard kvHeads > 0, headDim > 0, pageSize > 5 else { return false }
+        let pageElements = kvHeads * pageSize * headDim
+        let storage = MLXRandom.normal([2 * pageElements], key: MLXRandom.key(21)).asType(dtype)
+        eval(storage)
+        let records = MLXArray([Int32(0), 3, 0, 5] + [Int32](repeating: 0, count: 20))
+        let fence = copyKernel(dtype: dtype)(
+            [storage, records, MLXArray.zeros([1], type: Int32.self)],
+            template: [
+                ("T", dtype), ("H", kvHeads), ("D", headDim), ("S", pageSize),
+                ("VBASE", pageElements),
+            ],
+            grid: (headDim, kvHeads, 1), threadGroup: (min(256, headDim), 1, 1),
+            outputShapes: [[1]], outputDTypes: [.int32])[0]
+        eval(fence)
+        let page = storage.reshaped([2, kvHeads, pageSize, headDim]).asType(.float32)
+        let same = all(page[0..., 0..., 3 ..< 4, 0...] .== page[0..., 0..., 5 ..< 6, 0...])
+        eval(same)
+        return same.item(Bool.self)
+    }
+
+    /// Runs a `copyPlan`: one dispatch per segment, ordered on the group's
+    /// write fence like every other in-place write.
+    static func copy(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])]) {
+        for (segment, quads) in plan where !quads.isEmpty {
+            let padded = quads + Array(repeating: 0, count: max(0, 24 - quads.count))
+            group.writeFence = copyKernel(dtype: group.dtype)(
+                [segment.storage, MLXArray(padded), group.writeFence],
+                template: [
+                    ("T", group.dtype), ("H", group.key.kvHeads), ("D", group.key.headDim),
+                    ("S", group.pageSize), ("VBASE", segment.valueOffset),
+                ],
+                grid: (group.key.headDim, group.key.kvHeads, quads.count / 4),
+                threadGroup: (min(256, group.key.headDim), 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+        }
+        // Submit now: the source slot's page may go back to the free list at
+        // this round's commit, before anything else would evaluate the copy.
+        asyncEval([group.writeFence])
+    }
+
     static func gather(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int)
         -> (keys: MLXArray, values: MLXArray)
     {

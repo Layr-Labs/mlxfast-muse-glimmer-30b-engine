@@ -249,6 +249,87 @@ extension EngineLoopV2 {
             var naturalEmitted: Int
             var constraintFailure: String? = nil
             var nonFiniteAfterPrefix = false
+            /// Draft tree: the committed leaf's verify column (the round
+            /// commits `accepted` drafts, the leaf token and the target there).
+            var treeLeafColumn: Int? = nil
+            /// Draft tree: that leaf's K/V move, planned before anything commits.
+            var treeCopy: [(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])])]? = nil
+        }
+
+        // Draft tree (CBV2_VERIFY_TREE): the chain is the window's first
+        // `chain` drafts; leaves commit only from a valid forward, after an
+        // exactness probe has passed, and never past a failed one.
+        // Same-width round: its layout, chosen on device, read back with the
+        // packet (meta [4], rowpos [k + 1]). A layout this design cannot verify
+        // exactly commits its leading chain columns only.
+        var roundTree = verify.tree
+        if var tree = roundTree, tree.sameWidth, let base = tree.sameWidthBase,
+            base + 4 + k + 1 <= host.count
+        {
+            let chain = Int(host[base])
+            let leaves = Int(host[base + 1])
+            let probe = host[base + 2] != 0
+            let rowPositions = Array(host[(base + 4) ..< (base + 4 + k + 1)])
+            if CBv2SameWidthTree.layoutIsValid(
+                rowPositions: rowPositions, chain: chain, leaves: leaves, drafts: k)
+            {
+                tree.chain = chain
+                if leaves > 0 {
+                    tree.layout = CBv2VerifyTree.Layout(
+                        chain: chain,
+                        leaves: (0 ..< leaves).map { j in
+                            CBv2VerifyTree.Leaf(
+                                row: Int(rowPositions[chain + 1 + j]) - 1,
+                                rank: probe && j == leaves - 1 ? 1 : 2)
+                        },
+                        probe: probe ? leaves - 1 : nil)
+                } else if tree.why.isEmpty {
+                    tree.why = "sw_chain"
+                }
+            } else {
+                var chain = 0
+                while chain < k, rowPositions.count > chain + 1,
+                    rowPositions[chain + 1] == Int32(chain + 1)
+                {
+                    chain += 1
+                }
+                tree.chain = chain
+                tree.valid = false
+                tree.why = "layout_invalid"
+            }
+            roundTree = tree
+        }
+        let treeChain = roundTree?.chain ?? k
+        var treeHitsAllowed = false
+        var treeProbe: Bool? = nil
+        if let tree = roundTree, let layout = tree.layout {
+            CBv2VerifyTree.counters.armedRounds += 1
+            CBv2VerifyTree.counters.leaves += layout.leaves.count - (layout.probe == nil ? 0 : 1)
+            if !tree.valid { CBv2VerifyTree.counters.invalidRounds += 1 }
+            if tree.valid, let probe = layout.probe, let base = tree.probeBase, base < host.count {
+                let column = layout.column(ofLeaf: probe)
+                let chainColumn = layout.leaves[probe].row + 1
+                let t = draftCount + column
+                let c = draftCount + chainColumn
+                let ok = host[base] == 1 && t < host.count && host[t] == host[c]
+                treeProbe = ok
+                CBv2VerifyTree.probesRun += 1
+                CBv2VerifyTree.counters.probeRounds += 1
+                if ok {
+                    CBv2VerifyTree.probePassed = true
+                } else {
+                    CBv2VerifyTree.probeFailed = true
+                    CBv2VerifyTree.counters.probeFailures += 1
+                    FileHandle.standardError.write(
+                        Data(
+                            ("[cbv2-tree] PROBE FAILED: leaf column \(column) differs from chain "
+                                + "column \(chainColumn) (hidden bits equal: \(host[base] == 1)); "
+                                + "leaves off for this process\n").utf8))
+                }
+            }
+            treeHitsAllowed =
+                tree.valid && !CBv2VerifyTree.probeFailed
+                && (CBv2VerifyTree.probePassed || CBv2VerifyTree.probeRounds == 0)
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -307,20 +388,53 @@ extension EngineLoopV2 {
 
             var accepted = 0
             if let span = metadata.freeSpan {
-                while accepted < k, targets[accepted] == drafts[accepted],
+                while accepted < treeChain, targets[accepted] == drafts[accepted],
                     span.continues(with: drafts[accepted])
                 {
                     accepted += 1
                 }
             } else if let acceptBase {
-                while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
+                while accepted < treeChain, host[acceptBase + batchIndex * k + accepted] != 0 {
                     accepted += 1
                 }
             } else {
-                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+                while accepted < treeChain, targets[accepted] == drafts[accepted] { accepted += 1 }
             }
-            let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
+            var committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
             var naturalEmitted = accepted + 1
+            // Draft tree: a leaf at the first rejected row that carries the
+            // target's token there commits, with the target at its column.
+            var treeLeafColumn: Int? = nil
+            var treeCopy: [(group: PagedKVGroup, plan: [(PagedKVSegment, [Int32])])]? = nil
+            // (A leaf at row `chain` is the alternative after a fully
+            // accepted chain; a rank >= 2 token equal to the target there
+            // implies the rank-1 draft would have been rejected.)
+            if treeHitsAllowed, let layout = roundTree?.layout, metadata.freeSpan == nil,
+                acceptBase == nil, accepted <= layout.chain
+            {
+                for (index, leaf) in layout.leaves.enumerated()
+                where index != layout.probe && leaf.row == accepted {
+                    let column = layout.column(ofLeaf: index)
+                    guard drafts[column - 1] == targets[accepted],
+                        targets[column] != Int(CBv2NonFiniteLogits.invalidTarget)
+                    else { continue }
+                    let paged = metadata.storageRows.compactMap { $0 as? PagedSequenceKV }
+                    let seed = (paged.first?.absoluteOffset ?? 0) - targetWidth
+                    if paged.count == metadata.storageRows.count,
+                        paged.allSatisfy({ $0.absoluteOffset - targetWidth == seed }),
+                        let plan = PagedSequenceKV.treeLeafCopyPlan(
+                            rows: paged, source: seed + column, destination: seed + accepted + 1)
+                    {
+                        treeLeafColumn = column
+                        treeCopy = plan
+                        committed = Array(drafts[0 ..< accepted]) + [drafts[column - 1], targets[column]]
+                        naturalEmitted = accepted + 2
+                    } else {
+                        CBv2VerifyTree.counters.notArmed["copy_unavailable", default: 0] += 1
+                    }
+                    break
+                }
+            }
             naturalEmitted = min(
                 naturalEmitted,
                 rec.request.maxTokens - rec.generatedTokenCount)
@@ -332,7 +446,14 @@ extension EngineLoopV2 {
             // A position this row would commit was decided by non-finite
             // target logits: commit nothing and fail the request exactly like
             // any other finalize-time verify failure.
-            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+            // A committed leaf: the positions it commits are targets 0 ... a
+            // and the target at its own column (not chain column a + 1).
+            let decisiveTargets =
+                treeLeafColumn.map { column in
+                    Array(targets[0 ... accepted])
+                        + (naturalEmitted > accepted + 1 ? [targets[column]] : [])
+                } ?? Array(targets[..<naturalEmitted])
+            if decisiveTargets.contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
                 nonFiniteVerifyFailures += 1
                 step.discard.insert(id)
                 releaseDiscarded(metadata)
@@ -348,7 +469,9 @@ extension EngineLoopV2 {
                     targets: targets,
                     committed: committed,
                     accepted: accepted,
-                    naturalEmitted: naturalEmitted))
+                    naturalEmitted: naturalEmitted,
+                    treeLeafColumn: treeLeafColumn,
+                    treeCopy: treeCopy))
         }
 
         if let logits = verify.constraintLogits {
@@ -399,9 +522,9 @@ extension EngineLoopV2 {
             for outcome in outcomes {
                 let accepted = min(outcome.accepted, outcome.naturalEmitted)
                 mtp.recordStepAcceptance(
-                    drafted: k, accepted: accepted,
+                    drafted: treeChain, accepted: accepted,
                     observedDrafts: outcome.naturalEmitted <= accepted
-                        ? outcome.naturalEmitted : min(k, accepted + 1),
+                        ? outcome.naturalEmitted : min(treeChain, accepted + 1),
                     decodeRowBucket: mtp.planDecodeRowBucket,
                     measurement: step.mtpMeasurement)
             }
@@ -409,9 +532,9 @@ extension EngineLoopV2 {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
             let observedDrafts =
                 commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
+                ? commonEmitted : min(treeChain, stepAccepted + 1)
             mtp.recordStepAcceptance(
-                drafted: k,
+                drafted: treeChain,
                 accepted: stepAccepted,
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket,
@@ -426,6 +549,12 @@ extension EngineLoopV2 {
             let accepted = outcome.accepted
             let emitted = Array(
                 outcome.committed.prefix(perRowWidth ? outcome.naturalEmitted : commonEmitted))
+            // CBV2_TREE_TRACE (measurement only): the plan's inputs and the
+            // drafter's block, read before this row commits anything.
+            let traceHead =
+                CBv2TreeTrace.enabled && nativeShutdownState == nil
+                ? mtpTraceRoundHead(rec: rec, assistantState: metadata.assistantState, driver: mtp)
+                : nil
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.
@@ -499,6 +628,18 @@ extension EngineLoopV2 {
                     targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
+            // Draft tree: the leaf and the target at its column both
+            // committed. (A leaf cut by a stop or the length bound commits
+            // only the leaf token, which equals the chain's target there: a
+            // chain outcome, with nothing to move.)
+            let leafColumn: Int? =
+                outcome.treeLeafColumn.flatMap { confirmed == accepted + 2 ? $0 : nil }
+            if leafColumn != nil, let copy = outcome.treeCopy {
+                // The leaf's K/V onto its logical slot, bitwise, before the
+                // rollback releases its column's slot.
+                PagedSequenceKV.runTreeLeafCopy(copy)
+                CBv2VerifyTree.counters.copies += 1
+            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -537,23 +678,49 @@ extension EngineLoopV2 {
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
-            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            let committedDraftCount =
+                leafColumn != nil ? accepted + 1 : min(accepted, max(0, confirmed - 1))
             if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
+                // A committed leaf: inputs seed, d1 ... da, leaf; the rows of
+                // seed ... da are verify columns 0 ... a, the leaf's row is the
+                // carry.
+                if leafColumn != nil, let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter {
+                    treeDrafter.treePrepareLeafCommit(
+                        stagedRows: committedDraftCount, requestState: state)
+                }
+                let draftTokens =
+                    leafColumn.map { column in
+                        concatenated(
+                            [
+                                verify.draftIDs[batchIndex ..< batchIndex + 1, 0 ..< accepted],
+                                verify.draftIDs[
+                                    batchIndex ..< batchIndex + 1, (column - 1) ..< column],
+                            ], axis: 1)
+                    }
+                    ?? verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount]
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
+                    committedDraftTokens: draftTokens,
                     committedTargetHidden: verify.lastHidden[
                         batchIndex ..< batchIndex + 1,
                         0 ..< committedDraftCount,
                         0...])
+                // The 8-row tree's speculation covered chain outcomes only; a
+                // same-width round's is tree-positioned and is confirmed for
+                // the leaf's rows with the carry below.
+                if leafColumn != nil, roundTree?.sameWidth != true,
+                    let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+                {
+                    treeDrafter.treeLeafCommitted(requestState: state)
+                }
             }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
@@ -590,10 +757,13 @@ extension EngineLoopV2 {
             }
 
             let observedAccepted = min(accepted, confirmed)
+            // A committed leaf counts as one more accepted draft in the
+            // round's records (committed = accepted + 1, accepted <= drafted).
+            let recordedAccepted = leafColumn != nil ? accepted + 1 : observedAccepted
             // Per-request timing: this verify row confirmed at the step's
             // readback-done instant (already read by `finalize`).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
-            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            rec.recordMTPRound(drafted: k, accepted: recordedAccepted)
             if confirmed > 0 {
                 rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
                 step.forwardShapes?.confirmTokens(
@@ -604,16 +774,55 @@ extension EngineLoopV2 {
             }
             // engine-local: per-round audit record (benchmark free-run audit)
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                drafted: k, accepted: recordedAccepted, emitted: confirmed,
                 audit: CBv2MTPRoundAuditRecord(
                     requestID: id.raw, drafted: k,
-                    accepted: accepted, committed: confirmed))
-            let rejectionObserved = accepted < k && confirmed > accepted
+                    accepted: leafColumn != nil ? accepted + 1 : accepted, committed: confirmed))
+            // The request's acceptance history and regime observe the chain
+            // only (`treeChain == k` outside an armed tree round); the
+            // ceiling still counts every committed token.
+            let rejectionObserved = accepted < treeChain && confirmed > accepted
             let acceptanceTruncated =
-                !rejectionObserved && confirmed <= accepted && confirmed < k
+                !rejectionObserved && confirmed <= accepted && confirmed < treeChain
+            if let tree = roundTree {
+                // Sibling hit rates learn from every row whose drafter top-1
+                // the target rejected: the chain's first rejection, or the row
+                // after a fully accepted chain (its bonus target is known).
+                if let base = tree.topBase, accepted < tree.topRows, accepted < outcome.targets.count {
+                    let row = base + accepted * 3
+                    let truth = outcome.targets[accepted]
+                    if row + 2 < host.count, Int(host[row]) != truth,
+                        truth != Int(CBv2NonFiniteLogits.invalidTarget)
+                    {
+                        mtp.treeObserveRejection(
+                            id, row: accepted, rank2: Int(host[row + 1]) == truth,
+                            rank3: Int(host[row + 2]) == truth)
+                    }
+                }
+                if leafColumn != nil { CBv2VerifyTree.counters.hits += 1 }
+                CBv2VerifyTree.counters.eligibleRounds += tree.topBase != nil ? 1 : 0
+                let armedLeaves = tree.layout.map { $0.leaves.count - ($0.probe == nil ? 0 : 1) } ?? 0
+                mtp.treeRecord(
+                    id, armed: tree.layout != nil, leaves: armedLeaves, hit: leafColumn != nil,
+                    invalid: tree.layout != nil && !tree.valid,
+                    generated: rec.generatedTokenCount)
+                if CBv2TreeTrace.enabled {
+                    mtpEmitTraceTree(
+                        tree, id: id, k: k, drafts: (0 ..< k).map { Int(host[batchIndex * k + $0]) },
+                        accepted: accepted, confirmed: confirmed, leafColumn: leafColumn,
+                        probe: treeProbe, rates: mtp.treeSiblingRates(id))
+                }
+            }
+            if let traceHead {
+                mtpEmitTraceRound(
+                    traceHead, id: id, k: k,
+                    drafts: (0 ..< k).map { Int(host[batchIndex * k + $0]) },
+                    targets: outcome.targets, accepted: accepted, kept: kept,
+                    extra: roundTree.map { "\"chain\":\($0.chain)" })
+            }
             mtp.observeRequestAcceptance(
                 id: id,
-                draftedDepth: k,
+                draftedDepth: treeChain,
                 acceptedDepth: observedAccepted,
                 committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
@@ -634,8 +843,11 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                // A committed leaf's own row is the carry.
+                let hiddenColumn =
+                    leafColumn
+                    ?? CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears
@@ -679,6 +891,15 @@ extension EngineLoopV2 {
                         carryHidden: carryHidden, acceptedDrafts: accepted,
                         carryTokenIsTarget: kept[accepted]
                             == Int(host[draftCount + batchIndex * targetWidth + accepted]),
+                        requestState: state)
+                } else if let leafColumn, roundTree?.sameWidth == true,
+                    let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter,
+                    let state = metadata.assistantState
+                {
+                    // Same-width leaf commit: inputs seed, d1 ... da, leaf are
+                    // verify rows 0 ... a and the leaf's column.
+                    treeDrafter.treeConfirmSpeculation(
+                        carryHidden: carryHidden, rows: Array(0 ... accepted) + [leafColumn],
                         requestState: state)
                 }
             }
@@ -768,14 +989,29 @@ extension EngineLoopV2 {
             let state = verify.rows[0].assistantState
         else { return }
         let k = verify.k
+        // Draft tree round: the drafter staged the chain only, and only its
+        // outcomes are speculated (a leaf commit drops the speculation).
+        let depth = verify.tree?.layout != nil ? (verify.tree?.chain ?? k) : k
         // Packet: [1, k] drafts, then [1, k + 1] targets.
-        let targets = verify.acceptancePacket[k ..< (2 * k + 1)].reshaped([1, k + 1])
+        let targets = verify.acceptancePacket[k ..< (k + depth + 1)].reshaped([1, depth + 1])
+        let hidden =
+            depth == k ? verify.lastHidden : verify.lastHidden[0..., 0 ..< (depth + 1), 0...]
         let draftsBlock =
-            mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: k).map {
+            mtp.predictedFullAcceptance(for: verify.rows[0].id, depth: depth).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        CBv2DraftRegime.treeProposals =
+            verify.tree?.topBase != nil || verify.tree?.sameWidth == true
+        defer { CBv2DraftRegime.treeProposals = false }
+        // Same-width round: the speculation's context keys at the verify
+        // columns' tree depths (any outcome then appends its own rows).
+        if let rowPositions = verify.treeRowPositions,
+            let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+        {
+            treeDrafter.setSpeculationRowPositions(rowPositions, requestState: state)
+        }
         let roots = speculator.speculateNextRound(
-            targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
+            targetTokens: targets, targetHidden: hidden, depth: depth,
             draftsBlock: draftsBlock, requestState: state)
         guard !roots.isEmpty else { return }
         do {

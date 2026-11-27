@@ -136,7 +136,209 @@ public enum PagedOnePassAttention {
                 partitionTokens: ptok, softcap: softcap, source: source)
             outputs += [result.fence, result.out]
         }
+        if CBv2SameWidthTree.enabled {
+            // The same-width tree's depth variant (`CBV2_TREE_DEPTH`): probed
+            // and compiled per binding class, then checked bit for bit.
+            for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                let offsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
+                let rowdepth = MLXArray([Int32(0)])
+                let held =
+                    (try? withError { () -> Bool in
+                        let probed = segments(
+                            queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                            seqinfo: seqinfo, params: params, previous: previous,
+                            valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, probe: true, depthRows: rowdepth)
+                        eval(probed.fence, probed.out)
+                        return true
+                    }) ?? false
+                guard held else {
+                    CBv2VerifyTree.kernelSelfTestFailed = true
+                    FileHandle.standardError.write(
+                        Data("[cbv2-tree] depth attention probe failed bindings=\(bindings); tree off\n".utf8))
+                    break
+                }
+                let tree = segments(
+                    queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                    seqinfo: seqinfo, params: params, previous: previous,
+                    valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                    kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source, depthRows: rowdepth)
+                outputs += [tree.fence, tree.out]
+            }
+            if !CBv2VerifyTree.kernelSelfTestFailed {
+                let ok =
+                    (try? withError { () -> Bool in
+                        depthSelfTest(
+                            dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads,
+                            headDim: headDim, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                            partitionTokens: ptok, softcap: softcap, source: source)
+                    }) ?? false
+                if !ok {
+                    CBv2VerifyTree.kernelSelfTestFailed = true
+                    FileHandle.standardError.write(
+                        Data("[cbv2-tree] depth attention self-test failed; tree off\n".utf8))
+                }
+            }
+        }
+        if CBv2VerifyTree.enabled, !CBv2SameWidthTree.enabled {
+            // The draft-tree remap variant (`CBV2_TREE_REMAP`): probed like
+            // the record kernels; one that cannot hold its threadgroup turns
+            // leaves off for the process instead of failing a round.
+            for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                let offsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
+                let held =
+                    (try? withError { () -> Bool in
+                        let probed = segments(
+                            queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                            seqinfo: seqinfo, params: params, previous: previous,
+                            valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, probe: true, remap: true)
+                        eval(probed.fence, probed.out)
+                        return true
+                    }) ?? false
+                guard held else {
+                    CBv2VerifyTree.kernelSelfTestFailed = true
+                    FileHandle.standardError.write(
+                        Data("[cbv2-tree] remap attention probe failed bindings=\(bindings); leaves off\n".utf8))
+                    break
+                }
+                let tree = segments(
+                    queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                    seqinfo: seqinfo, params: params, previous: previous,
+                    valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                    kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                    partitionTokens: ptok, softcap: softcap, source: source, remap: true)
+                outputs += [tree.fence, tree.out]
+            }
+            if !CBv2VerifyTree.kernelSelfTestFailed {
+                let ok =
+                    (try? withError { () -> Bool in
+                        remapSelfTest(
+                            dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads,
+                            headDim: headDim, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                            partitionTokens: ptok, softcap: softcap, source: source)
+                    }) ?? false
+                if !ok {
+                    CBv2VerifyTree.kernelSelfTestFailed = true
+                    FileHandle.standardError.write(
+                        Data("[cbv2-tree] remap attention self-test failed; leaves off\n".utf8))
+                }
+            }
+        }
         eval(outputs)
+    }
+
+    /// Same-width tree load-time check of the `CBV2_TREE_DEPTH` variant, two
+    /// rows on one random page, raw bits: (A) `rowdepth` = identity equals the
+    /// record kernel; (B) row 1 at depth 0 (row 0's range, its own last key)
+    /// equals the record kernel's row 0 on a page whose slot `n0 - 1` holds
+    /// slot `n0` (row 1's own slot), both rows given the same query.
+    static func depthSelfTest(
+        dtype: DType, queryHeads: Int, kvHeads: Int, headDim: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, source: String
+    ) -> Bool {
+        guard pageSize >= 8 else { return true }
+        let pageElements = kvHeads * pageSize * headDim
+        let storage = MLXRandom.normal([2 * pageElements], key: MLXRandom.key(41)).asType(dtype)
+        let one = MLXRandom.normal([1, queryHeads, headDim], key: MLXRandom.key(42)).asType(dtype)
+        let other = MLXRandom.normal([1, queryHeads, headDim], key: MLXRandom.key(43)).asType(dtype)
+        let n0 = pageSize / 2
+        var page = storage.reshaped([2, kvHeads, pageSize, headDim])
+        page[0..., 0..., (n0 - 1) ..< n0, 0...] = page[0..., 0..., n0 ..< (n0 + 1), 0...]
+        let moved = page.reshaped([2 * pageElements])
+        let twoRows = concatenated([one, other], axis: 0)
+        let sameRows = concatenated([one, one], axis: 0)
+        eval(storage, moved, twoRows, sameRows)
+        let params = MLXArray([Float(1), 1, 0, 0, 0, 0, 0, 0])
+        let previous = MLXArray.zeros([1], type: Int32.self)
+        let offsets = MLXArray([Int64](repeating: Int64(pageElements), count: 8))
+        let seqinfo = MLXArray(
+            [Int32(0), Int32(n0), 1, 0, 0, 0, 0, 0, 0, Int32(n0 + 1), 1, 0, 0, 0, 0, 0], [2, 8])
+        var records = [Int32](repeating: 0, count: 2 * PagedSegmentDispatchPlan.recordStride)
+        for row in 0 ..< 2 {
+            let base = row * PagedSegmentDispatchPlan.recordStride
+            records[base] = Int32(row)
+            records[base + 3] = 1
+            records[base + 6] = 1
+        }
+        func run(_ q: MLXArray, _ backing: MLXArray, depth: [Int32]?) -> MLXArray {
+            segments(
+                queries: q, backing: [backing], seqinfo: seqinfo, params: params,
+                previous: previous, valueOffsets: offsets, records: MLXArray(records),
+                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+                source: source, depthRows: depth.map { MLXArray($0) }
+            ).out
+        }
+        let record = run(twoRows, storage, depth: nil)
+        let identity = run(twoRows, storage, depth: [0, 1])
+        let leaf = run(sameRows, storage, depth: [0, 0])
+        let reference = run(sameRows, moved, depth: nil)
+        func bits(_ x: MLXArray) -> MLXArray {
+            x.view(dtype: x.dtype.size == 4 ? .uint32 : .uint16)
+        }
+        let same = [
+            all(bits(record) .== bits(identity)),
+            all(bits(leaf[1 ..< 2]) .== bits(reference[0 ..< 1])),
+        ]
+        eval(same)
+        return same.allSatisfy { $0.item(Bool.self) }
+    }
+
+    /// Draft tree load-time check of the `CBV2_TREE_REMAP` variant on one
+    /// random page, raw bits: (1) with remap off it equals the record kernel;
+    /// (2) a row whose last key is remapped from slot `r` equals the record
+    /// kernel on a page whose slot `last` holds slot `r`'s K/V.
+    static func remapSelfTest(
+        dtype: DType, queryHeads: Int, kvHeads: Int, headDim: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, source: String
+    ) -> Bool {
+        guard pageSize >= 8 else { return true }
+        let pageElements = kvHeads * pageSize * headDim
+        let storage = MLXRandom.normal([2 * pageElements], key: MLXRandom.key(31)).asType(dtype)
+        let q = MLXRandom.normal([1, queryHeads, headDim], key: MLXRandom.key(32)).asType(dtype)
+        let last = pageSize / 2 - 1
+        let remapSlot = pageSize - 2
+        // The page with slot `last` replaced by slot `remapSlot` (keys and values).
+        var page = storage.reshaped([2, kvHeads, pageSize, headDim])
+        page[0..., 0..., last ..< (last + 1), 0...] = page[0..., 0..., remapSlot ..< (remapSlot + 1), 0...]
+        let moved = page.reshaped([2 * pageElements])
+        eval(storage, q, moved)
+        let params = MLXArray([Float(1), 1, 0, 0, 0, 0, 0, 0])
+        let previous = MLXArray.zeros([1], type: Int32.self)
+        let offsets = MLXArray([Int64](repeating: Int64(pageElements), count: 8))
+        var record = [Int32](repeating: 0, count: PagedSegmentDispatchPlan.recordStride)
+        record[3] = 1
+        record[6] = 1
+        var remapRecord = record
+        remapRecord[7] = PagedSegmentDispatchPlan.remapRecord(binding: 0, local: 0)
+        func run(_ backing: MLXArray, _ info: [Int32], _ rec: [Int32], remap: Bool) -> MLXArray {
+            segments(
+                queries: q, backing: [backing], seqinfo: MLXArray(info, [1, 8]), params: params,
+                previous: previous, valueOffsets: offsets, records: MLXArray(rec), dtype: dtype,
+                kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap, source: source,
+                remap: remap
+            ).out
+        }
+        let full: [Int32] = [0, Int32(pageSize), 1, 0, 0, 0, 0, 0]
+        let short: [Int32] = [0, Int32(last + 1), 1, 0, 0, 0, 0, 0]
+        let remapped: [Int32] = [0, Int32(last + 1), 1, 0, 0, 0, Int32(remapSlot), 1]
+        let a = run(storage, full, record, remap: false)
+        let b = run(storage, full, record, remap: true)
+        let c = run(moved, short, record, remap: false)
+        let d = run(storage, remapped, remapRecord, remap: true)
+        func bits(_ x: MLXArray) -> MLXArray {
+            x.view(dtype: x.dtype.size == 4 ? .uint32 : .uint16)
+        }
+        let same = [all(bits(a) .== bits(b)), all(bits(c) .== bits(d))]
+        eval(same)
+        return same.allSatisfy { $0.item(Bool.self) }
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
@@ -212,6 +414,46 @@ public enum PagedOnePassAttention {
             """
     }
 
+    /// Same-width tree (`CBV2_TREE_DEPTH`): row `b` runs the serial row
+    /// `rowdepth[b]` (that row's seqinfo and partition records) with its own
+    /// last key, read through its own last-partition record. `rowdepth[b] == b`
+    /// is the record row.
+    private static func segmentBodyDepth(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const int row = threadgroup_position_in_grid.y;
+            const int tmpl = rowdepth[row];
+            int first = 0;
+            for (int r = 0; r < tmpl; r++) {
+                first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own = (seqinfo[tmpl * 8 + 1] + PTOK - 1) / PTOK;
+            int own_first = 0;
+            for (int r = 0; r < row; r++) {
+                own_first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+            }
+            const int own_parts = (seqinfo[row * 8 + 1] + PTOK - 1) / PTOK;
+            const int wanted = (int)simdgroup_index_in_threadgroup / NSG;
+            const device int32_t* record =
+                records + (first + min(wanted, own - 1)) * STRIDE;
+            const device int32_t* own_record = records + (own_first + own_parts - 1) * STRIDE;
+            const int own_pos = seqinfo[row * 8] + seqinfo[row * 8 + 1] - 1;
+            const cbv2::PagedSegmentDepthAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D,
+                own_record, tmpl, own_pos, own_pos / S};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            \(scratch)
+            cbv2::paged_attention_onepass_impl<
+                T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
+                cbv2::PagedSegmentDepthAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
+                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            """
+    }
+
     private static func name(
         _ kind: String, dtype: DType, headDim: Int, pageSize: Int, gqa: Int, hpt: Int,
         simdgroups: Int, partitionTokens: Int, softcap: Bool
@@ -270,8 +512,10 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, remap: Bool = false,
+        depthRows: MLXArray? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
+        let depth = depthRows != nil
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
         let bindings = backing.count
@@ -279,7 +523,7 @@ public enum PagedOnePassAttention {
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+                softcap: softcap) + (remap ? "_remap" : "") + (depth ? "_depth" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -288,15 +532,21 @@ public enum PagedOnePassAttention {
             let made = MLXFast.metalKernel(
                 name: kernelName,
                 inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
-                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
-                outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                    + ["seqinfo", "params", "previous", "value_offsets", "records"]
+                    + (depth ? ["rowdepth"] : []),
+                outputNames: ["fence", "out"],
+                source: depth ? segmentBodyDepth(bindings: bindings) : segmentBody(bindings: bindings),
+                header: depth
+                    ? "#define CBV2_TREE_DEPTH 1\n" + source
+                    : (remap ? "#define CBV2_TREE_REMAP 1\n" + source : source),
+                ensureRowContiguous: true)
             kernels[kernelName] = made
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
         let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
+            [queries] + backing + [seqinfo, params, previous, valueOffsets, records]
+                + (depthRows.map { [$0.asType(.int32)] } ?? []),
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
                 ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),

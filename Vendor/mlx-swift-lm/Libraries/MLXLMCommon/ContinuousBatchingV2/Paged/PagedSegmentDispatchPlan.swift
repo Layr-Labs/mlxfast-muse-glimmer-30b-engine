@@ -18,14 +18,19 @@ struct PagedSegmentDispatchPlan {
         let pages: [Int32]
         let info: PagedAttentionKernel.SeqInfoRow
         let identity: Identity?
+        /// Draft tree only: the physical page holding `info.remapPosition`.
+        /// Its (binding, local page) travels in the row's last-partition
+        /// record header slot 7 (`remapRecord`), which no record kernel reads.
+        let remapPage: Int32?
 
         init(
             pages: [Int32], info: PagedAttentionKernel.SeqInfoRow,
-            identity: Identity? = nil
+            identity: Identity? = nil, remapPage: Int32? = nil
         ) {
             self.pages = pages
             self.info = info
             self.identity = identity
+            self.remapPage = remapPage
         }
     }
 
@@ -41,6 +46,14 @@ struct PagedSegmentDispatchPlan {
     let buckets: [Bucket]
     let partitionTokens: Int
     let maxPartitions: Int
+
+    /// Header slot 7 of a draft-tree leaf row's last-partition record:
+    /// `((binding << 26) | local) + 1`, 0 meaning none (`remap_page` in
+    /// pagedattention.metal decodes it).
+    static func remapRecord(binding: Int, local: Int) -> Int32 {
+        precondition(binding >= 0 && binding < 32 && local >= 0 && local < (1 << 26) - 1)
+        return Int32((binding << 26) | local) + 1
+    }
 
     /// PTOK + an unaligned first page can span at most 17 physical pages.
     /// Smaller page configurations get an explicit smaller PTOK specialization.
@@ -69,6 +82,7 @@ struct PagedSegmentDispatchPlan {
             let firstPage: Int
             let pages: [Int32]
             let write: Int32?
+            var remap: Int32? = nil
         }
         var result: [Bucket] = []
         var pending: [Item] = []
@@ -86,7 +100,12 @@ struct PagedSegmentDispatchPlan {
                 var record: [Int32] = [
                     Int32(item.row), Int32(item.partition), Int32(item.firstPage),
                     Int32(item.pages.count), Int32(writer?.0 ?? 0), Int32(writer?.1 ?? 0),
-                    Int32(maxPartitions), 0,
+                    Int32(maxPartitions),
+                    item.remap.map {
+                        Self.remapRecord(
+                            binding: binding[layout.segmentIndex(page: $0)]!,
+                            local: layout.localPage($0))
+                    } ?? 0,
                 ]
                 for page in item.pages {
                     record.append(Int32(binding[layout.segmentIndex(page: page)]!))
@@ -123,14 +142,19 @@ struct PagedSegmentDispatchPlan {
                     precondition(
                         writer == pages.last, "fused write must target the newest attended page")
                 }
-                let needed = Set(pages.map { layout.segmentIndex(page: $0) })
+                let remap = partition == partitions - 1 ? row.remapPage : nil
+                if let remap {
+                    precondition(layout.isUsable(remap), "remap names a poison or invalid page")
+                }
+                let needed = Set(
+                    (pages + (remap.map { [$0] } ?? [])).map { layout.segmentIndex(page: $0) })
                 precondition(needed.count <= Self.maximumBindings)
                 if segments.union(needed).count > Self.maximumBindings { flush() }
                 segments.formUnion(needed)
                 pending.append(
                     Item(
                         row: rowIndex, partition: partition, firstPage: first,
-                        pages: pages, write: writer))
+                        pages: pages, write: writer, remap: remap))
             }
         }
         flush()

@@ -1297,14 +1297,41 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
         descriptors.reserveCapacity(b * l)
+        // Draft tree round: a leaf column attends exactly the serial range of
+        // its logical position (the chain column it replaces) with its own
+        // K/V, written at its column's slot, remapped in as the last key.
+        let tree = CBv2VerifyTree.active(batch: b, columns: l)
+        // The depth variant only for windows of >= 3 rows (never armed below:
+        // `CBv2SameWidthTree.minimumDrafts`); a narrower one would be a bug, so
+        // the round keeps the record kernel and commits its chain only.
+        let depthRows: MLXArray? =
+            tree?.sameWidth == true && l >= 1 + CBv2SameWidthTree.minimumDrafts
+            ? tree?.rowDepth : nil
+        if let tree, tree.sameWidth, depthRows == nil { tree.fail("sw_short_window") }
         for row in rows {
+            let seed = row.absoluteOffset - l
             for t in 0 ..< l {
+                guard let tree, let leaf = tree.leaf(atColumn: t) else {
+                    descriptors.append(
+                        PagedSegmentDispatchPlan.Row(
+                            pages: row.table,
+                            info: row.seqInfoRow(
+                                attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                            identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+                    continue
+                }
+                var info = row.seqInfoRow(
+                    attending: attendRange(row: row, qPosFromEnd: l - 1 - leaf.servesColumn))
+                let own = seed + t
+                let page = row.physicalPage(position: own)
+                if page == nil { tree.fail("remap_page") }
+                info.remapPosition = own
+                info.remaps = page != nil
                 descriptors.append(
                     PagedSegmentDispatchPlan.Row(
-                        pages: row.table,
-                        info: row.seqInfoRow(
-                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
-                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+                        pages: row.table, info: info,
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion),
+                        remapPage: page))
             }
         }
         let result = PagedSegmentAttention.decode(
@@ -1315,7 +1342,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            remap: tree != nil && tree?.sameWidth != true,
+            depthRows: depthRows)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

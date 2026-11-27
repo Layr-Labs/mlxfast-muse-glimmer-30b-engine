@@ -776,6 +776,27 @@ extension EngineLoopV2 {
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
+        if CBv2TreeTrace.enabled {
+            for row in verifyRows { mtp.traceNoteBuild(row.rec.id) }
+        }
+        // Draft tree (CBV2_VERIFY_TREE): this plan's decision for the one
+        // verify row; its layout only while it still spans the planned width.
+        let treePlan: CBv2MTPRoundDriver.TreePlan? =
+            CBv2VerifyTree.enabled && batch == 1 && nativeShutdownState == nil
+                && verifyRows[0].rec.request.tokenConstraint == nil
+                && verifyRows[0].rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+            ? mtp.treePlans[verifyRows[0].rec.id] : nil
+        let treeDrafter = mtp.drafter as? any CBv2MTPTreeDrafter
+        var treeLayout: CBv2VerifyTree.Layout? = nil
+        var treeWhy = treePlan?.why ?? ""
+        if let plan = treePlan, !plan.layout.leaves.isEmpty {
+            if plan.layout.drafts == k, treeDrafter != nil {
+                treeLayout = plan.layout
+            } else {
+                treeWhy = "plan_clamped"
+            }
+        }
+        var treeArmed = false
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
         var assistantOwnersTransferred = false
@@ -862,6 +883,8 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        CBv2DraftRegime.treeProposals = treePlan?.eligible == true
+        defer { CBv2DraftRegime.treeProposals = false }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -894,6 +917,23 @@ extension EngineLoopV2 {
                     })
             }
             for draftIndex in 0 ..< k {
+                // Draft tree: after the chain, the leaves' tokens come from
+                // the block's top-3 on device. Without them the loop goes on
+                // and the round verifies a chain of k drafts.
+                if let layout = treeLayout, draftIndex == layout.chain {
+                    if let state = rowMetadata[0].assistantState,
+                        let leafTokens = treeDrafter?.treeLeafTokens(
+                            layout.gather, requestState: state)
+                    {
+                        for index in 0 ..< layout.leaves.count {
+                            draftSteps.append(leafTokens[index ..< (index + 1)])
+                        }
+                        treeArmed = true
+                        break
+                    }
+                    treeLayout = nil
+                    treeWhy = "no_topk"
+                }
                 var nextRows: [MLXArray] = []
                 var nextHiddens: [MLXArray] = []
                 var stepEvalTargets: [MLXArray] = []
@@ -968,7 +1008,26 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        var draftIDs = stacked(draftSteps, axis: 1)
+        // Same-width tree: the window's k draft columns re-spent best first on
+        // device from this round's drafter top-4 (no host sync, no extra rows).
+        var sameWidth: (tokens: MLXArray, rowPositions: MLXArray, meta: MLXArray, probe: Bool)? =
+            nil
+        if let plan = treePlan, plan.sameWidth, plan.eligible,
+            k >= CBv2SameWidthTree.minimumDrafts, batch == 1,
+            let state = rowMetadata[0].assistantState,
+            let top = treeDrafter?.treeTop4(requestState: state),
+            top.ids.shape == [CBv2SameWidthTree.rows, CBv2SameWidthTree.width],
+            top.raw.shape == [CBv2SameWidthTree.rows, CBv2SameWidthTree.width]
+        {
+            let selected = CBv2SameWidthTree.select(
+                topIDs: top.ids, topRaw: top.raw, drafts: k, probe: plan.probe)
+            sameWidth = (selected.tokens, selected.rowPositions, selected.meta, plan.probe)
+            draftIDs = selected.tokens.reshaped([batch, k])
+            treeArmed = true
+        } else if let plan = treePlan, plan.sameWidth, plan.eligible {
+            treeWhy = "sw_no_top4"
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -981,10 +1040,20 @@ extension EngineLoopV2 {
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
-        let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        let targetColumns =
+            sameWidth.map { tree in
+                [seedColumn] + (0 ..< k).map { tree.tokens[$0 ..< ($0 + 1)].reshaped([batch, 1]) }
+            } ?? ([seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) })
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        let treeBuild =
+            sameWidth.map { CBv2VerifyTree.Build(sameWidthDrafts: k, rowPositions: $0.rowPositions) }
+            ?? (treeArmed ? treeLayout.map { CBv2VerifyTree.Build(layout: $0) } : nil)
+        CBv2VerifyTree.current = treeBuild
+        let built = Result {
+            try mtpBuildTargetVerification(columns: targetColumns, rows: verifyRows, driver: mtp)
+        }
+        CBv2VerifyTree.current = nil
+        let target = try built.get()
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -997,6 +1066,68 @@ extension EngineLoopV2 {
         }
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
+        }
+        // Draft tree: the block's top-3 ids (sibling hit-rate learning) and
+        // the probe leaf's bit-equality flag ride at the packet's end, read
+        // by the round's one acceptance readback.
+        var roundTree: CBv2VerifyTree.RoundTree? = nil
+        if let plan = treePlan {
+            var tree = CBv2VerifyTree.RoundTree(
+                chain: treeArmed ? (treeLayout?.chain ?? k) : k, layout: nil, valid: false,
+                why: treeWhy, topBase: nil, topRows: 0, probeBase: nil, forward: "")
+            let plain = target.shortlist == nil && target.accept == nil && target.recurrent.isEmpty
+            var offset = packetParts.reduce(0) { $0 + $1.size }
+            if plain, plan.eligible, !plan.sameWidth, let state = rowMetadata[0].assistantState,
+                let top = treeDrafter?.treeTopIDs(requestState: state)
+            {
+                tree.topBase = offset
+                tree.topRows = top.size / 3
+                packetParts.append(top.asType(.int32))
+                offset += top.size
+            }
+            if let selected = sameWidth, let build = treeBuild {
+                // Layout read back with the packet: meta [4], rowpos [k + 1].
+                tree.sameWidth = true
+                tree.valid = plain && build.valid
+                tree.forward = build.summary
+                if !tree.valid { tree.why = plain ? "forward_invalid" : "packet_shape" }
+                tree.sameWidthBase = offset
+                packetParts.append(selected.meta.asType(.int32))
+                packetParts.append(selected.rowPositions.asType(.int32))
+                offset += 4 + k + 1
+                if tree.valid, selected.probe {
+                    // Probe form: column k is a copy of chain column 1.
+                    let hidden = target.hidden
+                    func bits(_ x: MLXArray) -> MLXArray {
+                        x.view(dtype: x.dtype.size == 4 ? .uint32 : x.dtype.size == 2 ? .uint16 : .uint8)
+                    }
+                    let same = all(
+                        bits(hidden[0..., k ..< (k + 1), 0...]) .== bits(hidden[0..., 1 ..< 2, 0...]))
+                    tree.probeBase = offset
+                    packetParts.append(same.asType(.int32).reshaped([1]))
+                    offset += 1
+                }
+            } else if let layout = treeLayout, treeArmed, let build = treeBuild {
+                tree.layout = layout
+                tree.valid = plain && build.valid
+                tree.forward = build.summary
+                if !tree.valid { tree.why = plain ? "forward_invalid" : "packet_shape" }
+                if tree.valid, let probe = layout.probe {
+                    let column = layout.column(ofLeaf: probe)
+                    let chainColumn = layout.leaves[probe].row + 1
+                    let hidden = target.hidden
+                    func bits(_ x: MLXArray) -> MLXArray {
+                        x.view(dtype: x.dtype.size == 4 ? .uint32 : x.dtype.size == 2 ? .uint16 : .uint8)
+                    }
+                    let same = all(
+                        bits(hidden[0..., column ..< (column + 1), 0...])
+                            .== bits(hidden[0..., chainColumn ..< (chainColumn + 1), 0...]))
+                    tree.probeBase = offset
+                    packetParts.append(same.asType(.int32).reshaped([1]))
+                    offset += 1
+                }
+            }
+            roundTree = tree
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -1013,6 +1144,8 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.tree = roundTree
+        result.treeRowPositions = sameWidth?.rowPositions
         return result
     }
 

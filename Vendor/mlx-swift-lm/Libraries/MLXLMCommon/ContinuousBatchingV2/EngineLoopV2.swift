@@ -5805,6 +5805,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             takeStream(id)?.finish(reason: reason, usage: usage)
             return
         }
+        if CBv2TreeTrace.enabled { mtpEmitTraceDone(rec, reason: reason) }
         var hybridPublication = hybridPublicationIntent(for: rec, reason: reason)
         let holdsCompleteExportReservation =
             completeCheckpointCapture != nil && hybridPublication != nil

@@ -229,6 +229,7 @@ extension EngineLoopV2 {
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
+        if CBv2VerifyTree.enabled { mtp.clearTreePlans() }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
@@ -266,8 +267,18 @@ extension EngineLoopV2 {
             }
         }
         mtp.beginDraftConfidencePlan()
-        if mtp.usesFixedDepthAcceptanceWindow, mtp.planDepth > 0,
-            !eligibleRows.isEmpty
+        if let forced = CBv2TreeTrace.forcedWindow, mtp.usesFixedDepthAcceptanceWindow,
+            mtp.planDepth > 0, !eligibleRows.isEmpty
+        {
+            // Measurement only (CBV2_TREE_FORCE_WINDOW): every round verifies
+            // `forced` drafts, bypassing the acceptance window and ceiling.
+            // Exact acceptance: the committed tokens are unchanged.
+            if forced < mtp.planDepth {
+                mtp.clampPlanDepth(to: forced, reason: "trace_forced_window")
+            }
+        }
+        if CBv2TreeTrace.forcedWindow == nil, mtp.usesFixedDepthAcceptanceWindow,
+            mtp.planDepth > 0, !eligibleRows.isEmpty
         {
             // Host arithmetic over acceptance already read back at the
             // previous finalize, plus, after a fully accepted round, the
@@ -283,12 +294,29 @@ extension EngineLoopV2 {
                         remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
                         verificationLimit: verificationLimit)
                 }.min() ?? mtp.planDepth
-            if window < mtp.planDepth {
-                mtp.clampPlanDepth(to: window, reason: "acceptance_window")
+            // Draft tree (CBV2_VERIFY_TREE): one decode row only. The chain
+            // stays the window above; leaves only widen the verify window.
+            var verifyDepth = window
+            if CBv2VerifyTree.enabled, rows.count == 1, eligibleRows.count == 1, window > 0 {
+                let rec = eligibleRows[0]
+                // Greedy, unconstrained rows only: a sampled verify draws each
+                // column's noise by its column index, which a leaf column
+                // would not share with the serial step it replaces.
+                if rec.request.tokenConstraint == nil,
+                    rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+                {
+                    let plan = mtp.planTree(
+                        for: rec.id, chain: min(window, mtp.planDepth),
+                        offeredDepth: mtp.planDepth)
+                    verifyDepth = plan.layout.drafts
+                }
+            }
+            if verifyDepth < mtp.planDepth {
+                mtp.clampPlanDepth(to: verifyDepth, reason: "acceptance_window")
             }
         }
-        if mtp.usesFixedDepthAcceptanceWindow, mtp.planDepth > 0,
-            !eligibleRows.isEmpty
+        if CBv2TreeTrace.forcedWindow == nil, mtp.usesFixedDepthAcceptanceWindow,
+            mtp.planDepth > 0, !eligibleRows.isEmpty
         {
             // Acceptance ceiling: bound the draft count by the request's
             // committed-tokens-per-round budget. Applied after the

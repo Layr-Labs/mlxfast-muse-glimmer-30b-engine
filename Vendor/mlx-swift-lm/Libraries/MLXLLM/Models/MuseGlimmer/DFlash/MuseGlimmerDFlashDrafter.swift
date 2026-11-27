@@ -183,6 +183,48 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
         contextKeyEpilogue = ContextKeyEpilogue(model)
+        if CBv2SameWidthTree.enabled, model.activationDType == .bfloat16 {
+            // Same-width tree: the fused argmax + top-4 kernel and the
+            // tree-positioned context keys, checked bit for bit at load.
+            let textTarget = target as? MuseGlimmerTextModel
+            let epilogue = contextKeyEpilogue
+            let ok =
+                (try? MLX.withError { () -> Bool in
+                    guard let textTarget,
+                        Self.top4SelfTest(
+                            vocabulary: target.dflashVocabularySize,
+                            outputMultiplier: textTarget.configuration.outputMultiplier,
+                            softcap: textTarget.configuration.finalLogitSoftcapping)
+                    else { return false }
+                    guard let epilogue else { return true }
+                    let rows = 6
+                    let width = epilogue.kvHeads * 128
+                    let projections = (0 ..< 5).map {
+                        MLXRandom.normal([rows, width], key: MLXRandom.key(UInt64(50 + $0)))
+                            .asType(.bfloat16)
+                    }
+                    let record = epilogue.apply(projections, rows: rows, position: 333)
+                    let identity = epilogue.apply(
+                        projections, rows: rows, position: 333,
+                        rowPositions: MLXArray((0 ..< rows).map { Int32($0) }))
+                    let same = all(record.view(dtype: .uint16) .== identity.view(dtype: .uint16))
+                    eval(same)
+                    return same.item(Bool.self)
+                }) ?? false
+            if !ok {
+                CBv2VerifyTree.kernelSelfTestFailed = true
+                FileHandle.standardError.write(
+                    Data("[cbv2-tree] top-4 / context-key self-test failed; tree off\n".utf8))
+            }
+        }
+        if CBv2VerifyTree.enabled, model.activationDType == .bfloat16,
+            !((try? MLX.withError { () -> Bool in
+                Self.top3SelfTest(vocabulary: target.dflashVocabularySize)
+            }) ?? false)
+        {
+            CBv2VerifyTree.kernelSelfTestFailed = true
+            FileHandle.standardError.write(Data("[cbv2-tree] top-3 self-test failed; leaves off\n".utf8))
+        }
         try MLX.withError { errors in
             var warm = [maskEmbedding]
             if let textTarget = target as? MuseGlimmerTextModel,
@@ -269,6 +311,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var speculation: Speculation?
         /// The last finalized round accepted every draft.
         var lastRoundFullyAccepted = false
+        /// `CBV2_TREE_TRACE` only: this round's block top entries, lazy.
+        var trace: ProposalTraceArrays?
+        /// `CBV2_VERIFY_TREE` only: this round's top-3 ids per block row
+        /// `[maximumDraftTokens, 3]` int32 (column 0 equals the proposals).
+        var memoTop: MLXArray?
+        /// Same-width tree: this round's top-4 ids and raw head products per
+        /// block row `[maximumDraftTokens, 4]` (lazy; `cbv2_tree_select` reads them).
+        var memoTop4: (ids: MLXArray, raw: MLXArray)?
+        /// Same-width tree: the verify columns' depths for the next
+        /// `speculateNextRound` (set by the engine, consumed there).
+        var speculationRowPositions: MLXArray?
 
         init(owner: ObjectIdentifier, context: MuseGlimmerDFlashContextState) {
             self.owner = owner
@@ -304,6 +357,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var pending: MLXArray? = nil
         /// The carry the engine stored for that outcome.
         var carry: MLXArray? = nil
+        /// `CBV2_TREE_TRACE` only: the speculated block's top entries.
+        var trace: ProposalTraceArrays? = nil
+        /// `CBV2_VERIFY_TREE` only: the speculated block's top-3 ids.
+        var memoTop: MLXArray? = nil
+        /// Same-width tree: the speculated block's top-4.
+        var memoTop4: (ids: MLXArray, raw: MLXArray)? = nil
+        /// Same-width tree: `keys` were rotated at each verify row's depth, so a
+        /// leaf outcome can append rows `0 ... a` and the leaf's row (`rowMap`).
+        var treePositioned = false
+        var rowMap: [Int]? = nil
+    }
+
+    /// `CBV2_TREE_TRACE` only: a block's top `CBv2TreeTrace.width` entries
+    /// per row, lazy; read back once, at the round's finalize.
+    struct ProposalTraceArrays {
+        /// `[rows, width]` int32, unordered within a row.
+        let ids: MLXArray
+        /// `[rows, width]` float32: the head product the proposals rank.
+        let raw: MLXArray
+        /// `[rows, width]` float32: the same entries at the readout scale.
+        let scores: MLXArray
+        /// `[rows]` float32: log-sum-exp of the readout scores.
+        let logSumExp: MLXArray
+        let source: String
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -493,7 +570,32 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
-        s.memo = (proposals(logits, selection: s.selection), rows)
+        if CBv2DraftRegime.treeProposals, CBv2SameWidthTree.enabled, s.selection == nil,
+            let textTarget = target as? MuseGlimmerTextModel,
+            let out = Self.fusedArgMaxConfTop4(
+                logits, outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+        {
+            // Same-width tree round: the argmax (the record's total order) and
+            // the top 4 for `cbv2_tree_select` in one pass.
+            s.memo = (out.tokens, rows)
+            s.memoTop4 = (out.ids, out.raw)
+            s.memoTop = out.ids[0..., 0 ..< 3]
+        } else if CBv2DraftRegime.treeProposals, s.selection == nil,
+            let top = Self.fusedTop3(logits)
+        {
+            // Draft tree round: one pass gives the argmax (column 0, the same
+            // total order as `fastArgMax`) and the siblings.
+            s.memo = (top[0..., 0], rows)
+            s.memoTop = top
+        } else {
+            s.memo = (proposals(logits, selection: s.selection), rows)
+        }
+        if CBv2TreeTrace.tracesProposals {
+            s.trace = proposalTraceArrays(
+                logits, unscaled: headProductIsUnscaled(rows, readout: s.selection != nil),
+                source: "start")
+        }
         return nil
     }
 
@@ -567,9 +669,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 $0[1 ..< (1 + k), 0...]
             }
         }
+        let readout = states.contains { $0.selection != nil }
         let logits = draftHeadProduct(
             rows.count == 1 ? rows[0] : concatenated(rows, axis: 0),
-            readout: states.contains { $0.selection != nil })
+            readout: readout)
         guard logits.shape == [states.count * k, target.dflashVocabularySize] else {
             for s in states { s.refusal = "head" }
             return
@@ -580,6 +683,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 rows[index]
             )
             s.prestarted = true
+            if CBv2TreeTrace.tracesProposals {
+                s.trace = proposalTraceArrays(
+                    logits[(index * k) ..< ((index + 1) * k), 0...],
+                    unscaled: headProductIsUnscaled(rows[index], readout: readout),
+                    source: "batched")
+            }
         }
     }
 
@@ -593,13 +702,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private let contextKeyEpilogue: ContextKeyEpilogue?
 
-    private static let contextKeysKernel = MLXFast.metalKernel(
-        name: "dflash_context_keys",
-        inputNames: [
-            "k0", "k1", "k2", "k3", "k4", "w0", "w1", "w2", "w3", "w4", "dims", "params",
-        ],
-        outputNames: ["keys"],
-        source: """
+    /// The record kernel's source (unchanged text; the tree variant below
+    /// replaces one expression).
+    private static let contextKeysSource = """
             const uint lane = thread_index_in_simdgroup;
             const uint group = threadgroup_position_in_grid.y;
             const uint rows = uint(dims[0]);
@@ -643,7 +748,32 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 const float x2 = low ? other : v;
                 dst[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
             }
-            """)
+            """
+
+    private static let contextKeysKernel = MLXFast.metalKernel(
+        name: "dflash_context_keys",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "w0", "w1", "w2", "w3", "w4", "dims", "params",
+        ],
+        outputNames: ["keys"],
+        source: contextKeysSource)
+
+    /// Same-width tree speculation: each verify row's key rotated at
+    /// `position + rowpos[row]` (its tree depth) instead of `position + row`;
+    /// the same float expression for the same integer position.
+    private static let contextKeysTreeKernel: MLXFast.MLXFastKernel = {
+        let record = "const float pos = float(dims[1] + int(row));"
+        let tree = "const float pos = float(dims[1] + rowpos[row]);"
+        precondition(contextKeysSource.components(separatedBy: record).count == 2)
+        return MLXFast.metalKernel(
+            name: "dflash_context_keys_rowpos",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "w0", "w1", "w2", "w3", "w4", "dims", "params",
+                "rowpos",
+            ],
+            outputNames: ["keys"],
+            source: contextKeysSource.replacingOccurrences(of: record, with: tree))
+    }()
 
     private struct ContextKeyEpilogue {
         let kvHeads: Int
@@ -680,16 +810,35 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
                 outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
         }
+
+        /// `apply` with row `i` rotated at `position + rowPositions[i]`.
+        func apply(_ projections: [MLXArray], rows: Int, position: Int, rowPositions: MLXArray)
+            -> MLXArray
+        {
+            var inputs = projections
+            inputs.reserveCapacity(13)
+            inputs.append(contentsOf: weights)
+            inputs.append(MLXArray([Int32(rows), Int32(position)]))
+            inputs.append(coefficients)
+            inputs.append(rowPositions.asType(.int32))
+            return MuseGlimmerDFlashDrafter.contextKeysTreeKernel(
+                inputs, template: [("HEADS_", kvHeads)],
+                grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
+        }
     }
 
     private func speculativeContextKeyValues(
-        _ context: MLXArray, at position: Int
-    ) -> (keys: MLXArray, values: MLXArray) {
+        _ context: MLXArray, at position: Int, rowPositions: MLXArray? = nil
+    ) -> (keys: MLXArray, values: MLXArray)? {
         let c = model.configuration
         let rows = context.dim(0)
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
-        else { return model.contextKeyValues(context, at: position) }
+        else {
+            // Tree positions need the fused epilogue.
+            return rowPositions == nil ? model.contextKeyValues(context, at: position) : nil
+        }
         let shape = [1, rows, c.kvHeads, c.headDimensions]
         var keys: [MLXArray] = []
         var values: [MLXArray] = []
@@ -700,7 +849,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             values.append(layer.attention.vProj(context).reshaped(shape).transposed(0, 2, 1, 3))
         }
         guard keys.allSatisfy({ $0.dtype == .bfloat16 }) else {
-            return model.contextKeyValues(context, at: position)
+            return rowPositions == nil ? model.contextKeyValues(context, at: position) : nil
+        }
+        if let rowPositions {
+            guard rowPositions.size == rows else { return nil }
+            return (
+                epilogue.apply(keys, rows: rows, position: position, rowPositions: rowPositions),
+                concatenated(values, axis: 0))
         }
         return (
             epilogue.apply(keys, rows: rows, position: position),
@@ -733,6 +888,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     ) -> [MLXArray] {
         let s = state(requestState)
         s.speculation = nil
+        // Same-width tree positions are for this call only.
+        let rowPositions = s.speculationRowPositions
+        s.speculationRowPositions = nil
         let c = model.configuration
         let context = s.context
         let window = context.window
@@ -750,10 +908,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // all-accepted outcome's entry is all of them.
         let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
-        let projected = speculativeContextKeyValues(model.projectContext(features), at: start)
+        // Same-width tree round: each verify row's key at its tree depth, so
+        // any outcome (chain or leaf) can append the rows it committed.
+        guard
+            let projected = speculativeContextKeyValues(
+                model.projectContext(features), at: start, rowPositions: rowPositions)
+        else { return [] }
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)
+        speculation.treePositioned = rowPositions != nil
         guard draftsBlock, s.lastRoundFullyAccepted else {
             s.speculation = speculation
             return [projected.keys, projected.values]
@@ -833,9 +997,23 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.speculation = speculation
             return [projected.keys, projected.values]
         }
+        if CBv2TreeTrace.tracesProposals {
+            speculation.trace = proposalTraceArrays(
+                logits, unscaled: headProductIsUnscaled(rows, readout: false), source: "spec")
+        }
         let memo: (tokens: MLXArray, hidden: MLXArray)
         let confidence: MLXArray
-        if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
+        if CBv2DraftRegime.treeProposals, CBv2SameWidthTree.enabled,
+            let textTarget = target as? MuseGlimmerTextModel,
+            let out = Self.fusedArgMaxConfTop4(
+                logits, outputMultiplier: textTarget.configuration.outputMultiplier,
+                softcap: textTarget.configuration.finalLogitSoftcapping)
+        {
+            memo = (tokens: out.tokens, hidden: rows)
+            confidence = out.confidence
+            speculation.memoTop4 = (out.ids, out.raw)
+            speculation.memoTop = out.ids[0..., 0 ..< 3]
+        } else if let textTarget = target as? MuseGlimmerTextModel, logits.dtype == .bfloat16 {
             let (tokens, conf) = Self.fusedArgMaxAndConfidence(
                 logits,
                 outputMultiplier: textTarget.configuration.outputMultiplier,
@@ -852,8 +1030,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         speculation.memo = memo
         speculation.confidence = confidence
+        if CBv2DraftRegime.treeProposals, speculation.memoTop == nil {
+            speculation.memoTop = Self.fusedTop3(logits)
+        }
         s.speculation = speculation
         return [memo.tokens, memo.hidden, projected.keys, projected.values, confidence]
+            + (speculation.memoTop.map { [$0] } ?? [])
+            + (speculation.memoTop4.map { [$0.ids, $0.raw] } ?? [])
     }
 
     /// The confirmed speculation's per-row draft confidence, still lazy (the
@@ -920,7 +1103,14 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         s.pending = nil
         s.awaitsCarry = false
         s.committedInputCount += 1
-        if accepted == speculation.depth {
+        if let rowMap = speculation.rowMap {
+            // Same-width tree leaf outcome: rows 0 ... a and the leaf's row,
+            // each already rotated at its tree depth.
+            let rows = MLXArray(rowMap.map { Int32($0) })
+            s.context.append(
+                keys: take(speculation.keys, rows, axis: 2),
+                values: take(speculation.values, rows, axis: 2))
+        } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {
             let rows = 0 ..< (accepted + 1)
@@ -930,6 +1120,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         guard let memo else { return .committed }
         s.memo = memo
+        s.trace = speculation.trace
+        s.memoTop = speculation.memoTop
+        s.memoTop4 = speculation.memoTop4
         return .drafted
     }
 
@@ -944,6 +1137,33 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return target.dflashHeadProduct(rows)
         }
         return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
+    }
+
+    /// Whether `draftHeadProduct(rows, readout:)` skipped `weight_scale_2`.
+    private func headProductIsUnscaled(_ rows: MLXArray, readout: Bool) -> Bool {
+        guard !readout, let draftHead else { return false }
+        return rows.dim(-1) == draftHead.inputDimensions
+    }
+
+    /// `CBV2_TREE_TRACE` only: each row's top entries of a block's head
+    /// products `[rows, vocabulary]`, lazy. Off the proposal path: nothing
+    /// that proposes, verifies or commits reads these arrays.
+    private func proposalTraceArrays(_ logits: MLXArray, unscaled: Bool, source: String)
+        -> ProposalTraceArrays?
+    {
+        let width = CBv2TreeTrace.width
+        guard CBv2TreeTrace.tracesProposals, logits.ndim == 2, logits.dim(1) > width else {
+            return nil
+        }
+        let raw = logits.asType(.float32)
+        let top = argPartition(-raw, kth: width - 1, axis: -1)[0..., 0 ..< width]
+        var product = logits
+        if unscaled, let draftHead { product = draftHead.scaled(logits) }
+        let scores = target.dflashReadout(product).asType(.float32)
+        return ProposalTraceArrays(
+            ids: top.asType(.int32), raw: takeAlong(raw, top, axis: -1),
+            scores: takeAlong(scores, top, axis: -1), logSumExp: scores.logSumExp(axis: -1),
+            source: source)
     }
 
     /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
@@ -1248,6 +1468,254 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             """)
 
+    // MARK: Same-width tree: argmax + confidence + top-4 in one pass
+
+    /// `argMaxConfStage1` with each thread also keeping its top 4 raw values
+    /// (the argmax's total order: larger first, ties to the lower id, NaN never
+    /// enters); four pop rounds merge the threadgroup's lists. The argmax and
+    /// the softcapped sum are the record kernel's expressions.
+    private static let argMaxConfTop4Stage1 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top4_s1",
+        inputNames: ["logits", "params"],
+        outputNames: ["p_sc", "p_sum", "p_raw4", "p_idx4"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            constexpr int chunk_size = (V + CHUNKS - 1) / CHUNKS;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+
+            const int start = int(chunk) * chunk_size;
+            const int end = min(V, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + size_t(row) * size_t(V);
+            const bfloat16_t b_mult = bfloat16_t(params[0]);
+            const bfloat16_t b_cap = bfloat16_t(params[1]);
+            const bool has_cap = params[1] > 0.0f;
+
+            float lv[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+            int li[4] = {V, V, V, V};
+            float best_sc = -INFINITY;
+            float sum_exp = 0.0f;
+            for (int i = start + int(lid); i < end; i += 256) {
+              const bfloat16_t raw_bf = row_ptr[i];
+              const float raw_f = float(raw_bf);
+              if (raw_f > lv[3] || (raw_f == lv[3] && i < li[3])) {
+                int at = 3;
+                while (at > 0 && (raw_f > lv[at - 1] || (raw_f == lv[at - 1] && i < li[at - 1]))) {
+                  lv[at] = lv[at - 1];
+                  li[at] = li[at - 1];
+                  at -= 1;
+                }
+                lv[at] = raw_f;
+                li[at] = i;
+              }
+              bfloat16_t s_bf = raw_bf * b_mult;
+              if (has_cap) {
+                s_bf = bfloat16_t(metal::precise::tanh(float(s_bf / b_cap))) * b_cap;
+              }
+              const float sc = float(s_bf);
+              if (sc > best_sc) {
+                sum_exp = (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sc) + 1.0f) : 1.0f;
+                best_sc = sc;
+              } else {
+                sum_exp += metal::exp(sc - best_sc);
+              }
+            }
+
+            const float sg_sc = simd_max(best_sc);
+            const float sg_sum = simd_sum(
+                (sum_exp > 0.0f) ? (sum_exp * metal::exp(best_sc - sg_sc)) : 0.0f);
+            threadgroup float sh_sc[8];
+            threadgroup float sh_sum[8];
+            threadgroup float sh_val[8];
+            threadgroup int sh_idx[8];
+            if (lane == 0) {
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            int ptr = 0;
+            for (uint k = 0; k < 4; k++) {
+              const float hv = ptr < 4 ? lv[ptr] : -INFINITY;
+              const int hi = ptr < 4 ? li[ptr] : V;
+              const float s_val = simd_max(hv);
+              const int s_idx = simd_min((hv == s_val) ? hi : V);
+              if (lane == 0) {
+                sh_val[sg] = s_val;
+                sh_idx[sg] = s_idx;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              const float v8 = (lane < 8) ? sh_val[lane] : -INFINITY;
+              const int i8 = (lane < 8) ? sh_idx[lane] : V;
+              const float t_val = simd_max(v8);
+              const int t_idx = simd_min((v8 == t_val) ? i8 : V);
+              if (lid == 0) {
+                const uint o = (row * uint(CHUNKS) + chunk) * 4 + k;
+                p_raw4[o] = t_val;
+                p_idx4[o] = t_idx;
+              }
+              if (ptr < 4 && hv == t_val && hi == t_idx) ptr++;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (sg == 0) {
+              const float v_sc = (lane < 8) ? sh_sc[lane] : -INFINITY;
+              const float v_sum = (lane < 8) ? sh_sum[lane] : 0.0f;
+              const float tg_sc = simd_max(v_sc);
+              const float tg_sum = simd_sum(
+                  (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - tg_sc)) : 0.0f);
+              if (lane == 0) {
+                const uint out_i = row * uint(CHUNKS) + chunk;
+                p_sc[out_i] = tg_sc;
+                p_sum[out_i] = tg_sum;
+              }
+            }
+            """)
+
+    /// Stage 2: per row, the 64 chunks' top 4 merged (four pop rounds) and the
+    /// record kernel's confidence merge.
+    private static let argMaxConfTop4Stage2 = MLXFast.metalKernel(
+        name: "dflash_argmax_conf_top4_s2",
+        inputNames: ["p_sc", "p_sum", "p_raw4", "p_idx4"],
+        outputNames: ["tokens", "confidence", "ids", "raw"],
+        source: """
+            constexpr int V = V_;
+            constexpr int CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint idx = row * uint(CHUNKS) + lid;
+
+            const float v_sc = p_sc[idx];
+            const float v_sum = p_sum[idx];
+            const float sg_sc = simd_max(v_sc);
+            const float sg_sum = simd_sum(
+                (v_sum > 0.0f) ? (v_sum * metal::exp(v_sc - sg_sc)) : 0.0f);
+            threadgroup float sh_sc[2];
+            threadgroup float sh_sum[2];
+            threadgroup float sh_val[2];
+            threadgroup int sh_idx[2];
+            if (lane == 0) {
+              sh_sc[sg] = sg_sc;
+              sh_sum[sg] = sg_sum;
+            }
+            float lv[4];
+            int li[4];
+            for (int k = 0; k < 4; k++) {
+              lv[k] = p_raw4[idx * 4 + k];
+              li[k] = p_idx4[idx * 4 + k];
+            }
+            int ptr = 0;
+            for (uint k = 0; k < 4; k++) {
+              const float hv = ptr < 4 ? lv[ptr] : -INFINITY;
+              const int hi = ptr < 4 ? li[ptr] : V;
+              const float s_val = simd_max(hv);
+              const int s_idx = simd_min((hv == s_val) ? hi : V);
+              if (lane == 0) {
+                sh_val[sg] = s_val;
+                sh_idx[sg] = s_idx;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              const float v2 = (lane < 2) ? sh_val[lane] : -INFINITY;
+              const int i2 = (lane < 2) ? sh_idx[lane] : V;
+              const float r_val = simd_max(v2);
+              const int r_idx = simd_min((v2 == r_val) ? i2 : V);
+              if (lid == 0) {
+                ids[row * 4 + k] = r_idx;
+                raw[row * 4 + k] = r_val;
+                if (k == 0) tokens[row] = r_idx;
+              }
+              if (ptr < 4 && hv == r_val && hi == r_idx) ptr++;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (sg == 0) {
+              const float f_sc = (lane < 2) ? sh_sc[lane] : -INFINITY;
+              const float f_sum = (lane < 2) ? sh_sum[lane] : 0.0f;
+              const float row_sc = simd_max(f_sc);
+              const float row_sum = simd_sum(
+                  (f_sum > 0.0f) ? (f_sum * metal::exp(f_sc - row_sc)) : 0.0f);
+              if (lane == 0) {
+                confidence[row] = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+              }
+            }
+            """)
+
+    /// Tokens (the argmax, `fastArgMax`'s total order), the softcapped top-1
+    /// probability, and the top 4 ids and raw values per row of bf16
+    /// `[rows, V]` head products. Nil for another shape or dtype.
+    static func fusedArgMaxConfTop4(_ logits: MLXArray, outputMultiplier: Float, softcap: Float)
+        -> (tokens: MLXArray, confidence: MLXArray, ids: MLXArray, raw: MLXArray)?
+    {
+        guard logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 else { return nil }
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let params = MLXArray([outputMultiplier, softcap])
+        let partials = argMaxConfTop4Stage1(
+            [logits, params],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks * 4], [rows, chunks * 4]],
+            outputDTypes: [.float32, .float32, .float32, .int32])
+        let out = argMaxConfTop4Stage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows], [rows], [rows, 4], [rows, 4]],
+            outputDTypes: [.int32, .float32, .int32, .float32])
+        return (out[0], out[1], out[2], out[3])
+    }
+
+    /// Load-time check of `fusedArgMaxConfTop4` against `fastArgMax` (tokens)
+    /// and a host top 4 in the same total order (ids and raw values).
+    static func top4SelfTest(vocabulary: Int, outputMultiplier: Float, softcap: Float) -> Bool {
+        let rows = 7
+        var host = (0 ..< rows * vocabulary).map { _ in Float.random(in: -8 ... 8) }
+        for row in 0 ..< rows {
+            let base = row * vocabulary
+            host[base + (row * 7919) % vocabulary] = 30
+            host[base + (row * 104729 + 13) % vocabulary] = 30
+            host[base + (row * 1299709 + 101) % vocabulary] = 29
+            host[base + (row * 15485863 + 7) % vocabulary] = 29
+        }
+        let logits = MLXArray(host, [rows, vocabulary]).asType(.bfloat16)
+        guard
+            let out = fusedArgMaxConfTop4(
+                logits, outputMultiplier: outputMultiplier, softcap: softcap)
+        else { return false }
+        let argmax = fastArgMax(logits)
+        let rounded = logits.asType(.float32)
+        eval(out.tokens, out.ids, out.raw, argmax, rounded)
+        let ids = out.ids.asArray(Int32.self)
+        let raw = out.raw.asArray(Float.self)
+        let tokens = out.tokens.asArray(Int32.self)
+        let first = argmax.asArray(Int32.self)
+        let values = rounded.asArray(Float.self)
+        for row in 0 ..< rows {
+            let base = row * vocabulary
+            var best: [(value: Float, id: Int)] = []
+            for id in 0 ..< vocabulary {
+                let v = values[base + id]
+                guard !v.isNaN else { continue }
+                if best.count == 4, !(v > best[3].value) { continue }
+                var at = best.count
+                while at > 0, v > best[at - 1].value { at -= 1 }
+                best.insert((v, id), at: at)
+                if best.count > 4 { best.removeLast() }
+            }
+            guard best.count == 4, tokens[row] == first[row], ids[row * 4] == first[row] else {
+                return false
+            }
+            for k in 0 ..< 4 {
+                guard ids[row * 4 + k] == Int32(best[k].id), raw[row * 4 + k] == best[k].value
+                else { return false }
+            }
+        }
+        return true
+    }
+
     private static func fusedArgMaxAndConfidence(
         _ logits: MLXArray, outputMultiplier: Float, softcap: Float
     ) -> (tokens: MLXArray, confidence: MLXArray) {
@@ -1268,6 +1736,182 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             outputShapes: [[rows], [rows]],
             outputDTypes: [.int32, .float32])
         return (out[0], out[1])
+    }
+
+    // MARK: Draft tree top-3 (CBV2_VERIFY_TREE)
+
+    /// Stage 1: per (row, chunk), the chunk's top 3 entries in the argmax's
+    /// total order (larger value first, ties to the lower id; NaN never
+    /// enters, as in `fastArgMaxStage1`). Each thread keeps its own sorted
+    /// top 3, then three pop rounds merge the threadgroup's lists.
+    private static let top3Stage1 = MLXFast.metalKernel(
+        name: "dflash_top3_s1",
+        inputNames: ["logits"],
+        outputNames: ["p_val", "p_idx"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint chunk_size = (vocab + CHUNKS - 1) / CHUNKS;
+            const uint start = chunk * chunk_size;
+            const uint end = min(vocab, start + chunk_size);
+            const device bfloat16_t* row_ptr = logits + ulong(row) * ulong(vocab);
+
+            float lv[3] = {-INFINITY, -INFINITY, -INFINITY};
+            int li[3] = {int(vocab), int(vocab), int(vocab)};
+            for (uint i = start + lid; i < end; i += 256u) {
+              const float v = float(row_ptr[i]);
+              const int idx = int(i);
+              if (v > lv[2] || (v == lv[2] && idx < li[2])) {
+                if (v > lv[1] || (v == lv[1] && idx < li[1])) {
+                  lv[2] = lv[1]; li[2] = li[1];
+                  if (v > lv[0] || (v == lv[0] && idx < li[0])) {
+                    lv[1] = lv[0]; li[1] = li[0];
+                    lv[0] = v; li[0] = idx;
+                  } else {
+                    lv[1] = v; li[1] = idx;
+                  }
+                } else {
+                  lv[2] = v; li[2] = idx;
+                }
+              }
+            }
+
+            threadgroup float sh_val[8];
+            threadgroup int sh_idx[8];
+            int ptr = 0;
+            for (uint k = 0; k < 3; k++) {
+              const float hv = ptr < 3 ? lv[ptr] : -INFINITY;
+              const int hi = ptr < 3 ? li[ptr] : int(vocab);
+              const float sg_val = simd_max(hv);
+              const int sg_idx = simd_min((hv == sg_val) ? hi : int(vocab));
+              if (lane == 0) {
+                sh_val[sg] = sg_val;
+                sh_idx[sg] = sg_idx;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              const float v8 = (lane < 8) ? sh_val[lane] : -INFINITY;
+              const int i8 = (lane < 8) ? sh_idx[lane] : int(vocab);
+              const float tg_val = simd_max(v8);
+              const int tg_idx = simd_min((v8 == tg_val) ? i8 : int(vocab));
+              if (lid == 0) {
+                const uint out_i = (row * CHUNKS + chunk) * 3 + k;
+                p_val[out_i] = tg_val;
+                p_idx[out_i] = tg_idx;
+              }
+              if (ptr < 3 && hv == tg_val && hi == tg_idx) ptr++;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+
+    /// Stage 2: per row, merge the 64 chunks' sorted top 3 the same way.
+    private static let top3Stage2 = MLXFast.metalKernel(
+        name: "dflash_top3_s2",
+        inputNames: ["p_val", "p_idx"],
+        outputNames: ["ids"],
+        source: """
+            constexpr uint CHUNKS = 64;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint vocab = uint(V_);
+            const uint base = (row * CHUNKS + lid) * 3;
+            float lv[3] = {p_val[base], p_val[base + 1], p_val[base + 2]};
+            int li[3] = {p_idx[base], p_idx[base + 1], p_idx[base + 2]};
+            threadgroup float sh_val[2];
+            threadgroup int sh_idx[2];
+            int ptr = 0;
+            for (uint k = 0; k < 3; k++) {
+              const float hv = ptr < 3 ? lv[ptr] : -INFINITY;
+              const int hi = ptr < 3 ? li[ptr] : int(vocab);
+              const float sg_val = simd_max(hv);
+              const int sg_idx = simd_min((hv == sg_val) ? hi : int(vocab));
+              if (lane == 0) {
+                sh_val[sg] = sg_val;
+                sh_idx[sg] = sg_idx;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              const float v2 = (lane < 2) ? sh_val[lane] : -INFINITY;
+              const int i2 = (lane < 2) ? sh_idx[lane] : int(vocab);
+              const float r_val = simd_max(v2);
+              const int r_idx = simd_min((v2 == r_val) ? i2 : int(vocab));
+              if (lid == 0) {
+                ids[row * 3 + k] = r_idx;
+              }
+              if (ptr < 3 && hv == r_val && hi == r_idx) ptr++;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+
+    /// `[rows, 3]` int32: each row's top-3 ids of bf16 `[rows, V]` logits,
+    /// column 0 equal to `fastArgMax`. Nil for another shape or dtype.
+    static func fusedTop3(_ logits: MLXArray) -> MLXArray? {
+        guard logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 else { return nil }
+        let rows = logits.dim(0)
+        let vocab = logits.dim(1)
+        let chunks = 64
+        let partials = top3Stage1(
+            [logits],
+            template: [("V_", vocab)],
+            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, chunks * 3], [rows, chunks * 3]],
+            outputDTypes: [.float32, .int32])
+        return top3Stage2(
+            partials,
+            template: [("V_", vocab)],
+            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+            outputShapes: [[rows, 3]],
+            outputDTypes: [.int32])[0]
+    }
+
+    /// Load-time check of `fusedTop3` against `fastArgMax` and a host sort in
+    /// the same total order, on random bf16 rows with planted ties at the
+    /// top. False disables the tree for the process.
+    static func top3SelfTest(vocabulary: Int) -> Bool {
+        let rows = 7
+        var host = (0 ..< rows * vocabulary).map { _ in Float.random(in: -8 ... 8) }
+        for row in 0 ..< rows {
+            let base = row * vocabulary
+            // Ties: a top value at a high and a low id, a second-place tie.
+            let a = (row * 7919) % vocabulary
+            let b = (row * 104729 + 13) % vocabulary
+            let c = (row * 1299709 + 101) % vocabulary
+            host[base + a] = 30
+            host[base + b] = 30
+            host[base + c] = 29
+            if row == 3 { host[base + (a + 1) % vocabulary] = .nan }
+        }
+        let logits = MLXArray(host, [rows, vocabulary]).asType(.bfloat16)
+        guard let top = fusedTop3(logits) else { return false }
+        let argmax = fastArgMax(logits)
+        let rounded = logits.asType(.float32)
+        eval(top, argmax, rounded)
+        let ids = top.asArray(Int32.self)
+        let first = argmax.asArray(Int32.self)
+        let values = rounded.asArray(Float.self)
+        for row in 0 ..< rows {
+            let base = row * vocabulary
+            // Host top 3 in the same total order (ids ascend, so a later
+            // equal value never displaces an earlier one).
+            var best: [(value: Float, id: Int)] = []
+            for id in 0 ..< vocabulary {
+                let v = values[base + id]
+                guard !v.isNaN else { continue }
+                if best.count == 3, !(v > best[2].value) { continue }
+                var at = best.count
+                while at > 0, v > best[at - 1].value { at -= 1 }
+                best.insert((v, id), at: at)
+                if best.count > 3 { best.removeLast() }
+            }
+            guard best.count == 3, ids[row * 3] == first[row] else { return false }
+            for k in 0 ..< 3 where ids[row * 3 + k] != Int32(best[k].id) { return false }
+        }
+        return true
     }
 
     private static let fastArgMaxStage1 = MLXFast.metalKernel(
@@ -1488,6 +2132,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         s.selection = nil
         s.prestarted = false
         s.stagedInputCount = 0
+        s.trace = nil
+        s.memoTop = nil
+        s.memoTop4 = nil
     }
 
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
@@ -1500,6 +2147,131 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         s.awaitsCarry = false
         s.committedInputCount = 0
         s.released = true
+    }
+}
+
+// MARK: - Draft tree
+
+extension MuseGlimmerDFlashDrafter: CBv2MTPTreeDrafter {
+    public func treeLeafTokens(
+        _ leaves: [(row: Int, rank: Int)], requestState: any CBv2MTPRequestState
+    ) -> MLXArray? {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released,
+            let top = s.memoTop, top.ndim == 2, !leaves.isEmpty,
+            leaves.allSatisfy({ $0.row >= 0 && $0.row < top.dim(0) && (1 ... top.dim(1)).contains($0.rank) })
+        else { return nil }
+        let width = top.dim(1)
+        let indices = MLXArray(leaves.map { Int32($0.row * width + $0.rank - 1) })
+        return take(top.reshaped([-1]), indices, axis: 0)
+    }
+
+    public func treeTopIDs(requestState: any CBv2MTPRequestState) -> MLXArray? {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
+        else { return nil }
+        return s.memoTop?.reshaped([-1])
+    }
+
+    public func treePrepareLeafCommit(stagedRows: Int, requestState: any CBv2MTPRequestState) {
+        let s = state(requestState)
+        // A leaf after a fully accepted chain commits one input past the
+        // chain's drafted positions; finalizeRound checks against this count.
+        if stagedRows > s.stagedInputCount, stagedRows <= settings.maximumDraftTokens {
+            s.stagedInputCount = stagedRows
+        }
+    }
+
+    public func treeTop4(requestState: any CBv2MTPRequestState) -> (ids: MLXArray, raw: MLXArray)? {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
+        else { return nil }
+        return s.memoTop4
+    }
+
+    public func setSpeculationRowPositions(
+        _ rowPositions: MLXArray?, requestState: any CBv2MTPRequestState
+    ) {
+        state(requestState).speculationRowPositions = rowPositions
+    }
+
+    /// A same-width tree round committed a leaf: `rows` are the verify rows of
+    /// its committed inputs (0 ... a, then the leaf's row). Keeps the
+    /// tree-positioned speculation's commit for exactly those rows; any other
+    /// speculation is dropped. True when kept.
+    @discardableResult
+    public func treeConfirmSpeculation(
+        carryHidden: MLXArray, rows: [Int], requestState: any CBv2MTPRequestState
+    ) -> Bool {
+        let s = state(requestState)
+        s.lastRoundFullyAccepted = false
+        guard var speculation = s.speculation, speculation.treePositioned,
+            speculation.carry == nil, let accepted = speculation.accepted,
+            accepted == rows.count - 1, rows.allSatisfy({ $0 >= 0 && $0 <= speculation.depth }),
+            (accepted == 0) == (speculation.pending == nil)
+        else {
+            s.speculation = nil
+            return false
+        }
+        speculation.memo = nil
+        speculation.confidence = nil
+        speculation.rowMap = rows
+        speculation.carry = carryHidden
+        s.speculation = speculation
+        return true
+    }
+
+    public func treeLeafCommitted(requestState: any CBv2MTPRequestState) {
+        let s = state(requestState)
+        // The post-verify speculation covered the chain outcomes only, and the
+        // round did not accept every draft.
+        s.speculation = nil
+        s.lastRoundFullyAccepted = false
+    }
+}
+
+// MARK: - Tree trace
+
+extension MuseGlimmerDFlashDrafter: CBv2MTPProposalTracing {
+    /// The current round's block trace, read back (waits for the device),
+    /// each row best first with ties to the lower id. Nil unless
+    /// `CBV2_TREE_TRACE` built one for this round. Clears it.
+    public func takeProposalTrace(requestState: any CBv2MTPRequestState)
+        -> CBv2MTPProposalTrace?
+    {
+        guard CBv2TreeTrace.tracesProposals, let s = requestState as? State,
+            s.owner == ObjectIdentifier(self), !s.released, let trace = s.trace
+        else { return nil }
+        s.trace = nil
+        let memoTokens = s.memo?.tokens
+        var arrays = [trace.ids, trace.raw, trace.scores, trace.logSumExp]
+        if let memoTokens { arrays.append(memoTokens) }
+        eval(arrays)
+        let rows = trace.ids.dim(0)
+        let width = trace.ids.dim(1)
+        let ids = trace.ids.asArray(Int32.self)
+        let raw = trace.raw.asArray(Float.self)
+        let scores = trace.scores.asArray(Float.self)
+        guard ids.count == rows * width, raw.count == ids.count, scores.count == ids.count
+        else { return nil }
+        var sortedIDs: [Int32] = []
+        var sortedRaw: [Float] = []
+        var sortedScores: [Float] = []
+        sortedIDs.reserveCapacity(ids.count)
+        sortedRaw.reserveCapacity(ids.count)
+        sortedScores.reserveCapacity(ids.count)
+        for row in 0 ..< rows {
+            let order = (0 ..< width).map { row * width + $0 }.sorted { a, b in
+                raw[a] != raw[b] ? raw[a] > raw[b] : ids[a] < ids[b]
+            }
+            for index in order {
+                sortedIDs.append(ids[index])
+                sortedRaw.append(raw[index])
+                sortedScores.append(scores[index])
+            }
+        }
+        let proposals = memoTokens.map { $0.asType(.int32).asArray(Int32.self) } ?? []
+        return CBv2MTPProposalTrace(
+            rows: rows, width: width, ids: sortedIDs, raw: sortedRaw, scores: sortedScores,
+            logSumExp: trace.logSumExp.asArray(Float.self), proposals: proposals,
+            source: trace.source)
     }
 }
 

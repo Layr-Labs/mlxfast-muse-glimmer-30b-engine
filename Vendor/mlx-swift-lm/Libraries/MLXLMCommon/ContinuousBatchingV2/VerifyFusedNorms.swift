@@ -304,4 +304,86 @@ public enum VerifyFusedQK {
             outputDTypes: [queries.dtype, keys.dtype])
         return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
     }
+
+    // MARK: Draft tree (CBV2_VERIFY_TREE)
+
+    /// The record kernel's source with one change: column `l` rotates at
+    /// position `offset + rowpos[l]` instead of `offset + l`. Same float
+    /// expression for the same integer position, so a column whose
+    /// `rowpos[l] == l` gets the record kernel's bytes, and a leaf column gets
+    /// the bytes of a chain column at its logical position.
+    static let treeSource: String = {
+        let record = "float L = scale * static_cast<float>(l + batch_offset);"
+        let tree = "float L = scale * static_cast<float>(int(rowpos[l]) + batch_offset);"
+        precondition(
+            source.components(separatedBy: record).count == 2,
+            "VerifyFusedQK: tree variant anchor not found exactly once")
+        return source.replacingOccurrences(of: record, with: tree)
+    }()
+
+    static let treeKernel = MLXFast.metalKernel(
+        name: "verify_qk_norm_rope_tree",
+        inputNames: ["q", "k", "offsets", "rowpos", "params"],
+        outputNames: ["qo", "ko"],
+        source: treeSource)
+
+    /// `apply` with per-column position offsets `rowPositions` `[L]` int32
+    /// (RoPE layers only; NoPE layers take `apply` unchanged).
+    public static func applyTree(
+        queries: MLXArray, keys: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
+        eps: Float, queryScale: Float, ropeBase: Float, ropeScale: Float = 1,
+        offsets: MLXArray, rowPositions: MLXArray
+    ) -> (queries: MLXArray, keys: MLXArray) {
+        let (b, l) = (queries.dim(0), queries.dim(1))
+        precondition(rowPositions.size == l, "VerifyFusedQK: one position per column")
+        let offs = offsets.dtype == .int32 ? offsets : offsets.asType(.int32)
+        let params = MLXArray([eps, queryScale, log2(ropeBase), ropeScale])
+        let out = treeKernel(
+            [queries, keys, offs, rowPositions, params],
+            template: [
+                ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
+                ("ROPE_", true), ("OFFB_", offs.size == 1 ? 0 : 1),
+            ],
+            grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
+            outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
+            outputDTypes: [queries.dtype, keys.dtype])
+        return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+    }
+
+    /// Load-time check: with `rowpos = 0 ..< L` the tree kernel equals the
+    /// record kernel bit for bit, and a column moved to position `p` equals the
+    /// record kernel's column `p` (raw bits, RoPE on). True when both hold.
+    public static func treeSelfTest(heads: Int, kvHeads: Int, headDim: Int) -> Bool {
+        guard supports(headDim: headDim, dtype: .bfloat16) else { return false }
+        let l = 6
+        // Fixed keys: the global random state is left alone.
+        let q = MLXRandom.normal([1, l, heads * headDim], key: MLXRandom.key(11)).asType(.bfloat16)
+        let k = MLXRandom.normal([1, l, kvHeads * headDim], key: MLXRandom.key(12))
+            .asType(.bfloat16)
+        let offsets = MLXArray([Int32(777)])
+        let record = apply(
+            queries: q, keys: k, heads: heads, kvHeads: kvHeads, headDim: headDim,
+            eps: 1e-6, queryScale: 0.125, ropeBase: 10000, offsets: offsets)
+        let identity = applyTree(
+            queries: q, keys: k, heads: heads, kvHeads: kvHeads, headDim: headDim,
+            eps: 1e-6, queryScale: 0.125, ropeBase: 10000, offsets: offsets,
+            rowPositions: MLXArray((0 ..< l).map { Int32($0) }))
+        // Column 5 carries column 2's input at column 2's position.
+        let moved = [0, 1, 2, 3, 4, 2]
+        let qMoved = take(q, MLXArray(moved.map { Int32($0) }), axis: 1)
+        let kMoved = take(k, MLXArray(moved.map { Int32($0) }), axis: 1)
+        let leaf = applyTree(
+            queries: qMoved, keys: kMoved, heads: heads, kvHeads: kvHeads, headDim: headDim,
+            eps: 1e-6, queryScale: 0.125, ropeBase: 10000, offsets: offsets,
+            rowPositions: MLXArray(moved.map { Int32($0) }))
+        func bits(_ x: MLXArray) -> MLXArray { x.view(dtype: .uint16) }
+        let same = [
+            all(bits(record.queries) .== bits(identity.queries)),
+            all(bits(record.keys) .== bits(identity.keys)),
+            all(bits(record.queries[0..., 0..., 2 ..< 3, 0...]) .== bits(leaf.queries[0..., 0..., 5 ..< 6, 0...])),
+            all(bits(record.keys[0..., 0..., 2 ..< 3, 0...]) .== bits(leaf.keys[0..., 0..., 5 ..< 6, 0...])),
+        ]
+        eval(same)
+        return same.allSatisfy { $0.item(Bool.self) }
+    }
 }
