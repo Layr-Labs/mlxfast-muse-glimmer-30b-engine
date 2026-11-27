@@ -319,6 +319,12 @@ extension MuseGlimmerTextModel {
             offsets: usesRope ? (ropeOffsets ?? (attending.positionOffsets + 0)) : nil)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
+        if let paged = attending as? PagedLayerCache {
+            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+            let gated = paged.updateAndAttendGated(
+                queries: queries, keys: keys, values: values, scale: a.scale, gate: gate)
+            return verifyOutputProjection(a.outputProj, gated.reshaped(batch, length, -1))
+        }
         var output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         // Gate the `[B, L, H, D]` view of the attention output directly: the

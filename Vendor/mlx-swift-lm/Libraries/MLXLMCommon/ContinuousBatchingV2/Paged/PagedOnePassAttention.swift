@@ -48,11 +48,13 @@ public enum PagedOnePassAttention {
     /// constrained pipeline on every dispatch (host string work per layer);
     /// the two-pass kernels are used instead. Same bytes either way.
     nonisolated(unsafe) private(set) static var threadgroupProbeFailed = false
+    static var appendWarmed: Bool { lock.withLock { !appendVariants.isEmpty } }
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var appendVariants: Set<String> = []
     nonisolated(unsafe) private static var checked = 0
     nonisolated(unsafe) private static var differing = 0
 
@@ -91,62 +93,131 @@ public enum PagedOnePassAttention {
         else { return }
         let gqa = queryHeads / kvHeads
         guard let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa),
-            let hpt = eligible(headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1)
+            eligible(
+                headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1) != nil
         else { return }
         let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
             PagedAttentionKernel.partitionTokens, pageSize: pageSize)
         let pageElements = kvHeads * pageSize * headDim
-        let storage = MLXArray.zeros([2 * pageElements], dtype: dtype)
+        let gateWarmed = PagedSegmentAttention.warmGate(
+            dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim,
+            pageSize: pageSize, partitionTokens: ptok, source: source)
+        let storage = contiguous(MLXArray.zeros([2 * pageElements], dtype: dtype))
         let q = MLXArray.zeros([1, queryHeads, headDim], dtype: dtype)
         let seqinfo = MLXArray([Int32(0), 1, 1, 0, 0, 0, 0, 0], [1, 8])
         let params = MLXArray([Float(1), 1, 0, 0, 0, 0, 0, 0])
         let previous = MLXArray.zeros([1], type: Int32.self)
+        let pending = MLXArray.zeros([1, kvHeads, headDim], dtype: dtype)
         var record = [Int32](repeating: 0, count: PagedSegmentDispatchPlan.recordStride)
         record[3] = 1
         record[6] = 1
         var outputs = [MLXArray]()
-        for bindings in PagedSegmentDispatchPlan.bindingClasses {
-            let offsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
-            // Probe first: one threadgroup on zero inputs, output discarded.
-            let held =
-                (try? withError { () -> Bool in
-                    let probed = segments(
-                        queries: q, backing: [MLXArray](repeating: storage, count: bindings),
-                        seqinfo: seqinfo, params: params, previous: previous,
-                        valueOffsets: MLXArray(offsets), records: MLXArray(record),
-                        dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
-                        simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                        source: source, probe: true)
-                    eval(probed.fence, probed.out)
-                    return true
-                }) ?? false
-            if logs {
-                FileHandle.standardError.write(
-                    Data("[onepass] threadgroup probe bindings=\(bindings) held=\(held)\n".utf8))
+        for capacity in 1 ... maxPartitions {
+            var warmedHeads = Set<Int>()
+            for rows in 1 ... 8 {
+                guard let variant = eligible(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: capacity,
+                    rows: rows)
+                else { continue }
+                let heads = variant.heads
+                guard warmedHeads.insert(heads).inserted else { continue }
+                for bindings in PagedSegmentDispatchPlan.bindingClasses {
+                    let backing = [MLXArray](repeating: storage, count: bindings)
+                    let valueOffsets = MLXArray(
+                        [Int64](repeating: Int64(pageElements), count: max(8, bindings)))
+                    let records = MLXArray(record)
+                    if capacity == maxPartitions, rows == 1 {
+                        let held =
+                            (try? withError { () -> Bool in
+                                let probed = segments(
+                                    queries: q,
+                                    backing: backing, seqinfo: seqinfo, params: params,
+                                    previous: previous, valueOffsets: valueOffsets, records: records,
+                                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize,
+                                    hpt: heads, simdgroups: nsg, partitionTokens: ptok,
+                                    softcap: softcap, source: source, probe: true,
+                                    capacity: capacity)
+                                eval(probed.fence, probed.out)
+                                return true
+                            }) ?? false
+                        if logs {
+                            FileHandle.standardError.write(
+                                Data(
+                                    "[onepass] threadgroup probe bindings=\(bindings) held=\(held)\n"
+                                        .utf8))
+                        }
+                        guard held else {
+                            threadgroupProbeFailed = true
+                            return
+                        }
+                    }
+                    let result = segments(
+                        queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                        previous: previous, valueOffsets: valueOffsets, records: records,
+                        dtype: dtype, kvHeads: kvHeads, pageSize: pageSize,
+                        hpt: heads, simdgroups: nsg,
+                        partitionTokens: ptok, softcap: softcap, source: source,
+                        capacity: capacity)
+                    outputs += [result.fence, result.out]
+                    let held = (try? withError { () -> Bool in
+                        let appended = segments(
+                            queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                            previous: result.fence, valueOffsets: valueOffsets, records: records,
+                            dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: heads,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, probe: true, capacity: capacity,
+                            pending: (pending, pending))
+                        eval(appended.fence, appended.out)
+                        return true
+                    }) ?? false
+                    if held {
+                        let key = segmentName(
+                            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa,
+                            pageSize: pageSize, hpt: heads, simdgroups: nsg,
+                            partitionTokens: ptok, softcap: softcap, capacity: capacity,
+                            bindings: bindings, appending: true)
+                        lock.withLock { _ = appendVariants.insert(key) }
+                    }
+                    if gateWarmed {
+                        for appending in (held ? [false, true] : [false]) {
+                            let gatedHeld = (try? withError { () -> Bool in
+                                let gated = segments(
+                                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                                    previous: result.fence, valueOffsets: valueOffsets,
+                                    records: records, dtype: dtype, kvHeads: kvHeads,
+                                    pageSize: pageSize, hpt: heads, simdgroups: nsg,
+                                    partitionTokens: ptok, softcap: softcap, source: source,
+                                    probe: true, capacity: capacity, gate: q,
+                                    pending: appending ? (pending, pending) : nil)
+                                eval(gated.fence, gated.out)
+                                return true
+                            }) ?? false
+                            if gatedHeld {
+                                let key = segmentName(
+                                    dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa,
+                                    pageSize: pageSize, hpt: heads, simdgroups: nsg,
+                                    partitionTokens: ptok, softcap: softcap, capacity: capacity,
+                                    bindings: bindings, appending: appending, gated: true)
+                                lock.withLock { _ = gateVariants.insert(key) }
+                            }
+                        }
+                    }
+                }
             }
-            guard held else {
-                threadgroupProbeFailed = true
-                return
-            }
-            let result = segments(
-                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
-                seqinfo: seqinfo, params: params, previous: previous,
-                valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
-                kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
-                partitionTokens: ptok, softcap: softcap, source: source)
-            outputs += [result.fence, result.out]
         }
         eval(outputs)
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
-    /// requested count whose threadgroup memory fits Metal's limit.
-    static func headsPerThreadgroup(headDim: Int, gqa: Int, simdgroups: Int) -> Int? {
-        var hpt = min(gqa, requestedHeads)
+    static func headsPerThreadgroup(
+        headDim: Int, gqa: Int, simdgroups: Int, capacity: Int, rows: Int
+    ) -> Int? {
+        let wanted = rows >= 5 ? max(requestedHeads, 4) : requestedHeads
+        var hpt = min(gqa, wanted)
         while hpt >= 1 {
             let floats =
-                hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                + maxPartitions * hpt * (headDim + 2)
+                hpt * headDim + capacity * simdgroups * hpt * (headDim + 2)
+                + capacity * hpt * (headDim + 2)
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -155,13 +226,23 @@ public enum PagedOnePassAttention {
         return nil
     }
 
+    static func headsPerThreadgroup(headDim: Int, gqa: Int, simdgroups: Int) -> Int? {
+        headsPerThreadgroup(
+            headDim: headDim, gqa: gqa, simdgroups: simdgroups, capacity: maxPartitions,
+            rows: 1)
+    }
+
     static func eligible(
         headDim: Int, gqa: Int, simdgroups: Int, partitions: Int, rows: Int
-    ) -> Int? {
+    ) -> (heads: Int, capacity: Int)? {
+        let capacity = min(max(1, partitions), maxPartitions)
         guard !threadgroupProbeFailed, partitions >= 1, partitions <= maxPartitions,
-            rows <= 64, 32 * simdgroups * maxPartitions <= 1024
+            rows <= 64, 32 * simdgroups * capacity <= 1024,
+            let heads = headsPerThreadgroup(
+                headDim: headDim, gqa: gqa, simdgroups: simdgroups, capacity: capacity,
+                rows: rows)
         else { return nil }
-        return headsPerThreadgroup(headDim: headDim, gqa: gqa, simdgroups: simdgroups)
+        return (heads, capacity)
     }
 
     private static let scratch = """
@@ -185,8 +266,12 @@ public enum PagedOnePassAttention {
 
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
-    private static func segmentBody(bindings: Int) -> String {
+    private static func segmentBody(bindings: Int, appending: Bool, gated: Bool) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        let append = appending ? "true" : "false"
+        let pending = appending ? ", knew, vnew" : ""
+        let hasGate = gated ? "true" : "false"
+        let epilogueInputs = gated ? (appending ? ", gate" : ", nullptr, nullptr, gate") : ""
         return """
             const int row = threadgroup_position_in_grid.y;
             int first = 0;
@@ -205,16 +290,16 @@ public enum PagedOnePassAttention {
             \(scratch)
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
-                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK>(
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, \(append), \(hasGate)>(
                 q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
-                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup\(pending)\(epilogueInputs));
             """
     }
 
     private static func name(
         _ kind: String, dtype: DType, headDim: Int, pageSize: Int, gqa: Int, hpt: Int,
-        simdgroups: Int, partitionTokens: Int, softcap: Bool
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, capacity: Int
     ) -> String {
         let d: String
         switch dtype {
@@ -224,8 +309,46 @@ public enum PagedOnePassAttention {
         default: d = "dt\(dtype)"
         }
         return "cbv2_paged_onepass_\(kind)_\(d)_d\(headDim)_s\(pageSize)_g\(gqa)_h\(hpt)"
-            + "_n\(simdgroups)_t\(partitionTokens)_p\(maxPartitions)_cap\(softcap ? 1 : 0)"
+            + "_n\(simdgroups)_t\(partitionTokens)_p\(capacity)_cap\(softcap ? 1 : 0)"
             + "_b\(block)"
+    }
+
+    private static func segmentName(
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, capacity: Int, bindings: Int,
+        appending: Bool, gated: Bool = false
+    ) -> String {
+        name(
+            "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: headDim, pageSize: pageSize,
+            gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            softcap: softcap, capacity: capacity) + (appending ? "_append" : "")
+            + (gated ? "_gate" : "")
+    }
+
+    static func supportsAppend(
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, capacity: Int, bindings: Int
+    ) -> Bool {
+        let key = segmentName(
+            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            softcap: softcap, capacity: capacity, bindings: bindings, appending: true)
+        return lock.withLock { appendVariants.contains(key) }
+    }
+
+    nonisolated(unsafe) private static var gateVariants: Set<String> = []
+
+    static func supportsGate(
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, capacity: Int, bindings: Int,
+        appending: Bool
+    ) -> Bool {
+        let key = segmentName(
+            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            softcap: softcap, capacity: capacity, bindings: bindings, appending: appending,
+            gated: true)
+        return lock.withLock { gateVariants.contains(key) }
     }
 
     /// Direct-slab entry: `[B, QH, D]` in the slab dtype.
@@ -233,7 +356,7 @@ public enum PagedOnePassAttention {
         queries: MLXArray, kSlab: MLXArray, vSlab: MLXArray, tables: MLXArray,
         seqinfo: MLXArray, params: MLXArray, softcap: Bool, pageSize: Int,
         writeFence: MLXArray, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        source: String, stream: StreamOrDevice
+        source: String, stream: StreamOrDevice, capacity: Int
     ) -> MLXArray {
         let dtype = kSlab.dtype
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
@@ -241,7 +364,8 @@ public enum PagedOnePassAttention {
         let gqa = qh / kvh
         let kernelName = name(
             "slab", dtype: dtype, headDim: d, pageSize: pageSize, gqa: gqa, hpt: hpt,
-            simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap)
+            simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+            capacity: capacity)
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             let made = MLXFast.metalKernel(
@@ -252,12 +376,12 @@ public enum PagedOnePassAttention {
             kernels[kernelName] = made
             return made
         }
-        let tg = 32 * simdgroups * maxPartitions
+        let tg = 32 * simdgroups * capacity
         return kernel(
             [queries, kSlab, vSlab, tables, seqinfo, params, writeFence],
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("GQA", gqa), ("HPT", hpt),
-                ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", maxPartitions),
+                ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", capacity),
                 ("HAS_SOFTCAP", softcap), ("BLOCK", block),
             ],
             grid: (kvh * (gqa / hpt) * tg, b, 1), threadGroup: (tg, 1, 1),
@@ -270,37 +394,50 @@ public enum PagedOnePassAttention {
         queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
-        softcap: Bool, source: String, probe: Bool = false
+        softcap: Bool, source: String, probe: Bool = false, capacity: Int,
+        gate: MLXArray? = nil,
+        pending: (keys: MLXArray, values: MLXArray)? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
         let bindings = backing.count
-        let kernelName =
-            name(
-                "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
-                gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap)
+        let appending = pending != nil
+        let kernelName = segmentName(
+            dtype: dtype, headDim: d, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize, hpt: hpt,
+            simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+            capacity: capacity, bindings: bindings, appending: appending, gated: gate != nil)
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
                 FileHandle.standardError.write(Data("[onepass] new kernel \(kernelName)\n".utf8))
             }
+            let segments = (0 ..< bindings).map { "segment\($0)" }
             let made = MLXFast.metalKernel(
                 name: kernelName,
-                inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
-                    + ["seqinfo", "params", "previous", "value_offsets", "records"],
-                outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                inputNames: ["q"] + segments
+                    + ["seqinfo", "params", "previous", "value_offsets", "records"]
+                    + (appending ? ["knew", "vnew"] : [])
+                    + (gate != nil ? ["gate"] : []),
+                outputNames: ["fence", "out"],
+                source: segmentBody(bindings: bindings, appending: appending, gated: gate != nil),
+                header: source, ensureRowContiguous: true,
+                mutableInputs: appending ? segments : [])
             kernels[kernelName] = made
             return made
         }
-        let tg = 32 * simdgroups * maxPartitions
+        let tg = 32 * simdgroups * capacity
+        var inputs = [queries] + backing + [seqinfo, params, previous, valueOffsets, records]
+        if let pending {
+            inputs.append(pending.keys)
+            inputs.append(pending.values)
+        }
+        if let gate { inputs.append(gate) }
         let outputs = kernel(
-            [queries] + backing + [seqinfo, params, previous, valueOffsets, records],
+            inputs,
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
                 ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
-                ("MAXPART", maxPartitions), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
+                ("MAXPART", capacity), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
                 ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
             ],
             // The probe asks for the same thread count as one (tg / 2, 2, 1)

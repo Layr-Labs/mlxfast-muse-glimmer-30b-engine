@@ -527,6 +527,22 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttendImpl(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks, gate: nil)
+    }
+
+    package func updateAndAttendGated(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, gate: MLXArray
+    ) -> MLXArray {
+        updateAndAttendImpl(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil, gate: gate)
+            .transposed(0, 2, 1, 3)
+    }
+
+    private func updateAndAttendImpl(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, gate: MLXArray?
+    ) -> MLXArray {
         guard
             pool.writeValidation.validate(
                 keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
@@ -552,6 +568,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // Sinks apply only to layers that declare them (same gate as
         // CBv2AttentionV1) — a sink-free layer must ignore a passed array.
         let effectiveSinks = kind.hasSinks ? sinks : nil
+        var gateApplied = false
 
         let metadata = attentionMetadata?.begin(
             cache: self, queries: queries, keys: keys, values: values, scale: scale,
@@ -618,9 +635,18 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // rectangular VERIFICATION, never a packed prompt chunk.
             retainedPrefillKV = []
             dropPrefillMirrors()
-            output = attendRectangularColumns(
-                queries: queries, keys: keys, values: values,
-                rows: pagedRows, scale: scale, sinks: effectiveSinks)
+            if let gate, !usesGatheredNativeDecode, mtpBatchesRectangularColumnsAsRows,
+                let gated = attendColumnsAsDecodeRows(
+                    queries: queries, keys: keys, values: values, rows: pagedRows,
+                    scale: scale, sinks: effectiveSinks, gate: gate)
+            {
+                output = gated
+                gateApplied = true
+            } else {
+                output = attendRectangularColumns(
+                    queries: queries, keys: keys, values: values,
+                    rows: pagedRows, scale: scale, sinks: effectiveSinks)
+            }
         } else {
             precondition(
                 boundSpanContext == nil || b == 1,
@@ -682,6 +708,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
         advancePositionOffsets(by: l)
+        if !gateApplied, let gate {
+            let gated = PagedSegmentAttention.applyGate(output.transposed(0, 2, 1, 3), gate)
+            return finishAttentionCall(gated.transposed(0, 2, 1, 3))
+        }
         return finishAttentionCall(output)
     }
 
@@ -1271,7 +1301,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// round's writes leave every column's window in place.
     private func attendColumnsAsDecodeRows(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?, gate: MLXArray? = nil
     ) -> MLXArray? {
         let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
         guard (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !rows.isEmpty,
@@ -1291,8 +1321,27 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
             })
         else { return nil }
-        for (index, row) in rows.enumerated() {
-            row.write(keys: keys[index], values: values[index])
+        if let gate, gate.dtype != group.dtype || queries.dtype != group.dtype { return nil }
+        let canAppend: Bool
+        if b == 1, sinks == nil, !segmentDecodeReference,
+            !PagedOnePassAttention.threadgroupProbeFailed
+        {
+            let row = rows[0]
+            let length = row.absoluteOffset + l - row.baseOffset
+            let partition = PagedSegmentDispatchPlan.boundedPartitionTokens(
+                PagedAttentionKernel.partitionTokens, pageSize: group.pageSize)
+            canAppend = min(length, row.windowSize ?? length)
+                <= PagedOnePassAttention.maxPartitions * partition
+                && PagedOnePassAttention.appendWarmed
+        } else {
+            canAppend = false
+        }
+        if canAppend {
+            guard rows[0].prepareDecodeAppend(count: l) else { return faultOutput(queries) }
+        } else {
+            for (index, row) in rows.enumerated() {
+                row.write(keys: keys[index], values: values[index])
+            }
         }
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
@@ -1315,7 +1364,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            gate: gate?.reshaped(b * l, qh, d),
+            pending: canAppend ? (keys.squeezed(axis: 0), values.squeezed(axis: 0)) : nil)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
