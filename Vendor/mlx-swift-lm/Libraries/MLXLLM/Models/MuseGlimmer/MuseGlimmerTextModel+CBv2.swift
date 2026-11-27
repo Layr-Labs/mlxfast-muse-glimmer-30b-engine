@@ -265,11 +265,28 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
+            if index + 1 == Self.lowAcceptanceVerifySubmittedLayers, CBv2DraftRegime.lowAcceptance {
+                // Nonblocking; the round's acceptance fence still joins it.
+                asyncEval(h, layerInput)
+            }
         }
         let parts = capture.map { captured[$0]! }
         let normed = model.norm(h)
         return (normed, parts.count == 1 ? parts[0] : concatenated(parts, axis: -1))
     }
+
+    /// A low-acceptance round's verify submits its first 9 layers as soon as
+    /// their graph exists (`CBv2DraftRegime.lowAcceptance`, set while that
+    /// round is built), so the device can start the verify while the host
+    /// builds the other 43 layers and the head. Otherwise the verify reaches
+    /// the device only after its whole graph is built and 100 of its
+    /// operations are encoded (`MuseGlimmerDecodeCommandBuffers`), and that
+    /// round's drafter, submitted layer by layer, can finish first. Only when
+    /// the work is submitted changes: every operation, shape and kernel is
+    /// the same, so every value is the same. High-acceptance rounds keep one
+    /// submission. `CBV2_VERIFY_EARLY_SUBMIT=0` turns it off.
+    static let lowAcceptanceVerifySubmittedLayers =
+        ProcessInfo.processInfo.environment["CBV2_VERIFY_EARLY_SUBMIT"] == "0" ? 0 : 9
     func fusedVerifyForwardWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
         -> (logits: MLXArray, hidden: MLXArray)?
     {
