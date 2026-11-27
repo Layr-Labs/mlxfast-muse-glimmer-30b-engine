@@ -627,7 +627,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
     static let deepLowEarlyCommittedMinRounds: Int = {
-        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 5
     }()
     static let deepLowEarlyCommittedHundredths: Int = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_COMMITTED"].flatMap(Int.init) ?? 305
