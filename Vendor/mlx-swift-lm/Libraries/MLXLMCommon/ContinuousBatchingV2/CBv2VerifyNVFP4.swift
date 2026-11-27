@@ -45,24 +45,51 @@ public enum CBv2VerifyNVFP4 {
         }
     }
 
+    /// `CBV2_NVFP4_COALESCED=1` enables coalesced `uint4` weight + `uint` scale loads (off by default).
+    public static let coalescedEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_NVFP4_COALESCED"] == "1"
+
+    private static let prefetchEnv: Int? =
+        ProcessInfo.processInfo.environment["CBV2_NVFP4_PF"].flatMap(Int.init)
+
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
 
-    /// Measured on the M5 Ultra (micro, chained, M = 1 to 8): 8-row tiles
-    /// everywhere, except 16-row tiles with prefetch for the 19,968-input
-    /// rows (MLP down) at 8 rows, where the activation stream of 8-row tiles
-    /// costs more than the extra fragment (113 against 120 µs; tied at 7).
+    /// Coalesced `uint4` + aligned `uint` scale schedule with 5-reg prefetch on M5 Max.
     public static func geometry(rows: Int, inputs: Int) -> Geometry {
         if let geometryOverride { return geometryOverride }
-        if inputs >= 16384 && rows >= 8 { return Geometry(fragments: 2, prefetch: 1) }
-        return Geometry(fragments: 1, prefetch: 0)
+        let pf = prefetchEnv ?? (coalescedEnabled ? 1 : (inputs >= 16384 && rows >= 8 ? 1 : 0))
+        if inputs >= 16384 && rows >= 7 { return Geometry(fragments: 2, prefetch: pf) }
+        return Geometry(fragments: 1, prefetch: pf)
     }
 
     static let tileHelper = """
 
+        inline half2 cbv2_vn_e4m3x2(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        inline void cbv2_vn_transpose4(uint4 v, bool odd, bool hi, thread uint* q) {
+            const uint r_lo = simd_shuffle_xor(odd ? v.x : v.y, ushort(1));
+            const uint r_hi = simd_shuffle_xor(odd ? v.z : v.w, ushort(1));
+            const uint a0 = odd ? r_lo : v.x;
+            const uint a1 = odd ? v.y : r_lo;
+            const uint b0 = odd ? r_hi : v.z;
+            const uint b1 = odd ? v.w : r_hi;
+            const uint p0 = simd_shuffle_xor(hi ? a0 : b0, ushort(8));
+            const uint p1 = simd_shuffle_xor(hi ? a1 : b1, ushort(8));
+            q[0] = hi ? p0 : a0;
+            q[1] = hi ? p1 : a1;
+            q[2] = hi ? b0 : p0;
+            q[3] = hi ? b1 : p1;
+        }
+
         // One tile of 8 * TN outputs of one projection: the stock matrix
         // kernel's arithmetic (see CBv2VerifyNVFP4) on 8 * TN rows.
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED>
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool COAL>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
@@ -92,6 +119,100 @@ public enum CBv2VerifyNVFP4 {
                     C[t][mt] = float2(0);
                 }
             }
+            if constexpr (COAL) {
+                const short c = fn >> 1;
+                const bool odd = (simd_lid & 1) != 0;
+                const bool hi = (simd_lid & 8) != 0;
+                const uint sshift = hi ? 8u : 0u;
+                const device uint4* w4l[TN];
+                const device uint* s4l[TN];
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    const int row = min(y_col + fm + 8 * t, N - 1);
+                    w4l[t] = (const device uint4*)(
+                        (const device uint8_t*)w + size_t(row) * row_bytes) + c;
+                    s4l[t] = (const device uint*)(
+                        scales + size_t(row) * row_scales) + (hi ? 1 : 0);
+                }
+                uint4 w_cur[TN];
+                uint s_cur[TN];
+                if (PF == 1 && int(simd_gid) * BK < K) {
+                    const int k0 = int(simd_gid) * BK;
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        w_cur[t] = w4l[t][k0 / 32];
+                        s_cur[t] = s4l[t][k0 / 64];
+                    }
+                }
+                for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                    uint4 w_use[TN];
+                    uint s_use[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if (PF == 1) {
+                            w_use[t] = w_cur[t];
+                            s_use[t] = s_cur[t];
+                        } else {
+                            w_use[t] = w4l[t][k / 32];
+                            s_use[t] = s4l[t][k / 64];
+                        }
+                    }
+                    const int kn = k + WK * BK;
+                    if (PF == 1 && kn < K) {
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            w_cur[t] = w4l[t][kn / 32];
+                            s_cur[t] = s4l[t][kn / 64];
+                        }
+                    }
+                    uint q[TN][4];
+                    half2 hs0[TN], hs1[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        cbv2_vn_transpose4(w_use[t], odd, hi, q[t]);
+                        const uint s_peer = simd_shuffle_xor(s_use[t], ushort(8));
+                        const uint s_lo = hi ? s_peer : s_use[t];
+                        const uint s_hi = hi ? s_use[t] : s_peer;
+                        hs0[t] = cbv2_vn_e4m3x2((s_lo >> sshift) & 0x00FF00FFu);
+                        hs1[t] = cbv2_vn_e4m3x2((s_hi >> sshift) & 0x00FF00FFu);
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        ushort4 xv[TM][2];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                            }
+                        }
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            s[t] = (block < 2) ? hs0[t][block] : hs1[t][block - 2];
+                        }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            float2 bf[TM];
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                bf[mt] = float2(
+                                    float(as_type<bfloat>(xv[mt][0][i])),
+                                    float(as_type<bfloat>(xv[mt][1][i])));
+                            }
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(q[t][block], i, s[t]);
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
             const device uint* wl[TN];
             const device uint8_t* sl[TN];
             MO_WO_UNROLL
@@ -172,6 +293,7 @@ public enum CBv2VerifyNVFP4 {
                     }
                 }
             }
+            }
 
             constexpr int tile_elems = TN * TM * 2;
             if (simd_gid > 0) {
@@ -241,7 +363,7 @@ public enum CBv2VerifyNVFP4 {
             let tiles = "((N\(i) + 8 * TN - 1) / (8 * TN))"
             body += """
                 \(i == 0 ? "" : "else ")if (tg < \(offset) + \(tiles)) {
-                    cbv2_vn_tile<T, V, K, N\(i), TN, PF, SCALED>(
+                    cbv2_vn_tile<T, V, K, N\(i), TN, PF, SCALED, COAL>(
                         w\(i), sc\(i), x, ts\(i)[0], y\(i), tg - (\(offset)), sg, sl, partials);
                 }
 
@@ -256,8 +378,52 @@ public enum CBv2VerifyNVFP4 {
     }
 
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
-        1: kernel(segments: 1), 2: kernel(segments: 2),
+        1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
+
+    private struct LaunchKey: Hashable {
+        let segments: Int
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let fragments: Int
+        let prefetch: Int
+        let scaled: Bool
+        let coalesced: Bool
+        let outputs: [Int]
+    }
+
+    private static let launchLock = NSLock()
+    nonisolated(unsafe) private static var launchCache: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+    private static func preparedLaunch(
+        segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
+        scaled: Bool, outputs: [Int]
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let coal = coalescedEnabled
+        let key = LaunchKey(
+            segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
+            prefetch: prefetch, scaled: scaled, coalesced: coal, outputs: outputs)
+        if let hit = launchLock.withLock({ launchCache[key] }) { return hit }
+        let tile = 8 * fragments
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
+            ("SCALED", scaled), ("COAL", coal),
+        ]
+        var shapes = [[Int]]()
+        shapes.reserveCapacity(outputs.count)
+        var tiles = 0
+        for (i, n) in outputs.enumerated() {
+            template.append(("N\(i)", n))
+            shapes.append([rows, n])
+            tiles += (n + tile - 1) / tile
+        }
+        let made = kernels[segments]!.prepare(
+            template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
+        launchLock.withLock { launchCache[key] = made }
+        return made
+    }
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
@@ -293,16 +459,12 @@ public enum CBv2VerifyNVFP4 {
         else { return nil }
         let outputs = weight.dim(0)
         let g = geometry(rows: rows, inputs: inputs)
-        let tile = 8 * g.fragments
-        let template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("PF", g.prefetch),
-            ("SCALED", tensorScale != nil), ("N0", outputs),
-        ]
-        let result = kernels[1]!(
-            [weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs)],
-            template: template,
-            grid: (32, 8 * ((outputs + tile - 1) / tile), 1), threadGroup: (32, 8, 1),
-            outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
+        let launch = preparedLaunch(
+            segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: g.fragments,
+            prefetch: g.prefetch, scaled: tensorScale != nil, outputs: [outputs])
+        let result = launch([
+            weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs),
+        ])[0]
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
@@ -312,11 +474,13 @@ public enum CBv2VerifyNVFP4 {
         product(x, weight: layer.weight, blockScales: layer.weightScale, tensorScale: layer.weightScale2)
     }
 
-    /// The products of two sibling NVFP4 layers of one input (MLP gate and
-    /// up), one launch, each equal to its layer's own row-exact product; nil
-    /// when the pair is not taken.
+    /// The products of sibling NVFP4 layers of one input (MLP gate and
+    /// up; attention q, k, v and gate), one launch, each equal to its layer's own
+    /// row-exact product; nil when the group is not taken.
     public static func products(_ layers: [any UnaryLayer], _ x: MLXArray) -> [MLXArray]? {
-        guard layers.count == 2, let nv = layers as? [ModelOptWeightOnlyNVFP4Linear] else {
+        guard kernels[layers.count] != nil, layers.count >= 2,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear]
+        else {
             return nil
         }
         let inputs = x.dim(-1)
@@ -330,25 +494,20 @@ public enum CBv2VerifyNVFP4 {
             else { return nil }
         }
         let g = geometry(rows: rows, inputs: inputs)
-        let tile = 8 * g.fragments
         var arrays = [MLXArray]()
-        var template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", g.fragments), ("PF", g.prefetch),
-            ("SCALED", true),
-        ]
-        var shapes = [[Int]]()
-        var tiles = 0
-        for (i, layer) in nv.enumerated() {
+        arrays.reserveCapacity(nv.count * 3 + 1)
+        var outputDims = [Int]()
+        outputDims.reserveCapacity(nv.count)
+        for layer in nv {
             let outputs = layer.weight.dim(0)
             arrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
-            template.append(("N\(i)", outputs))
-            shapes.append([rows, outputs])
-            tiles += (outputs + tile - 1) / tile
+            outputDims.append(outputs)
         }
         arrays.append(x.reshaped(rows, inputs))
-        let results = kernels[2]!(
-            arrays, template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: shapes, outputDTypes: [x.dtype, x.dtype])
+        let launch = preparedLaunch(
+            segments: nv.count, dtype: x.dtype, rows: rows, inputs: inputs,
+            fragments: g.fragments, prefetch: g.prefetch, scaled: true, outputs: outputDims)
+        let results = launch(arrays)
         let lead = Array(x.shape.dropLast())
         return zip(results, nv).map { $0.reshaped(lead + [$1.weight.dim(0)]) }
     }
