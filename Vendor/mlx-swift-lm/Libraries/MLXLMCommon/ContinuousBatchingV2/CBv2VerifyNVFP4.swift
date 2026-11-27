@@ -49,6 +49,11 @@ public enum CBv2VerifyNVFP4 {
     public static let coalescedEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_NVFP4_COALESCED"] == "1"
 
+    /// `CBV2_FUSED_GATE_UP_SILU`: `"0"` disables fused NVFP4 `gate + up + silu(gate)*up`
+    /// (+ optional inline ModelOpt FP8 activation cast when `down` is FP8) on low-acc rounds.
+    public static let fusedGateUpSiluEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FUSED_GATE_UP_SILU"] != "0" 
+
     private static let prefetchEnv: Int? =
         ProcessInfo.processInfo.environment["CBV2_NVFP4_PF"].flatMap(Int.init)
 
@@ -530,5 +535,311 @@ public enum CBv2VerifyNVFP4 {
             }
         }
         if !outs.isEmpty { eval(outs) }
+    }
+
+    // MARK: - Fused Gate + Up + SiLU * Up (+ optional FP8 cast)
+
+    private static let fusedGateUpHeader = ModelOptWeightOnlyNVFP4RowExact.header
+        + ModelOptActivationKernels.header + tileHelper + """
+
+        inline bfloat16_t cbv2_vn_bf16_sigmoid(bfloat16_t x) {
+            bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+            bfloat16_t one = bfloat16_t(1.0f);
+            bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+
+        inline bfloat16_t cbv2_vn_bf16_cast_fp8(
+            bfloat16_t yb, float m0, float m1, float bound, float nan_value
+        ) {
+            float scaled = static_cast<float>(yb) * m0;
+            uint8_t bits = modelopt_e4m3_bits(scaled);
+            float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+            return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+        }
+        """
+
+    private static let fusedGateUpSource = """
+        constexpr int WK = 8;
+        constexpr int BK = 128;
+        constexpr short TM = (V + 7) / 8;
+        constexpr int row_bytes = K / 2;
+        constexpr int row_scales = K / 16;
+        static_assert(K % BK == 0, "whole chunks only");
+        constexpr int TILE_ELEMS = 2 * TM * 2;
+        threadgroup float partials[7 * TILE_ELEMS * 32];
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const short qid = simd_lid / 4;
+        const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+        const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+        const int y_col = tile * 8;
+        const int row = min(y_col + fm, N - 1);
+
+        const device T* xr[TM][2];
+        float2 Cg[TM];
+        float2 Cu[TM];
+        MO_WO_UNROLL
+        for (short mt = 0; mt < TM; mt++) {
+            MO_WO_UNROLL
+            for (short j = 0; j < 2; j++) {
+                xr[mt][j] = x + size_t(min(8 * mt + fn + j, V - 1)) * K + 4 * fm;
+            }
+            Cg[mt] = float2(0);
+            Cu[mt] = float2(0);
+        }
+
+        if constexpr (COAL) {
+            const short c = fn >> 1;
+            const bool odd = (simd_lid & 1) != 0;
+            const bool hi = (simd_lid & 8) != 0;
+            const uint sshift = hi ? 8u : 0u;
+            const device uint4* wg4l = (const device uint4*)(
+                (const device uint8_t*)wg + size_t(row) * row_bytes) + c;
+            const device uint* sg4l = (const device uint*)(
+                scg + size_t(row) * row_scales) + (hi ? 1 : 0);
+            const device uint4* wu4l = (const device uint4*)(
+                (const device uint8_t*)wu + size_t(row) * row_bytes) + c;
+            const device uint* su4l = (const device uint*)(
+                scu + size_t(row) * row_scales) + (hi ? 1 : 0);
+            for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                const uint4 wg_use = wg4l[k / 32];
+                const uint sg_use = sg4l[k / 64];
+                const uint4 wu_use = wu4l[k / 32];
+                const uint su_use = su4l[k / 64];
+                uint qg[4], qu[4];
+                cbv2_vn_transpose4(wg_use, odd, hi, qg);
+                cbv2_vn_transpose4(wu_use, odd, hi, qu);
+                const uint sg_peer = simd_shuffle_xor(sg_use, ushort(8));
+                const uint sg_lo = hi ? sg_peer : sg_use;
+                const uint sg_hi = hi ? sg_use : sg_peer;
+                const half2 hsg0 = cbv2_vn_e4m3x2((sg_lo >> sshift) & 0x00FF00FFu);
+                const half2 hsg1 = cbv2_vn_e4m3x2((sg_hi >> sshift) & 0x00FF00FFu);
+                const uint su_peer = simd_shuffle_xor(su_use, ushort(8));
+                const uint su_lo = hi ? su_peer : su_use;
+                const uint su_hi = hi ? su_use : su_peer;
+                const half2 hsu0 = cbv2_vn_e4m3x2((su_lo >> sshift) & 0x00FF00FFu);
+                const half2 hsu1 = cbv2_vn_e4m3x2((su_hi >> sshift) & 0x00FF00FFu);
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    ushort4 xv[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                    const half sg_h = (block < 2) ? hsg0[block] : hsg1[block - 2];
+                    const half su_h = (block < 2) ? hsu0[block] : hsu1[block - 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(
+                                float(as_type<bfloat>(xv[mt][0][i])),
+                                float(as_type<bfloat>(xv[mt][1][i])));
+                        }
+                        const float2 ag = mo_wo_pair(qg[block], i, sg_h);
+                        const float2 au = mo_wo_pair(qu[block], i, su_h);
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            mo_wo_mma(Cg[mt], ag, bf[mt]);
+                            mo_wo_mma(Cu[mt], au, bf[mt]);
+                        }
+                    }
+                }
+            }
+        } else {
+            const device uint* wgl = (const device uint*)(
+                (const device uint8_t*)wg + size_t(row) * row_bytes + 2 * fn);
+            const device uint8_t* sgl = scg + size_t(row) * row_scales + fn / 4;
+            const device uint* wul = (const device uint*)(
+                (const device uint8_t*)wu + size_t(row) * row_bytes + 2 * fn);
+            const device uint8_t* sul = scu + size_t(row) * row_scales + fn / 4;
+            for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    ushort4 xv[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                        }
+                    }
+                    const uint qg = wgl[b / 8];
+                    const half sg_h = mo_wo_e4m3(sgl[b / 16]);
+                    const uint qu = wul[b / 8];
+                    const half su_h = mo_wo_e4m3(sul[b / 16]);
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        float2 bf[TM];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            bf[mt] = float2(
+                                float(as_type<bfloat>(xv[mt][0][i])),
+                                float(as_type<bfloat>(xv[mt][1][i])));
+                        }
+                        const float2 ag = mo_wo_pair(qg, i, sg_h);
+                        const float2 au = mo_wo_pair(qu, i, su_h);
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            mo_wo_mma(Cg[mt], ag, bf[mt]);
+                            mo_wo_mma(Cu[mt], au, bf[mt]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (simd_gid > 0) {
+            threadgroup float* p = partials + (simd_gid - 1) * TILE_ELEMS * 32 + simd_lid;
+            MO_WO_UNROLL
+            for (short mt = 0; mt < TM; mt++) {
+                p[(mt * 4 + 0) * 32] = Cg[mt][0];
+                p[(mt * 4 + 1) * 32] = Cg[mt][1];
+                p[(mt * 4 + 2) * 32] = Cu[mt][0];
+                p[(mt * 4 + 3) * 32] = Cu[mt][1];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 0) {
+            for (int s = 0; s < WK - 1; s++) {
+                const threadgroup float* p = partials + s * TILE_ELEMS * 32 + simd_lid;
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    Cg[mt][0] += p[(mt * 4 + 0) * 32];
+                    Cg[mt][1] += p[(mt * 4 + 1) * 32];
+                    Cu[mt][0] += p[(mt * 4 + 2) * 32];
+                    Cu[mt][1] += p[(mt * 4 + 3) * 32];
+                }
+            }
+            const float scale_g = tsg[0];
+            const float scale_u = tsu[0];
+            const float m0 = CAST_FP8 ? fp8_mu[0] : 0.0f;
+            const float m1 = CAST_FP8 ? fp8_mu[1] : 0.0f;
+            const float bound = CAST_FP8 ? fp8_bd[0] : 0.0f;
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            const int out = y_col + fm;
+            if (out < N) {
+                MO_WO_UNROLL
+                for (short mt = 0; mt < TM; mt++) {
+                    MO_WO_UNROLL
+                    for (short j = 0; j < 2; j++) {
+                        if (8 * mt + fn + j < V) {
+                            const bfloat16_t g_bf = mo_wo_result<bfloat16_t>(Cg[mt][j], true, scale_g);
+                            const bfloat16_t u_bf = mo_wo_result<bfloat16_t>(Cu[mt][j], true, scale_u);
+                            bfloat16_t yb = (g_bf * cbv2_vn_bf16_sigmoid(g_bf)) * u_bf;
+                            if constexpr (CAST_FP8) {
+                                yb = cbv2_vn_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
+                            }
+                            y[size_t(8 * mt + fn + j) * N + out] = yb;
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+    private static let fusedGateUpKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_gate_up_silu",
+        inputNames: ["wg", "scg", "tsg", "wu", "scu", "tsu", "x", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fusedGateUpSource,
+        header: fusedGateUpHeader)
+
+    private struct FusedGateUpLaunchKey: Hashable {
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+        let coalesced: Bool
+        let castFP8: Bool
+    }
+
+    nonisolated(unsafe) private static var fusedGateUpLaunchCache:
+        [FusedGateUpLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static let dummyFP8Mu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummyFP8Bound: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    /// Fuses NVFP4 `gate_proj` + `up_proj` + `silu(gate) * up` (+ optional inline ModelOpt
+    /// FP8 activation cast when `fp8Down` is provided) in one dispatch, reading `x` once per
+    /// 8-output tile and eliminating both intermediate `[V, N]` buffers (0-ULP bit-exact).
+    public static func fusedGateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear,
+        up: ModelOptWeightOnlyNVFP4Linear,
+        _ x: MLXArray,
+        fp8Down: ModelOptCalibratedLinear? = nil
+    ) -> MLXArray? {
+        guard fusedGateUpSiluEnabled else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        let outputs = gate.weight.dim(0)
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            up.weight.dim(0) == outputs,
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            takes(
+                weight: gate.weight, blockScales: gate.weightScale,
+                tensorScale: gate.weightScale2, inputs: inputs),
+            takes(
+                weight: up.weight, blockScales: up.weightScale,
+                tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+        let mu: MLXArray
+        let bound: MLXArray
+        let castFP8: Bool
+        if let fp8Down {
+            guard let constants = fp8Down.graphConstants,
+                case .fp8(let m, let b) = constants.storage
+            else { return nil }
+            mu = m
+            bound = b
+            castFP8 = true
+        } else {
+            mu = dummyFP8Mu
+            bound = dummyFP8Bound
+            castFP8 = false
+        }
+        let coal = coalescedEnabled
+        let key = FusedGateUpLaunchKey(
+            dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs,
+            coalesced: coal, castFP8: castFP8)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ fusedGateUpLaunchCache[key] }) {
+            launch = hit
+        } else {
+            let tiles = (outputs + 7) / 8
+            let made = fusedGateUpKernel.prepare(
+                template: [
+                    ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
+                    ("COAL", coal), ("CAST_FP8", castFP8),
+                ],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])
+            launchLock.withLock { fusedGateUpLaunchCache[key] = made }
+            launch = made
+        }
+        let res = launch([
+            gate.weight, gate.weightScale, gate.weightScale2.reshaped(1),
+            up.weight, up.weightScale, up.weightScale2.reshaped(1),
+            x.reshaped(rows, inputs), mu, bound,
+        ])[0]
+        return res.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 }

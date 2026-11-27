@@ -941,6 +941,8 @@ extension EngineLoopV2 {
         let draftTokens: MLXArray? =
             Self.mtpOutcomeSpeculation && mtp.inLowAcceptanceRegime(id)
             ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
+        CBv2DraftRegime.xnorDraftHeadEligible = mtp.inDeepLowAcceptanceRegime(id)
+        defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
             draftsBlock: draftsBlock, draftTokens: draftTokens,

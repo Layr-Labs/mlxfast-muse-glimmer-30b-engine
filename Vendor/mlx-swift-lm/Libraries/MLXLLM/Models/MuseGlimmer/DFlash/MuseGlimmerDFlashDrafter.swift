@@ -144,6 +144,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    /// Read-only 2-stage compressed draft head (1-bit sign + g256 L1 scale + exact NVFP4
+    /// Top-1024 rescore) used strictly on low-acceptance dynamic-tree rounds.
+    private let compressedDraftHead: CompressedDraftHead?
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -182,6 +185,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
+        compressedDraftHead =
+            (Device.defaultDevice().deviceType == .gpu && model.activationDType == .bfloat16)
+            ? draftHead.flatMap { CompressedDraftHead(head: $0) }
+            : nil
         let headScale2: Float = draftHead.map { $0.weightScale2.asType(.float32).item(Float.self) } ?? 1.0
         let outMult: Float = (target as? MuseGlimmerTextModel)?.configuration.outputMultiplier ?? 1.0
         let softcap: Float = (target as? MuseGlimmerTextModel)?.configuration.finalLogitSoftcapping ?? 0.0
@@ -230,6 +237,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         Self.fastDynamicTreeArgMax(
                             p.val, p.idx, vocab: target.dflashVocabularySize),
                     ]
+                    if let comp = compressedDraftHead {
+                        let dummyH = MLXArray.zeros(
+                            [settings.maximumDraftTokens, c.hiddenSize], dtype: .bfloat16)
+                        if let cp = comp.dynamicTreePartials(dummyH, params: dtParams) {
+                            warm += [cp.val, cp.idx, cp.sum]
+                        }
+                    }
                     let maxDk = min(7, settings.maximumDraftTokens)
                     if maxDk >= 2 {
                         for dk in 2 ... maxDk {
@@ -956,6 +970,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
             draftCount: settings.maximumDraftTokens)
+        let dynK = CBv2DraftRegime.activeDynamicTreeK
+        if s.selection == nil, CBv2DraftRegime.lowAcceptance,
+            CBv2DraftRegime.xnorDraftHeadEligible,
+            dynK >= 2, dynK <= settings.maximumDraftTokens, rows.dim(0) == settings.maximumDraftTokens,
+            let comp = compressedDraftHead,
+            let p = comp.dynamicTreePartials(rows, params: dynTreeParams)
+        {
+            let dyn = Self.fastDynamicTreeStage2(
+                p.val, p.idx, p.sum, k: dynK, vocab: target.dflashVocabularySize,
+                params: dynTreeParams)
+            CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
+            s.memo = (dyn.tokens, rows)
+            return nil
+        }
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -1430,6 +1458,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             draftCount: settings.maximumDraftTokens, devicePosition: position)
         if usedZeroCopyTail {
             context.recordSpeculativeRead(rows)
+        }
+        if CBv2DraftRegime.xnorDraftHeadEligible,
+            CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
+            let comp = compressedDraftHead,
+            let p = comp.dynamicTreePartials(rows, params: dynTreeParams)
+        {
+            speculation.dynPartials = (val: p.val, idx: p.idx, sum: p.sum, hidden: rows)
+            speculation.memo = nil
+            speculation.confidence = nil
+            speculation.deviceOutcome = true
+            s.speculation = speculation
+            return [p.val, p.idx, p.sum, rows, projected.keys, projected.values]
         }
         let logits = draftHeadProduct(rows, readout: false)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
@@ -3081,6 +3121,480 @@ extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
                 if let biases = linear.biases { arrays.append(biases) }
             }
         }
+        if let comp = compressedDraftHead {
+            arrays += comp.residentArrays
+        }
         return arrays + [maskEmbedding]
+    }
+}
+
+// MARK: - 2-Stage Compressed Draft Head (Low-Acceptance Dynamic Tree)
+
+extension MuseGlimmerDFlashDrafter {
+    /// Read-only 2-stage compressed draft head built once at load time from the
+    /// frozen target NVFP4 `lm_head` (`ModelOptWeightOnlyNVFP4Linear`):
+    /// - Load-time 181 MB index: TG-contiguous, strided-vocab 1-bit weight sign
+    ///   bitplanes (`w1Bits4`) + per-256-dim L1 weight scales (`g256Sc`).
+    /// - Stage 1 (`dflash_xnor_quant_x2` + `dflash_xnor_stage1`): 2-bit optimal
+    ///   Gaussian Lloyd-Max activation quantization + 512-TG coalesced `uint4`
+    ///   popcount scan selecting 1,024 distinct candidates per draft row.
+    /// - Stage 2 (`dflash_xnor_stage2_dyntree`): exact NVFP4 rescore of those
+    ///   1,024 candidates per row directly into `(p_val, p_idx, p_sum)` for
+    ///   `fastDynamicTreeStage2`, eliminating the `[R, V]` BF16 logit tensor and
+    ///   cutting draft head traffic from ~762 MB/rd to ~208 MB/rd.
+    /// Target weights are strictly read-only; used only on low-acceptance dynamic
+    /// tree rounds (`CBV2_DRAFTER_XNOR_HEAD=0` disables).
+    private final class CompressedDraftHead: @unchecked Sendable {
+        private static let enabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_DRAFTER_XNOR_HEAD"] != "0"
+
+        private static let header = """
+            inline half dflash_xnor_e4m3(uint bits) {
+                const uint v = bits & 127u;
+                const uint u = (v << 7) | (((v + 1u) >> 7) << 14) | ((bits & 128u) << 8);
+                return as_type<half>(ushort(u)) * 256.0h;
+            }
+
+            inline float dflash_xnor_e2m1_abs(uint nib) {
+                const uint p = (nib & 7u) << 9;
+                return float(as_type<half>(ushort(p)) * 16384.0h);
+            }
+
+            inline void dflash_xnor_insert_top2(
+                thread float& v0, thread int& i0,
+                thread float& v1, thread int& i1,
+                float v, int idx
+            ) {
+                if (idx < 0 || !(v > v1)) { return; }
+                if (v > v0) {
+                    v1 = v0; i1 = i0;
+                    v0 = v;  i0 = idx;
+                } else {
+                    v1 = v;  i1 = idx;
+                }
+            }
+
+            inline void dflash_xnor_insert_top5(
+                thread float& v0, thread int& i0,
+                thread float& v1, thread int& i1,
+                thread float& v2, thread int& i2,
+                thread float& v3, thread int& i3,
+                thread float& v4, thread int& i4,
+                float v, int idx, int ivocab
+            ) {
+                if (idx >= ivocab || idx < 0) { return; }
+                if (!(v > v4 || (v == v4 && idx < i4))) { return; }
+                if (v > v0 || (v == v0 && idx < i0)) {
+                    v4 = v3; i4 = i3; v3 = v2; i3 = i2; v2 = v1; i2 = i1; v1 = v0; i1 = i0; v0 = v; i0 = idx;
+                } else if (v > v1 || (v == v1 && idx < i1)) {
+                    v4 = v3; i4 = i3; v3 = v2; i3 = i2; v2 = v1; i2 = i1; v1 = v; i1 = idx;
+                } else if (v > v2 || (v == v2 && idx < i2)) {
+                    v4 = v3; i4 = i3; v3 = v2; i3 = i2; v2 = v; i2 = idx;
+                } else if (v > v3 || (v == v3 && idx < i3)) {
+                    v4 = v3; i4 = i3; v3 = v; i3 = idx;
+                } else {
+                    v4 = v; i4 = idx;
+                }
+            }
+
+            inline float dflash_xnor_scale_logit(float raw, float eff_scale, float cap) {
+                float v = raw * eff_scale;
+                if (cap > 0.0f) { v = cap * metal::fast::tanh(v / cap); }
+                return v;
+            }
+            """
+
+        private static let buildKernel = MLXFast.metalKernel(
+            name: "dflash_build_xnor_index",
+            inputNames: ["w", "scales"],
+            outputNames: ["w1_bits", "g256_sc"],
+            source: """
+                const uint slot = thread_position_in_grid.x;
+                const uint g = thread_position_in_grid.y;
+                const uint tg = thread_position_in_grid.z;
+                if (slot >= uint(STRIDE_) || g >= uint(K256_) || tg >= uint(NUM_TGS_)) { return; }
+                const uint v = slot * uint(NUM_TGS_) + tg;
+                const size_t sc_off = (size_t(tg) * size_t(K256_) + size_t(g)) * size_t(STRIDE_) + size_t(slot);
+                const size_t w4_base = (size_t(tg) * size_t(K256_) + size_t(g)) * 2u * size_t(STRIDE_) + size_t(slot);
+                device uint4* w1_bits4 = (device uint4*)w1_bits;
+                if (v >= uint(V_)) {
+                    w1_bits4[w4_base] = uint4(0u);
+                    w1_bits4[w4_base + size_t(STRIDE_)] = uint4(0u);
+                    g256_sc[sc_off] = half(0.0f);
+                    return;
+                }
+                const device uint* w_row = w + size_t(v) * size_t(K_ / 8) + size_t(g) * 32u;
+                const device uint8_t* sc_row = scales + size_t(v) * size_t(K_ / 16) + size_t(g) * 16u;
+                float l1_sum = 0.0f;
+                uint out_w[8];
+                for (uint j = 0u; j < 8u; ++j) {
+                    uint bits = 0u;
+                    for (uint b2 = 0u; b2 < 2u; ++b2) {
+                        const float sc = float(dflash_xnor_e4m3(sc_row[j * 2u + b2]));
+                        for (uint w2 = 0u; w2 < 2u; ++w2) {
+                            const uint q = w_row[j * 4u + b2 * 2u + w2];
+                            const uint bit_base = (b2 * 2u + w2) * 8u;
+                            float block_abs = 0.0f;
+                            #pragma unroll
+                            for (uint n = 0u; n < 8u; ++n) {
+                                const uint nib = (q >> (n * 4u)) & 0xFu;
+                                if ((nib & 8u) == 0u) {
+                                    bits |= (1u << (bit_base + n));
+                                }
+                                block_abs += dflash_xnor_e2m1_abs(nib);
+                            }
+                            l1_sum += block_abs * sc;
+                        }
+                    }
+                    out_w[j] = bits;
+                }
+                w1_bits4[w4_base] = uint4(out_w[0], out_w[1], out_w[2], out_w[3]);
+                w1_bits4[w4_base + size_t(STRIDE_)] = uint4(out_w[4], out_w[5], out_w[6], out_w[7]);
+                g256_sc[sc_off] = half(l1_sum * (1.0f / 256.0f));
+                """,
+            header: header)
+
+        private static let quantKernel = MLXFast.metalKernel(
+            name: "dflash_xnor_quant_x2",
+            inputNames: ["x"],
+            outputNames: ["x_bits", "x_scale"],
+            source: """
+                const uint lane = thread_index_in_simdgroup;
+                const uint g = threadgroup_position_in_grid.y;
+                const uint r = threadgroup_position_in_grid.z;
+                const device bfloat16_t* xr = x + size_t(r) * size_t(K_) + size_t(g) * 256u;
+                float vals[8];
+                float sq = 0.0f;
+                #pragma unroll
+                for (uint j = 0u; j < 8u; ++j) {
+                    const float v = float(xr[j * 32u + lane]);
+                    vals[j] = v;
+                    sq += v * v;
+                }
+                const float rms = sqrt(simd_sum(sq) * (1.0f / 256.0f) + 1e-12f);
+                const float thresh = 0.9816f * rms;
+                uint bhi[8], blo[8];
+                #pragma unroll
+                for (uint j = 0u; j < 8u; ++j) {
+                    const float v = vals[j];
+                    const bool hi = (v >= 0.0f);
+                    const bool big = (fabs(v) >= thresh);
+                    const bool lo = hi ? big : !big;
+                    bhi[j] = uint(simd_vote::vote_t(simd_ballot(hi)));
+                    blo[j] = uint(simd_vote::vote_t(simd_ballot(lo)));
+                }
+                if (lane == 0u) {
+                    device uint4* x_bits4 = (device uint4*)x_bits;
+                    const uint base = (g * uint(R_) + r) * 4u;
+                    x_bits4[base + 0u] = uint4(bhi[0], bhi[1], bhi[2], bhi[3]);
+                    x_bits4[base + 1u] = uint4(bhi[4], bhi[5], bhi[6], bhi[7]);
+                    x_bits4[base + 2u] = uint4(blo[0], blo[1], blo[2], blo[3]);
+                    x_bits4[base + 3u] = uint4(blo[4], blo[5], blo[6], blo[7]);
+                    x_scale[g * uint(R_) + r] = half(rms);
+                }
+                """,
+            header: header)
+
+        private static let stage1Kernel = MLXFast.metalKernel(
+            name: "dflash_xnor_stage1",
+            inputNames: ["w1_bits", "g256_sc", "x_bits", "x_scale"],
+            outputNames: ["cand_ids"],
+            source: """
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint tg = threadgroup_position_in_grid.x;
+                const device uint4* w1_bits4 = (const device uint4*)w1_bits;
+                const device uint4* x_bits4 = (const device uint4*)x_bits;
+
+                threadgroup uint4 sh_x[K256_][R_][4];
+                threadgroup half sh_xs[K256_][R_];
+                constexpr uint total_x4 = uint(K256_) * uint(R_) * 4u;
+                for (uint i = lid; i < total_x4; i += 256u) {
+                    ((threadgroup uint4*)sh_x)[i] = x_bits4[i];
+                }
+                constexpr uint total_xs = uint(K256_) * uint(R_);
+                for (uint i = lid; i < total_xs; i += 256u) {
+                    ((threadgroup half*)sh_xs)[i] = x_scale[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float s0[R_], s1[R_];
+                int id0 = -1, id1 = -1;
+                const device uint4* tg_w4 = w1_bits4 + size_t(tg) * size_t(K256_ * 2 * STRIDE_);
+                const device half* tg_sc = g256_sc + size_t(tg) * size_t(K256_ * STRIDE_);
+
+                for (uint it = 0u; it < 2u; ++it) {
+                    const uint slot = it * 256u + lid;
+                    const int v = (slot < uint(STRIDE_)) ? int(slot * uint(NUM_TGS_) + tg) : -1;
+                    const bool valid = (v >= 0 && v < int(V_));
+                    if (it == 0u) { id0 = valid ? v : -1; } else { id1 = valid ? v : -1; }
+                    if (!valid) {
+                        for (uint r = 0u; r < uint(R_); ++r) {
+                            if (it == 0u) { s0[r] = -INFINITY; } else { s1[r] = -INFINITY; }
+                        }
+                        continue;
+                    }
+                    float acc[R_];
+                    for (uint r = 0u; r < uint(R_); ++r) { acc[r] = 0.0f; }
+                    for (uint g = 0u; g < uint(K256_); ++g) {
+                        const float sc_w = float(tg_sc[g * uint(STRIDE_) + slot]);
+                        const uint4 wa = tg_w4[(g * 2u + 0u) * uint(STRIDE_) + slot];
+                        const uint4 wb = tg_w4[(g * 2u + 1u) * uint(STRIDE_) + slot];
+                        #pragma unroll
+                        for (uint r = 0u; r < uint(R_); ++r) {
+                            const uint4 ph = popcount(wa ^ sh_x[g][r][0]) + popcount(wb ^ sh_x[g][r][1]);
+                            const uint4 pl = popcount(wa ^ sh_x[g][r][2]) + popcount(wb ^ sh_x[g][r][3]);
+                            const uint p_hi = (ph.x + ph.y) + (ph.z + ph.w);
+                            const uint p_lo = (pl.x + pl.y) + (pl.z + pl.w);
+                            const float dot_g = 386.56f - 1.963f * float(p_hi) - 1.057f * float(p_lo);
+                            acc[r] = fma(dot_g, sc_w * float(sh_xs[g][r]), acc[r]);
+                        }
+                    }
+                    for (uint r = 0u; r < uint(R_); ++r) {
+                        if (it == 0u) { s0[r] = acc[r]; } else { s1[r] = acc[r]; }
+                    }
+                }
+
+                threadgroup float sh_v[8][2];
+                threadgroup int sh_i[8][2];
+                for (uint r = 0u; r < uint(R_); ++r) {
+                    float v0 = -INFINITY, v1 = -INFINITY;
+                    int i0 = -1, i1 = -1;
+                    dflash_xnor_insert_top2(v0, i0, v1, i1, s0[r], id0);
+                    dflash_xnor_insert_top2(v0, i0, v1, i1, s1[r], id1);
+                    for (ushort off = 16u; off > 0u; off >>= 1u) {
+                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                        if (lane < off) {
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
+                        }
+                    }
+                    if (lane == 0u) {
+                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
+                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0u) {
+                        if (lane < 8u) {
+                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
+                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
+                        } else {
+                            v0 = v1 = -INFINITY; i0 = i1 = -1;
+                        }
+                        for (ushort off = 4u; off > 0u; off >>= 1u) {
+                            const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                            const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                            if (lane < off) {
+                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
+                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
+                            }
+                        }
+                        if (lane == 0u) {
+                            const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
+                            cand_ids[base + 0u] = i0;
+                            cand_ids[base + 1u] = i1;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                """,
+            header: header)
+
+        private static let stage2Kernel = MLXFast.metalKernel(
+            name: "dflash_xnor_stage2_dyntree",
+            inputNames: ["cand_ids", "w", "scales", "x", "tparams"],
+            outputNames: ["p_val", "p_idx", "p_sum"],
+            source: """
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint chunk = threadgroup_position_in_grid.y;
+                const uint row = threadgroup_position_in_grid.z;
+                const int ivocab = int(V_);
+                const float eff_scale = tparams[0];
+                const float cap = tparams[1];
+                const float row_T = max(0.05f, tparams[2] + float(row) * tparams[14]);
+                const float inv_t_log2e = 1.44269504f / row_T;
+                const device bfloat16_t* x_row = x + size_t(row) * size_t(K_);
+
+                threadgroup float sh_v[16];
+                threadgroup int sh_i[16];
+
+                for (uint sub = 0u; sub < 2u; ++sub) {
+                    const uint local_c = sg * 2u + sub;
+                    const int v = cand_ids[row * 1024u + chunk * 16u + local_c];
+                    float acc = 0.0f;
+                    if (v >= 0 && v < ivocab) {
+                        const device uint2* w2_row = (const device uint2*)(w + size_t(v) * size_t(K_ / 8));
+                        const device uint8_t* sc_row = scales + size_t(v) * size_t(K_ / 16);
+                        for (uint b = lane; b < uint(K_ / 16); b += 32u) {
+                            const uint2 qw = w2_row[b];
+                            const float fs = float(dflash_xnor_e4m3(sc_row[b])) * 16384.0f;
+                            const device bfloat16_t* xb = x_row + b * 16u;
+                            const float4 x0 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 0u))));
+                            const float4 x1 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 4u))));
+                            const uint q0 = qw.x;
+                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs;
+                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs;
+                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs;
+                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs;
+                            acc = fma(a0.x, x0.x, acc); acc = fma(a1.x, x0.y, acc);
+                            acc = fma(a2.x, x0.z, acc); acc = fma(a3.x, x0.w, acc);
+                            acc = fma(a0.y, x1.x, acc); acc = fma(a1.y, x1.y, acc);
+                            acc = fma(a2.y, x1.z, acc); acc = fma(a3.y, x1.w, acc);
+
+                            const float4 x2 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 8u))));
+                            const float4 x3 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 12u))));
+                            const uint q1 = qw.y;
+                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs;
+                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs;
+                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs;
+                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs;
+                            acc = fma(b0.x, x2.x, acc); acc = fma(b1.x, x2.y, acc);
+                            acc = fma(b2.x, x2.z, acc); acc = fma(b3.x, x2.w, acc);
+                            acc = fma(b0.y, x3.x, acc); acc = fma(b1.y, x3.y, acc);
+                            acc = fma(b2.y, x3.z, acc); acc = fma(b3.y, x3.w, acc);
+                        }
+                        acc = simd_sum(acc);
+                    }
+                    if (lane == 0u) {
+                        sh_v[local_c] = (v >= 0 && v < ivocab) ? dflash_xnor_scale_logit(acc, eff_scale, cap) : -INFINITY;
+                        sh_i[local_c] = (v >= 0 && v < ivocab) ? v : ivocab;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0u) {
+                    const float lv = (lane < 16u) ? sh_v[lane] : -INFINITY;
+                    const int li = (lane < 16u) ? sh_i[lane] : ivocab;
+                    const float m = simd_max(lv);
+                    const float diff = (m - lv) * inv_t_log2e;
+                    const float e = (lv > -INFINITY && diff < 24.0f) ? metal::fast::exp2(-diff) : 0.0f;
+                    const float s = simd_sum(e);
+
+                    float v0 = lv, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY, v4 = -INFINITY;
+                    int i0 = li, i1 = ivocab, i2 = ivocab, i3 = ivocab, i4 = ivocab;
+                    for (ushort off = 8u; off > 0u; off >>= 1u) {
+                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                        const float ov2 = simd_shuffle_down(v2, off); const int oi2 = simd_shuffle_down(i2, off);
+                        const float ov3 = simd_shuffle_down(v3, off); const int oi3 = simd_shuffle_down(i3, off);
+                        const float ov4 = simd_shuffle_down(v4, off); const int oi4 = simd_shuffle_down(i4, off);
+                        if (lane < off) {
+                            dflash_xnor_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov0, oi0, ivocab);
+                            dflash_xnor_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov1, oi1, ivocab);
+                            dflash_xnor_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov2, oi2, ivocab);
+                            dflash_xnor_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov3, oi3, ivocab);
+                            dflash_xnor_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, ov4, oi4, ivocab);
+                        }
+                    }
+                    if (lane == 0u) {
+                        const uint base = (row * 64u + chunk) * 5u;
+                        p_val[base + 0u] = v0; p_idx[base + 0u] = i0;
+                        p_val[base + 1u] = v1; p_idx[base + 1u] = i1;
+                        p_val[base + 2u] = v2; p_idx[base + 2u] = i2;
+                        p_val[base + 3u] = v3; p_idx[base + 3u] = i3;
+                        p_val[base + 4u] = v4; p_idx[base + 4u] = i4;
+                        p_sum[row * 64u + chunk] = s;
+                    }
+                }
+                """,
+            header: header)
+
+        let vocab: Int
+        let hidden: Int
+        let k256: Int
+        let numTGs: Int
+        let stride: Int
+        private let headWeight: MLXArray
+        private let headScales: MLXArray
+        private let w1Bits: MLXArray
+        private let g256Sc: MLXArray
+
+        private let lock = NSLock()
+        private var launches: [Int: (
+            quant: MLXFast.MLXFastKernel.Launch,
+            stage1: MLXFast.MLXFastKernel.Launch,
+            stage2: MLXFast.MLXFastKernel.Launch
+        )] = [:]
+
+        var residentArrays: [MLXArray] { [w1Bits, g256Sc] }
+
+        init?(head: ModelOptWeightOnlyNVFP4Linear) {
+            guard Self.enabled else { return nil }
+            let v = head.outputDimensions
+            let k = head.inputDimensions
+            let tgs = 512
+            let st = (((v + tgs - 1) / tgs) + 15) & ~15
+            guard v >= 4096, k >= 256, k % 256 == 0, st <= 512,
+                head.weight.dtype == .uint32, head.weight.shape == [v, k / 8],
+                head.weightScale.dtype == .uint8, head.weightScale.shape == [v, k / 16]
+            else { return nil }
+            self.vocab = v
+            self.hidden = k
+            self.k256 = k / 256
+            self.numTGs = tgs
+            self.stride = st
+            self.headWeight = head.weight
+            self.headScales = head.weightScale
+            let gridX = ((st + 63) / 64) * 64
+            let built = Self.buildKernel(
+                [head.weight, head.weightScale],
+                template: [
+                    ("V_", v), ("K_", k), ("K256_", k / 256), ("NUM_TGS_", tgs), ("STRIDE_", st),
+                ],
+                grid: (gridX, k / 256, tgs),
+                threadGroup: (64, 1, 4),
+                outputShapes: [[tgs, k / 256, 2, st, 4], [tgs, k / 256, st]],
+                outputDTypes: [.uint32, .float16])
+            self.w1Bits = built[0]
+            self.g256Sc = built[1]
+            eval(self.w1Bits, self.g256Sc)
+        }
+
+        func dynamicTreePartials(
+            _ x: MLXArray, params: MLXArray
+        ) -> (val: MLXArray, idx: MLXArray, sum: MLXArray)? {
+            guard x.ndim == 2, x.dtype == .bfloat16, x.dim(1) == hidden else { return nil }
+            let rows = x.dim(0)
+            guard (1 ... 7).contains(rows) else { return nil }
+            let pair: (
+                quant: MLXFast.MLXFastKernel.Launch,
+                stage1: MLXFast.MLXFastKernel.Launch,
+                stage2: MLXFast.MLXFastKernel.Launch
+            )
+            if let hit = lock.withLock({ launches[rows] }) {
+                pair = hit
+            } else {
+                let q = Self.quantKernel.prepare(
+                    template: [("R_", rows), ("K_", hidden), ("K256_", k256)],
+                    grid: (32, k256, rows),
+                    threadGroup: (32, 1, 1),
+                    outputShapes: [[k256, rows, 16], [k256, rows]],
+                    outputDTypes: [.uint32, .float16])
+                let s1 = Self.stage1Kernel.prepare(
+                    template: [
+                        ("R_", rows), ("V_", vocab), ("K256_", k256),
+                        ("NUM_TGS_", numTGs), ("STRIDE_", stride),
+                    ],
+                    grid: (256 * numTGs, 1, 1),
+                    threadGroup: (256, 1, 1),
+                    outputShapes: [[rows, numTGs * 2]],
+                    outputDTypes: [.int32])
+                let s2 = Self.stage2Kernel.prepare(
+                    template: [("V_", vocab), ("K_", hidden)],
+                    grid: (32, 8 * 64, rows),
+                    threadGroup: (32, 8, 1),
+                    outputShapes: [[rows, 64, 5], [rows, 64, 5], [rows, 64]],
+                    outputDTypes: [.float32, .int32, .float32])
+                let made = (q, s1, s2)
+                lock.withLock { launches[rows] = made }
+                pair = made
+            }
+            let qOut = pair.quant([x])
+            let candIDs = pair.stage1([w1Bits, g256Sc, qOut[0], qOut[1]])[0]
+            let s2Out = pair.stage2([candIDs, headWeight, headScales, x, params])
+            return (s2Out[0], s2Out[1], s2Out[2])
+        }
     }
 }
