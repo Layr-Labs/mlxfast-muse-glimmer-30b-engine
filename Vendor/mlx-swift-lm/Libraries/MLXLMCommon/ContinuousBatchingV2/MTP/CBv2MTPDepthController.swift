@@ -605,6 +605,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     private(set) var roundAcceptanceFraction = 1.0
     private(set) var observedRegimeRounds = 0
     private(set) var enteredLowAcceptanceRegime = false
+    private(set) var enteredDeepLowAcceptanceRegime = false
     private static let regimeAlpha = 0.15
     static let lowAcceptanceRegimeThreshold = 0.75
     static let lowAcceptanceExitThreshold = 0.85
@@ -626,15 +627,23 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowAcceptanceMaxCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MAX_COMMITTED"].flatMap(Int.init) ?? 300
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Deep low-acceptance gate: the sticky EWMA condition (entered at
+    /// `deepLowAcceptanceMinRounds` observed rounds with acceptance fraction under
+    /// `deepLowAcceptanceThreshold`, held while in the low-acceptance regime), OR cumulative committed tokens per round under
+    /// `deepLowAcceptanceMaxCommittedHundredths / 100` (3.00). The second entry is
+    /// tree-invariant (the EWMA divides by chain depth on tree rounds and
+    /// oscillates) and reaches only the lowest-acceptance requests (~2.8 per
+    /// round); ~3.2-per-round requests keep the EWMA duty cycle and
+    /// ceiling-clamped requests (~5.1 per round) never meet either.
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        (enteredDeepLowAcceptanceRegime && inLowAcceptanceRegime)
+            || (ceilingRounds >= Self.deepLowAcceptanceMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowAcceptanceMaxCommittedHundredths * ceilingRounds)
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
@@ -739,6 +748,13 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                 enteredLowAcceptanceRegime = true
             } else if roundAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
                 enteredLowAcceptanceRegime = false
+            }
+            if observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+                && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+            {
+                enteredDeepLowAcceptanceRegime = true
+            } else if roundAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
+                enteredDeepLowAcceptanceRegime = false
             }
         }
         if rejectionObserved, accepted < drafted {
