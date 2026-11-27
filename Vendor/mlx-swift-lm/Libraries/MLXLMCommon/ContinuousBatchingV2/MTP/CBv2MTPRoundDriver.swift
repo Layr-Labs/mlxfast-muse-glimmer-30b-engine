@@ -689,6 +689,13 @@ final class CBv2MTPRoundDriver {
             && (requestAcceptance[id] ?? initialRequestAcceptance).isDeepLowAcceptanceRegime
     }
 
+    /// Lowest-acceptance requests (cumulative committed tokens per round under
+    /// `CBV2_MULTIHOP_MAX_COMMITTED` hundredths) take multi-hop tree branches.
+    func inMultiHopRegime(_ id: CBv2RequestID) -> Bool {
+        usesFixedDepthAcceptanceWindow
+            && (requestAcceptance[id] ?? initialRequestAcceptance).isMultiHopRegime
+    }
+
     func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
         inLowAcceptanceRegime(id)
             && (!CBv2DraftRegime.treeCooldownEnabled || !treeCooldownRequests.contains(id))
@@ -1670,6 +1677,19 @@ public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
     /// Stricter deep-low-acceptance flag for approximate Stage-1 draft-head screening.
     nonisolated(unsafe) public static var xnorDraftHeadEligible = false
+    /// Multi-hop branches (branch length `multiHopBranchLen`) for this round:
+    /// set per round from the request's cumulative committed tokens per round
+    /// (`CBv2MTPRequestAcceptanceState.isMultiHopRegime`).
+    nonisolated(unsafe) public static var multiHopEligible = false
+    /// Branch length on multi-hop rounds (`CBV2_MULTIHOP_BRANCH_LEN`, default 3).
+    public static let multiHopBranchLen: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_MULTIHOP_BRANCH_LEN"],
+            let v = Int(raw), (1 ... 4).contains(v)
+        {
+            return v
+        }
+        return 3
+    }()
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1740,6 +1760,7 @@ public enum CBv2DraftRegime {
         return dynamicTreeMaxLeavesAt5
     }()
     /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
+    /// Above 1 a chosen branch node may carry the next row's argmax below it.
     public static let dynamicTreeMaxBranchLen: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
             let v = Int(raw), (1 ... 4).contains(v)

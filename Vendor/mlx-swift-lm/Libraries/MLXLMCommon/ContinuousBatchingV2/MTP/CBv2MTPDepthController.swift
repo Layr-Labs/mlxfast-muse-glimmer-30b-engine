@@ -623,18 +623,34 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceMinRounds: Int = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MIN_ROUNDS"].flatMap(Int.init) ?? 3
     }()
-    static let deepLowAcceptanceThreshold: Double = {
-        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
+    static let deepLowAcceptanceMaxCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MAX_COMMITTED"].flatMap(Int.init) ?? 360
     }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Tree-invariant deep low-acceptance gate based on cumulative committed
+    /// tokens per speculative round (`ceilingCommittedTokens / ceilingRounds < 3.60`, below the 4.04 acceptance-ceiling line that clamps high-acceptance windows
+    /// after at least `deepLowAcceptanceMinRounds` rounds). Unlike
+    /// `roundAcceptanceFraction` (which divides by `chainDepth` on dynamic tree
+    /// rounds and skips `terminalBranchHit` rounds), cumulative committed tokens
+    /// per round cleanly separates high-acceptance windows (~5.1+ tok/rd) from
+    /// low-acceptance windows (~2.7-3.3 tok/rd) without oscillating on tree rounds.
+    static let multiHopMaxCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_MULTIHOP_MAX_COMMITTED"].flatMap(Int.init) ?? 300
+    }()
+
+    /// Multi-hop tree branches help only the lowest-acceptance requests (about
+    /// 2.8 committed tokens per round) and cost the 3.2-per-round and
+    /// ceiling-clamped ones; same cumulative counters as the deep-low gate.
+    var isMultiHopRegime: Bool {
+        ceilingRounds >= Self.deepLowAcceptanceMinRounds
+            && ceilingCommittedTokens * 100
+                < Self.multiHopMaxCommittedHundredths * ceilingRounds
+    }
+
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        ceilingRounds >= Self.deepLowAcceptanceMinRounds
+            && ceilingCommittedTokens * 100
+                < Self.deepLowAcceptanceMaxCommittedHundredths * ceilingRounds
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
