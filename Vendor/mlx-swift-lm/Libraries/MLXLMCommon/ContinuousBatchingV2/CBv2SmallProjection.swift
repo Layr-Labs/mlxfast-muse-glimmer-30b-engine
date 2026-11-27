@@ -826,6 +826,7 @@ public enum CBv2SmallProjection {
         let rowGroups: Int
         let vectorDecode: Bool
         let lowVerify: Bool
+        let deepLow: Bool
         let sharedInput: Bool
     }
 
@@ -863,7 +864,8 @@ public enum CBv2SmallProjection {
         sharedInput: Bool
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
+        let deepLow = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -877,7 +879,7 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
-                lowVerify: lowVerify, sharedInput: sharedInput)
+                lowVerify: lowVerify, deepLow: deepLow, sharedInput: sharedInput)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 var args = plan.weightArrays
                 args.append(cast)
@@ -902,11 +904,36 @@ public enum CBv2SmallProjection {
                                 rows: rows, split: run.split, lowVerify: lowVerify)))
                 }
             }
+            let outputDims = layers.map(\.outputDimensions)
+            let canGLoop =
+                deepLow && fp8GLoopEnvEnabled && (layers.count == 1 || sharedInput)
+                && rows >= 4 && rows <= 8 && inputs % 128 == 0
+                && segments.allSatisfy({ $0.split && $0.tm == 2 && $0.input == 0 })
+                && layers.allSatisfy(isFP8BranchlessSafe)
+            if canGLoop {
+                let gloopShape = FP8Shape(
+                    vectorDecode: false, rowsOuter: true, rowGroups: 1,
+                    weights: layers.count, outputs: layers.count, segments: segments,
+                    record: false)
+                if ensureFP8GLoopVerified(
+                    shape: gloopShape, weightArrays: weightArrays, dtype: flat.dtype,
+                    inputs: inputs, rows: rows, outputDims: outputDims, bm: 16, gs: 2)
+                {
+                    let launch = fp8GLoopLaunch(
+                        shape: gloopShape, dtype: flat.dtype, inputs: inputs, rows: rows,
+                        outputDims: outputDims, bm: 16, gs: 2)
+                    let plan = FP8GroupPlan(
+                        launch: launch, weightArrays: weightArrays, outputDims: outputDims)
+                    fastLock.withLockUnchecked { $0.fp8[planKey] = plan }
+                    var args = weightArrays
+                    args.append(cast)
+                    return launch(args)
+                }
+            }
             let rg = segments.allSatisfy(\.split) ? targetRG : 1
             let shape = FP8Shape(
                 vectorDecode: useVectorDecode, rowsOuter: useRowsOuter, rowGroups: rg,
                 weights: layers.count, outputs: layers.count, segments: segments)
-            let outputDims = layers.map(\.outputDimensions)
             let launchKey = FP8LaunchKey(
                 shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
             let launch: MLXFast.MLXFastKernel.Launch
@@ -982,7 +1009,8 @@ public enum CBv2SmallProjection {
         guard inputs > 0, !layers.isEmpty else { return nil }
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
+        let deepLow = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -995,7 +1023,7 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
-                lowVerify: lowVerify, sharedInput: true)
+                lowVerify: lowVerify, deepLow: deepLow, sharedInput: true)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 let flat = preCast.reshaped(rows, inputs)
                 var args = plan.weightArrays
@@ -1496,7 +1524,7 @@ public enum CBv2SmallProjection {
         guard (1 ... maximumRows).contains(rows), ModelOptRowExact.geometryOverride == nil else {
             return nil
         }
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1884,5 +1912,742 @@ public enum CBv2SmallProjection {
             let zeros = MLXArray.zeros([1, count, inputs], dtype: dtype)
             if let outputs = fp8Products(layers, zeros) { eval(outputs) }
         }
+    }
+
+    // MARK: - Wave-9 FP8 Sequential/Interleaved-g GLOOP (0-ULP, DV_MODE=2, deep-low only)
+
+    /// `CBV2_FP8_GLOOP=0`: disables Wave-9 sequential/interleaved-g FP8 kernels
+    /// (`BM=16, GS=2` for 28L qkvg & 12L down; `BM=32, GS=1` for 7L fused SwiGLU).
+    public static let fp8GLoopEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_GLOOP"] != "0"
+
+    private static let fp8SafeLock = NSLock()
+    nonisolated(unsafe) private static var fp8SafeCache: [ObjectIdentifier: Bool] = [:]
+
+    private static func isScaleSafeFor256(_ scale: Float) -> Bool {
+        guard scale.isFinite else { return false }
+        let a = abs(scale)
+        return a == 0 || (a >= Float.leastNormalMagnitude && a <= 1e35)
+    }
+
+    /// Batch-verifies frozen FP8 layers once at load time in one GPU sync:
+    /// checks zero `0x7F`/`0xFF` NaN bytes and normal non-overflowing `outputScale * 256.0f`.
+    public static func warmFP8BranchlessSafe(_ layers: [ModelOptCalibratedLinear]) {
+        guard fp8GLoopEnvEnabled else { return }
+        var pending: [(id: ObjectIdentifier, hasNaN: MLXArray, scale: MLXArray)] = []
+        fp8SafeLock.withLock {
+            for layer in layers {
+                let id = ObjectIdentifier(layer)
+                guard fp8SafeCache[id] == nil,
+                    layer.format == .fp8, layer.weight.dtype == .uint8,
+                    let constants = layer.graphConstants,
+                    constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+                else { continue }
+                let w = layer.weight
+                let hasNaN = MLX.any(
+                    logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF)))))
+                pending.append((id, hasNaN, constants.outputScale))
+            }
+        }
+        guard !pending.isEmpty else { return }
+        eval(pending.flatMap { [$0.hasNaN, $0.scale] })
+        let results: [(ObjectIdentifier, Bool)] = pending.map { item in
+            let safe = !item.hasNaN.item(Bool.self)
+                && isScaleSafeFor256(item.scale.item(Float.self))
+            return (item.id, safe)
+        }
+        fp8SafeLock.withLock {
+            for (id, safe) in results {
+                fp8SafeCache[id] = safe
+            }
+        }
+    }
+
+    /// True when `layer` has been proven NaN-byte-free (`0x7F`/`0xFF`) and scale-safe.
+    public static func isFP8BranchlessSafe(_ layer: ModelOptCalibratedLinear) -> Bool {
+        let id = ObjectIdentifier(layer)
+        if let cached = fp8SafeLock.withLock({ fp8SafeCache[id] }) {
+            return cached
+        }
+        guard layer.format == .fp8, layer.weight.dtype == .uint8,
+            let constants = layer.graphConstants,
+            constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+        else {
+            fp8SafeLock.withLock { fp8SafeCache[id] = false }
+            return false
+        }
+        let scaleVal = constants.outputScale.item(Float.self)
+        guard isScaleSafeFor256(scaleVal) else {
+            fp8SafeLock.withLock { fp8SafeCache[id] = false }
+            return false
+        }
+        let w = layer.weight
+        let hasNaN = MLX.any(
+            logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF))))
+        ).item(Bool.self)
+        let safe = !hasNaN
+        fp8SafeLock.withLock { fp8SafeCache[id] = safe }
+        return safe
+    }
+
+    static let fp8GLoopHelper = """
+
+        // Branchless FP8 E4M3 -> T -> float (exact rounding point, 1 conversion outside V loop).
+        // Caller verified zero 0x7F/0xFF weight bytes and isScaleSafeFor256(weight_scale).
+        template <typename T>
+        inline void cbv2_w9_gl_dec4(uint w, float dscale, thread float* out) {
+            const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+            const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+            out[0] = static_cast<float>(static_cast<T>(f02.x));
+            out[1] = static_cast<float>(static_cast<T>(f13.x));
+            out[2] = static_cast<float>(static_cast<T>(f02.y));
+            out[3] = static_cast<float>(static_cast<T>(f13.y));
+        }
+
+        // Exact ModelOptRowExact BN=8 schedule with GS K-simdgroups per tile (GS=2 => 8 KB TGEM,
+        // 32 output rows/TG sharing activations in L1). Unconditionally barrier-safe for any N.
+        template <typename T, int K, int V, int TM, int GS, int N, int NOUT>
+        inline void cbv2_w9_fp8_gloop_tile(
+            const device uint8_t* mat, float weight_scale, const device T* in_vec,
+            device T* out_vec, int tile, bool active, uint sgG, uint simd_lid,
+            threadgroup float* my_tgp) {
+            constexpr int BN = 8;
+            constexpr int TN = 4;
+            constexpr int blockN = BN * 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            static_assert(P <= 16, "TM<=2, V<=8 => P<=16");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : 16;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : 1;
+            constexpr uint LOW = (1u << SH) - 1u;
+            constexpr int GP = 8 / GS;
+            const float dscale = weight_scale * 256.0f;
+            const int orig_row = tile * TM;
+            const bool row_ok = active && (orig_row < N);
+            const int out_row = row_ok ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
+            const device uint8_t* rows = mat + size_t(out_row) * K;
+            const ushort lid = ushort(simd_lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int idx = int(simd_lid >> SH);
+
+            float total_acc = 0.0f;
+            for (int gp = 0; gp < GP; gp++) {
+                const int g = (GS == 1) ? gp : (int(sgG) + gp * GS);
+                int bn = (32 * g + int(simd_lid)) * TN;
+                float r[P2];
+                CBV2_SP_UNROLL
+                for (int i = 0; i < P2; i++) { r[i] = 0.0f; }
+                for (int i0 = 0; i0 < n_iter; i0++) {
+                    float iw[TM][4];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = *(const device uint*)(rows + size_t(tm) * K + bn);
+                        cbv2_w9_gl_dec4<T>(w, dscale, iw[tm]);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += iw[tm][tn] * a;
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+                if constexpr (leftover > 0) {
+                    if (bn + TN <= K) {
+                        float iw[TM][4];
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            const uint w = *(const device uint*)(rows + size_t(tm) * K + bn);
+                            cbv2_w9_gl_dec4<T>(w, dscale, iw[tm]);
+                        }
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                const float a = static_cast<float>(as_type<T>(av[tn]));
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += iw[tm][tn] * a;
+                                }
+                            }
+                        }
+                    } else {
+                        CBV2_SP_UNROLL
+                        for (int i = 0; i < P; i++) { r[i] += 0.0f; }
+                    }
+                }
+                cbv2_sp_tree_step<P2, 16>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+                if constexpr (GS == 1) {
+                    if (holds) { total_acc = (gp == 0) ? r[0] : (total_acc + r[0]); }
+                } else {
+                    if (holds && idx < 16) { my_tgp[g * 16 + idx] = r[0]; }
+                }
+            }
+            if constexpr (GS == 1) {
+                if (row_ok && holds && idx < P) {
+                    out_vec[(idx / TM) * NOUT + out_row + (idx % TM)] = static_cast<T>(total_acc);
+                }
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (row_ok && sgG == 0 && holds && idx < P) {
+                    float res = my_tgp[idx];
+                    for (int s = 1; s < 8; s++) { res += my_tgp[s * 16 + idx]; }
+                    out_vec[(idx / TM) * NOUT + out_row + (idx % TM)] = static_cast<T>(res);
+                }
+            }
+        }
+        """
+
+    private struct FP8GLoopLaunchKey: Hashable {
+        let shape: FP8Shape
+        let dtype: DType
+        let inputs: Int
+        let rows: Int
+        let outputs: [Int]
+        let bm: Int
+        let gs: Int
+    }
+
+    nonisolated(unsafe) private static var fp8GLoopKernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var fp8GLoopLaunchCache:
+        [FP8GLoopLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var fp8GLoopVerifiedMap: [String: Bool] = [:]
+
+    private static func fp8GLoopKernel(_ shape: FP8Shape, bm: Int, gs: Int) -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = "w9gl_bm\(bm)_gs\(gs)_" + shape.segments.map {
+            "\($0.weight)_\($0.row0)_\($0.rows)_\($0.tm)_\($0.outputWidth)"
+        }.joined(separator: "_")
+        if let existing = fp8GLoopKernels[key] { return existing }
+        var inputs = [String]()
+        for w in 0 ..< shape.weights { inputs += ["m\(w)", "ws\(w)"] }
+        inputs.append("xc")
+        let outputs = (0 ..< shape.outputs).map { "y\($0)" }
+        let totalTiles = shape.segments.reduce(0) { $0 + $1.tiles(rowGroups: 1) }
+        var body = """
+            threadgroup float sp_tgp_all[\(gs > 1 ? bm * 8 * 16 : 1)];
+            const uint sid = simdgroup_index_in_threadgroup;
+            const uint bm_idx = sid / \(gs);
+            const uint sgG = sid % \(gs);
+            const uint sl = thread_index_in_simdgroup;
+            const int tile = int(threadgroup_position_in_grid.y) * \(bm) + int(bm_idx);
+            const bool active = tile < \(totalTiles);
+            const int ctile = active ? tile : \(max(0, totalTiles - 1));
+            threadgroup float* my_tgp = sp_tgp_all + \(gs > 1 ? "bm_idx * 128" : "0");
+
+            """
+        var offset = 0
+        for (index, s) in shape.segments.enumerated() {
+            let end = offset + s.tiles(rowGroups: 1)
+            body += """
+                \(index == 0 ? "" : "else ")if (ctile < \(end)) {
+                    cbv2_w9_fp8_gloop_tile<T, K, V, \(s.tm), \(gs), \(s.rows), \(s.outputWidth)>(
+                        m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
+                        xc + size_t(\(s.input)) * V * K,
+                        y\(s.output) + \(s.column0), ctile - \(offset), active, sgG, sl, my_tgp);
+                }
+
+                """
+            offset = end
+        }
+        let name = "cbv2_small_fp8_w9gl_" + stableName(body)
+        let made = MLXFast.metalKernel(
+            name: name, inputNames: inputs, outputNames: outputs, source: body,
+            header: ModelOptActivationKernels.header + fp8HelperRec + fp8GLoopHelper)
+        fp8GLoopKernels[key] = made
+        return made
+    }
+
+    private static func fp8GLoopLaunch(
+        shape: FP8Shape, dtype: DType, inputs: Int, rows: Int, outputDims: [Int], bm: Int, gs: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = FP8GLoopLaunchKey(
+            shape: shape, dtype: dtype, inputs: inputs, rows: rows, outputs: outputDims,
+            bm: bm, gs: gs)
+        if let hit = lock.withLock({ fp8GLoopLaunchCache[key] }) { return hit }
+        let totalTiles = shape.segments.reduce(0) { $0 + $1.tiles(rowGroups: 1) }
+        let groups = (totalTiles + bm - 1) / bm
+        let made = fp8GLoopKernel(shape, bm: bm, gs: gs).prepare(
+            template: [("T", dtype), ("K", inputs), ("V", rows)],
+            grid: (32, bm * gs * groups, 1), threadGroup: (32, bm * gs, 1),
+            outputShapes: outputDims.map { [rows, $0] },
+            outputDTypes: Array(repeating: dtype, count: outputDims.count))
+        lock.withLock { fp8GLoopLaunchCache[key] = made }
+        return made
+    }
+
+    private static func ensureFP8GLoopVerified(
+        shape: FP8Shape, weightArrays: [MLXArray], dtype: DType, inputs: Int, rows: Int,
+        outputDims: [Int], bm: Int, gs: Int
+    ) -> Bool {
+        let vkey = "\(shape.weights)_\(inputs)_\(outputDims)_\(dtype)_bm\(bm)_gs\(gs)"
+        if let cached = lock.withLock({ fp8GLoopVerifiedMap[vkey] }) { return cached }
+        let checkRows = 8
+        var vals = [Float]()
+        vals.reserveCapacity(checkRows * inputs)
+        for i in 0 ..< (checkRows * inputs) {
+            vals.append(Float(((i * 11 + 5) % 29) - 14) * 0.0625)
+        }
+        var testArrays = weightArrays
+        testArrays.append(MLXArray(vals, [checkRows, inputs]).asType(dtype))
+        let refShape = FP8Shape(
+            vectorDecode: false, rowsOuter: false, rowGroups: 1,
+            weights: shape.weights, outputs: shape.outputs, segments: shape.segments,
+            record: true)
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                let tiles = refShape.segments.reduce(0) { $0 + $1.tiles(rowGroups: 1) }
+                let refLaunch = fp8Kernel(refShape).prepare(
+                    template: [("T", dtype), ("K", inputs), ("V", checkRows)],
+                    grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                    outputShapes: outputDims.map { [checkRows, $0] },
+                    outputDTypes: Array(repeating: dtype, count: outputDims.count))
+                let ref = refLaunch(testArrays)
+                let got = fp8GLoopLaunch(
+                    shape: shape, dtype: dtype, inputs: inputs, rows: checkRows,
+                    outputDims: outputDims, bm: bm, gs: gs)(testArrays)
+                var totalDiff = MLXArray(Int32(0))
+                for (a, b) in zip(got, ref) {
+                    totalDiff = totalDiff
+                        + (a.view(dtype: .uint16) .!= b.view(dtype: .uint16)).asType(.int32).sum()
+                }
+                eval(totalDiff)
+                return totalDiff.item(Int.self) == 0
+            }) ?? false
+        lock.withLock { fp8GLoopVerifiedMap[vkey] = ok }
+        return ok
+    }
+
+    // MARK: - Wave-9 Fused FP8 SwiGLU GLOOP (BM=32, GS=1, 0 KB TGEM, 0 barrier, 0-ULP)
+
+    private static let fp8SwiGLUGLoopSource = """
+        constexpr int TN = 4;
+        constexpr int blockN = 8 * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        constexpr int P = V;
+        static_assert(P <= 8, "at most 8 verify rows");
+        constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : 8;
+        constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : 2;
+        constexpr uint LOW = (1u << SH) - 1u;
+        const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+        const float dscale_g = wsg[0] * 256.0f;
+        const float dscale_u = wsu[0] * 256.0f;
+        const uint sid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int out_row = int(threadgroup_position_in_grid.y) * BM + int(sid);
+        if (out_row >= N) { return; }
+        const device uint8_t* row_g = mg + size_t(out_row) * K;
+        const device uint8_t* row_u = mu + size_t(out_row) * K;
+        const ushort lid = ushort(simd_lid);
+        const bool holds = (simd_lid & LOW) == 0;
+        const int v_idx = int(simd_lid >> SH);
+
+        float total_g = 0.0f;
+        float total_u = 0.0f;
+        for (int g = 0; g < 8; g++) {
+            int bn = (32 * g + int(simd_lid)) * TN;
+            float rg[P2], ru[P2];
+            CBV2_SP_UNROLL
+            for (int i = 0; i < P2; i++) { rg[i] = 0.0f; ru[i] = 0.0f; }
+            for (int i0 = 0; i0 < n_iter; i0++) {
+                float ig[4], iu[4];
+                cbv2_w9_gl_dec4<T>(*(const device uint*)(row_g + bn), dscale_g, ig);
+                cbv2_w9_gl_dec4<T>(*(const device uint*)(row_u + bn), dscale_u, iu);
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av = ushort4(*(const device packed_ushort4*)(xc + size_t(v) * K + bn));
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < 4; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av[tn]));
+                        rg[v] += ig[tn] * a;
+                        ru[v] += iu[tn] * a;
+                    }
+                }
+                bn += blockN;
+            }
+            if constexpr (leftover > 0) {
+                if (bn + TN <= K) {
+                    float ig[4], iu[4];
+                    cbv2_w9_gl_dec4<T>(*(const device uint*)(row_g + bn), dscale_g, ig);
+                    cbv2_w9_gl_dec4<T>(*(const device uint*)(row_u + bn), dscale_u, iu);
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av = ushort4(*(const device packed_ushort4*)(xc + size_t(v) * K + bn));
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < 4; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av[tn]));
+                            rg[v] += ig[tn] * a;
+                            ru[v] += iu[tn] * a;
+                        }
+                    }
+                } else {
+                    CBV2_SP_UNROLL
+                    for (int i = 0; i < P; i++) { rg[i] += 0.0f; ru[i] += 0.0f; }
+                }
+            }
+            cbv2_sp_tree_step<P2, 16>(rg, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(rg, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(rg, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(rg, lid);
+            cbv2_sp_tree_step<1, 1>(rg, lid);
+            cbv2_sp_tree_step<P2, 16>(ru, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(ru, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(ru, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(ru, lid);
+            cbv2_sp_tree_step<1, 1>(ru, lid);
+            if (holds) {
+                total_g = (g == 0) ? rg[0] : (total_g + rg[0]);
+                total_u = (g == 0) ? ru[0] : (total_u + ru[0]);
+            }
+        }
+        if (holds && v_idx < P) {
+            const bfloat16_t gv = static_cast<bfloat16_t>(total_g);
+            const bfloat16_t uv = static_cast<bfloat16_t>(total_u);
+            const bfloat16_t zero_bf = bfloat16_t(0.0f);
+            const bfloat16_t one_bf = bfloat16_t(1.0f);
+            const bfloat16_t ax = (gv < zero_bf) ? -gv : gv;
+            const bfloat16_t ey = static_cast<bfloat16_t>(
+                metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t sy = one_bf / (one_bf + ey);
+            const bfloat16_t sig = (gv < zero_bf) ? sy : (one_bf - sy);
+            bfloat16_t act = (gv * sig) * uv;
+            if constexpr (CAST_FP8) {
+                const float scaled = static_cast<float>(act) * fp8_mu[0];
+                const uint8_t bits = modelopt_e4m3_bits(scaled);
+                const float decoded =
+                    (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > fp8_bd[0];
+                act = static_cast<bfloat16_t>(invalid ? nan_value : decoded * fp8_mu[1]);
+            }
+            y[size_t(v_idx) * N + out_row] = static_cast<T>(act);
+        }
+        """
+
+    private static let fp8SwiGLURefSource = """
+        constexpr int TN = 4;
+        constexpr int blockN = 8 * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        constexpr int P = V;
+        constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : 8;
+        constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : 2;
+        constexpr uint LOW = (1u << SH) - 1u;
+        const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+        const float scale_g = wsg[0];
+        const float scale_u = wsu[0];
+        const uint g = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int out_row = int(threadgroup_position_in_grid.y);
+        if (out_row >= N) { return; }
+        const device uint8_t* row_g = mg + size_t(out_row) * K;
+        const device uint8_t* row_u = mu + size_t(out_row) * K;
+        int bn = (32 * int(g) + int(simd_lid)) * TN;
+        float rg[P2], ru[P2];
+        CBV2_SP_UNROLL
+        for (int i = 0; i < P2; i++) { rg[i] = 0.0f; ru[i] = 0.0f; }
+        for (int i0 = 0; i0 < n_iter; i0++) {
+            T ig[4], iu[4];
+            CBV2_SP_UNROLL
+            for (int tn = 0; tn < 4; tn++) {
+                const uint8_t cg = row_g[bn + tn];
+                const uint8_t cu = row_u[bn + tn];
+                const float dg = (cg & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cg);
+                const float du = (cu & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cu);
+                ig[tn] = static_cast<T>(dg * scale_g);
+                iu[tn] = static_cast<T>(du * scale_u);
+            }
+            CBV2_SP_UNROLL
+            for (int v = 0; v < V; v++) {
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < 4; tn++) {
+                    const float a = static_cast<float>(xc[size_t(v) * K + bn + tn]);
+                    rg[v] += ig[tn] * a;
+                    ru[v] += iu[tn] * a;
+                }
+            }
+            bn += blockN;
+        }
+        if (leftover > 0) {
+            T ig[4], iu[4];
+            for (int tn = 0; tn < 4; tn++) {
+                if (bn + tn < K) {
+                    const uint8_t cg = row_g[bn + tn];
+                    const uint8_t cu = row_u[bn + tn];
+                    const float dg = (cg & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cg);
+                    const float du = (cu & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cu);
+                    ig[tn] = static_cast<T>(dg * scale_g);
+                    iu[tn] = static_cast<T>(du * scale_u);
+                } else {
+                    ig[tn] = T(0); iu[tn] = T(0);
+                }
+            }
+            for (int v = 0; v < V; v++) {
+                for (int tn = 0; tn < 4; tn++) {
+                    const float a = bn + tn < K ? static_cast<float>(xc[size_t(v) * K + bn + tn]) : 0.0f;
+                    rg[v] += ig[tn] * a;
+                    ru[v] += iu[tn] * a;
+                }
+            }
+        }
+        const ushort lid = ushort(simd_lid);
+        cbv2_sp_tree_step<P2, 16>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(rg, lid);
+        cbv2_sp_tree_step<1, 1>(rg, lid);
+        cbv2_sp_tree_step<P2, 16>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(ru, lid);
+        cbv2_sp_tree_step<1, 1>(ru, lid);
+        threadgroup float tgp_g[8 * 8];
+        threadgroup float tgp_u[8 * 8];
+        const bool holds = (simd_lid & LOW) == 0;
+        const int i = int(simd_lid >> SH);
+        if (holds && i < 8) {
+            tgp_g[g * 8 + i] = rg[0];
+            tgp_u[g * 8 + i] = ru[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g == 0 && holds && i < P) {
+            float res_g = tgp_g[i];
+            float res_u = tgp_u[i];
+            for (int s = 1; s < 8; s++) {
+                res_g += tgp_g[s * 8 + i];
+                res_u += tgp_u[s * 8 + i];
+            }
+            const bfloat16_t gv = static_cast<bfloat16_t>(res_g);
+            const bfloat16_t uv = static_cast<bfloat16_t>(res_u);
+            const bfloat16_t zero_bf = bfloat16_t(0.0f);
+            const bfloat16_t one_bf = bfloat16_t(1.0f);
+            const bfloat16_t ax = (gv < zero_bf) ? -gv : gv;
+            const bfloat16_t ey = static_cast<bfloat16_t>(
+                metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t sy = one_bf / (one_bf + ey);
+            const bfloat16_t sig = (gv < zero_bf) ? sy : (one_bf - sy);
+            bfloat16_t act = (gv * sig) * uv;
+            if constexpr (CAST_FP8) {
+                const float scaled = static_cast<float>(act) * fp8_mu[0];
+                const uint8_t bits = modelopt_e4m3_bits(scaled);
+                const float decoded =
+                    (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > fp8_bd[0];
+                act = static_cast<bfloat16_t>(invalid ? nan_value : decoded * fp8_mu[1]);
+            }
+            y[size_t(i) * N + out_row] = static_cast<T>(act);
+        }
+        """
+
+    private static let fp8SwiGLUGLoopKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_swiglu_w9gl_bm32",
+        inputNames: ["mg", "wsg", "mu", "wsu", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8SwiGLUGLoopSource,
+        header: ModelOptActivationKernels.header + fp8HelperRec + fp8GLoopHelper)
+
+    private static let fp8SwiGLURefKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_swiglu_w9ref",
+        inputNames: ["mg", "wsg", "mu", "wsu", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8SwiGLURefSource,
+        header: ModelOptActivationKernels.header + fp8HelperRec)
+
+    private struct FP8SwiGLUGLoopLaunchKey: Hashable {
+        let dtype: DType
+        let inputs: Int
+        let outputs: Int
+        let rows: Int
+        let castFP8: Bool
+    }
+
+    private struct FP8SwiGLUGLoopPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let downID: ObjectIdentifier?
+        let dtype: DType
+        let inputs: Int
+        let rows: Int
+    }
+
+    private struct FP8SwiGLUGLoopPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let mg: MLXArray
+        let wsg: MLXArray
+        let mu: MLXArray
+        let wsu: MLXArray
+        let fmu: MLXArray
+        let fbd: MLXArray
+        let outputs: Int
+    }
+
+    private final class FP8SwiGLUCacheBox: @unchecked Sendable {
+        var launches: [FP8SwiGLUGLoopLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var plans: [FP8SwiGLUGLoopPlanKey: FP8SwiGLUGLoopPlan] = [:]
+        var verified: [String: Bool] = [:]
+    }
+
+    private static let fp8SwiGLULock = OSAllocatedUnfairLock(initialState: FP8SwiGLUCacheBox())
+
+    nonisolated(unsafe) private static let dummySwiGLUFP8Mu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummySwiGLUFP8Bd: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    private static func fp8SwiGLUGLoopLaunch(
+        dtype: DType, inputs: Int, outputs: Int, rows: Int, castFP8: Bool
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = FP8SwiGLUGLoopLaunchKey(
+            dtype: dtype, inputs: inputs, outputs: outputs, rows: rows, castFP8: castFP8)
+        if let hit = fp8SwiGLULock.withLockUnchecked({ $0.launches[key] }) { return hit }
+        let bm = 32
+        let tgs = (outputs + bm - 1) / bm
+        let made = fp8SwiGLUGLoopKernel.prepare(
+            template: [
+                ("T", dtype), ("K", inputs), ("V", rows), ("N", outputs),
+                ("BM", bm), ("CAST_FP8", castFP8),
+            ],
+            grid: (32, bm * tgs, 1), threadGroup: (32, bm, 1),
+            outputShapes: [[rows, outputs]], outputDTypes: [dtype])
+        fp8SwiGLULock.withLockUnchecked { $0.launches[key] = made }
+        return made
+    }
+
+    private static func ensureFP8SwiGLUGLoopVerified(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear,
+        fmu: MLXArray, fbd: MLXArray, castFP8: Bool,
+        dtype: DType, inputs: Int, outputs: Int
+    ) -> Bool {
+        let vkey = "\(inputs)_\(outputs)_\(dtype)_\(castFP8)"
+        if let cached = fp8SwiGLULock.withLockUnchecked({ $0.verified[vkey] }) { return cached }
+        let checkRows = 8
+        var vals = [Float]()
+        vals.reserveCapacity(checkRows * inputs)
+        for i in 0 ..< (checkRows * inputs) {
+            vals.append(Float(((i * 7 + 3) % 29) - 14) * 0.0625)
+        }
+        let testX = MLXArray(vals, [checkRows, inputs]).asType(dtype)
+        let args = [
+            gate.weight, gate.graphConstants!.outputScale,
+            up.weight, up.graphConstants!.outputScale,
+            testX, fmu, fbd,
+        ]
+        let ok: Bool =
+            (try? MLX.withError { () -> Bool in
+                let refLaunch = fp8SwiGLURefKernel.prepare(
+                    template: [
+                        ("T", dtype), ("K", inputs), ("V", checkRows), ("N", outputs),
+                        ("CAST_FP8", castFP8),
+                    ],
+                    grid: (32, 8 * outputs, 1), threadGroup: (32, 8, 1),
+                    outputShapes: [[checkRows, outputs]], outputDTypes: [dtype])
+                let ref = refLaunch(args)[0]
+                let got = fp8SwiGLUGLoopLaunch(
+                    dtype: dtype, inputs: inputs, outputs: outputs, rows: checkRows,
+                    castFP8: castFP8)(args)[0]
+                let diff = (got.view(dtype: .uint16) .!= ref.view(dtype: .uint16))
+                    .asType(.int32).sum()
+                eval(diff)
+                return diff.item(Int.self) == 0
+            }) ?? false
+        fp8SwiGLULock.withLockUnchecked { $0.verified[vkey] = ok }
+        return ok
+    }
+
+    /// Fused FP8 `gate_proj` + `up_proj` + `silu(gate) * up` (+ optional inline FP8 cast when
+    /// `fp8Down` is provided) using `BM=32, GS=1` sequential-g (0 KB TGEM, 0 barrier, 0-ULP).
+    /// Routed strictly for `rows = 4...8` on pre-cast BF16 activations with load-time verified
+    /// NaN-free FP8 weights.
+    public static func fp8FusedGateUpSilu(
+        gate: ModelOptCalibratedLinear,
+        up: ModelOptCalibratedLinear,
+        preCast x: MLXArray,
+        fp8Down: ModelOptCalibratedLinear? = nil
+    ) -> MLXArray? {
+        guard fp8GLoopEnvEnabled, x.dtype == .bfloat16 else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0, inputs % 128 == 0 else { return nil }
+        let rows = x.size / inputs
+        guard (4 ... maximumRows).contains(rows) else { return nil }
+        let pkey = FP8SwiGLUGLoopPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+            downID: fp8Down.map(ObjectIdentifier.init), dtype: x.dtype, inputs: inputs, rows: rows)
+        if ModelOptRowExact.geometryOverride == nil,
+            let plan = fp8SwiGLULock.withLockUnchecked({ $0.plans[pkey] })
+        {
+            let res = plan.launch([
+                plan.mg, plan.wsg, plan.mu, plan.wsu, x.reshaped(rows, inputs), plan.fmu, plan.fbd,
+            ])[0]
+            if x.ndim == 3 {
+                return res.reshaped(x.dim(0), x.dim(1), plan.outputs)
+            }
+            return res.reshaped(Array(x.shape.dropLast()) + [plan.outputs])
+        }
+        guard fp8Takes(gate, inputs: inputs, dtype: x.dtype),
+            fp8Takes(up, inputs: inputs, dtype: x.dtype),
+            gate.outputDimensions == up.outputDimensions,
+            fp8Runs(gate).allSatisfy(\.split),
+            fp8Runs(up).allSatisfy(\.split),
+            isFP8BranchlessSafe(gate),
+            isFP8BranchlessSafe(up)
+        else { return nil }
+        let outputs = gate.outputDimensions
+        let fmu: MLXArray
+        let fbd: MLXArray
+        let castFP8: Bool
+        if let fp8Down {
+            guard let constants = fp8Down.graphConstants,
+                case .fp8(let m, let b) = constants.storage
+            else { return nil }
+            fmu = m
+            fbd = b
+            castFP8 = true
+        } else {
+            fmu = dummySwiGLUFP8Mu
+            fbd = dummySwiGLUFP8Bd
+            castFP8 = false
+        }
+        guard ensureFP8SwiGLUGLoopVerified(
+            gate: gate, up: up, fmu: fmu, fbd: fbd, castFP8: castFP8,
+            dtype: x.dtype, inputs: inputs, outputs: outputs)
+        else { return nil }
+        let launch = fp8SwiGLUGLoopLaunch(
+            dtype: x.dtype, inputs: inputs, outputs: outputs, rows: rows, castFP8: castFP8)
+        let wsg = gate.graphConstants!.outputScale
+        let wsu = up.graphConstants!.outputScale
+        if ModelOptRowExact.geometryOverride == nil {
+            let plan = FP8SwiGLUGLoopPlan(
+                launch: launch, mg: gate.weight, wsg: wsg, mu: up.weight, wsu: wsu,
+                fmu: fmu, fbd: fbd, outputs: outputs)
+            fp8SwiGLULock.withLockUnchecked { $0.plans[pkey] = plan }
+        }
+        let res = launch([
+            gate.weight, wsg, up.weight, wsu, x.reshaped(rows, inputs), fmu, fbd,
+        ])[0]
+        if x.ndim == 3 {
+            return res.reshaped(x.dim(0), x.dim(1), outputs)
+        }
+        return res.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 }

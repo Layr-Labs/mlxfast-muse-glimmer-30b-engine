@@ -621,20 +621,28 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     }
 
     static let deepLowAcceptanceMinRounds: Int = {
-        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MIN_ROUNDS"].flatMap(Int.init) ?? 6
     }()
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowCommittedPerRoundThreshold: Double = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_THRESHOLD"].flatMap(Double.init)
+            ?? 3.9
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Tree-invariant deep-low-acceptance gate: requires `inLowAcceptanceRegime`,
+    /// at least `deepLowAcceptanceMinRounds` finalized speculative rounds (`6`),
+    /// and average committed tokens per round strictly below
+    /// `deepLowCommittedPerRoundThreshold` (`3.9`), so high-acceptance windows
+    /// (5.1-8.0 tok/rd, ceiling >= 4.04) never enter deep-low paths while
+    /// dynamic-tree low-acceptance windows (2.1-3.8 tok/rd) stay stably engaged
+    /// without chain-depth shutoffs.
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        inLowAcceptanceRegime
+            && ceilingRounds >= Self.deepLowAcceptanceMinRounds
+            && Double(ceilingCommittedTokens)
+                < Self.deepLowCommittedPerRoundThreshold * Double(ceilingRounds)
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens

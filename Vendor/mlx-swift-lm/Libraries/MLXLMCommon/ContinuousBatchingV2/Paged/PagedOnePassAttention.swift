@@ -64,7 +64,7 @@ public enum PagedOnePassAttention {
     /// buffers, the record's heads-per-threadgroup rule); low-acceptance rounds
     /// launch the register-query / in-place-merge kernel. Same bytes either way.
     static var useRecordKernel: Bool {
-        CBv2DraftRegime.lowOnlyVerifySpeedups && !CBv2DraftRegime.lowAcceptance
+        CBv2DraftRegime.lowOnlyVerifySpeedups && !CBv2DraftRegime.xnorDraftHeadEligible
     }
     /// Set by `warm` when the `DYN_TREE = true` one-pass variant fails the threadgroup probe;
     /// leaves `DYN_TREE = false` unaffected and falls back to two-pass only for dynamic-tree rounds.
@@ -228,7 +228,7 @@ public enum PagedOnePassAttention {
                         treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec)
                     outputs += [dynResult.fence, dynResult.out]
                 }
-                if appendEnabled {
+                if appendEnabled && !useRec {
                     outputs += warmAppend(
                         q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
                         params: params, previous: previous, valueOffsets: MLXArray(offsets),
@@ -485,7 +485,7 @@ public enum PagedOnePassAttention {
     private static func resolvedMaxPart(_ maxPart: Int?, probe: Bool, forceMaxPart: Bool) -> Int {
         let allowDynPart =
             dynamicMaxPartitions
-            && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+            && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible)
         return ((!probe || forceMaxPart) && allowDynPart)
             ? min(maxPartitions, max(1, maxPart ?? maxPartitions))
             : maxPartitions
@@ -498,7 +498,7 @@ public enum PagedOnePassAttention {
         simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int?, bindings: Int,
         record: Bool = useRecordKernel
     ) -> Bool {
-        guard appendEnabled else { return false }
+        guard appendEnabled, !record else { return false }
         let key = AppendKey(
             dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
             hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
@@ -533,7 +533,7 @@ public enum PagedOnePassAttention {
         if let pending {
             inputs += [pending.keys, pending.values]
         }
-        if !probe {
+        if !probe && !record {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
@@ -576,7 +576,7 @@ public enum PagedOnePassAttention {
             ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
             ("DYN_TREE", dynTree),
         ]
-        if !probe {
+        if !probe && !record {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
@@ -589,6 +589,15 @@ public enum PagedOnePassAttention {
                 outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
             lock.withLock { segLaunchCache[lkey] = launch }
             let outputs = launch(inputs)
+            return (outputs[0], outputs[1])
+        }
+        if !probe {
+            let outputs = kernel(
+                inputs,
+                template: template,
+                grid: (kvHeads * (gqa / hpt) * tg, b, 1),
+                threadGroup: (tg, 1, 1),
+                outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
             return (outputs[0], outputs[1])
         }
         let outputs = kernel(
