@@ -1678,7 +1678,50 @@ template <
       }
     }
   } else {
+  // Weights and scales of this simdgroup's next K block are requested before
+  // the current block's dequant and MMAs, so their device latency overlaps
+  // the math instead of opening every iteration. Same values, same order.
+  uint4 wn[TN][2][loads];
+  scale_bits_t sn[TN][2];
+  auto fetch = [&](int kb) {
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        const int row = 16 * t + 8 * r;
+        const device uint8_t* wt =
+            wl + row * static_cast<int64_t>(row_bytes) + kb / pack_factor;
+        const device uint8_t* st =
+            scales + row * static_cast<int64_t>(row_scales) + kb / group_size;
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          wn[t][r][l] = *(const device uint4*)(wt + 16 * l);
+        }
+        sn[t][r] = *(const device scale_bits_t*)st;
+      }
+    }
+  };
+  if (simd_gid * BK < K) {
+    fetch(simd_gid * BK);
+  }
+
   for (int k = simd_gid * BK; k < K; k += WK * BK) {
+    uint4 ws[TN][2][loads];
+    scale_bits_t ss[TN][2];
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          ws[t][r][l] = wn[t][r][l];
+        }
+        ss[t][r] = sn[t][r];
+      }
+    }
+    if (k + WK * BK < K) {
+      fetch(k + WK * BK);
+    }
     vec<T, 8> xs[2][4];
     STEEL_PRAGMA_UNROLL
     for (short r = 0; r < 2; r++) {
@@ -1688,24 +1731,6 @@ template <
             ? *(const device vec<T, 8>*)(x + r * 8 * static_cast<int64_t>(K) +
                                          k + 8 * i)
             : vec<T, 8>(0);
-      }
-    }
-    uint4 ws[TN][2][loads];
-    scale_bits_t ss[TN][2];
-    STEEL_PRAGMA_UNROLL
-    for (short t = 0; t < TN; t++) {
-      STEEL_PRAGMA_UNROLL
-      for (short r = 0; r < 2; r++) {
-        const int row = 16 * t + 8 * r;
-        const device uint8_t* wt =
-            wl + row * static_cast<int64_t>(row_bytes) + k / pack_factor;
-        const device uint8_t* st =
-            scales + row * static_cast<int64_t>(row_scales) + k / group_size;
-        STEEL_PRAGMA_UNROLL
-        for (short l = 0; l < loads; l++) {
-          ws[t][r][l] = *(const device uint4*)(wt + 16 * l);
-        }
-        ss[t][r] = *(const device scale_bits_t*)st;
       }
     }
 
