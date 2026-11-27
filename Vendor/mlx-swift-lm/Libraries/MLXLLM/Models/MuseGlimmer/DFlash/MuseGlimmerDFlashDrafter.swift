@@ -2441,50 +2441,90 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               int chain_len = 0;
               int num_nodes = 1;
 
-              if (dp_mode != 0 && max_branch_len == 1) {
+              if (dp_mode != 0) {
+                // Exact max over the main-chain length L; the K - L branch
+                // slots are filled best-first. With max_branch_len > 1 the
+                // frontier also holds continuations: the next row's argmax
+                // under a chosen branch node, at EV parent * p * cont_decay.
+                // A child never outranks its parent, so best-first keeps the
+                // set prefix-closed (every node's parent is chosen first).
                 const int max_L = min(K_, R_);
                 const int min_L = min(max_L, (chain_bonus > 0.0f)
                     ? 1 : max(2, K_ - max(0, max_leaves)));
+                const bool use_cont = max_branch_len > 1 && cont_decay > 0.0f;
                 float best_total = -1.0f;
                 int best_L = max_L;
                 int best_lcnt = 0;
-                int best_lr[6];
-                int best_lc[6];
+                int best_lr[7];
+                int best_lc[7];
+                int best_lp[7];
                 for (int L = max_L; L >= min_L; --L) {
                   float total = 0.0f;
                   for (int r = 0; r < L; ++r) {
                     total += surv[r] * row_probs[r][0] * chain_bonus;
                   }
-                  const int budget = min(K_ - L, max(0, max_leaves));
+                  const int budget = use_cont ? (K_ - L) : min(K_ - L, max(0, max_leaves));
                   const int leaf_limit = min(L, max_leaf_depth);
                   bool used[7][5];
                   for (int r = 0; r < 7; ++r) {
                     for (int c = 0; c < 5; ++c) { used[r][c] = false; }
                   }
                   int cur_lcnt = 0;
-                  int cur_lr[6];
-                  int cur_lc[6];
+                  int cur_leaves = 0;
+                  int cur_lr[7];
+                  int cur_lc[7];
+                  int cur_lp[7];
+                  int cur_bs[7];
+                  float cur_ev[7];
+                  bool cur_cu[7];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
-                    int br = -1, bc = -1;
-                    for (int r = 0; r < leaf_limit; ++r) {
-                      const float base_w = surv[r] * leaf_mult[r];
-                      for (int c = 1; c < top_k_use; ++c) {
-                        if (!used[r][c] && row_ids[r][c] < ivocab) {
-                          const float ev = base_w * row_probs[r][c];
+                    int br = -1, bc = -1, bp = -1;
+                    if (cur_leaves < max_leaves) {
+                      for (int r = 0; r < leaf_limit; ++r) {
+                        const float base_w = surv[r] * leaf_mult[r];
+                        for (int c = 1; c < top_k_use; ++c) {
+                          if (!used[r][c] && row_ids[r][c] < ivocab) {
+                            const float ev = base_w * row_probs[r][c];
+                            if (ev > bev) {
+                              bev = ev;
+                              br = r;
+                              bc = c;
+                            }
+                          }
+                        }
+                      }
+                    }
+                    if (use_cont) {
+                      for (int j = 0; j < cur_lcnt; ++j) {
+                        const int d = cur_lr[j] + 1;
+                        if (!cur_cu[j] && cur_bs[j] < max_branch_len && d < R_
+                            && row_ids[d][0] < ivocab) {
+                          const float ev = cur_ev[j] * row_probs[d][0] * cont_decay;
                           if (ev > bev) {
                             bev = ev;
-                            br = r;
-                            bc = c;
+                            br = d;
+                            bc = 0;
+                            bp = j;
                           }
                         }
                       }
                     }
                     if (br >= 0 && bev > 0.0f) {
-                      used[br][bc] = true;
+                      if (bp < 0) {
+                        used[br][bc] = true;
+                        cur_leaves += 1;
+                        cur_bs[cur_lcnt] = 1;
+                      } else {
+                        cur_cu[bp] = true;
+                        cur_bs[cur_lcnt] = cur_bs[bp] + 1;
+                      }
                       total += bev;
                       cur_lr[cur_lcnt] = br;
                       cur_lc[cur_lcnt] = bc;
+                      cur_lp[cur_lcnt] = bp;
+                      cur_ev[cur_lcnt] = bev;
+                      cur_cu[cur_lcnt] = false;
                       cur_lcnt += 1;
                     } else {
                       break;
@@ -2497,6 +2537,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     for (int b = 0; b < cur_lcnt; ++b) {
                       best_lr[b] = cur_lr[b];
                       best_lc[b] = cur_lc[b];
+                      best_lp[b] = cur_lp[b];
                     }
                   }
                 }
@@ -2511,16 +2552,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   n_cont_used[id] = false;
                   chain_node[r + 1] = id;
                 }
+                int sel_node[7];
                 for (int b = 0; b < best_lcnt && num_nodes <= K_; ++b) {
                   const int r = best_lr[b];
                   const int c = best_lc[b];
+                  const int pj = best_lp[b];
                   const int id = num_nodes++;
-                  n_parent[id] = chain_node[r];
+                  n_parent[id] = (pj < 0) ? chain_node[r] : sel_node[pj];
                   n_depth[id] = r + 1;
                   n_token[id] = row_ids[r][c];
-                  n_ev[id] = surv[r] * leaf_mult[r] * row_probs[r][c];
-                  n_bstep[id] = 1;
+                  n_ev[id] = (pj < 0) ? surv[r] * leaf_mult[r] * row_probs[r][c] : 0.0f;
+                  n_bstep[id] = (pj < 0) ? 1 : (n_bstep[sel_node[pj]] + 1);
                   n_cont_used[id] = false;
+                  sel_node[b] = id;
                 }
               } else {
                 bool chosen[7][5];
