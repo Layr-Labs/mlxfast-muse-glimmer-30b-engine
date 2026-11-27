@@ -187,6 +187,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private let fusedBlockQKV: [QuantizedLinear]
     private let fusedLastKV: QuantizedLinear?
     private let nvfp4Drafter: NVFP4DrafterState?
+    /// Layer 0 mask products before RoPE, computed with the full block shape.
+    private let fusedMaskQKV: MLXArray?
+    private let nvfp4MaskQKV: MLXArray?
     /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
     /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
     /// than the target's row-exact verify kernel: the same E2M1 x E4M3
@@ -241,6 +244,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         fusedContextKV = fused.contextKV
         fusedBlockQKV = fused.blockQKV
         fusedLastKV = fused.lastKV
+        let maskAnchor = maskEmbedding.reshaped([1, 1, c.hiddenSize])
+        let maskBlock = broadcast(maskAnchor, to: [1, c.blockSize, c.hiddenSize])
+        if let qkv = fused.blockQKV.first {
+            fusedMaskQKV = qkv(model.layers[0].inputNorm(maskBlock))
+        } else {
+            fusedMaskQKV = nil
+        }
+        if let nv = nvfp4Drafter {
+            nvfp4MaskQKV = nv.blockQKV[0](
+                MLXFast.rmsNorm(
+                    maskBlock, weight: nv.inputNormWeightScaled[0],
+                    eps: model.layers[0].inputNorm.eps))
+        } else {
+            nvfp4MaskQKV = nil
+        }
         compressedDraftHead =
             (Device.defaultDevice().deviceType == .gpu && model.activationDType == .bfloat16)
             ? draftHead.flatMap { CompressedDraftHead(head: $0) }
@@ -273,6 +291,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
+            if let maskQKV = fusedMaskQKV, let qkv = fusedBlockQKV.first {
+                warm += [maskQKV, qkv(model.layers[0].inputNorm(maskAnchor))]
+            }
+            if let maskQKV = nvfp4MaskQKV, let nv = nvfp4Drafter {
+                warm += [
+                    maskQKV,
+                    nv.blockQKV[0](
+                        MLXFast.rmsNorm(
+                            maskAnchor, weight: nv.inputNormWeightScaled[0],
+                            eps: model.layers[0].inputNorm.eps)),
+                ]
+            }
             if let textTarget = target as? MuseGlimmerTextModel,
                 model.activationDType == .bfloat16
             {
@@ -2868,20 +2898,29 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let ringBuffers = (useFusedAttn && context != nil) ? ringContext?.ringTailBuffers() : nil
         var tailFence = ringBuffers?.fence
         var nextX: MLXArray? = nil
+        let firstMaskQKV = useNVFP4 ? nvfp4MaskQKV : fusedMaskQKV
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
+            let reusesMask = useFusedAttn && index == 0 && firstMaskQKV != nil
+            let normInput = reusesMask ? hidden[0..., 0 ..< 1, 0...] : hidden
             let x: MLXArray
             if let nx = nextX {
                 x = nx
             } else if useNVFP4, let nv {
                 x = MLXFast.rmsNorm(
-                    hidden, weight: nv.inputNormWeightScaled[index], eps: layer.inputNorm.eps)
+                    normInput, weight: nv.inputNormWeightScaled[index], eps: layer.inputNorm.eps)
             } else {
-                x = layer.inputNorm(hidden)
+                x = layer.inputNorm(normInput)
             }
             nextX = nil
             if useFusedAttn, index < lastIndex, let epilogue = contextKeyEpilogue, let posScalar {
-                let qkv = useNVFP4 ? nv!.blockQKV[index](x) : fusedBlockQKV[index](x)
+                let projected = useNVFP4 ? nv!.blockQKV[index](x) : fusedBlockQKV[index](x)
+                let qkv: MLXArray
+                if index == 0, let firstMaskQKV {
+                    qkv = concatenated([projected, firstMaskQKV[0..., 1..., 0...]], axis: 1)
+                } else {
+                    qkv = projected
+                }
                 let queries: MLXArray
                 var keys: MLXArray
                 var values: MLXArray
@@ -4475,7 +4514,7 @@ extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
         if let comp = compressedDraftHead {
             arrays += comp.residentArrays
         }
-        return arrays + [maskEmbedding]
+        return arrays + [maskEmbedding] + [fusedMaskQKV, nvfp4MaskQKV].compactMap { $0 }
     }
 }
 
