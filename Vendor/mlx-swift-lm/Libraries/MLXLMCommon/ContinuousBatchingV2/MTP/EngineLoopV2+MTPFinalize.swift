@@ -532,6 +532,16 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts,
                     targets: outcome.targets)
             }
+            if CBv2DraftRegime.treeLookupEnabled, verify.rows.count == 1, finishReason == nil {
+                let targetCount = outcome.targets.count
+                for s in 1 ... k where s < targetCount {
+                    let prevTok = Int(host[batchIndex * k + (s - 1)])
+                    let nextTok = outcome.targets[s]
+                    if prevTok >= 0 && nextTok >= 0 {
+                        mtp.recordRecycledBigram(for: id, prev: prevTok, next: nextTok)
+                    }
+                }
+            }
             let rejected = (1 + k) - confirmed
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {

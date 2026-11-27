@@ -144,6 +144,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// weights, FP32 accumulation and `weight_scale_2`, in another order.
     /// Proposals only decide acceptance; the target verifies every token.
     private let draftHead: ModelOptWeightOnlyNVFP4Linear?
+    /// 2-stage XNOR-1bit+g256 compressed draft head shortlist index (178.6 MB)
+    /// + fused exact NVFP4 top-1024 stage-2 rescore for low-acceptance dynamic
+    /// tree rounds (`CBV2_DRAFT_HEAD_SHORTLIST=0` disables). Read-only over
+    /// frozen `draftHead`; never alters target verification.
+    private let shortlistHead: DraftHeadShortlist?
 
     public init(
         target: any MuseGlimmerDFlashTarget, model: MuseGlimmerDFlashDraftModel,
@@ -204,9 +209,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             CBv2DraftRegime.dynamicTreeTempSlope,
             CBv2DraftRegime.dynamicTreeLeafDecay,
             CBv2DraftRegime.dynamicTreePurityExp,
+            CBv2DraftRegime.treeDPContEnabled ? 1.0 : 0.0,
         ])
         eval(dtParams)
         self.dynTreeParams = dtParams
+        if model.activationDType == .bfloat16,
+            let head = draftHead
+        {
+            self.shortlistHead = DraftHeadShortlist.makeVerified(
+                draftHead: head, probe: maskEmbedding, params: dtParams)
+        } else {
+            self.shortlistHead = nil
+        }
         contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
@@ -314,6 +328,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         let dummyHeadIn = MLXArray.zeros(
                             [rows, c.hiddenSize], dtype: model.activationDType)
                         warm.append(draftHeadProduct(dummyHeadIn, readout: false))
+                        if let sl = shortlistHead, rows <= 7 {
+                            let sp = sl.stage1Partials(dummyHeadIn, params: dtParams)
+                            warm += [sp.val, sp.idx, sp.sum]
+                        }
                     }
                 }
                 warm.append(
@@ -956,6 +974,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
             draftCount: settings.maximumDraftTokens)
+        if CBv2DraftRegime.lowAcceptance, s.selection == nil,
+            rows.ndim == 2, rows.dtype == .bfloat16,
+            let sl = shortlistHead, rows.dim(1) == sl.inputDimensions,
+            rows.dim(0) == settings.maximumDraftTokens, rows.dim(0) <= 7
+        {
+            let dynK = CBv2DraftRegime.activeDynamicTreeK
+            if dynK >= 2, dynK <= rows.dim(0) {
+                let p = sl.stage1Partials(rows, params: dynTreeParams)
+                let dyn = Self.fastDynamicTreeStage2(
+                    p.val, p.idx, p.sum, k: dynK, vocab: target.dflashVocabularySize,
+                    params: dynTreeParams)
+                CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
+                s.memo = (dyn.tokens, rows)
+                return nil
+            }
+        }
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -1430,6 +1464,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             draftCount: settings.maximumDraftTokens, devicePosition: position)
         if usedZeroCopyTail {
             context.recordSpeculativeRead(rows)
+        }
+        if CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
+            rows.ndim == 2, rows.dtype == .bfloat16,
+            let sl = shortlistHead, rows.dim(0) == settings.maximumDraftTokens,
+            rows.dim(0) <= 7, rows.dim(1) == sl.inputDimensions
+        {
+            let p = sl.stage1Partials(rows, params: dynTreeParams)
+            speculation.dynPartials = (val: p.val, idx: p.idx, sum: p.sum, hidden: rows)
+            speculation.memo = nil
+            speculation.confidence = nil
+            speculation.deviceOutcome = true
+            s.speculation = speculation
+            return [p.val, p.idx, p.sum, rows, projected.keys, projected.values]
         }
         let logits = draftHeadProduct(rows, readout: false)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
@@ -2092,7 +2139,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         inline float dflash_scale_logit(float raw, float eff_scale, float cap) {
             float v = raw * eff_scale;
             if (cap > 0.0f) {
-                v = cap * metal::fast::tanh(v / cap);
+                v = cap * metal::fast::tanh(clamp(v / cap, -20.0f, 20.0f));
             }
             return v;
         }
@@ -2305,7 +2352,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private static let fastDynTreeStage2Kernel = MLXFast.metalKernel(
         name: "dflash_fast_dyntree_s2",
-        inputNames: ["p_val", "p_idx", "p_sum", "tparams"],
+        inputNames: ["p_val", "p_idx", "p_sum", "tparams", "lookup_hint"],
         outputNames: ["tokens", "tree_meta"],
         source: """
             constexpr uint CHUNKS = 64;
@@ -2326,6 +2373,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             const float t_slope = tparams[14];
             const float leaf_decay = tparams[15];
             const float purity_exp = tparams[16];
+            const bool dp_cont = (tparams[17] > 0.5f);
 
             threadgroup float sh_v[2][5];
             threadgroup int sh_i[2][5];
@@ -2407,6 +2455,54 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
 
             if (lid == 0) {
+              const int hint_len = lookup_hint[0];
+              if (hint_len >= 2) {
+                float h_decay = 1.0f;
+                for (int r = 0; r < R_; ++r) {
+                  const int htok = lookup_hint[1 + r];
+                  if (htok >= 0 && htok < ivocab) {
+                    float prior = 0.0f;
+                    if (hint_len >= 4) {
+                      prior = 0.55f * h_decay;
+                    } else if (hint_len == 3) {
+                      prior = 0.35f * h_decay;
+                    } else if (r == 0) {
+                      prior = 0.22f;
+                    }
+                    if (prior > 0.0f) {
+                      int found = -1;
+                      for (int c = 0; c < 5; ++c) {
+                        if (row_ids[r][c] == htok) { found = c; break; }
+                      }
+                      if (found >= 0) {
+                        if (prior > row_probs[r][found]) {
+                          row_probs[r][found] = prior;
+                          int pos = found;
+                          while (pos > 0 && row_probs[r][pos] > row_probs[r][pos - 1]) {
+                            const float tp = row_probs[r][pos - 1];
+                            const int ti = row_ids[r][pos - 1];
+                            row_probs[r][pos - 1] = row_probs[r][pos];
+                            row_ids[r][pos - 1] = row_ids[r][pos];
+                            row_probs[r][pos] = tp;
+                            row_ids[r][pos] = ti;
+                            --pos;
+                          }
+                        }
+                      } else if (prior > row_probs[r][4]) {
+                        int pos = 4;
+                        while (pos > 0 && prior > row_probs[r][pos - 1]) {
+                          row_probs[r][pos] = row_probs[r][pos - 1];
+                          row_ids[r][pos] = row_ids[r][pos - 1];
+                          --pos;
+                        }
+                        row_probs[r][pos] = prior;
+                        row_ids[r][pos] = htok;
+                      }
+                    }
+                  }
+                  h_decay *= 0.85f;
+                }
+              }
               for (int s = 0; s < R_; ++s) {
                 tokens[s] = row_ids[s][0];
               }
@@ -2448,8 +2544,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 float best_total = -1.0f;
                 int best_L = max_L;
                 int best_lcnt = 0;
+                int best_kind[6];
                 int best_lr[6];
-                int best_lc[6];
+                int best_tok[6];
+                float best_ev_arr[6];
                 for (int L = max_L; L >= min_L; --L) {
                   float total = 0.0f;
                   for (int r = 0; r < L; ++r) {
@@ -2462,11 +2560,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     for (int c = 0; c < 5; ++c) { used[r][c] = false; }
                   }
                   int cur_lcnt = 0;
+                  int cur_kind[6];
                   int cur_lr[6];
-                  int cur_lc[6];
+                  int cur_depth[6];
+                  int cur_tok[6];
+                  float cur_ev[6];
+                  bool cur_cont_used[6];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
-                    int br = -1, bc = -1;
+                    int bkind = -1;
+                    int br = -1, bc = -1, btok = ivocab;
                     for (int r = 0; r < leaf_limit; ++r) {
                       const float base_w = surv[r] * leaf_mult[r];
                       for (int c = 1; c < top_k_use; ++c) {
@@ -2474,17 +2577,60 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                           const float ev = base_w * row_probs[r][c];
                           if (ev > bev) {
                             bev = ev;
+                            bkind = 1;
                             br = r;
                             bc = c;
+                            btok = row_ids[r][c];
                           }
                         }
                       }
                     }
-                    if (br >= 0 && bev > 0.0f) {
+                    if (dp_cont && cont_decay > 0.0f) {
+                      const float cont_mult = cont_decay * 0.85f;
+                      for (int j = 0; j < cur_lcnt; ++j) {
+                        if (cur_kind[j] == 1 && !cur_cont_used[j] && cur_depth[j] < R_) {
+                          const int d = cur_depth[j];
+                          int ctok = row_ids[d][0];
+                          float cprob = row_probs[d][0];
+                          if (hint_len >= 3 && d >= 1 && cur_tok[j] == lookup_hint[d]) {
+                            const int hnext = lookup_hint[1 + d];
+                            if (hnext >= 0 && hnext < ivocab) {
+                              ctok = hnext;
+                              cprob = max(cprob, (hint_len >= 4) ? 0.55f : 0.35f);
+                            }
+                          }
+                          if (ctok < ivocab) {
+                            const float ev = cur_ev[j] * cprob * cont_mult;
+                            if (ev > bev) {
+                              bev = ev;
+                              bkind = 2;
+                              br = j;
+                              bc = -1;
+                              btok = ctok;
+                            }
+                          }
+                        }
+                      }
+                    }
+                    if (bkind == 1 && br >= 0 && bev > 0.0f) {
                       used[br][bc] = true;
                       total += bev;
+                      cur_kind[cur_lcnt] = 1;
                       cur_lr[cur_lcnt] = br;
-                      cur_lc[cur_lcnt] = bc;
+                      cur_depth[cur_lcnt] = br + 1;
+                      cur_tok[cur_lcnt] = btok;
+                      cur_ev[cur_lcnt] = bev;
+                      cur_cont_used[cur_lcnt] = false;
+                      cur_lcnt += 1;
+                    } else if (bkind == 2 && br >= 0 && bev > 0.0f) {
+                      cur_cont_used[br] = true;
+                      total += bev;
+                      cur_kind[cur_lcnt] = 2;
+                      cur_lr[cur_lcnt] = br;
+                      cur_depth[cur_lcnt] = cur_depth[br] + 1;
+                      cur_tok[cur_lcnt] = btok;
+                      cur_ev[cur_lcnt] = bev;
+                      cur_cont_used[cur_lcnt] = true;
                       cur_lcnt += 1;
                     } else {
                       break;
@@ -2495,8 +2641,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     best_L = L;
                     best_lcnt = cur_lcnt;
                     for (int b = 0; b < cur_lcnt; ++b) {
+                      best_kind[b] = cur_kind[b];
                       best_lr[b] = cur_lr[b];
-                      best_lc[b] = cur_lc[b];
+                      best_tok[b] = cur_tok[b];
+                      best_ev_arr[b] = cur_ev[b];
                     }
                   }
                 }
@@ -2511,16 +2659,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   n_cont_used[id] = false;
                   chain_node[r + 1] = id;
                 }
+                int branch_node_id[6];
                 for (int b = 0; b < best_lcnt && num_nodes <= K_; ++b) {
-                  const int r = best_lr[b];
-                  const int c = best_lc[b];
                   const int id = num_nodes++;
-                  n_parent[id] = chain_node[r];
-                  n_depth[id] = r + 1;
-                  n_token[id] = row_ids[r][c];
-                  n_ev[id] = surv[r] * leaf_mult[r] * row_probs[r][c];
-                  n_bstep[id] = 1;
+                  if (best_kind[b] == 1) {
+                    const int r = best_lr[b];
+                    n_parent[id] = chain_node[r];
+                    n_depth[id] = r + 1;
+                    n_bstep[id] = 1;
+                  } else {
+                    const int pid = branch_node_id[best_lr[b]];
+                    n_parent[id] = pid;
+                    n_depth[id] = n_depth[pid] + 1;
+                    n_bstep[id] = 2;
+                  }
+                  n_token[id] = best_tok[b];
+                  n_ev[id] = best_ev_arr[b];
                   n_cont_used[id] = false;
+                  branch_node_id[b] = id;
                 }
               } else {
                 bool chosen[7][5];
@@ -2809,9 +2965,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return (partials[0], partials[1], partials[2])
     }
 
+    nonisolated(unsafe) private static let zeroLookupHint: MLXArray = {
+        let a = MLXArray([Int32](repeating: 0, count: 8))
+        eval(a)
+        return a
+    }()
+
     private static func fastDynamicTreeStage2(
         _ pVal: MLXArray, _ pIdx: MLXArray, _ pSum: MLXArray,
-        k: Int, vocab: Int, params: MLXArray
+        k: Int, vocab: Int, params: MLXArray,
+        lookupHint: MLXArray? = nil
     ) -> (tokens: MLXArray, treeMeta: MLXArray) {
         let rows = pVal.dim(0)
         let chunks = 64
@@ -2828,8 +2991,439 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             dynTreeLock.withLock { dynTreeS2Cache[key] = made }
             launch = made
         }
-        let out = launch([pVal, pIdx, pSum, params])
+        let hint = lookupHint ?? CBv2DraftRegime.activeTreeLookupHint ?? zeroLookupHint
+        let out = launch([pVal, pIdx, pSum, params, hint])
         return (out[0], out[1])
+    }
+
+    /// 2-stage XNOR-1bit+g256 compressed draft head shortlist index (178.6 MB)
+    /// + fused exact NVFP4 top-1024 stage-2 rescore directly emitting the
+    /// 64-chunk partial format consumed by `fastDynamicTreeStage2`.
+    /// Strictly read-only over the target's frozen `ModelOptWeightOnlyNVFP4Linear`.
+    private final class DraftHeadShortlist: @unchecked Sendable {
+        static let enabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_DRAFT_HEAD_SHORTLIST"] != "0"
+
+        let inputDimensions: Int
+        let vocab: Int
+        let partStride: Int
+        private let weight: MLXArray
+        private let weightScale: MLXArray
+        private let w1Bits: MLXArray
+        private let g256Sc: MLXArray
+
+        private static let nvfp4DecodeHeader = """
+            inline half dflash_e4m3(uint bits) {
+                const uint v = bits & 127u;
+                const uint u = (v << 7) | (((v + 1u) >> 7) << 14) | ((bits & 128u) << 8);
+                return as_type<half>(ushort(u)) * 256.0h;
+            }
+            inline float dflash_e2m1(uint nibble) {
+                const uint p = ((nibble & 7u) << 9) | ((nibble & 8u) << 12);
+                return float(as_type<half>(ushort(p)) * 16384.0h);
+            }
+            inline void dflash_insert_top4(
+                thread float* tv, thread int* ti, float v, int id
+            ) {
+                if (v < tv[3] || (v == tv[3] && id >= ti[3])) return;
+                int pos = 3;
+                while (pos > 0 && (v > tv[pos - 1] || (v == tv[pos - 1] && id < ti[pos - 1]))) {
+                    tv[pos] = tv[pos - 1];
+                    ti[pos] = ti[pos - 1];
+                    --pos;
+                }
+                tv[pos] = v;
+                ti[pos] = id;
+            }
+            """
+
+        private static let buildXnorG256Kernel = MLXFast.metalKernel(
+            name: "dflash_build_xnor_g256",
+            inputNames: ["w", "sc"],
+            outputNames: ["w1_bits", "g256_sc"],
+            source: """
+                const uint v = thread_position_in_grid.x;
+                const uint V = uint(V_);
+                if (v >= V) return;
+                constexpr uint K8 = uint(K_) / 8u;
+                constexpr uint K16 = uint(K_) / 16u;
+                constexpr uint K256 = uint(K_) / 256u;
+                constexpr uint COL_TOTAL = 256u * uint(PS_);
+                const uint col = (v & 255u) * uint(PS_) + (v >> 8);
+                const device uint32_t* wr = w + size_t(v) * size_t(K8);
+                const device uint8_t* sr = sc + size_t(v) * size_t(K16);
+                for (uint g256 = 0u; g256 < K256; ++g256) {
+                    float g_abs = 0.0f;
+                    for (uint sub = 0u; sub < 8u; ++sub) {
+                        const uint g32 = g256 * 8u + sub;
+                        uint sbits = 0u;
+                        const float s0 = float(dflash_e4m3(sr[g32 * 2u + 0u]));
+                        const float s1 = float(dflash_e4m3(sr[g32 * 2u + 1u]));
+                        #pragma unroll
+                        for (uint w4 = 0u; w4 < 4u; ++w4) {
+                            const uint word = wr[g32 * 4u + w4];
+                            const float scv = (w4 < 2u) ? s0 : s1;
+                            #pragma unroll
+                            for (uint nib = 0u; nib < 8u; ++nib) {
+                                const float val = dflash_e2m1((word >> (nib * 4u)) & 0xFu) * scv;
+                                g_abs += fabs(val);
+                                if (val >= 0.0f) sbits |= (1u << (w4 * 8u + nib));
+                            }
+                        }
+                        w1_bits[size_t(g32) * size_t(COL_TOTAL) + size_t(col)] = sbits;
+                    }
+                    g256_sc[size_t(g256) * size_t(COL_TOTAL) + size_t(col)] = half(g_abs * (1.0f / 256.0f));
+                }
+                """,
+            header: nvfp4DecodeHeader)
+
+        private static let quantizeXKernel = MLXFast.metalKernel(
+            name: "dflash_xnor_quant_x",
+            inputNames: ["x"],
+            outputNames: ["x_planes", "x_g256_scale"],
+            source: """
+                constexpr uint K32 = uint(K_) / 32u;
+                constexpr uint K256 = uint(K_) / 256u;
+                const uint g256 = threadgroup_position_in_grid.x;
+                const uint r = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const device bfloat16_t* xg = x + size_t(r) * size_t(K_) + size_t(g256) * 256u;
+                const float xv = float(xg[lid]);
+                const float ssq = simd_sum(xv * xv);
+                threadgroup float sh[8];
+                if (lane == 0u) sh[sg] = ssq;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup float inv_step_tg;
+                if (sg == 0u) {
+                    const float tot = simd_sum((lane < 8u) ? sh[lane] : 0.0f);
+                    if (lane == 0u) {
+                        const float rms = sqrt(max(tot * (1.0f / 256.0f), 1e-12f));
+                        // 2-bit Gaussian Lloyd-Max threshold 0.98 * rms (calibrated on pinned lm_head).
+                        inv_step_tg = 1.0f / (0.98f * rms);
+                        x_g256_scale[r * K256 + g256] = 0.49f * rms;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const int q2 = clamp(int(floor(xv * inv_step_tg)) + 2, 0, 3);
+                const uint p1 = uint(simd_vote::vote_t(simd_ballot((q2 & 2) != 0)));
+                const uint p0 = uint(simd_vote::vote_t(simd_ballot((q2 & 1) != 0)));
+                if (lane == 0u) {
+                    const uint g32 = g256 * 8u + sg;
+                    device uint32_t* out = x_planes + size_t(r) * size_t(2u * K32);
+                    out[0u * K32 + g32] = p1;
+                    out[1u * K32 + g32] = p0;
+                }
+                """)
+
+        private static let stage1XnorKernel = MLXFast.metalKernel(
+            name: "dflash_xnor_stage1",
+            inputNames: ["w1_bits", "g256_sc", "x_planes", "x_g256_scale"],
+            outputNames: ["cand_ids"],
+            source: """
+                constexpr uint N_TG = 256u;
+                constexpr uint K32 = uint(K_) / 32u;
+                constexpr uint K256 = uint(K_) / 256u;
+                constexpr uint P_LEN = (uint(V_) + 255u) >> 8;
+                constexpr uint COL_TOTAL = 256u * uint(PS_);
+                const uint V = uint(V_);
+                const int ivocab = int(V);
+                const uint tg = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint col_base = tg * uint(PS_);
+
+                threadgroup uint32_t tg_x[R_ * 2 * (K_ / 32)];
+                threadgroup float tg_xs[R_ * (K_ / 256)];
+                const uint total_x = uint(R_) * 2u * K32;
+                for (uint i = lid; i < total_x; i += 256u) {
+                    tg_x[i] = x_planes[i];
+                }
+                const uint total_xs = uint(R_) * K256;
+                for (uint i = lid; i < total_xs; i += 256u) {
+                    tg_xs[i] = x_g256_scale[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float tv[R_][4];
+                int ti[R_][4];
+                #pragma unroll
+                for (int r = 0; r < R_; ++r) {
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) { tv[r][c] = -INFINITY; ti[r][c] = ivocab; }
+                }
+
+                constexpr int gbias = 3 * 256;
+                for (uint idx = lid; idx < P_LEN; idx += 256u) {
+                    const uint v = (idx << 8) | tg;
+                    if (v >= V) break;
+                    const uint col = col_base + idx;
+                    float score[R_];
+                    #pragma unroll
+                    for (int r = 0; r < R_; ++r) score[r] = 0.0f;
+
+                    for (uint g256 = 0u; g256 < K256; ++g256) {
+                        int gacc[R_];
+                        #pragma unroll
+                        for (int r = 0; r < R_; ++r) gacc[r] = 0;
+                        const uint g32_base = g256 * 8u;
+                        #pragma unroll
+                        for (uint sub = 0u; sub < 8u; ++sub) {
+                            const uint g32 = g32_base + sub;
+                            const uint w = w1_bits[size_t(g32) * size_t(COL_TOTAL) + size_t(col)];
+                            #pragma unroll
+                            for (int r = 0; r < R_; ++r) {
+                                const uint xb = uint(r) * (2u * K32) + g32;
+                                gacc[r] += (int(popcount(w ^ tg_x[xb])) << 1)
+                                         +  int(popcount(w ^ tg_x[xb + K32]));
+                            }
+                        }
+                        const float wsc = float(g256_sc[size_t(g256) * size_t(COL_TOTAL) + size_t(col)]);
+                        #pragma unroll
+                        for (int r = 0; r < R_; ++r) {
+                            score[r] += float(gbias - 2 * gacc[r]) * (wsc * tg_xs[uint(r) * K256 + g256]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < R_; ++r) dflash_insert_top4(tv[r], ti[r], score[r], int(v));
+                }
+
+                threadgroup float sh_v[8][4];
+                threadgroup int sh_i[8][4];
+                for (int r = 0; r < R_; ++r) {
+                    float lv[4]; int li[4];
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) { lv[c] = tv[r][c]; li[c] = ti[r][c]; }
+                    for (ushort off = 16; off > 0; off >>= 1) {
+                        #pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            const float ov = simd_shuffle_down(lv[c], off);
+                            const int oi = simd_shuffle_down(li[c], off);
+                            if (lane < off) dflash_insert_top4(lv, li, ov, oi);
+                        }
+                    }
+                    if (lane == 0u) {
+                        #pragma unroll
+                        for (int c = 0; c < 4; ++c) { sh_v[sg][c] = lv[c]; sh_i[sg][c] = li[c]; }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0u) {
+                        #pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            lv[c] = (lane < 8u) ? sh_v[lane][c] : -INFINITY;
+                            li[c] = (lane < 8u) ? sh_i[lane][c] : ivocab;
+                        }
+                        for (ushort off = 4; off > 0; off >>= 1) {
+                            #pragma unroll
+                            for (int c = 0; c < 4; ++c) {
+                                const float ov = simd_shuffle_down(lv[c], off);
+                                const int oi = simd_shuffle_down(li[c], off);
+                                if (lane < off) dflash_insert_top4(lv, li, ov, oi);
+                            }
+                        }
+                        if (lane == 0u) {
+                            const uint out_base = (uint(r) * N_TG + tg) * 4u;
+                            #pragma unroll
+                            for (int c = 0; c < 4; ++c) cand_ids[out_base + c] = li[c];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                """,
+            header: nvfp4DecodeHeader)
+
+        private static let stage2Nvfp4DynTreeKernel = MLXFast.metalKernel(
+            name: "dflash_xnor_stage2_dyntree",
+            inputNames: ["w", "sc", "x", "cand_ids", "tparams"],
+            outputNames: ["p_val", "p_idx", "p_sum"],
+            source: """
+                const uint chunk = threadgroup_position_in_grid.x;
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const int ivocab = int(V_);
+                constexpr uint K8 = uint(K_) / 8u;
+                constexpr uint K16 = uint(K_) / 16u;
+                const float eff_scale = tparams[0];
+                const float cap = tparams[1];
+                const float row_T = max(0.05f, tparams[2] + float(row) * tparams[14]);
+                const float inv_t_log2e = 1.44269504f / row_T;
+                const device bfloat16_t* xr = x + size_t(row) * size_t(K_);
+                const uint c_base = row * 1024u + chunk * 16u;
+
+                threadgroup float sh_v[16];
+                threadgroup int sh_i[16];
+
+                for (uint rep = 0u; rep < 2u; ++rep) {
+                    const uint ci = sg * 2u + rep;
+                    const int vid = cand_ids[c_base + ci];
+                    if (vid >= 0 && vid < ivocab) {
+                        const device uint32_t* wr = w + size_t(vid) * size_t(K8);
+                        const device uint8_t* sr = sc + size_t(vid) * size_t(K16);
+                        float sum = 0.0f;
+                        for (uint g16 = lane; g16 < K16; g16 += 32u) {
+                            const float scv = float(dflash_e4m3(sr[g16]));
+                            const uint w0 = wr[g16 * 2u + 0u];
+                            const uint w1 = wr[g16 * 2u + 1u];
+                            const device bfloat16_t* xp = xr + size_t(g16) * 16u;
+                            float acc = 0.0f;
+                            #pragma unroll
+                            for (uint nib = 0u; nib < 8u; ++nib) {
+                                acc += dflash_e2m1((w0 >> (nib * 4u)) & 0xFu) * float(xp[nib]);
+                                acc += dflash_e2m1((w1 >> (nib * 4u)) & 0xFu) * float(xp[nib + 8u]);
+                            }
+                            sum += acc * scv;
+                        }
+                        sum = simd_sum(sum);
+                        if (lane == 0u) {
+                            sh_v[ci] = dflash_scale_logit(sum, eff_scale, cap);
+                            sh_i[ci] = vid;
+                        }
+                    } else if (lane == 0u) {
+                        sh_v[ci] = -INFINITY;
+                        sh_i[ci] = ivocab;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0u && lane == 0u) {
+                    float v0 = -INFINITY, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY, v4 = -INFINITY;
+                    int i0 = ivocab, i1 = ivocab, i2 = ivocab, i3 = ivocab, i4 = ivocab;
+                    float sm_m = -INFINITY, sm_s = 0.0f;
+                    for (int c = 0; c < 16; ++c) {
+                        const int id = sh_i[c];
+                        if (id < ivocab) {
+                            const float v = sh_v[c];
+                            dflash_insert_top5(v0, i0, v1, i1, v2, i2, v3, i3, v4, i4, v, id, ivocab);
+                            dflash_accum_softmax(sm_m, sm_s, v, inv_t_log2e);
+                        }
+                    }
+                    const uint ob = (row * 64u + chunk) * 5u;
+                    p_val[ob + 0u] = v0; p_idx[ob + 0u] = i0;
+                    p_val[ob + 1u] = v1; p_idx[ob + 1u] = i1;
+                    p_val[ob + 2u] = v2; p_idx[ob + 2u] = i2;
+                    p_val[ob + 3u] = v3; p_idx[ob + 3u] = i3;
+                    p_val[ob + 4u] = v4; p_idx[ob + 4u] = i4;
+                    p_sum[row * 64u + chunk] = sm_s;
+                }
+                """,
+            header: nvfp4DecodeHeader + "\n" + fastDynTreeHeader)
+
+        private struct LaunchKey: Hashable {
+            let rows: Int
+            let k: Int
+            let vocab: Int
+        }
+        private let lock = NSLock()
+        private var quantCache: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        private var stage1Cache: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        private var stage2Cache: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+        private init(
+            inputDimensions: Int, vocab: Int, partStride: Int, weight: MLXArray,
+            weightScale: MLXArray, w1Bits: MLXArray, g256Sc: MLXArray
+        ) {
+            self.inputDimensions = inputDimensions
+            self.vocab = vocab
+            self.partStride = partStride
+            self.weight = weight
+            self.weightScale = weightScale
+            self.w1Bits = w1Bits
+            self.g256Sc = g256Sc
+        }
+
+        static func makeVerified(
+            draftHead: ModelOptWeightOnlyNVFP4Linear, probe: MLXArray, params: MLXArray
+        ) -> DraftHeadShortlist? {
+            guard enabled, Device.defaultDevice().deviceType == .gpu else { return nil }
+            let k = draftHead.inputDimensions
+            let v = draftHead.outputDimensions
+            guard k > 0, k % 256 == 0, v >= 1024,
+                draftHead.weight.dtype == .uint32,
+                draftHead.weightScale.dtype == .uint8,
+                probe.ndim == 2, probe.dtype == .bfloat16, probe.dim(1) == k
+            else { return nil }
+            let pLen = (v + 255) / 256
+            let pStride = ((pLen + 31) / 32) * 32
+            let colTotal = 256 * pStride
+            do {
+                return try MLX.withError { errors in
+                    let gridX = ((v + 255) / 256) * 256
+                    let built = buildXnorG256Kernel(
+                        [draftHead.weight, draftHead.weightScale],
+                        template: [("V_", v), ("K_", k), ("PS_", pStride)],
+                        grid: (gridX, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[k / 32, colTotal], [k / 256, colTotal]],
+                        outputDTypes: [.uint32, .float16])
+                    eval(built)
+                    try errors.check()
+                    let sl = DraftHeadShortlist(
+                        inputDimensions: k, vocab: v, partStride: pStride,
+                        weight: draftHead.weight, weightScale: draftHead.weightScale,
+                        w1Bits: built[0], g256Sc: built[1])
+                    let p = sl.stage1Partials(probe, params: params)
+                    let topID = MuseGlimmerDFlashDrafter.fastDynamicTreeArgMax(
+                        p.val, p.idx, vocab: v)
+                    eval([p.val, p.idx, p.sum, topID])
+                    try errors.check()
+                    let id = Int(topID[0].item(Int32.self))
+                    let maxVal = p.val.max().item(Float.self)
+                    let sumVal = p.sum.sum().item(Float.self)
+                    guard (0 ..< v).contains(id), maxVal.isFinite, sumVal.isFinite, sumVal > 0
+                    else { return nil }
+                    return sl
+                }
+            } catch {
+                return nil
+            }
+        }
+
+        func stage1Partials(
+            _ rows: MLXArray, params: MLXArray
+        ) -> (val: MLXArray, idx: MLXArray, sum: MLXArray) {
+            let r = rows.dim(0)
+            let k = inputDimensions
+            let v = vocab
+            let key = LaunchKey(rows: r, k: k, vocab: v)
+            let quantLaunch: MLXFast.MLXFastKernel.Launch
+            let s1Launch: MLXFast.MLXFastKernel.Launch
+            let s2Launch: MLXFast.MLXFastKernel.Launch
+            lock.lock()
+            if let ql = quantCache[key], let l1 = stage1Cache[key], let l2 = stage2Cache[key] {
+                quantLaunch = ql
+                s1Launch = l1
+                s2Launch = l2
+                lock.unlock()
+            } else {
+                let ql = Self.quantizeXKernel.prepare(
+                    template: [("K_", k)],
+                    grid: (256 * (k / 256), r, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[r, 2, k / 32], [r, k / 256]],
+                    outputDTypes: [.uint32, .float32])
+                let l1 = Self.stage1XnorKernel.prepare(
+                    template: [("R_", r), ("K_", k), ("V_", v), ("PS_", partStride)],
+                    grid: (256 * 256, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[r, 1024]],
+                    outputDTypes: [.int32])
+                let l2 = Self.stage2Nvfp4DynTreeKernel.prepare(
+                    template: [("K_", k), ("V_", v)],
+                    grid: (256 * 64, r, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[r, 64, 5], [r, 64, 5], [r, 64]],
+                    outputDTypes: [.float32, .int32, .float32])
+                quantCache[key] = ql
+                stage1Cache[key] = l1
+                stage2Cache[key] = l2
+                quantLaunch = ql
+                s1Launch = l1
+                s2Launch = l2
+                lock.unlock()
+            }
+            let qOut = quantLaunch([rows])
+            let candIDs = s1Launch([w1Bits, g256Sc, qOut[0], qOut[1]])[0]
+            let s2Out = s2Launch([weight, weightScale, rows, candIDs, params])
+            return (s2Out[0], s2Out[1], s2Out[2])
+        }
     }
 
     private static func fastDynamicTreeArgMax(

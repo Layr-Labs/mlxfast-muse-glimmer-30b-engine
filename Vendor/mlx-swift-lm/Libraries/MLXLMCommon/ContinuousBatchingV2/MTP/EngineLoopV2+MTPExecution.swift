@@ -876,10 +876,53 @@ extension EngineLoopV2 {
         CBv2DraftRegime.activeVerifyTree = verifyTree
         CBv2DraftRegime.activeDynamicTreeK = useDynamicTree ? k : 0
         CBv2DraftRegime.activeDynamicTreeMeta = nil
+        var activeLookupHint: MLXArray? = nil
+        if useDynamicTree, CBv2DraftRegime.treeLookupEnabled {
+            let row0 = verifyRows[0]
+            let tokens = row0.rec.tokens
+            let seedTok = row0.carry!.token
+            let n = tokens.count
+            var bestLen = 0
+            var bestPos = -1
+            if n >= 4 && tokens[n - 1] == seedTok {
+                let lo = max(2, n - 4096)
+                let hi = n - 2
+                if hi >= lo {
+                    var pos = hi
+                    while pos >= lo {
+                        if tokens[pos] == seedTok {
+                            var mlen = 1
+                            let maxCheck = min(6, pos + 1, n)
+                            while mlen < maxCheck && tokens[pos - mlen] == tokens[n - 1 - mlen] {
+                                mlen += 1
+                            }
+                            if mlen >= 3 && mlen > bestLen {
+                                bestLen = mlen
+                                bestPos = pos
+                                if bestLen >= 6 { break }
+                            }
+                        }
+                        pos -= 1
+                    }
+                }
+            }
+            if bestLen >= 3 && bestPos >= 0 && bestPos + 1 < n {
+                var hint: [Int32] = [Int32(bestLen), -1, -1, -1, -1, -1, -1, -1]
+                let avail = min(7, n - 1 - bestPos)
+                for r in 0 ..< avail {
+                    hint[1 + r] = Int32(tokens[bestPos + 1 + r])
+                }
+                activeLookupHint = MLXArray(hint)
+            } else if let recycled = mtp.recycledNextToken(for: row0.rec.id, after: seedTok) {
+                activeLookupHint = MLXArray([Int32(2), Int32(recycled), -1, -1, -1, -1, -1, -1])
+            }
+        }
+        CBv2DraftRegime.activeTreeLookupHint = activeLookupHint
         defer {
             CBv2DraftRegime.activeVerifyTree = nil
             CBv2DraftRegime.activeDynamicTreeK = 0
             CBv2DraftRegime.activeDynamicTreeMeta = nil
+            CBv2DraftRegime.activeTreeLookupHint = nil
         }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.

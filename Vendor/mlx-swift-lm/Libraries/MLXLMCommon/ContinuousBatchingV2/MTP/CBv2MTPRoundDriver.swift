@@ -335,6 +335,9 @@ final class CBv2MTPRoundDriver {
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
     /// Optional per-request tree cooldown set when `CBV2_TREE_COOLDOWN=1`.
     private var treeCooldownRequests: Set<CBv2RequestID> = []
+    /// Per-request verified target bigrams (`prevTok -> targetTok`) harvested
+    /// from verify windows (including rejected slots) for dynamic-tree lookup hints.
+    private var recycledBigrams: [CBv2RequestID: [Int: Int]] = [:]
     /// Plan-scoped: the confirmed post-verify speculation's lazy draft
     /// confidence for each row whose window this plan offered it to, kept
     /// until that round's finalize calibrates with it. Cleared every plan.
@@ -695,6 +698,19 @@ final class CBv2MTPRoundDriver {
         } else if !wasTree && accepted < 4 {
             treeCooldownRequests.remove(id)
         }
+    }
+
+    func recordRecycledBigram(for id: CBv2RequestID, prev: Int, next: Int) {
+        var table = recycledBigrams[id] ?? [:]
+        if table.count >= 2048 && table[prev] == nil {
+            table.removeAll(keepingCapacity: true)
+        }
+        table[prev] = next
+        recycledBigrams[id] = table
+    }
+
+    func recycledNextToken(for id: CBv2RequestID, after token: Int) -> Int? {
+        recycledBigrams[id]?[token]
     }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
@@ -1200,6 +1216,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        recycledBigrams.removeValue(forKey: id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -1215,6 +1232,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        recycledBigrams.removeValue(forKey: id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1254,6 +1272,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
         treeCooldownRequests.removeAll(keepingCapacity: false)
+        recycledBigrams.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
@@ -1668,6 +1687,15 @@ public enum CBv2DraftRegime {
     /// `[0] = packedPosDeltas`, `[1...8] = ancPacked[0...7]`, `[9...16] = depth[0...7]`,
     /// `[17] = packedParents`.
     nonisolated(unsafe) public static var activeDynamicTreeMeta: MLXArray? = nil
+    /// Optional per-request `[8]` int32 lookup hint (`[matchLen, tok0...tok6]`)
+    /// from prompt-suffix copy or recycled target bigrams for the active dynamic tree round.
+    nonisolated(unsafe) public static var activeTreeLookupHint: MLXArray? = nil
+    /// `CBV2_TREE_LOOKUP=0` disables prompt-suffix and recycled-bigram dynamic tree hints.
+    public static let treeLookupEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_LOOKUP"] != "0"
+    /// `CBV2_TREE_DP_CONT=0` disables depth-2 branch continuations inside the exact dynamic tree DP.
+    public static let treeDPContEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_DP_CONT"] != "0"
     /// `CBV2_TREE_LOW=0` disables tree verification on low-acceptance rounds.
     public static let verifyTreeMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1
