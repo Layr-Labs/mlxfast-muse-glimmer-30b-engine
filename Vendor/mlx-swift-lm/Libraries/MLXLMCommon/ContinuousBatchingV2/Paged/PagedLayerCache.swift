@@ -1313,6 +1313,52 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
     }
 
+    /// Low-acceptance variant of `attendColumnsPreWritten` fusing `output * sigmoid(gate)`
+    /// (+ optional ModelOpt FP8 activation cast when `fp8OutputProj` is provided) directly
+    /// into the one-pass paged attention epilogue (0-ULP). Returns `fusedApplied == false`
+    /// when falling back to plain attention so the caller runs the unfused gate/cast.
+    public func attendColumnsPreWrittenFusedGate(
+        queriesBLHD: MLXArray, scale: Float, sinks: MLXArray?,
+        gateBLHD: MLXArray, fp8OutputProj: ModelOptCalibratedLinear? = nil
+    ) -> (output: MLXArray, fusedApplied: Bool) {
+        var fp8Mu: MLXArray? = nil
+        var fp8Bd: MLXArray? = nil
+        if let fp8 = fp8OutputProj {
+            guard let constants = fp8.graphConstants,
+                case .fp8(let mu, let bd) = constants.storage
+            else {
+                return (attendColumnsPreWritten(queriesBLHD: queriesBLHD, scale: scale, sinks: sinks), false)
+            }
+            fp8Mu = mu
+            fp8Bd = bd
+        }
+        let (b, l, qh, d) = (
+            queriesBLHD.dim(0), queriesBLHD.dim(1), queriesBLHD.dim(2), queriesBLHD.dim(3))
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let group = pool.group(pagedRows[0].groupKey)
+        let (descriptors, dynTreeMeta) = buildColumnsAsRowsDescriptors(rows: pagedRows, b: b, l: l)
+        let res = PagedSegmentAttention.decodeWithFusedGate(
+            queries: queriesBLHD.reshaped(b * l, qh, d),
+            gate: gateBLHD.reshaped(b * l, qh, d),
+            fp8Multipliers: fp8Mu, fp8OverflowBound: fp8Bd,
+            group: group, rows: descriptors,
+            sinks: preparedSinks(effectiveSinks), params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            treeMeta: dynTreeMeta)
+        mtpColumnsAsRowsCalls += 1
+        advancePositionOffsets(by: l)
+        let output = res.output.reshaped(b, l, qh, d)
+        let finished = finishAttentionCall(
+            output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
+        return (finished, res.fusedApplied)
+    }
+
     private func buildColumnsAsRowsDescriptors(rows: [PagedSequenceKV], b: Int, l: Int)
         -> (descriptors: [PagedSegmentDispatchPlan.Row], dynTreeMeta: MLXArray?)
     {

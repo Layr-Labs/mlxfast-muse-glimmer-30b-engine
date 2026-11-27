@@ -222,6 +222,86 @@ enum PagedSegmentAttention {
         }
     }
 
+    /// Variant of `decode` that fuses `output * sigmoid(gate)` (+ optional ModelOpt FP8 cast)
+    /// into the one-pass paged attention epilogue when eligible and `fusedGateActive`.
+    /// Falls back transparently to stock `decode` (`fusedApplied == false`) otherwise.
+    static func decodeWithFusedGate(
+        queries: MLXArray, gate: MLXArray,
+        fp8Multipliers: MLXArray?, fp8OverflowBound: MLXArray?,
+        group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
+        sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        zeroFilledScratch: Bool = false,
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil,
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        treeMeta: MLXArray? = nil
+    ) -> (output: MLXArray, fusedApplied: Bool) {
+        var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
+        if !group.writeValidation.isFaulted,
+            sinks == nil, dispatchCache != nil, PagedOnePassAttention.fusedGateActive,
+            !PagedOnePassAttention.checks,
+            group.dtype == .bfloat16, gate.dtype == .bfloat16,
+            q.ndim == 3, q.dim(0) == rows.count
+        {
+            let dtype = group.dtype
+            let b = q.dim(0)
+            let qh = q.dim(1)
+            let d = q.dim(2)
+            let kvh = group.key.kvHeads
+            if d == group.key.headDim, qh % kvh == 0, gate.shape == [b, qh, d] {
+                let gqa = qh / kvh
+                if let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa) {
+                    let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
+                    let splits = gqa / hpt
+                    let (seqinfo, maxLength) =
+                        seqinfoCache?.seqinfo(rows.map(\.info))
+                        ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
+                    let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
+                        PagedAttentionKernel.partitionTokensForDispatch(
+                            maxAttendLength: maxLength, batch: b, kvHeads: kvh,
+                            headSplits: splits, pageSize: group.pageSize),
+                        pageSize: group.pageSize)
+                    let prepared =
+                        dispatchCache?.prepare(
+                            rows: rows, group: group, partitionTokens: ptok, hasWrite: false)
+                        ?? PagedSegmentPreparedDispatch(
+                            rows: rows, group: group, partitionTokens: ptok, hasWrite: false)
+                    let plan = prepared.plan
+                    if plan.buckets.count == 1,
+                        let heads = PagedOnePassAttention.eligible(
+                            headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions,
+                            rows: b, dynTree: treeMeta != nil)
+                    {
+                        if q.dtype != dtype { q = q.asType(dtype) }
+                        let bucket = plan.buckets[0]
+                        var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
+                        backing.append(
+                            contentsOf: repeatElement(
+                                backing[0], count: bucket.bindingClass - backing.count))
+                        let result = PagedOnePassAttention.segmentsFusedGate(
+                            queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                            previous: group.writeFence,
+                            valueOffsets: prepared.metadata[0].valueOffsets,
+                            records: prepared.metadata[0].records,
+                            gate: gate, fp8Multipliers: fp8Multipliers,
+                            fp8OverflowBound: fp8OverflowBound,
+                            dtype: dtype, kvHeads: kvh, pageSize: group.pageSize, hpt: heads,
+                            simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                            source: source, treeMeta: treeMeta, maxPart: plan.maxPartitions)
+                        group.writeFence = result.fence
+                        return (result.out, true)
+                    }
+                }
+            }
+        }
+        let plain = decode(
+            queries: queries, newKeys: nil, newValues: nil, group: group, rows: rows,
+            sinks: sinks, params: params, softcap: softcap, source: source,
+            dispatchCache: dispatchCache, zeroFilledScratch: zeroFilledScratch,
+            seqinfoCache: seqinfoCache, mergeScratch: mergeScratch, treeMeta: treeMeta)
+        return (plain, false)
+    }
+
     static func decode(
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],

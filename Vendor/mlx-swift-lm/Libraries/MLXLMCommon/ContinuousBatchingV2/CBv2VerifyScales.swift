@@ -815,6 +815,250 @@ public enum CBv2VerifyScales {
         source: fp8Source,
         header: fp8Header)
 
+    // MARK: FP8 BLD + vec512 + packed tree (low-acceptance verify)
+
+    /// `CBV2_FP8_BLD`: `0` disables the low-acceptance branchless half2 SIMD FP8
+    /// verify kernel (`cbv2_verify_scales_fp8_bld`, default `1`).
+    public static let fp8BldEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_BLD"] != "0"
+    private static let fp8BldLock = NSLock()
+    nonisolated(unsafe) private static var fp8BldVerified = false
+    /// Load-time self-checks only: forces the stock `cbv2_verify_scales_fp8` kernel.
+    nonisolated(unsafe) static var fp8BldSuspended = false
+
+    public static var fp8BldActive: Bool {
+        fp8BldEnvEnabled && !fp8BldSuspended
+            && fp8BldLock.withLock { fp8BldVerified }
+            && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+    }
+
+    static let fp8BldHeader = """
+        #define CB_W6_UNROLL _Pragma("clang loop unroll(full)")
+
+        // Branchless 2-byte FP8 E4M3 -> half2 decode for bytes 0 & 2 (`lo`) and
+        // bytes 1 & 3 (`hi`). Bit-exact to `(code & 0x7F) == 0x7F ? qNaN : modelopt_e4m3_value(code)`
+        // for all 256 byte values including -0.0 (0x80) and NaN (0x7F / 0xFF).
+        inline half2 cb_w6_e4m3_lo(uint w) {
+            const uint v = w & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((w & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        inline half2 cb_w6_e4m3_hi(uint w) {
+            const uint v = (w >> 1) & 0x3F803F80u;
+            const uint u = v | ((v + 0x00800080u) & 0x40004000u) | (w & 0x80008000u);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        template <typename T>
+        inline void cb_w6_decode4_bld(uint w, float scale, thread T* out) {
+            const half2 h02 = cb_w6_e4m3_lo(w);
+            const half2 h13 = cb_w6_e4m3_hi(w);
+            out[0] = static_cast<T>(static_cast<float>(h02.x) * scale);
+            out[1] = static_cast<T>(static_cast<float>(h13.x) * scale);
+            out[2] = static_cast<T>(static_cast<float>(h02.y) * scale);
+            out[3] = static_cast<T>(static_cast<float>(h13.y) * scale);
+        }
+
+        template <int C, int OFF>
+        inline void cb_w6_tree_step(thread float* x, ushort lid) {
+            if constexpr (C >= 2) {
+                constexpr int H = C / 2;
+                const bool up = (lid & OFF) != 0;
+                CB_W6_UNROLL
+                for (int j = 0; j < H; j++) {
+                    const float keep = up ? x[j + H] : x[j];
+                    const float send = up ? x[j] : x[j + H];
+                    const float recv = simd_shuffle_xor(send, ushort(OFF));
+                    x[j] = up ? (recv + keep) : (keep + recv);
+                }
+            } else {
+                x[0] = x[0] + simd_shuffle_down(x[0], ushort(OFF));
+            }
+        }
+        """
+
+    /// 0-ULP FP8 split-K product with branchless half2 E4M3 decode, vectorized
+    /// leftover tail (`K % 4 == 0`), streamed activation loads (eliminates the
+    /// `v_coeff[V][4]` register array), and packed shuffle-XOR reduction.
+    private static let fp8BldSource = """
+        constexpr int SN = 32;
+        constexpr int TN = 4;
+        constexpr int TM = 2;
+        constexpr int threadsN = BN * SN;
+        constexpr int blockM = BM * TM;
+        constexpr int blockN = threadsN * TN;
+        constexpr int P = V * TM;
+        static_assert(P <= 32, "at most 32 values per lane");
+        constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+        constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+        constexpr uint LOW = (1u << SH) - 1u;
+
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const float weight_scale = scale[0];
+
+        const int thrN = int(simd_lid);
+        const int sgN = BN != 1 ? int(simd_gid % BN) : 0;
+        const int simdM = BN != 1 ? int(simd_gid / BN) : int(simd_gid);
+        const int simdN = BN != 1 ? SN * sgN : 0;
+        const int bm = simdM * TM;
+        int bn = (simdN + thrN) * TN;
+        int out_row = int(threadgroup_position_in_grid.x) * blockM + bm;
+        if (out_row >= N) {
+            return;
+        }
+        out_row = out_row + TM <= N ? out_row : N - TM;
+        const device uint8_t* rows = mat + size_t(out_row) * K;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+
+        float r[P2];
+        CB_W6_UNROLL
+        for (int i = 0; i < P2; i++) {
+            r[i] = 0.0f;
+        }
+        for (int i = 0; i < n_iter; ++i) {
+            T inter[TM][TN];
+            CB_W6_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                const uint word = *(const device uint*)(rows + size_t(tm) * K + bn);
+                cb_w6_decode4_bld<T>(word, weight_scale, inter[tm]);
+            }
+            CB_W6_UNROLL
+            for (int v = 0; v < V; v++) {
+                const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                CB_W6_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av[tn]));
+                    CB_W6_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        r[v * TM + tm] += inter[tm][tn] * a;
+                    }
+                }
+            }
+            bn += blockN;
+        }
+        if (leftover > 0 && bn < K) {
+            T inter[TM][TN];
+            CB_W6_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                const uint word = *(const device uint*)(rows + size_t(tm) * K + bn);
+                cb_w6_decode4_bld<T>(word, weight_scale, inter[tm]);
+            }
+            CB_W6_UNROLL
+            for (int v = 0; v < V; v++) {
+                const ushort4 av = ushort4(*(const device packed_ushort4*)(in_vec + size_t(v) * K + bn));
+                CB_W6_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av[tn]));
+                    CB_W6_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        r[v * TM + tm] += inter[tm][tn] * a;
+                    }
+                }
+            }
+        }
+        const ushort lid = ushort(simd_lid);
+        cb_w6_tree_step<P2, 16>(r, lid);
+        cb_w6_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+        cb_w6_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+        cb_w6_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+        cb_w6_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+        const bool holds = (simd_lid & LOW) == 0;
+        const int idx = int(simd_lid >> SH);
+        threadgroup float sp_tgp[BM * 8 * 32];
+        if (BN > 1) {
+            if (holds) {
+                sp_tgp[(simdM * 8 + sgN) * 32 + idx] = r[0];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgN == 0 && holds && idx < P) {
+                float res = r[0];
+                for (int s = 1; s < BN; s++) {
+                    res += sp_tgp[(simdM * 8 + s) * 32 + idx];
+                }
+                out_vec[(idx / TM) * N + out_row + (idx % TM)] = static_cast<T>(res);
+            }
+        } else if (holds && idx < P) {
+            out_vec[(idx / TM) * N + out_row + (idx % TM)] = static_cast<T>(r[0]);
+        }
+        """
+
+    private static let fp8BldKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_scales_fp8_bld",
+        inputNames: ["mat", "scale", "in_vec"],
+        outputNames: ["out_vec"],
+        source: fp8BldSource,
+        header: fp8BldHeader)
+
+    private struct FP8BldLaunchKey: Hashable {
+        let dtype: DType
+        let bm: Int
+        let bn: Int
+        let inputs: Int
+        let outputs: Int
+        let rows: Int
+    }
+
+    nonisolated(unsafe) private static var fp8BldLaunchCache:
+        [FP8BldLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
+    /// Load-time 0-ULP parity check of `cbv2_verify_scales_fp8_bld` against stock
+    /// `cbv2_verify_scales_fp8` on non-zero BF16 inputs across 6, 7 and 8 rows.
+    /// Fail-closed on any bit mismatch or MLX error, then warms rows 6...maxRows.
+    public static func verifyFP8Bld(
+        down: ModelOptCalibratedLinear, dtype: DType, rows: ClosedRange<Int> = 6 ... 8
+    ) {
+        guard fp8BldEnvEnabled, dtype == .bfloat16 else { return }
+        let prevLow = CBv2DraftRegime.lowAcceptance
+        CBv2DraftRegime.lowAcceptance = true
+        defer {
+            CBv2DraftRegime.lowAcceptance = prevLow
+            fp8BldSuspended = false
+        }
+        let width = down.inputDimensions
+        func makeInput(_ testRows: Int) -> MLXArray {
+            var vals = [Float]()
+            vals.reserveCapacity(testRows * width)
+            for i in 0 ..< (testRows * width) {
+                vals.append(Float(((i * 13 + 7) % 31) - 15) * 0.0625)
+            }
+            return MLXArray(vals, [1, testRows, width]).asType(.bfloat16)
+        }
+        fp8BldLock.withLock { fp8BldVerified = true }
+        let passed: Bool =
+            (try? MLX.withError { errors -> Bool in
+                var diffs = [MLXArray]()
+                for testRows in [6, 7, 8] {
+                    let x = makeInput(testRows)
+                    fp8BldSuspended = true
+                    guard let ref = fp8ProductPreCast(down, preCast: x) else { return false }
+                    fp8BldSuspended = false
+                    guard let got = fp8ProductPreCast(down, preCast: x) else { return false }
+                    diffs.append(
+                        (contiguous(got).view(dtype: .uint16)
+                            .!= contiguous(ref).view(dtype: .uint16)).asType(.int32).sum())
+                }
+                let total = diffs.dropFirst().reduce(diffs.first ?? MLXArray(Int32(0))) { $0 + $1 }
+                eval(total)
+                try errors.check()
+                guard total.item(Int.self) == 0 else { return false }
+                var warm = [MLXArray]()
+                for r in rows where r >= 6 {
+                    let z = MLXArray.zeros([1, r, width], dtype: dtype)
+                    if let y = fp8ProductPreCast(down, preCast: z) {
+                        warm.append(y)
+                    }
+                }
+                if !warm.isEmpty { eval(warm) }
+                try errors.check()
+                return true
+            }) ?? false
+        fp8BldLock.withLock { fp8BldVerified = passed }
+    }
+
     /// `ModelOptRowExact.product(mat, scale:, vectors:, splitsK:, schedule: .windows)`
     /// for 1 to 8 rows of cast activations, bit for bit. `rowGroups` (BM)
     /// only schedules the work; `packedDecode`, `vectorWeights` and
@@ -831,6 +1075,29 @@ public enum CBv2VerifyScales {
                 && vectors.dim(1) == inputs)
         let bn = splitsK ? 8 : 1
         let bm = rowGroups
+        if fp8BldActive && splitsK && vectorWeights && vectorActivations
+            && (vectors.dtype == .bfloat16 || vectors.dtype == .float16)
+        {
+            let bldKey = FP8BldLaunchKey(
+                dtype: vectors.dtype, bm: bm, bn: bn, inputs: inputs, outputs: outputs,
+                rows: count)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = launchLock.withLock({ fp8BldLaunchCache[bldKey] }) {
+                launch = hit
+            } else {
+                let groups = (outputs + bm * 2 - 1) / (bm * 2)
+                let made = fp8BldKernel.prepare(
+                    template: [
+                        ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("K", inputs),
+                        ("N", outputs), ("V", count),
+                    ],
+                    grid: (groups * 32, bn, bm), threadGroup: (32, bn, bm),
+                    outputShapes: [[count, outputs]], outputDTypes: [vectors.dtype])
+                launchLock.withLock { fp8BldLaunchCache[bldKey] = made }
+                launch = made
+            }
+            return launch([mat, scale, vectors])[0]
+        }
         let key = FP8LaunchKey(
             dtype: vectors.dtype, bm: bm, bn: bn, inputs: inputs, outputs: outputs, rows: count,
             packedDecode: packedDecode, vectorWeights: vectorWeights,

@@ -637,10 +637,59 @@ inline void paged_attention_merge_impl(
 // Threadgroup memory: q_smem[HPT * D], red_smem[MAXPART * NSG * HPT * (D + 2)],
 // part_smem[MAXPART * HPT * (D + 2)] floats.
 // BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
+// Bit-exact ModelOpt E4M3 activation cast + BF16 sigmoid helpers for fused
+// one-pass paged attention epilogue (`FUSED_GATE = true`, 0-ULP).
+inline uint8_t w7_e4m3_bits(float value) {
+    uint32_t fp8_max = 543 << 21;
+    uint32_t denorm_mask = 141 << 23;
+    uint32_t f_bits = as_type<uint32_t>(value);
+    uint32_t sign = f_bits & 0x80000000;
+    f_bits ^= sign;
+    uint8_t bits;
+    if (f_bits >= fp8_max) {
+        bits = 0x7E;
+    } else if (f_bits < (121 << 23)) {
+        f_bits = as_type<uint32_t>(
+            as_type<float>(f_bits) + as_type<float>(denorm_mask));
+        bits = static_cast<uint8_t>(f_bits - denorm_mask);
+    } else {
+        uint8_t mant_odd = (f_bits >> 20) & 1;
+        f_bits += ((uint32_t)(7 - 127) << 23) + 0x7FFFF;
+        f_bits += mant_odd;
+        bits = static_cast<uint8_t>(f_bits >> 20);
+    }
+    return bits | static_cast<uint8_t>(sign >> 24);
+}
+
+inline float w7_e4m3_value(uint8_t bits) {
+    half converted = as_type<half>(static_cast<uint16_t>((bits & 127) << 7));
+    converted *= 256.0;
+    return static_cast<float>((bits & 128) ? -converted : converted);
+}
+
+inline bfloat16_t w7_bf16_sigmoid(bfloat16_t x) {
+    bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+    bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+    bfloat16_t one = bfloat16_t(1.0f);
+    bfloat16_t y = one / (one + ey);
+    return (x < bfloat16_t(0.0f)) ? y : (one - y);
+}
+
+inline bfloat16_t w7_bf16_cast_fp8(
+    bfloat16_t yb, float m0, float m1, float bound, float nan_value
+) {
+    float scaled = static_cast<float>(yb) * m0;
+    uint8_t bits = w7_e4m3_bits(scaled);
+    float decoded = (bits & 0x7F) == 0x7F ? nan_value : w7_e4m3_value(bits);
+    bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+    return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+}
+
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
-    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false>
+    bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
+    bool FUSED_GATE = false, bool CAST_FP8 = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -657,7 +706,11 @@ inline void paged_attention_onepass_impl(
     uint3 tpitg,
     uint sgitg,
     uint lane,
-    const device int32_t* tree_meta = nullptr
+    const device int32_t* tree_meta = nullptr,
+    const device bfloat16_t* gate = nullptr,
+    float fp8_m0 = 1.0f,
+    float fp8_m1 = 1.0f,
+    float fp8_bound = 448.0f
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -900,10 +953,28 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t row_off = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + row_off;
+            if constexpr (FUSED_GATE) {
+                const device bfloat16_t* grow = gate + row_off;
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
 #pragma unroll
-            for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                for (int e = 0; e < EPT; e++) {
+                    const bfloat16_t ob = static_cast<bfloat16_t>(gacc[e] * inv);
+                    const bfloat16_t gb = grow[lane * EPT + e];
+                    const bfloat16_t yb = ob * w7_bf16_sigmoid(gb);
+                    if constexpr (CAST_FP8) {
+                        orow[lane * EPT + e] = static_cast<T>(
+                            w7_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value));
+                    } else {
+                        orow[lane * EPT + e] = static_cast<T>(yb);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    orow[lane * EPT + e] = T(gacc[e] * inv);
+                }
             }
         }
     }
