@@ -420,9 +420,20 @@ extension MuseGlimmerTextModel {
                 posDeltas: treePos,
                 treeMeta: dynTreeMeta,
                 target: target)
+            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
+            if x.dtype == .bfloat16, gate.dtype == .bfloat16, verifyRows(p[3]) != nil,
+                a.outputProj is ModelOptWeightOnlyNVFP4Linear,
+                !MuseGlimmerVerifyProjections.selfTest
+            {
+                let gated = paged.attendColumnsPreWritten(
+                    queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil,
+                    outputGate: (gate, { output, gate in
+                        MuseGlimmerFusion.sigmoidGate([output, gate])[0]
+                    }))
+                return verifyOutputProjection(a.outputProj, gated.reshaped(batch, length, -1))
+            }
             let outputBLHD = paged.attendColumnsPreWritten(
                 queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil)
-            let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
             if let fp8 = a.outputProj as? ModelOptCalibratedLinear,
                 verifyRows(p[3]) != nil,
                 let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(

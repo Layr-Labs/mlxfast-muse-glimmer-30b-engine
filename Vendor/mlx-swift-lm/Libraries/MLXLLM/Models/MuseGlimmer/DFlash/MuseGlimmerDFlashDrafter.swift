@@ -148,9 +148,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// calls; gated on low-acceptance rounds to keep high-acceptance Pair 1 untouched).
     private static let fusedProjEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_PROJ"] != "0"
+    /// `CBV2_DRAFTER_NVFP4=0`: disables deep-low `.nvfp4` (4b g16 E4M3) M5 NAX drafter copies.
+    private static let nvfp4DrafterEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DRAFTER_NVFP4"] != "0"
+    /// `CBV2_DFLASH_ZEROCOPY_BLK=0`: disables zero-copy in-place block K/V ring tail writes.
+    private static let zeroCopyBlockKVEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_ZEROCOPY_BLK"] != "0"
     private let fusedContextKV: QuantizedLinear?
     private let fusedBlockQKV: [QuantizedLinear]
     private let fusedLastKV: QuantizedLinear?
+    /// Deep-low-acceptance `.nvfp4` (4b g16 E4M3) drafter copies built directly from the
+    /// pinned 8-bit/5-bit artifact weights with power-of-2 prescaling folded into norms and
+    /// epilogues (0 extra dispatches; 100% M5 `nvfp4_qmv_nax` across all 18 drafter GEMMs).
+    /// Strictly gated on `CBv2DraftRegime.xnorDraftHeadEligible` (0% Pair 1).
+    private let nvfp4Drafter: NVFP4DrafterState?
     /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
     /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
     /// than the target's row-exact verify kernel: the same E2M1 x E4M3
@@ -196,6 +207,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         maskEmbedding = mask.asType(model.activationDType)
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
+        // Build `.nvfp4` copies BEFORE `requantize8BitLayers` so `encoder.fc` and
+        // `self_attn.{q,k,v,o}_proj` quantize directly from pristine 8-bit weights.
+        nvfp4Drafter = NVFP4DrafterState(model)
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
         let fused = Self.buildFusedAttentionProjections(model)
@@ -355,6 +369,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 // so MLX's quantized matvec (`affine_qmv_wide` / `fp_qmv`) never compiles inside
                 // a timed decode window.
                 let prevLow = CBv2DraftRegime.lowAcceptance
+                let prevDeep = CBv2DraftRegime.xnorDraftHeadEligible
+                CBv2DraftRegime.xnorDraftHeadEligible = false
                 for rows in 1 ... (settings.maximumDraftTokens + 1) {
                     let dummyFeat = MLXArray.zeros(
                         [rows, c.contextWidth], dtype: model.activationDType)
@@ -367,6 +383,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         let kvLo = speculativeContextKeyValues(projCtx, at: 0)
                         warm += [kvLo.keys, kvLo.values]
                     }
+                    if nvfp4Drafter != nil {
+                        CBv2DraftRegime.lowAcceptance = true
+                        CBv2DraftRegime.xnorDraftHeadEligible = true
+                        let kvNV = speculativeProjectAndContextKV(dummyFeat, at: 0)
+                        warm += [kvNV.keys, kvNV.values]
+                        CBv2DraftRegime.xnorDraftHeadEligible = false
+                    }
                     if rows <= settings.maximumDraftTokens {
                         let dummyH = MLXArray.zeros(
                             [1, rows, c.hiddenSize], dtype: model.activationDType)
@@ -375,11 +398,29 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             warm.append(draftMLP(0, firstLayer.mlp, dummyH))
                             CBv2DraftRegime.lowAcceptance = true
                             warm.append(draftMLP(0, firstLayer.mlp, dummyH))
+                            if nvfp4Drafter != nil {
+                                CBv2DraftRegime.xnorDraftHeadEligible = true
+                                warm.append(draftMLP(0, firstLayer.mlp, dummyH, useNVFP4: true))
+                                CBv2DraftRegime.xnorDraftHeadEligible = false
+                            }
                         }
                         let dummyHeadIn = MLXArray.zeros(
                             [rows, c.hiddenSize], dtype: model.activationDType)
                         warm.append(draftHeadProduct(dummyHeadIn, readout: false))
                     }
+                }
+                if let nv = nvfp4Drafter, let firstLayer = model.layers.first {
+                    let dummyBlockH = MLXArray.zeros(
+                        [1, c.blockSize, c.hiddenSize], dtype: model.activationDType)
+                    CBv2DraftRegime.lowAcceptance = true
+                    CBv2DraftRegime.xnorDraftHeadEligible = true
+                    warm.append(draftMLP(0, firstLayer.mlp, dummyBlockH, useNVFP4: true))
+                    warm.append(nv.fusedBlockQKV[0](dummyBlockH))
+                    let dummyO = MLXArray.zeros(
+                        [1, c.blockSize, c.attentionHeads * c.headDimensions],
+                        dtype: model.activationDType)
+                    warm.append(nv.oProj[0](dummyO))
+                    CBv2DraftRegime.xnorDraftHeadEligible = false
                 }
                 warm.append(
                     concatenated(
@@ -405,6 +446,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         cols.reshaped([1, ctxLen + c.blockSize]),
                         to: [c.blockSize, ctxLen + c.blockSize])
                     CBv2DraftRegime.lowAcceptance = true
+                    CBv2DraftRegime.xnorDraftHeadEligible = false
                     let maskedRows = fastDraftBlockRows(
                         embeddings: dummyEmb, at: ctxLen, context: (ck, cv), mask: mask2d,
                         draftCount: settings.maximumDraftTokens, devicePosition: devPos)
@@ -414,6 +456,58 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         draftCount: settings.maximumDraftTokens)
                     eval(maskedRows, unmaskedRows)
                 }
+                if (nvfp4Drafter != nil || Self.zeroCopyBlockKVEnabled),
+                    c.slidingWindow >= 528 + c.blockSize
+                {
+                    let warmRK = MLXArray.zeros(
+                        [c.hiddenLayers, c.kvHeads, c.slidingWindow, c.headDimensions],
+                        dtype: model.activationDType)
+                    let warmRV = MLXArray.zeros(
+                        [c.hiddenLayers, c.kvHeads, c.slidingWindow, c.headDimensions],
+                        dtype: model.activationDType)
+                    let warmFence = MLXArray.zeros([1], dtype: .int32)
+                    eval(warmRK, warmRV, warmFence)
+                    CBv2DraftRegime.lowAcceptance = true
+                    CBv2DraftRegime.xnorDraftHeadEligible = true
+                    for ctxLen in [520, 528] {
+                        let tail = FastInPlaceContext.BlockTailContext(
+                            ringKeys: warmRK, ringValues: warmRV, dstSlot: ctxLen,
+                            window: c.slidingWindow, fence: warmFence)
+                        let cols = MLXArray.ones([ctxLen + c.blockSize], type: Bool.self)
+                        let mask2d = broadcast(
+                            cols.reshaped([1, ctxLen + c.blockSize]),
+                            to: [c.blockSize, ctxLen + c.blockSize])
+                        var outFence1: MLXArray? = nil
+                        let zcUnmasked = fastDraftBlockRows(
+                            embeddings: dummyEmb, at: ctxLen, context: nil, mask: nil,
+                            draftCount: settings.maximumDraftTokens,
+                            ringTail: tail, outBlockFence: &outFence1)
+                        eval(zcUnmasked)
+                        let tail2 = FastInPlaceContext.BlockTailContext(
+                            ringKeys: warmRK, ringValues: warmRV, dstSlot: ctxLen,
+                            window: c.slidingWindow, fence: outFence1 ?? warmFence)
+                        var outFence2: MLXArray? = nil
+                        let zcMasked = fastDraftBlockRows(
+                            embeddings: dummyEmb, at: ctxLen, context: nil, mask: mask2d,
+                            draftCount: settings.maximumDraftTokens, devicePosition: devPos,
+                            ringTail: tail2, outBlockFence: &outFence2)
+                        eval(zcMasked)
+                    }
+                    if let epilogue = contextKeyEpilogue, let lastLayer = model.layers.last {
+                        let posArr = MLXArray([Int32(512)])
+                        for r in 1 ... settings.maximumDraftTokens {
+                            let qDummy = MLXArray.zeros(
+                                [1, r, c.attentionHeads * c.headDimensions],
+                                dtype: model.activationDType)
+                            warm.append(
+                                Self.applyBlockQEpilogue(
+                                    qRaw: qDummy, qNormWeight: lastLayer.attention.qNorm.weight,
+                                    posScalar: posArr, coeffs: epilogue.coefficients,
+                                    attentionHeads: c.attentionHeads, rows: r))
+                        }
+                    }
+                }
+                CBv2DraftRegime.xnorDraftHeadEligible = prevDeep
                 CBv2DraftRegime.lowAcceptance = prevLow
             }
             eval(warm)
@@ -660,6 +754,31 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         func recordSpeculativeRead(_ dep: MLXArray) {
             speculativeReadDeps.append(dep)
+        }
+
+        struct BlockTailContext {
+            let ringKeys: MLXArray
+            let ringValues: MLXArray
+            let dstSlot: Int
+            let window: Int
+            let fence: MLXArray
+        }
+
+        /// Reserves the contiguous unused ring tail `[count + offset ..< count + offset + blockSize)`
+        /// for zero-copy in-place block K/V writes without advancing `nextPosition`.
+        func beginBlockTail(offset: Int, blockSize: Int) -> BlockTailContext? {
+            guard inPlaceRing, let keys, let values,
+                offset >= 0, firstPosition == basePosition, count + offset + blockSize <= window
+            else { return nil }
+            consumeReadBarriers()
+            return BlockTailContext(
+                ringKeys: keys, ringValues: values, dstSlot: count + offset,
+                window: window, fence: writeFence)
+        }
+
+        func finishBlockTail(fence: MLXArray, readDep: MLXArray) {
+            writeFence = fence
+            speculativeReadDeps.append(readDep)
         }
 
         func append(keys newKeys: MLXArray, values newValues: MLXArray, skipping: Int = 0) {
@@ -1059,24 +1178,40 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             (CBv2DraftRegime.activeDynamicTreeK >= 2)
             ? min(settings.maximumDraftTokens, CBv2DraftRegime.activeDynamicTreeK)
             : settings.maximumDraftTokens
+        let ringTail: FastInPlaceContext.BlockTailContext? =
+            (CBv2DraftRegime.xnorDraftHeadEligible && Self.zeroCopyBlockKVEnabled
+                && visible != nil && visible?.mask == nil)
+            ? s.context.beginBlockTail(offset: 0, blockSize: c.blockSize) : nil
+        var blockFence: MLXArray? = nil
         let rows = fastDraftBlockRows(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: activeDraftCount)
+            draftCount: activeDraftCount,
+            ringTail: ringTail, outBlockFence: &blockFence)
+        if let blockFence {
+            s.context.finishBlockTail(fence: blockFence, readDep: rows)
+        }
         let dynK = CBv2DraftRegime.activeDynamicTreeK
         if s.selection == nil, CBv2DraftRegime.lowAcceptance, CBv2DraftRegime.xnorDraftHeadEligible,
             rows.ndim == 2, rows.dim(0) == activeDraftCount,
-            dynK >= 2, dynK <= rows.dim(0), rows.dim(0) <= 7,
+            rows.dim(0) <= 7,
             let comp = compressedDraftHead,
             let p = comp.dynamicTreePartials(rows, params: dynTreeParams)
         {
-            let dyn = Self.fastDynamicTreeStage2(
-                p.val, p.idx, p.sum, k: dynK, vocab: target.dflashVocabularySize,
-                params: dynTreeParams)
-            CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
-            s.memo = (dyn.tokens, rows)
-            return nil
+            if dynK >= 2, dynK <= rows.dim(0) {
+                let dyn = Self.fastDynamicTreeStage2(
+                    p.val, p.idx, p.sum, k: dynK, vocab: target.dflashVocabularySize,
+                    params: dynTreeParams)
+                CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
+                s.memo = (dyn.tokens, rows)
+                return nil
+            } else if dynK == 0, CBv2DraftRegime.activeVerifyTree == nil {
+                let tokens = Self.fastDynamicTreeArgMax(
+                    p.val, p.idx, vocab: target.dflashVocabularySize)
+                s.memo = (tokens, rows)
+                return nil
+            }
         }
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [activeDraftCount, target.dflashVocabularySize] else {
@@ -1410,6 +1545,178 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             *(device vec<bfloat16_t, 4>*)dst = out4;
             """)
 
+    private static let blockQKVEpilogueInPlaceKernel = MLXFast.metalKernel(
+        name: "dflash_block_qkv_epilogue_inplace",
+        inputNames: [
+            "qkv", "qw", "kw", "pos_in", "params", "ring_k", "ring_v", "meta", "prev_fence",
+        ],
+        outputNames: ["q_out", "fence"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = threadgroup_position_in_grid.y;
+            if (group == 0u && lane == 0u) {
+                fence[0] = prev_fence[0] + 1;
+            }
+            const uint row = group % uint(B_);
+            const uint h_all = group / uint(B_);
+            const uint total_h = uint(HQ_ + 2 * HKV_);
+            const uint layer = uint(meta[0]);
+            const uint dst_slot = uint(meta[1]) + row;
+            const device bfloat16_t* src =
+                qkv + (size_t(row) * size_t(total_h) + size_t(h_all)) * 128u + lane * 4u;
+            if (h_all >= uint(HQ_ + HKV_)) {
+                const uint vh = h_all - uint(HQ_ + HKV_);
+                device bfloat16_t* dst =
+                    ring_v + ((size_t(layer) * size_t(HKV_) + size_t(vh)) * size_t(W_) + size_t(dst_slot)) * 128u + lane * 4u;
+                *(device vec<bfloat16_t, 4>*)dst = *(const device vec<bfloat16_t, 4>*)src;
+                return;
+            }
+            const bool is_q = h_all < uint(HQ_);
+            const uint h_idx = is_q ? h_all : (h_all - uint(HQ_));
+            const vec<bfloat16_t, 4> wv = *(const device vec<bfloat16_t, 4>*)((is_q ? qw : kw) + lane * 4u);
+            device bfloat16_t* dst =
+                (is_q
+                    ? q_out + (size_t(h_idx) * size_t(B_) + size_t(row)) * 128u
+                    : ring_k + ((size_t(layer) * size_t(HKV_) + size_t(h_idx)) * size_t(W_) + size_t(dst_slot)) * 128u)
+                + lane * 4u;
+            const vec<bfloat16_t, 4> sv = *(const device vec<bfloat16_t, 4>*)src;
+            float x[4];
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = float(sv[i]);
+                sum += x[i] * x[i];
+            }
+            sum = simd_sum(sum);
+            sum = simd_sum(lane == 0 ? sum : 0.0f);
+            const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
+            const bool low = lane < 16;
+            const float pos = float(pos_in[0] + int(row));
+            vec<bfloat16_t, 4> out4;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                const bfloat16_t norm = wv[i] * static_cast<bfloat16_t>(x[i] * inv);
+                const float v = static_cast<float>(norm);
+                const float other = simd_shuffle_xor(v, ushort(16));
+                const float d = float((lane % 16) * 4 + i) / 64.0f;
+                const float theta = pos * metal::exp2(-d * params[1]);
+                const float c = metal::fast::cos(theta);
+                const float s = metal::fast::sin(theta);
+                const float x1 = low ? v : other;
+                const float x2 = low ? other : v;
+                out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+            }
+            *(device vec<bfloat16_t, 4>*)dst = out4;
+            """,
+        ensureRowContiguous: false,
+        mutableInputs: ["ring_k", "ring_v"])
+
+    private static let blockKVEpilogueInPlaceKernel = MLXFast.metalKernel(
+        name: "dflash_block_kv_epilogue_inplace",
+        inputNames: [
+            "kv", "kw", "pos_in", "params", "ring_k", "ring_v", "meta", "prev_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = threadgroup_position_in_grid.y;
+            if (group == 0u && lane == 0u) {
+                fence[0] = prev_fence[0] + 1;
+            }
+            const uint row = group % uint(B_);
+            const uint h_all = group / uint(B_);
+            const uint total_h = uint(2 * HKV_);
+            const uint layer = uint(meta[0]);
+            const uint dst_slot = uint(meta[1]) + row;
+            const device bfloat16_t* src =
+                kv + (size_t(row) * size_t(total_h) + size_t(h_all)) * 128u + lane * 4u;
+            if (h_all >= uint(HKV_)) {
+                const uint vh = h_all - uint(HKV_);
+                device bfloat16_t* dst =
+                    ring_v + ((size_t(layer) * size_t(HKV_) + size_t(vh)) * size_t(W_) + size_t(dst_slot)) * 128u + lane * 4u;
+                *(device vec<bfloat16_t, 4>*)dst = *(const device vec<bfloat16_t, 4>*)src;
+                return;
+            }
+            const vec<bfloat16_t, 4> wv = *(const device vec<bfloat16_t, 4>*)(kw + lane * 4u);
+            device bfloat16_t* dst =
+                ring_k + ((size_t(layer) * size_t(HKV_) + size_t(h_all)) * size_t(W_) + size_t(dst_slot)) * 128u + lane * 4u;
+            const vec<bfloat16_t, 4> sv = *(const device vec<bfloat16_t, 4>*)src;
+            float x[4];
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = float(sv[i]);
+                sum += x[i] * x[i];
+            }
+            sum = simd_sum(sum);
+            sum = simd_sum(lane == 0 ? sum : 0.0f);
+            const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
+            const bool low = lane < 16;
+            const float pos = float(pos_in[0] + int(row));
+            vec<bfloat16_t, 4> out4;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                const bfloat16_t norm = wv[i] * static_cast<bfloat16_t>(x[i] * inv);
+                const float v = static_cast<float>(norm);
+                const float other = simd_shuffle_xor(v, ushort(16));
+                const float d = float((lane % 16) * 4 + i) / 64.0f;
+                const float theta = pos * metal::exp2(-d * params[1]);
+                const float c = metal::fast::cos(theta);
+                const float s = metal::fast::sin(theta);
+                const float x1 = low ? v : other;
+                const float x2 = low ? other : v;
+                out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+            }
+            *(device vec<bfloat16_t, 4>*)dst = out4;
+            """,
+        ensureRowContiguous: false,
+        mutableInputs: ["ring_k", "ring_v"])
+
+    private static let blockQEpilogueKernel = MLXFast.metalKernel(
+        name: "dflash_block_q_epilogue",
+        inputNames: ["q_in", "qw", "pos_in", "params"],
+        outputNames: ["q_out"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = threadgroup_position_in_grid.y;
+            const uint row = group % uint(R_);
+            const uint h_idx = group / uint(R_);
+            const device bfloat16_t* src =
+                q_in + (size_t(row) * size_t(HQ_) + size_t(h_idx)) * 128u + lane * 4u;
+            const vec<bfloat16_t, 4> wv = *(const device vec<bfloat16_t, 4>*)(qw + lane * 4u);
+            device bfloat16_t* dst =
+                q_out + (size_t(h_idx) * size_t(R_) + size_t(row)) * 128u + lane * 4u;
+            const vec<bfloat16_t, 4> sv = *(const device vec<bfloat16_t, 4>*)src;
+            float x[4];
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = float(sv[i]);
+                sum += x[i] * x[i];
+            }
+            sum = simd_sum(sum);
+            sum = simd_sum(lane == 0 ? sum : 0.0f);
+            const float inv = metal::precise::rsqrt(sum / 128u + params[0]);
+            const bool low = lane < 16;
+            const float pos = float(pos_in[0] + 1 + int(row));
+            vec<bfloat16_t, 4> out4;
+            #pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                const bfloat16_t norm = wv[i] * static_cast<bfloat16_t>(x[i] * inv);
+                const float v = static_cast<float>(norm);
+                const float other = simd_shuffle_xor(v, ushort(16));
+                const float d = float((lane % 16) * 4 + i) / 64.0f;
+                const float theta = pos * metal::exp2(-d * params[1]);
+                const float c = metal::fast::cos(theta);
+                const float s = metal::fast::sin(theta);
+                const float x1 = low ? v : other;
+                const float x2 = low ? other : v;
+                out4[i] = static_cast<bfloat16_t>(low ? x1 * c - x2 * s : x1 * s + x2 * c);
+            }
+            *(device vec<bfloat16_t, 4>*)dst = out4;
+            """,
+        ensureRowContiguous: true)
+
     private static let addRmsNormKernel = MLXFast.metalKernel(
         name: "dflash_add_rmsnorm",
         inputNames: ["res", "delta", "w", "params"],
@@ -1430,6 +1737,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 (device vec<bfloat16_t, 4>*)(h_out + size_t(row) * D_);
             device vec<bfloat16_t, 4>* y4 =
                 (device vec<bfloat16_t, 4>*)(y_out + size_t(row) * D_);
+            const float dscale = SCALE_DELTA_ ? params[1] : 1.0f;
             float buf[MAX_IT][4];
             float sum = 0.0f;
             uint it = 0u;
@@ -1439,7 +1747,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 vec<bfloat16_t, 4> hv;
                 #pragma unroll
                 for (uint k = 0; k < 4; ++k) {
-                    const bfloat16_t h = rv[k] + dv[k];
+                    const bfloat16_t d_eff = SCALE_DELTA_
+                        ? static_cast<bfloat16_t>(float(dv[k]) * dscale) : dv[k];
+                    const bfloat16_t h = rv[k] + d_eff;
                     hv[k] = h;
                     const float fv = float(h);
                     buf[it][k] = fv;
@@ -1502,44 +1812,80 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             """,
         ensureRowContiguous: true)
 
+    private static let splitSiluMulScaledKernel = MLXFast.metalKernel(
+        name: "dflash_split_silu_mul_scaled",
+        inputNames: ["gu", "scale_in"],
+        outputNames: ["y"],
+        source: """
+            const uint col4 = thread_position_in_grid.x;
+            if (col4 >= uint(M4_)) { return; }
+            const uint row = threadgroup_position_in_grid.y;
+            const device vec<bfloat16_t, 4>* g4 = (const device vec<bfloat16_t, 4>*)gu;
+            device vec<bfloat16_t, 4>* y4 = (device vec<bfloat16_t, 4>*)y;
+            const size_t base = size_t(row) * size_t(2u * M4_) + size_t(col4);
+            const vec<bfloat16_t, 4> gv = g4[base];
+            const vec<bfloat16_t, 4> uv = g4[base + size_t(M4_)];
+            const float out_scale = scale_in[0];
+            vec<bfloat16_t, 4> out;
+            const bfloat16_t one = bfloat16_t(1.0f);
+            #pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                const bfloat16_t g = gv[k];
+                const bfloat16_t ax = (g < bfloat16_t(0.0f)) ? -g : g;
+                const bfloat16_t ey =
+                    static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+                const bfloat16_t s = one / (one + ey);
+                const bfloat16_t sig = (g < bfloat16_t(0.0f)) ? s : (one - s);
+                out[k] = static_cast<bfloat16_t>(float((g * sig) * uv[k]) * out_scale);
+            }
+            y4[size_t(row) * size_t(M4_) + size_t(col4)] = out;
+            """,
+        ensureRowContiguous: true)
+
     private final class DrafterLaunchBox: @unchecked Sendable {
         var ctxKV: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var blkQKV: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var blkKV: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var blkQKVInPlace: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var blkKVInPlace: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var blkQ: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var addNorm: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var splitSilu: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
-        var epsArr: [UInt32: MLXArray] = [:]
+        var splitSiluScaled: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var epsScaleArr: [UInt64: MLXArray] = [:]
     }
 
     private static let drafterLaunchLock = OSAllocatedUnfairLock(initialState: DrafterLaunchBox())
 
     private static func fusedAddRMSNorm(
-        residual: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float
+        residual: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float, deltaScale: Float = 1.0
     ) -> (h: MLXArray, y: MLXArray) {
         let rows = residual.dim(1)
         let d = residual.dim(2)
-        let key = (UInt64(rows) << 32) | UInt64(d)
-        let (launch, epsArr): (MLXFast.MLXFastKernel.Launch, MLXArray) =
+        let scaleDelta = deltaScale != 1.0
+        let key = (UInt64(rows) << 33) | (UInt64(d) << 1) | (scaleDelta ? 1 : 0)
+        let pKey = (UInt64(eps.bitPattern) << 32) | UInt64(deltaScale.bitPattern)
+        let (launch, paramsArr): (MLXFast.MLXFastKernel.Launch, MLXArray) =
             drafterLaunchLock.withLockUnchecked { box in
                 let p: MLXArray
-                if let hit = box.epsArr[eps.bitPattern] {
+                if let hit = box.epsScaleArr[pKey] {
                     p = hit
                 } else {
-                    let a = MLXArray([eps])
+                    let a = MLXArray([eps, deltaScale])
                     eval(a)
-                    box.epsArr[eps.bitPattern] = a
+                    box.epsScaleArr[pKey] = a
                     p = a
                 }
                 if let hit = box.addNorm[key] { return (hit, p) }
                 let made = addRmsNormKernel.prepare(
-                    template: [("D_", d)],
+                    template: [("D_", d), ("SCALE_DELTA_", scaleDelta)],
                     grid: (256, rows, 1), threadGroup: (256, 1, 1),
                     outputShapes: [[1, rows, d], [1, rows, d]],
                     outputDTypes: [.bfloat16, .bfloat16])
                 box.addNorm[key] = made
                 return (made, p)
             }
-        let out = launch([residual, delta, weight, epsArr])
+        let out = launch([residual, delta, weight, paramsArr])
         return (out[0], out[1])
     }
 
@@ -1560,6 +1906,44 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return made
         }
         return launch([gu])[0]
+    }
+
+    private static func splitSiluMulScaled(_ gu: MLXArray, scaleArr: MLXArray) -> MLXArray {
+        let rows = gu.dim(1)
+        let mid = gu.dim(2) / 2
+        let mid4 = mid / 4
+        let key = (UInt64(rows) << 32) | UInt64(mid4)
+        let launch: MLXFast.MLXFastKernel.Launch = drafterLaunchLock.withLockUnchecked { box in
+            if let hit = box.splitSiluScaled[key] { return hit }
+            let tg = 256
+            let gridX = ((mid4 + tg - 1) / tg) * tg
+            let made = splitSiluMulScaledKernel.prepare(
+                template: [("M4_", mid4)],
+                grid: (gridX, rows, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [[1, rows, mid]], outputDTypes: [.bfloat16])
+            box.splitSiluScaled[key] = made
+            return made
+        }
+        return launch([gu, scaleArr])[0]
+    }
+
+    private static func applyBlockQEpilogue(
+        qRaw: MLXArray, qNormWeight: MLXArray, posScalar: MLXArray, coeffs: MLXArray,
+        attentionHeads: Int, rows: Int
+    ) -> MLXArray {
+        let key = (UInt64(attentionHeads) << 16) | UInt64(rows)
+        let launch: MLXFast.MLXFastKernel.Launch = drafterLaunchLock.withLockUnchecked { box in
+            if let hit = box.blkQ[key] { return hit }
+            let made = blockQEpilogueKernel.prepare(
+                template: [("HQ_", attentionHeads), ("R_", rows)],
+                grid: (32, attentionHeads * rows, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1, attentionHeads, rows, 128]],
+                outputDTypes: [.bfloat16])
+            box.blkQ[key] = made
+            return made
+        }
+        return launch([qRaw, qNormWeight, posScalar, coeffs])[0]
     }
 
     private struct ContextKeyEpilogue {
@@ -1632,6 +2016,27 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
     }
 
+    private func speculativeProjectAndContextKV(
+        _ features: MLXArray, at position: Int, treeMeta: MLXArray? = nil
+    ) -> (keys: MLXArray, values: MLXArray) {
+        let rows = features.dim(0)
+        if CBv2DraftRegime.xnorDraftHeadEligible, let nv = nvfp4Drafter,
+            let epilogue = contextKeyEpilogue, rows > 0,
+            position >= 0, position <= Int(Int32.max) - rows
+        {
+            let act = features.dtype == .bfloat16 ? features : features.asType(.bfloat16)
+            let projScaled = MLXFast.rmsNorm(
+                nv.fc(act), weight: nv.encNormWeightScaled, eps: nv.fcNormEps)
+            let allKV = nv.fusedContextKV(projScaled)
+            if allKV.dtype == .bfloat16 {
+                return epilogue.applyFusedKV(
+                    allKV, rows: rows, position: position, treeMeta: treeMeta)
+            }
+        }
+        return speculativeContextKeyValues(
+            model.projectContext(features), at: position, treeMeta: treeMeta)
+    }
+
     private func speculativeContextKeyValues(
         _ context: MLXArray, at position: Int, treeMeta: MLXArray? = nil
     ) -> (keys: MLXArray, values: MLXArray) {
@@ -1640,7 +2045,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
         else { return model.contextKeyValues(context, at: position) }
-        if Self.fusedProjEnabled && CBv2DraftRegime.lowAcceptance, let fusedContextKV {
+        if Self.fusedProjEnabled
+            && (CBv2DraftRegime.lowAcceptance || CBv2DraftRegime.xnorDraftHeadEligible),
+            let fusedContextKV
+        {
             let allKV = fusedContextKV(context)
             if allKV.dtype == .bfloat16 {
                 return epilogue.applyFusedKV(allKV, rows: rows, position: position, treeMeta: treeMeta)
@@ -1716,8 +2124,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         // all-accepted outcome's entry is all of them.
         let features = targetHidden[0 ..< 1, 0 ..< n, 0...].reshaped([n, c.contextWidth])
         let start = context.nextPosition
-        let projected = speculativeContextKeyValues(
-            model.projectContext(features), at: start, treeMeta: dynTreeMeta)
+        let projected = speculativeProjectAndContextKV(
+            features, at: start, treeMeta: dynTreeMeta)
         var speculation = Speculation(
             depth: k, anchor: start, first: context.firstPosition, keys: projected.keys,
             values: projected.values)
@@ -1902,11 +2310,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let prevLow = CBv2DraftRegime.lowAcceptance
         CBv2DraftRegime.lowAcceptance = true
         defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let ringTail: FastInPlaceContext.BlockTailContext? =
+            (usedZeroCopyTail && CBv2DraftRegime.xnorDraftHeadEligible
+                && Self.zeroCopyBlockKVEnabled)
+            ? context.beginBlockTail(offset: n, blockSize: block) : nil
+        var blockFence: MLXArray? = nil
         let rows = fastDraftBlockRows(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
             context: (ctxKeys, ctxValues), mask: mask,
-            draftCount: settings.maximumDraftTokens, devicePosition: position)
-        if usedZeroCopyTail {
+            draftCount: settings.maximumDraftTokens, devicePosition: position,
+            ringTail: ringTail, outBlockFence: &blockFence)
+        if let blockFence {
+            context.finishBlockTail(fence: blockFence, readDep: rows)
+        } else if usedZeroCopyTail {
             context.recordSpeculativeRead(rows)
         }
         if CBv2DraftRegime.xnorDraftHeadEligible,
@@ -2127,9 +2543,22 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return (contextKV, blockQKV, lastKV)
     }
 
-    /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
-    /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
-    private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
+    /// Layer `index`'s MLP: `.nvfp4` copy when `useNVFP4` is active (input pre-scaled
+    /// by `postAttnNormWeightScaled[index]`), else the 3-bit low-acceptance copy while
+    /// `CBv2DraftRegime.lowAcceptance`, else the pinned 5-bit copy.
+    private func draftMLP(
+        _ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray, useNVFP4: Bool = false
+    ) -> MLXArray {
+        if useNVFP4, let nv = nvfp4Drafter, index < nv.gateUp.count {
+            let gu = nv.gateUp[index](x)
+            if gu.dtype == .bfloat16 && gu.dim(0) == 1 && (gu.dim(2) / 2) % 4 == 0 {
+                return nv.down[index](
+                    Self.splitSiluMulScaled(gu, scaleArr: nv.downInvScaleArr[index]))
+            }
+            let mid = gu.dim(-1) / 2
+            let act = compiledSiluProduct(gu[0..., 0..., 0 ..< mid], gu[0..., 0..., mid...])
+            return nv.down[index]((act * nv.downInvScaleArr[index]).asType(act.dtype))
+        }
         if CBv2DraftRegime.lowAcceptance, index < lowMLP.count {
             let low = lowMLP[index]
             if let guProj = low.gateUp {
@@ -2258,6 +2687,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
         draftCount: Int, devicePosition: MLXArray? = nil
     ) -> MLXArray {
+        var unusedFence: MLXArray? = nil
+        return fastDraftBlockRows(
+            embeddings: embeddings, at: position, context: context, mask: mask,
+            draftCount: draftCount, devicePosition: devicePosition,
+            ringTail: nil, outBlockFence: &unusedFence)
+    }
+
+    private func fastDraftBlockRows(
+        embeddings: MLXArray, at position: Int,
+        context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
+        draftCount: Int, devicePosition: MLXArray? = nil,
+        ringTail: FastInPlaceContext.BlockTailContext?,
+        outBlockFence: inout MLXArray?
+    ) -> MLXArray {
         func rope(_ x: MLXArray, _ shift: Int) -> MLXArray {
             if let devicePosition {
                 return MLXFast.RoPE(
@@ -2281,58 +2724,118 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             && fusedBlockQKV.count == lastIndex && fusedLastKV != nil
             && c.headDimensions == 128 && model.activationDType == .bfloat16
         let useFusedAddNorm = useFusedAttn && c.hiddenSize % 4 == 0
+        let deepLow = CBv2DraftRegime.xnorDraftHeadEligible
+        let nv: NVFP4DrafterState? = (useFusedAddNorm && deepLow) ? nvfp4Drafter : nil
+        let useZeroCopyRing =
+            useFusedAttn && deepLow && Self.zeroCopyBlockKVEnabled && ringTail != nil
+        var curRingFence: MLXArray? = useZeroCopyRing ? ringTail?.fence : nil
         let posScalar: MLXArray? =
             useFusedAttn
             ? (devicePosition.map { $0.reshaped([1]) } ?? MLXArray([Int32(position)])) : nil
         var nextX: MLXArray? = nil
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
-            let x = nextX ?? layer.inputNorm(hidden)
-            nextX = nil
+            let x: MLXArray
+            if let pre = nextX {
+                x = pre
+                nextX = nil
+            } else if let nv {
+                x = MLXFast.rmsNorm(
+                    hidden, weight: nv.inputNormWeightScaled[index], eps: layer.inputNorm.eps)
+            } else {
+                x = layer.inputNorm(hidden)
+            }
             if useFusedAttn, index < lastIndex, let epilogue = contextKeyEpilogue, let posScalar {
-                let qkv = fusedBlockQKV[index](x)
-                let key = (UInt64(c.attentionHeads) << 24) | (UInt64(c.kvHeads) << 12) | UInt64(block)
-                let launch: MLXFast.MLXFastKernel.Launch =
-                    Self.drafterLaunchLock.withLockUnchecked { box in
-                        if let hit = box.blkQKV[key] { return hit }
-                        let made = Self.blockQKVEpilogueKernel.prepare(
-                            template: [("HQ_", c.attentionHeads), ("HKV_", c.kvHeads), ("B_", block)],
-                            grid: (32, (c.attentionHeads + 2 * c.kvHeads) * block, 1),
-                            threadGroup: (32, 1, 1),
-                            outputShapes: [
-                                [1, c.attentionHeads, block, 128],
-                                [1, c.kvHeads, block, 128],
-                                [1, c.kvHeads, block, 128],
-                            ],
-                            outputDTypes: [.bfloat16, .bfloat16, .bfloat16])
-                        box.blkQKV[key] = made
-                        return made
+                let qkv = nv != nil ? nv!.fusedBlockQKV[index](x) : fusedBlockQKV[index](x)
+                let queries: MLXArray
+                var keys: MLXArray
+                var values: MLXArray
+                if useZeroCopyRing, let tail = ringTail, let prevFence = curRingFence {
+                    let key =
+                        (UInt64(c.attentionHeads) << 40) | (UInt64(c.kvHeads) << 28)
+                        | (UInt64(block) << 16) | UInt64(tail.window)
+                    let launch: MLXFast.MLXFastKernel.Launch =
+                        Self.drafterLaunchLock.withLockUnchecked { box in
+                            if let hit = box.blkQKVInPlace[key] { return hit }
+                            let made = Self.blockQKVEpilogueInPlaceKernel.prepare(
+                                template: [
+                                    ("HQ_", c.attentionHeads), ("HKV_", c.kvHeads),
+                                    ("B_", block), ("W_", tail.window),
+                                ],
+                                grid: (32, (c.attentionHeads + 2 * c.kvHeads) * block, 1),
+                                threadGroup: (32, 1, 1),
+                                outputShapes: [
+                                    [1, c.attentionHeads, block, 128],
+                                    [1],
+                                ],
+                                outputDTypes: [.bfloat16, .int32])
+                            box.blkQKVInPlace[key] = made
+                            return made
+                        }
+                    let meta = MLXArray([Int32(index), Int32(tail.dstSlot)])
+                    let out = launch([
+                        qkv, attention.qNorm.weight, attention.kNorm.weight, posScalar,
+                        epilogue.coefficients, tail.ringKeys, tail.ringValues, meta, prevFence,
+                    ])
+                    queries = out[0]
+                    curRingFence = out[1]
+                    let pair = depends(
+                        inputs: [tail.ringKeys, tail.ringValues], dependencies: [out[1]])
+                    let totalLen = tail.dstSlot + block
+                    keys = pair[0][index ..< index + 1, 0..., 0 ..< totalLen, 0...]
+                    values = pair[1][index ..< index + 1, 0..., 0 ..< totalLen, 0...]
+                } else {
+                    let key =
+                        (UInt64(c.attentionHeads) << 24) | (UInt64(c.kvHeads) << 12) | UInt64(block)
+                    let launch: MLXFast.MLXFastKernel.Launch =
+                        Self.drafterLaunchLock.withLockUnchecked { box in
+                            if let hit = box.blkQKV[key] { return hit }
+                            let made = Self.blockQKVEpilogueKernel.prepare(
+                                template: [
+                                    ("HQ_", c.attentionHeads), ("HKV_", c.kvHeads), ("B_", block),
+                                ],
+                                grid: (32, (c.attentionHeads + 2 * c.kvHeads) * block, 1),
+                                threadGroup: (32, 1, 1),
+                                outputShapes: [
+                                    [1, c.attentionHeads, block, 128],
+                                    [1, c.kvHeads, block, 128],
+                                    [1, c.kvHeads, block, 128],
+                                ],
+                                outputDTypes: [.bfloat16, .bfloat16, .bfloat16])
+                            box.blkQKV[key] = made
+                            return made
+                        }
+                    let out = launch([
+                        qkv, attention.qNorm.weight, attention.kNorm.weight, posScalar,
+                        epilogue.coefficients,
+                    ])
+                    queries = out[0]
+                    keys = out[1]
+                    values = out[2]
+                    if let context {
+                        keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                        values = concatenated([context.values[index ..< index + 1], values], axis: 2)
                     }
-                let out = launch([
-                    qkv, attention.qNorm.weight, attention.kNorm.weight, posScalar,
-                    epilogue.coefficients,
-                ])
-                let queries = out[0]
-                var keys = out[1]
-                var values = out[2]
-                if let context {
-                    keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
-                    values = concatenated([context.values[index ..< index + 1], values], axis: 2)
                 }
                 let attended = MLXFast.scaledDotProductAttention(
                     queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-                let attnOut = attention.oProj(
-                    attended.transposed(0, 2, 1, 3).reshaped([
-                        1, block, c.attentionHeads * c.headDimensions,
-                    ]))
+                let attnFlat = attended.transposed(0, 2, 1, 3).reshaped([
+                    1, block, c.attentionHeads * c.headDimensions,
+                ])
+                let attnOut = nv != nil ? nv!.oProj[index](attnFlat) : attention.oProj(attnFlat)
                 if useFusedAddNorm {
                     let (hMid, mx) = Self.fusedAddRMSNorm(
-                        residual: hidden, delta: attnOut, weight: layer.postAttentionNorm.weight,
-                        eps: layer.postAttentionNorm.eps)
-                    let mlpOut = draftMLP(index, layer.mlp, mx)
+                        residual: hidden, delta: attnOut,
+                        weight: nv != nil
+                            ? nv!.postAttnNormWeightScaled[index] : layer.postAttentionNorm.weight,
+                        eps: layer.postAttentionNorm.eps,
+                        deltaScale: nv != nil ? nv!.oInvScale[index] : 1.0)
+                    let mlpOut = draftMLP(index, layer.mlp, mx, useNVFP4: nv != nil)
                     let nextLayer = model.layers[index + 1]
                     let (hNext, xNext) = Self.fusedAddRMSNorm(
-                        residual: hMid, delta: mlpOut, weight: nextLayer.inputNorm.weight,
+                        residual: hMid, delta: mlpOut,
+                        weight: nv != nil
+                            ? nv!.inputNormWeightScaled[index + 1] : nextLayer.inputNorm.weight,
                         eps: nextLayer.inputNorm.eps)
                     hidden = hNext
                     nextX = xNext
@@ -2348,29 +2851,59 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             if useFusedAttn, index == lastIndex, let fusedLastKV, let epilogue = contextKeyEpilogue,
                 let posScalar
             {
-                let kv = fusedLastKV(x)
-                let key = (UInt64(c.kvHeads) << 12) | UInt64(block)
-                let launch: MLXFast.MLXFastKernel.Launch =
-                    Self.drafterLaunchLock.withLockUnchecked { box in
-                        if let hit = box.blkKV[key] { return hit }
-                        let made = Self.blockKVEpilogueKernel.prepare(
-                            template: [("HKV_", c.kvHeads), ("B_", block)],
-                            grid: (32, 2 * c.kvHeads * block, 1),
-                            threadGroup: (32, 1, 1),
-                            outputShapes: [
-                                [1, c.kvHeads, block, 128],
-                                [1, c.kvHeads, block, 128],
-                            ],
-                            outputDTypes: [.bfloat16, .bfloat16])
-                        box.blkKV[key] = made
-                        return made
+                let kv = nv != nil ? nv!.fusedLastKV(x) : fusedLastKV(x)
+                if useZeroCopyRing, let tail = ringTail, let prevFence = curRingFence {
+                    let key =
+                        (UInt64(c.kvHeads) << 28) | (UInt64(block) << 16) | UInt64(tail.window)
+                    let launch: MLXFast.MLXFastKernel.Launch =
+                        Self.drafterLaunchLock.withLockUnchecked { box in
+                            if let hit = box.blkKVInPlace[key] { return hit }
+                            let made = Self.blockKVEpilogueInPlaceKernel.prepare(
+                                template: [
+                                    ("HKV_", c.kvHeads), ("B_", block), ("W_", tail.window),
+                                ],
+                                grid: (32, 2 * c.kvHeads * block, 1),
+                                threadGroup: (32, 1, 1),
+                                outputShapes: [[1]],
+                                outputDTypes: [.int32])
+                            box.blkKVInPlace[key] = made
+                            return made
+                        }
+                    let meta = MLXArray([Int32(index), Int32(tail.dstSlot)])
+                    let fenceOut = launch([
+                        kv, attention.kNorm.weight, posScalar, epilogue.coefficients,
+                        tail.ringKeys, tail.ringValues, meta, prevFence,
+                    ])[0]
+                    curRingFence = fenceOut
+                    let pair = depends(
+                        inputs: [tail.ringKeys, tail.ringValues], dependencies: [fenceOut])
+                    let totalLen = tail.dstSlot + block
+                    keys = pair[0][index ..< index + 1, 0..., 0 ..< totalLen, 0...]
+                    values = pair[1][index ..< index + 1, 0..., 0 ..< totalLen, 0...]
+                } else {
+                    let key = (UInt64(c.kvHeads) << 12) | UInt64(block)
+                    let launch: MLXFast.MLXFastKernel.Launch =
+                        Self.drafterLaunchLock.withLockUnchecked { box in
+                            if let hit = box.blkKV[key] { return hit }
+                            let made = Self.blockKVEpilogueKernel.prepare(
+                                template: [("HKV_", c.kvHeads), ("B_", block)],
+                                grid: (32, 2 * c.kvHeads * block, 1),
+                                threadGroup: (32, 1, 1),
+                                outputShapes: [
+                                    [1, c.kvHeads, block, 128],
+                                    [1, c.kvHeads, block, 128],
+                                ],
+                                outputDTypes: [.bfloat16, .bfloat16])
+                            box.blkKV[key] = made
+                            return made
+                        }
+                    let out = launch([kv, attention.kNorm.weight, posScalar, epilogue.coefficients])
+                    keys = out[0]
+                    values = out[1]
+                    if let context {
+                        keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                        values = concatenated([context.values[index ..< index + 1], values], axis: 2)
                     }
-                let out = launch([kv, attention.kNorm.weight, posScalar, epilogue.coefficients])
-                keys = out[0]
-                values = out[1]
-                if let context {
-                    keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
-                    values = concatenated([context.values[index ..< index + 1], values], axis: 2)
                 }
             } else {
                 keys = rope(
@@ -2389,50 +2922,74 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             {
                 let active = 1 ..< (1 + draftCount)
                 let xActive = x[0..., active, 0...]
-                let queries = rope(
-                    attention.qNorm(
-                        attention.qProj(xActive).reshaped([
-                            1, draftCount, c.attentionHeads, c.headDimensions,
-                        ]).transposed(0, 2, 1, 3)), 1)
+                let qRaw = nv != nil ? nv!.lastQProj(xActive) : attention.qProj(xActive)
+                let queries: MLXArray
+                if useFusedAttn, deepLow, let epilogue = contextKeyEpilogue, let posScalar {
+                    queries = Self.applyBlockQEpilogue(
+                        qRaw: qRaw, qNormWeight: attention.qNorm.weight,
+                        posScalar: posScalar, coeffs: epilogue.coefficients,
+                        attentionHeads: c.attentionHeads, rows: draftCount)
+                } else {
+                    queries = rope(
+                        attention.qNorm(
+                            qRaw.reshaped([
+                                1, draftCount, c.attentionHeads, c.headDimensions,
+                            ]).transposed(0, 2, 1, 3)), 1)
+                }
                 let activeMask = mask.map { $0[active, 0...] }
                 let attended = MLXFast.scaledDotProductAttention(
                     queries: queries, keys: keys, values: values, scale: scale, mask: activeMask)
-                let attnOut = attention.oProj(
-                    attended.transposed(0, 2, 1, 3).reshaped([
-                        1, draftCount, c.attentionHeads * c.headDimensions,
-                    ]))
+                let attnFlat = attended.transposed(0, 2, 1, 3).reshaped([
+                    1, draftCount, c.attentionHeads * c.headDimensions,
+                ])
+                let attnOut = nv != nil ? nv!.oProj[index](attnFlat) : attention.oProj(attnFlat)
                 if useFusedAddNorm {
                     let (hMid, mx) = Self.fusedAddRMSNorm(
                         residual: hidden[0..., active, 0...], delta: attnOut,
-                        weight: layer.postAttentionNorm.weight, eps: layer.postAttentionNorm.eps)
-                    let mlpOut = draftMLP(index, layer.mlp, mx)
+                        weight: nv != nil
+                            ? nv!.postAttnNormWeightScaled[index] : layer.postAttentionNorm.weight,
+                        eps: layer.postAttentionNorm.eps,
+                        deltaScale: nv != nil ? nv!.oInvScale[index] : 1.0)
+                    let mlpOut = draftMLP(index, layer.mlp, mx, useNVFP4: nv != nil)
                     let (_, normed) = Self.fusedAddRMSNorm(
                         residual: hMid, delta: mlpOut, weight: model.norm.weight,
                         eps: model.norm.eps)
+                    outBlockFence = curRingFence
                     return normed.reshaped([draftCount, c.hiddenSize])
                 }
                 var h = hidden[0..., active, 0...] + attnOut
                 let mx = layer.postAttentionNorm(h)
                 h = h + draftMLP(index, layer.mlp, mx)
+                outBlockFence = curRingFence
                 return model.norm(h).reshaped([draftCount, c.hiddenSize])
             }
+            let qFull = nv != nil ? nv!.lastQProj(x) : attention.qProj(x)
             let queries = rope(
                 attention.qNorm(
-                    attention.qProj(x).reshaped([1, block, c.attentionHeads, c.headDimensions])
+                    qFull.reshaped([1, block, c.attentionHeads, c.headDimensions])
                         .transposed(0, 2, 1, 3)), 0)
             let attended = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-            hidden =
-                hidden
-                + attention.oProj(
-                    attended.transposed(0, 2, 1, 3).reshaped([
-                        1, block, c.attentionHeads * c.headDimensions,
-                    ]))
+            let attnFlat = attended.transposed(0, 2, 1, 3).reshaped([
+                1, block, c.attentionHeads * c.headDimensions,
+            ])
+            let attnOut = nv != nil ? nv!.oProj[index](attnFlat) : attention.oProj(attnFlat)
+            if useFusedAddNorm, let nv {
+                let (hMid, mx) = Self.fusedAddRMSNorm(
+                    residual: hidden, delta: attnOut,
+                    weight: nv.postAttnNormWeightScaled[index],
+                    eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
+                let mlpOut = draftMLP(index, layer.mlp, mx, useNVFP4: true)
+                let (_, normed) = Self.fusedAddRMSNorm(
+                    residual: hMid, delta: mlpOut, weight: model.norm.weight, eps: model.norm.eps)
+                outBlockFence = curRingFence
+                return normed.reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
+            }
+            hidden = hidden + attnOut
             let mx = layer.postAttentionNorm(hidden)
-            hidden =
-                hidden
-                + draftMLP(index, layer.mlp, mx)
+            hidden = hidden + draftMLP(index, layer.mlp, mx)
         }
+        outBlockFence = curRingFence
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
 
@@ -3752,10 +4309,202 @@ extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
         addQL(fusedContextKV)
         for qkv in fusedBlockQKV { addQL(qkv) }
         addQL(fusedLastKV)
+        if let nv = nvfp4Drafter {
+            arrays += nv.residentArrays
+        }
         if let comp = compressedDraftHead {
             arrays += comp.residentArrays
         }
         return arrays + [maskEmbedding]
+    }
+}
+
+// MARK: - Deep-Low `.nvfp4` (4b g16 E4M3) Drafter State (M5 Hardware NAX)
+
+extension MuseGlimmerDFlashDrafter {
+    /// Holds `.nvfp4` (`4b g16 E4M3`, `globalScale: nil`) copies of all 18 5-layer DFlash
+    /// drafter GEMMs (`encoder.fc`, `fusedContextKV`, `4x fusedBlockQKV`, `fusedLastKV`,
+    /// `lastQProj`, `5x oProj`, `5x gateUp`, `5x down`) with exact power-of-2 prescaling
+    /// folded into RMSNorm weights and fused Metal epilogues (`0` extra dispatches).
+    ///
+    /// Why prescale (`S = 64.0` for `max(|w|) <= 32.0`): raw `nvfp4` without `globalScale`
+    /// places 92-99% of transformer E4M3 group scales into subnormal/zero range (`< 2^-6`).
+    /// Multiplying weights by `S = 64.0 = 2^6` shifts all group scales into full-precision
+    /// normal E4M3 (`0%` zeros/subnormals, `2.3x` lower heavy-tail error than `3b affine`
+    /// and `1.1x` lower than `4b affine`) while preserving single-dispatch M5 `nvfp4_qmv_nax`
+    /// (`quantized.cpp:653` enables `.nvfp4` for `qmv_nax` across `M = 6..16` and blacklists
+    /// `.affine`).
+    private final class NVFP4DrafterState: @unchecked Sendable {
+        let fc: QuantizedLinear
+        let fcNormEps: Float
+        let encNormWeightScaled: MLXArray
+        let fusedContextKV: QuantizedLinear
+        let fusedBlockQKV: [QuantizedLinear]
+        let fusedLastKV: QuantizedLinear
+        let lastQProj: QuantizedLinear
+        let oProj: [QuantizedLinear]
+        let oInvScale: [Float]
+        let gateUp: [QuantizedLinear]
+        let down: [QuantizedLinear]
+        let downInvScaleArr: [MLXArray]
+        let inputNormWeightScaled: [MLXArray]
+        let postAttnNormWeightScaled: [MLXArray]
+
+        var residentArrays: [MLXArray] {
+            var out: [MLXArray] = [
+                fc.weight, fc.scales, encNormWeightScaled,
+                fusedContextKV.weight, fusedContextKV.scales,
+                fusedLastKV.weight, fusedLastKV.scales,
+                lastQProj.weight, lastQProj.scales,
+            ]
+            for q in fusedBlockQKV { out += [q.weight, q.scales] }
+            for q in oProj { out += [q.weight, q.scales] }
+            for q in gateUp { out += [q.weight, q.scales] }
+            for q in down { out += [q.weight, q.scales] }
+            out += downInvScaleArr
+            out += inputNormWeightScaled
+            out += postAttnNormWeightScaled
+            return out
+        }
+
+        private static func dequantizeBF16(_ linear: Linear) -> MLXArray? {
+            guard linear.bias == nil else { return nil }
+            if let ql = linear as? QuantizedLinear {
+                return MLX.dequantized(
+                    ql.weight, scales: ql.scales, biases: ql.biases,
+                    groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode,
+                    dtype: .bfloat16)
+            }
+            return linear.weight.dtype == .bfloat16
+                ? linear.weight : linear.weight.asType(.bfloat16)
+        }
+
+        private static func safePowerOfTwoScale(_ dense: MLXArray) -> Float {
+            let maxAbs = abs(dense).max().asType(.float32).item(Float.self)
+            guard maxAbs.isFinite else { return 1.0 }
+            if maxAbs <= 32.0 { return 64.0 }
+            if maxAbs <= 128.0 { return 16.0 }
+            if maxAbs <= 512.0 { return 4.0 }
+            return 1.0
+        }
+
+        private static func quantizeNVFP4(_ dense: MLXArray, scale: Float) -> QuantizedLinear {
+            let scaled = scale == 1.0 ? dense : (dense * MLXArray(scale).asType(.bfloat16))
+            let copy = QuantizedLinear(
+                weight: scaled, bias: nil, groupSize: 16, bits: 4, mode: .nvfp4, globalScale: nil)
+            eval(copy.weight, copy.scales)
+            return copy
+        }
+
+        init?(_ model: MuseGlimmerDFlashDraftModel) {
+            let c = model.configuration
+            guard MuseGlimmerDFlashDrafter.nvfp4DrafterEnabled,
+                Device.defaultDevice().deviceType == .gpu,
+                model.activationDType == .bfloat16,
+                model.layers.count == 5,
+                c.headDimensions == 128,
+                c.hiddenSize >= 128, c.hiddenSize % 128 == 0,
+                c.intermediateSize >= 128, c.intermediateSize % 128 == 0,
+                c.contextWidth % 128 == 0,
+                (c.attentionHeads * c.headDimensions) % 128 == 0,
+                (c.kvHeads * c.headDimensions) % 16 == 0
+            else { return nil }
+
+            guard let fcDense = Self.dequantizeBF16(model.encoder.fc) else { return nil }
+            let fcScale = Self.safePowerOfTwoScale(fcDense)
+            self.fc = Self.quantizeNVFP4(fcDense, scale: fcScale)
+            self.fcNormEps = c.rmsNormEps * fcScale * fcScale
+
+            var kDenses: [MLXArray] = []
+            var vDenses: [MLXArray] = []
+            kDenses.reserveCapacity(5)
+            vDenses.reserveCapacity(5)
+            for layer in model.layers {
+                guard let kD = Self.dequantizeBF16(layer.attention.kProj),
+                    let vD = Self.dequantizeBF16(layer.attention.vProj)
+                else { return nil }
+                kDenses.append(kD)
+                vDenses.append(vD)
+            }
+            let ctxKVDense = concatenated(kDenses + vDenses, axis: 0)
+            let ctxKVScale = Self.safePowerOfTwoScale(ctxKVDense)
+            self.fusedContextKV = Self.quantizeNVFP4(ctxKVDense, scale: ctxKVScale)
+            let encW =
+                model.encoder.outputNorm.weight
+                * MLXArray(1.0 / ctxKVScale).asType(.bfloat16)
+            eval(encW)
+            self.encNormWeightScaled = encW
+
+            var blockQKV: [QuantizedLinear] = []
+            var oProjs: [QuantizedLinear] = []
+            var oInvScales: [Float] = []
+            var gateUps: [QuantizedLinear] = []
+            var downs: [QuantizedLinear] = []
+            var downInvArrs: [MLXArray] = []
+            var inNormWeights: [MLXArray] = []
+            var postNormWeights: [MLXArray] = []
+            var lastKVOpt: QuantizedLinear? = nil
+            var lastQOpt: QuantizedLinear? = nil
+
+            for (i, layer) in model.layers.enumerated() {
+                guard let qD = Self.dequantizeBF16(layer.attention.qProj),
+                    let oD = Self.dequantizeBF16(layer.attention.oProj),
+                    let gateD = Self.dequantizeBF16(layer.mlp.gate),
+                    let upD = Self.dequantizeBF16(layer.mlp.up),
+                    let downD = Self.dequantizeBF16(layer.mlp.down)
+                else { return nil }
+
+                if i < 4 {
+                    let qkvD = concatenated([qD, kDenses[i], vDenses[i]], axis: 0)
+                    let qkvScale = Self.safePowerOfTwoScale(qkvD)
+                    blockQKV.append(Self.quantizeNVFP4(qkvD, scale: qkvScale))
+                    let inW = layer.inputNorm.weight * MLXArray(1.0 / qkvScale).asType(.bfloat16)
+                    eval(inW)
+                    inNormWeights.append(inW)
+                } else {
+                    let kvD = concatenated([kDenses[i], vDenses[i]], axis: 0)
+                    let l4Scale = min(
+                        Self.safePowerOfTwoScale(qD), Self.safePowerOfTwoScale(kvD))
+                    lastKVOpt = Self.quantizeNVFP4(kvD, scale: l4Scale)
+                    lastQOpt = Self.quantizeNVFP4(qD, scale: l4Scale)
+                    let inW = layer.inputNorm.weight * MLXArray(1.0 / l4Scale).asType(.bfloat16)
+                    eval(inW)
+                    inNormWeights.append(inW)
+                }
+
+                let oScale = Self.safePowerOfTwoScale(oD)
+                oProjs.append(Self.quantizeNVFP4(oD, scale: oScale))
+                oInvScales.append(1.0 / oScale)
+
+                let guD = concatenated([gateD, upD], axis: 0)
+                let guScale = Self.safePowerOfTwoScale(guD)
+                gateUps.append(Self.quantizeNVFP4(guD, scale: guScale))
+                let postW =
+                    layer.postAttentionNorm.weight * MLXArray(1.0 / guScale).asType(.bfloat16)
+                eval(postW)
+                postNormWeights.append(postW)
+
+                let dScale = Self.safePowerOfTwoScale(downD)
+                downs.append(Self.quantizeNVFP4(downD, scale: dScale))
+                let dInv = MLXArray([1.0 / dScale])
+                eval(dInv)
+                downInvArrs.append(dInv)
+            }
+
+            guard blockQKV.count == 4, let lastKV = lastKVOpt, let lastQ = lastQOpt else {
+                return nil
+            }
+            self.fusedBlockQKV = blockQKV
+            self.fusedLastKV = lastKV
+            self.lastQProj = lastQ
+            self.oProj = oProjs
+            self.oInvScale = oInvScales
+            self.gateUp = gateUps
+            self.down = downs
+            self.downInvScaleArr = downInvArrs
+            self.inputNormWeightScaled = inNormWeights
+            self.postAttnNormWeightScaled = postNormWeights
+        }
     }
 }
 
@@ -3937,24 +4686,11 @@ extension MuseGlimmerDFlashDrafter {
                 const uint tg = threadgroup_position_in_grid.x;
                 const device uint4* w1_bits4 = (const device uint4*)w1_bits;
                 const device uint4* x_bits4 = (const device uint4*)x_bits;
-
-                threadgroup uint4 sh_x[K256_][R_][4];
-                threadgroup half sh_xs[K256_][R_];
-                constexpr uint total_x4 = uint(K256_) * uint(R_) * 4u;
-                for (uint i = lid; i < total_x4; i += 256u) {
-                    ((threadgroup uint4*)sh_x)[i] = x_bits4[i];
-                }
-                constexpr uint total_xs = uint(K256_) * uint(R_);
-                for (uint i = lid; i < total_xs; i += 256u) {
-                    ((threadgroup half*)sh_xs)[i] = x_scale[i];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                float s0[R_], s1[R_];
-                int id0 = -1, id1 = -1;
                 const device uint4* tg_w4 = w1_bits4 + size_t(tg) * size_t(K256_ * 2 * STRIDE_);
                 const device half* tg_sc = g256_sc + size_t(tg) * size_t(K256_ * STRIDE_);
 
+                float s0[R_], s1[R_];
+                int id0 = -1, id1 = -1;
                 for (uint it = 0u; it < 2u; ++it) {
                     const uint slot = it * 256u + lid;
                     const int v = (slot < uint(STRIDE_)) ? int(slot * uint(NUM_TGS_) + tg) : -1;
@@ -3969,17 +4705,30 @@ extension MuseGlimmerDFlashDrafter {
                     float acc[R_];
                     for (uint r = 0u; r < uint(R_); ++r) { acc[r] = 0.0f; }
                     for (uint g = 0u; g < uint(K256_); ++g) {
-                        const float sc_w = float(tg_sc[g * uint(STRIDE_) + slot]);
+                        const half sc_w = tg_sc[g * uint(STRIDE_) + slot];
                         const uint4 wa = tg_w4[(g * 2u + 0u) * uint(STRIDE_) + slot];
                         const uint4 wb = tg_w4[(g * 2u + 1u) * uint(STRIDE_) + slot];
+                        const device uint4* xg = x_bits4 + size_t(g * uint(R_) * 4u);
+                        const device half* xsg = x_scale + size_t(g * uint(R_));
                         #pragma unroll
                         for (uint r = 0u; r < uint(R_); ++r) {
-                            const uint4 ph = popcount(wa ^ sh_x[g][r][0]) + popcount(wb ^ sh_x[g][r][1]);
-                            const uint4 pl = popcount(wa ^ sh_x[g][r][2]) + popcount(wb ^ sh_x[g][r][3]);
-                            const uint p_hi = (ph.x + ph.y) + (ph.z + ph.w);
-                            const uint p_lo = (pl.x + pl.y) + (pl.z + pl.w);
-                            const float dot_g = 386.56f - 1.963f * float(p_hi) - 1.057f * float(p_lo);
-                            acc[r] = fma(dot_g, sc_w * float(sh_xs[g][r]), acc[r]);
+                            const uint4 x0 = xg[r * 4u + 0u];
+                            const uint4 x1 = xg[r * 4u + 1u];
+                            const ushort p_hi =
+                                ushort(popcount(wa.x ^ x0.x)) + ushort(popcount(wa.y ^ x0.y))
+                                + ushort(popcount(wa.z ^ x0.z)) + ushort(popcount(wa.w ^ x0.w))
+                                + ushort(popcount(wb.x ^ x1.x)) + ushort(popcount(wb.y ^ x1.y))
+                                + ushort(popcount(wb.z ^ x1.z)) + ushort(popcount(wb.w ^ x1.w));
+                            const uint4 x2 = xg[r * 4u + 2u];
+                            const uint4 x3 = xg[r * 4u + 3u];
+                            const ushort p_lo =
+                                ushort(popcount(wa.x ^ x2.x)) + ushort(popcount(wa.y ^ x2.y))
+                                + ushort(popcount(wa.z ^ x2.z)) + ushort(popcount(wa.w ^ x2.w))
+                                + ushort(popcount(wb.x ^ x3.x)) + ushort(popcount(wb.y ^ x3.y))
+                                + ushort(popcount(wb.z ^ x3.z)) + ushort(popcount(wb.w ^ x3.w));
+                            const float dot_g = fma(
+                                -1.963f, float(p_hi), fma(-1.057f, float(p_lo), 386.56f));
+                            acc[r] = fma(dot_g, float(sc_w) * float(xsg[r]), acc[r]);
                         }
                     }
                     for (uint r = 0u; r < uint(R_); ++r) {
@@ -3987,8 +4736,8 @@ extension MuseGlimmerDFlashDrafter {
                     }
                 }
 
-                threadgroup float sh_v[8][2];
-                threadgroup int sh_i[8][2];
+                threadgroup float sh_v[R_][8][2];
+                threadgroup int sh_i[R_][8][2];
                 for (uint r = 0u; r < uint(R_); ++r) {
                     float v0 = -INFINITY, v1 = -INFINITY;
                     int i0 = -1, i1 = -1;
@@ -4003,32 +4752,30 @@ extension MuseGlimmerDFlashDrafter {
                         }
                     }
                     if (lane == 0u) {
-                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
-                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                        sh_v[r][sg][0] = v0; sh_i[r][sg][0] = i0;
+                        sh_v[r][sg][1] = v1; sh_i[r][sg][1] = i1;
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (sg == 0u) {
-                        if (lane < 8u) {
-                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
-                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
-                        } else {
-                            v0 = v1 = -INFINITY; i0 = i1 = -1;
-                        }
-                        for (ushort off = 4u; off > 0u; off >>= 1u) {
-                            const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
-                            const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
-                            if (lane < off) {
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
-                            }
-                        }
-                        if (lane == 0u) {
-                            const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
-                            cand_ids[base + 0u] = i0;
-                            cand_ids[base + 1u] = i1;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg < uint(R_)) {
+                    const uint r = sg;
+                    float v0 = (lane < 8u) ? sh_v[r][lane][0] : -INFINITY;
+                    int i0 = (lane < 8u) ? sh_i[r][lane][0] : -1;
+                    float v1 = (lane < 8u) ? sh_v[r][lane][1] : -INFINITY;
+                    int i1 = (lane < 8u) ? sh_i[r][lane][1] : -1;
+                    for (ushort off = 4u; off > 0u; off >>= 1u) {
+                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                        if (lane < off) {
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0u) {
+                        const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
+                        cand_ids[base + 0u] = i0;
+                        cand_ids[base + 1u] = i1;
+                    }
                 }
                 """,
             header: header)
