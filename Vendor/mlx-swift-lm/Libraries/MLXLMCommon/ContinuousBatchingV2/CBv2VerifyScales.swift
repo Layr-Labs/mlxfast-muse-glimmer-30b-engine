@@ -356,38 +356,77 @@ public enum CBv2VerifyScales {
                 C[t] = float2(0);
             }
 
-            for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
-                uint qa[4][TN];
-                ushort4 xa[4][2];
-                MO_WO_UNROLL
-                for (short block = 0; block < 4; block++) {
-                    const int b = k + 32 * block;
+            if constexpr (LX) {
+                for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                    uint qa[4][TN];
                     MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
-                    xa[block][0] = *(const device ushort4*)(xr0 + b);
-                    xa[block][1] = *(const device ushort4*)(xr1 + b);
-                }
-                half2 hs[TN][2];
-                MO_WO_UNROLL
-                for (short t = 0; t < TN; t++) {
-                    const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
-                    hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
-                    hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
-                }
-                MO_WO_UNROLL
-                for (short block = 0; block < 4; block++) {
-                    half s[TN];
-                    MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
-                    MO_WO_UNROLL
-                    for (short i = 0; i < 4; i++) {
-                        const float2 bf = float2(
-                            float(as_type<bfloat>(xa[block][0][i])),
-                            float(as_type<bfloat>(xa[block][1][i])));
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
                         MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) {
-                            const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
-                            mo_wo_mma(C[t], a, bf);
+                        for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
+                    }
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                        hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
+                        hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        const ushort4 xv0 = *(const device ushort4*)(xr0 + b);
+                        const ushort4 xv1 = *(const device ushort4*)(xr1 + b);
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xv0[i])),
+                                float(as_type<bfloat>(xv1[i])));
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                                mo_wo_mma(C[t], a, bf);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
+                    uint qa[4][TN];
+                    ushort4 xa[4][2];
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
+                        xa[block][0] = *(const device ushort4*)(xr0 + b);
+                        xa[block][1] = *(const device ushort4*)(xr1 + b);
+                    }
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                        hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
+                        hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xa[block][0][i])),
+                                float(as_type<bfloat>(xa[block][1][i])));
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                                mo_wo_mma(C[t], a, bf);
+                            }
                         }
                     }
                 }
@@ -542,6 +581,7 @@ public enum CBv2VerifyScales {
         let scaled: Bool
         let chunks: Int
         let tn: Int
+        let lazyX: Bool
     }
 
     private struct NVFP4TopTwoPlanKey: Hashable {
@@ -551,6 +591,7 @@ public enum CBv2VerifyScales {
         let dtype: DType
         let chunks: Int
         let tn: Int
+        let lazyX: Bool
     }
 
     private struct NVFP4TopTwoPlan {
@@ -599,13 +640,14 @@ public enum CBv2VerifyScales {
         let inputs = x.dim(2)
         let rows = batch * width
         let tn = fusedLMHeadTN
+        let lazyX = CBv2DraftRegime.deepLowVerify
         let outputs = l.outputDimensions
         let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
         let minChunksFor16BitOffset = max(1, (outputs + 65_533) / 65_534)
         let chunks = min(totalTiles, max(fusedLMHeadChunks, minChunksFor16BitOffset))
         let pkey = NVFP4TopTwoPlanKey(
             id: ObjectIdentifier(l), rows: rows, inputs: inputs, dtype: x.dtype,
-            chunks: chunks, tn: tn)
+            chunks: chunks, tn: tn, lazyX: lazyX)
         if let plan = topTwoLock.withLockUnchecked({ $0.plans[pkey] }) {
             let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
             let partials = plan.launch([
@@ -626,7 +668,7 @@ public enum CBv2VerifyScales {
         let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
         let key = NVFP4TopTwoLaunchKey(
             dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs,
-            scaled: true, chunks: chunks, tn: tn)
+            scaled: true, chunks: chunks, tn: tn, lazyX: lazyX)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = topTwoLock.withLockUnchecked({ $0.launches[key] }) {
             launch = hit
@@ -634,7 +676,7 @@ public enum CBv2VerifyScales {
             let made = nvfp4TopTwoKernel.prepare(
                 template: [
                     ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
-                    ("SCALED", true), ("C_", chunks), ("TN", tn),
+                    ("SCALED", true), ("C_", chunks), ("TN", tn), ("LX", lazyX),
                 ],
                 grid: (32, 8, chunks), threadGroup: (32, 8, 1),
                 outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],
@@ -687,6 +729,7 @@ public enum CBv2VerifyScales {
         let outputs: Int
         let rows: Int
         let packedDecode: Bool
+        let branchlessDecode: Bool
         let vectorWeights: Bool
         let vectorActivations: Bool
     }
@@ -803,7 +846,17 @@ public enum CBv2VerifyScales {
             }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                if (PD) {
+                if constexpr (BLD) {
+                    const uint word = *(const device uint*)(rows + mat_offset + bn);
+                    const uint lo = ((word & 0x007F007Fu) << 7) | ((word & 0x00800080u) << 8);
+                    const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
+                    const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
+                    const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
+                    inter[0] = static_cast<T>(even.x);
+                    inter[1] = static_cast<T>(odd.x);
+                    inter[2] = static_cast<T>(even.y);
+                    inter[3] = static_cast<T>(odd.y);
+                } else if (PD) {
                     const uint word = *(const device uint*)(rows + mat_offset + bn);
                     if (((word & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u) {
                         for (int tn = 0; tn < TN; tn++) {
@@ -841,26 +894,68 @@ public enum CBv2VerifyScales {
             }
             bn += blockN;
         }
-        if (leftover > 0) {
-            for (int v = 0; v < V; v++) {
-                for (int tn = 0; tn < TN; tn++) {
-                    v_coeff[v][tn] = bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
-                }
-            }
-            for (int tm = 0; tm < TM; tm++) {
-                for (int tn = 0; tn < TN; tn++) {
-                    if (bn + tn < K) {
-                        const uint8_t code = rows[tm * K + bn + tn];
-                        const float decoded =
-                            (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                        inter[tn] = static_cast<T>(decoded * weight_scale);
-                    } else {
-                        inter[tn] = T(0);
+        if constexpr (leftover > 0) {
+            if constexpr (BLD && leftover % 128 == 0) {
+                if (bn < K) {
+                    for (int v = 0; v < V; v++) {
+                        if (AV) {
+                            const float4 f = float4(as_type<vec<T, 4>>(
+                                ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn))));
+                            for (int tn = 0; tn < TN; tn++) {
+                                v_coeff[v][tn] = f[tn];
+                            }
+                        } else {
+                            for (int tn = 0; tn < TN; tn++) {
+                                v_coeff[v][tn] = static_cast<float>(in_vec[v * K + bn + tn]);
+                            }
+                        }
+                    }
+                    int mat_offset = 0;
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint word = *(const device uint*)(rows + mat_offset + bn);
+                        const uint lo = ((word & 0x007F007Fu) << 7) | ((word & 0x00800080u) << 8);
+                        const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
+                        const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
+                        const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
+                        inter[0] = static_cast<T>(even.x);
+                        inter[1] = static_cast<T>(odd.x);
+                        inter[2] = static_cast<T>(even.y);
+                        inter[3] = static_cast<T>(odd.y);
+                        for (int v = 0; v < V; v++) {
+                            for (int tn = 0; tn < TN; tn++) {
+                                result[v][tm] += inter[tn] * v_coeff[v][tn];
+                            }
+                        }
+                        mat_offset += K;
+                    }
+                } else {
+                    for (int v = 0; v < V; v++) {
+                        for (int tm = 0; tm < TM; tm++) {
+                            result[v][tm] += 0.0f;
+                        }
                     }
                 }
+            } else {
                 for (int v = 0; v < V; v++) {
                     for (int tn = 0; tn < TN; tn++) {
-                        result[v][tm] += inter[tn] * v_coeff[v][tn];
+                        v_coeff[v][tn] = bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                    }
+                }
+                for (int tm = 0; tm < TM; tm++) {
+                    for (int tn = 0; tn < TN; tn++) {
+                        if (bn + tn < K) {
+                            const uint8_t code = rows[tm * K + bn + tn];
+                            const float decoded =
+                                (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                            inter[tn] = static_cast<T>(decoded * weight_scale);
+                        } else {
+                            inter[tn] = T(0);
+                        }
+                    }
+                    for (int v = 0; v < V; v++) {
+                        for (int tn = 0; tn < TN; tn++) {
+                            result[v][tm] += inter[tn] * v_coeff[v][tn];
+                        }
                     }
                 }
             }
@@ -934,8 +1029,8 @@ public enum CBv2VerifyScales {
     /// `vectorActivations` choose the load and decode form.
     public static func fp8Product(
         _ mat: MLXArray, scale: MLXArray, vectors: MLXArray, splitsK: Bool,
-        rowGroups: Int = 1, packedDecode: Bool = true, vectorWeights: Bool = true,
-        vectorActivations: Bool = true
+        rowGroups: Int = 1, packedDecode: Bool = true, branchlessDecode: Bool = false,
+        vectorWeights: Bool = true, vectorActivations: Bool = true
     ) -> MLXArray {
         let (outputs, inputs) = (mat.dim(0), mat.dim(1))
         let count = vectors.dim(0)
@@ -946,8 +1041,8 @@ public enum CBv2VerifyScales {
         let bm = rowGroups
         let key = FP8LaunchKey(
             dtype: vectors.dtype, bm: bm, bn: bn, inputs: inputs, outputs: outputs, rows: count,
-            packedDecode: packedDecode, vectorWeights: vectorWeights,
-            vectorActivations: vectorActivations)
+            packedDecode: packedDecode, branchlessDecode: branchlessDecode,
+            vectorWeights: vectorWeights, vectorActivations: vectorActivations)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = launchLock.withLock({ fp8LaunchCache[key] }) {
             launch = hit
@@ -955,7 +1050,8 @@ public enum CBv2VerifyScales {
             let groups = (outputs + bm * 2 - 1) / (bm * 2)
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("K", inputs), ("N", outputs),
-                ("V", count), ("PD", packedDecode), ("WV", vectorWeights), ("AV", vectorActivations),
+                ("V", count), ("PD", packedDecode), ("BLD", branchlessDecode),
+                ("WV", vectorWeights), ("AV", vectorActivations),
             ]
             let made = fp8Kernel.prepare(
                 template: template,
@@ -1034,7 +1130,8 @@ public enum CBv2VerifyScales {
                 rowGroups: {
                     fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
                 },
-                packedDecode: false)
+                packedDecode: false,
+                branchlessDecode: CBv2SmallProjection.shouldUseBranchlessFP8(for: [l]))
         }
         return nil
     }
@@ -1061,7 +1158,9 @@ public enum CBv2VerifyScales {
             rowGroups: {
                 fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
             },
-            packedDecode: false, preCast: true)
+            packedDecode: false,
+            branchlessDecode: CBv2SmallProjection.shouldUseBranchlessFP8(for: [l]),
+            preCast: true)
     }
 
     /// `product` for every layer, or nil unless it applies to all of them.
@@ -1113,6 +1212,7 @@ public enum CBv2VerifyScales {
         _ layer: ModelOptCalibratedLinear, _ x: MLXArray, stock: Bool = false,
         rowGroups: (_ splitsK: Bool, _ runRows: Int) -> Int = { _, _ in 1 },
         packedDecode: Bool = true,
+        branchlessDecode: Bool = false,
         vectorWeights: Bool = true, vectorActivations: Bool = true,
         preCast: Bool = false
     ) -> MLXArray? {
@@ -1138,6 +1238,7 @@ public enum CBv2VerifyScales {
                 : fp8Product(
                     mat, scale: constants.outputScale, vectors: vectors, splitsK: run.splitsK,
                     rowGroups: rowGroups(run.splitsK, run.rows.count), packedDecode: packedDecode,
+                    branchlessDecode: branchlessDecode,
                     vectorWeights: vectorWeights, vectorActivations: vectorActivations)
         }
         let result = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)

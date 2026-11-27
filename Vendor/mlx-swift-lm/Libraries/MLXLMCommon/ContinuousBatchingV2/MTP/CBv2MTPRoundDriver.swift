@@ -689,6 +689,11 @@ final class CBv2MTPRoundDriver {
             && (requestAcceptance[id] ?? initialRequestAcceptance).isDeepLowAcceptanceRegime
     }
 
+    func inDeepLowVerifyRegime(_ id: CBv2RequestID) -> Bool {
+        usesFixedDepthAcceptanceWindow
+            && (requestAcceptance[id] ?? initialRequestAcceptance).isDeepLowVerifyRegime
+    }
+
     func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
         inLowAcceptanceRegime(id)
             && (!CBv2DraftRegime.treeCooldownEnabled || !treeCooldownRequests.contains(id))
@@ -1048,8 +1053,13 @@ final class CBv2MTPRoundDriver {
             CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
             shouldUseVerifyTree(for: id)
         {
-            let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
-            let target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            let target: Int
+            if CBv2DraftRegime.treeFullWidthEnabled {
+                target = ceiling
+            } else {
+                let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
+                target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            }
             depth = min(ceiling, min(remainingTokens - 1, min(verificationLimit, target)))
         }
         return max(1, depth)
@@ -1106,7 +1116,9 @@ final class CBv2MTPRoundDriver {
         acceptedDepth: Int,
         committedTokens: Int,
         rejectionObserved: Bool,
-        endedByTruncation: Bool
+        endedByTruncation: Bool,
+        verifyDraftWidth: Int? = nil,
+        outputTruncated: Bool = false
     ) {
         guard usesRequestStatefulDrafter,
             config.fixedDraftTokens == nil || usesFixedDepthAcceptanceWindow
@@ -1117,7 +1129,9 @@ final class CBv2MTPRoundDriver {
             draftedDepth: draftedDepth,
             acceptedDepth: acceptedDepth,
             rejectionObserved: rejectionObserved,
-            endedByTruncation: endedByTruncation)
+            endedByTruncation: endedByTruncation,
+            verifyDraftWidth: verifyDraftWidth,
+            outputTruncated: outputTruncated)
         // The round's block confidence finished before its verify did, so it
         // is available here without waiting.
         if let array = planDraftConfidence.removeValue(forKey: id),
@@ -1670,6 +1684,9 @@ public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
     /// Stricter deep-low-acceptance flag for approximate Stage-1 draft-head screening.
     nonisolated(unsafe) public static var xnorDraftHeadEligible = false
+    /// Deep-low-acceptance flag for exact verify fast paths (never active on high-acceptance windows).
+    nonisolated(unsafe) public static var deepLowAcceptance = false
+    public static var deepLowVerify: Bool { !lowOnlyVerifySpeedups || deepLowAcceptance }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1843,4 +1860,7 @@ public enum CBv2DraftRegime {
     /// Reserve dynamic-tree leaf slots additively instead of shrinking chain depth (`CBV2_TREE_ADDITIVE != "0"`, default on).
     public static let treeAdditiveSlot: Bool =
         ProcessInfo.processInfo.environment["CBV2_TREE_ADDITIVE"] != "0"
+    /// Use full draft ceiling (`k = 7`) on dynamic-tree rounds (`CBV2_TREE_FULL_K=1` enables).
+    public static let treeFullWidthEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_FULL_K"] == "1"
 }

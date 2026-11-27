@@ -537,11 +537,60 @@ inline void paged_attention_part_impl(
         q_smem, red_smem, partials, meta, tgpig, tpitg, sgitg, lane);
 }
 
+// Inline BF16 sigmoid gate and ModelOpt E4M3 activation cast helpers for fused
+// attention output epilogues (GATE_MODE == 1: BF16 gate; GATE_MODE == 2: BF16
+// gate + FP8 cast). Matches VerifyFusedNorms/ModelOptActivationKernels bit-for-bit.
+inline bfloat16_t paged_bf16_sigmoid(bfloat16_t x) {
+    bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+    bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+    bfloat16_t one = bfloat16_t(1.0f);
+    bfloat16_t y = one / (one + ey);
+    return (x < bfloat16_t(0.0f)) ? y : (one - y);
+}
+
+inline uint8_t paged_e4m3_bits(float value) {
+    uint32_t fp8_max = 543 << 21;
+    uint32_t denorm_mask = 141 << 23;
+    uint32_t f_bits = as_type<uint32_t>(value);
+    uint32_t sign = f_bits & 0x80000000;
+    f_bits ^= sign;
+    uint8_t bits;
+    if (f_bits >= fp8_max) {
+        bits = 0x7E;
+    } else if (f_bits < (121 << 23)) {
+        f_bits = as_type<uint32_t>(
+            as_type<float>(f_bits) + as_type<float>(denorm_mask));
+        bits = static_cast<uint8_t>(f_bits - denorm_mask);
+    } else {
+        uint8_t mant_odd = (f_bits >> 20) & 1;
+        f_bits += ((uint32_t)(7 - 127) << 23) + 0x7FFFF;
+        f_bits += mant_odd;
+        bits = static_cast<uint8_t>(f_bits >> 20);
+    }
+    return bits | static_cast<uint8_t>(sign >> 24);
+}
+
+inline float paged_e4m3_value(uint8_t bits) {
+    half converted = as_type<half>(static_cast<uint16_t>((bits & 127) << 7));
+    converted *= 256.0;
+    return static_cast<float>((bits & 128) ? -converted : converted);
+}
+
+inline bfloat16_t paged_bf16_cast_fp8(
+    bfloat16_t yb, float m0, float m1, float bound, float nan_value
+) {
+    float scaled = static_cast<float>(yb) * m0;
+    uint8_t bits = paged_e4m3_bits(scaled);
+    float decoded = (bits & 0x7F) == 0x7F ? nan_value : paged_e4m3_value(bits);
+    bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+    return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+}
+
 // Pass B: one threadgroup (a single simdgroup) merges one (sequence, query
 // head)'s partition partials with a global softmax merge; sinks fold into
 // the denominator only. The partition count is recomputed from the row's
 // OWN attended length, so slots written for longer batchmates are ignored.
-template <typename T, int D, int PTOK, bool HAS_SINKS, bool DYN_TREE = false>
+template <typename T, int D, int PTOK, bool HAS_SINKS, bool DYN_TREE = false, int GATE_MODE = 0>
 inline void paged_attention_merge_impl(
     const device float* partials,
     const device float* meta,
@@ -553,7 +602,11 @@ inline void paged_attention_merge_impl(
     uint3 tgpig,
     uint lane,
     int output_columns = 0,
-    const device int32_t* tree_meta = nullptr
+    const device int32_t* tree_meta = nullptr,
+    const device T* gate = nullptr,
+    float fp8_m0 = 0.0f,
+    float fp8_m1 = 0.0f,
+    float fp8_bound = 0.0f
 ) {
     constexpr int EPT = D / 32;
 
@@ -610,12 +663,41 @@ inline void paged_attention_merge_impl(
     }
     const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
 
-    device T* orow = output_columns > 0
-        ? out + ((size_t)head * output_columns + seqinfo[b * 8 + 5]) * D
-        : out + row * D;
+    const size_t ooff = output_columns > 0
+        ? ((size_t)head * output_columns + seqinfo[b * 8 + 5]) * D
+        : row * D;
+    device T* orow = out + ooff;
+    if constexpr (GATE_MODE == 0) {
 #pragma unroll
-    for (int e = 0; e < EPT; e++) {
-        orow[lane * EPT + e] = T(acc[e] * inv);
+        for (int e = 0; e < EPT; e++) {
+            orow[lane * EPT + e] = T(acc[e] * inv);
+        }
+    } else {
+        const device T* grow = gate + ooff;
+        const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+        if constexpr (EPT == 4) {
+            const vec<T, 4> g4 = *reinterpret_cast<const device vec<T, 4>*>(grow + lane * 4);
+            vec<T, 4> o4;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                bfloat16_t yb = bfloat16_t(acc[e] * inv) * paged_bf16_sigmoid(bfloat16_t(g4[e]));
+                if constexpr (GATE_MODE == 2) {
+                    yb = paged_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value);
+                }
+                o4[e] = T(yb);
+            }
+            *reinterpret_cast<device vec<T, 4>*>(orow + lane * 4) = o4;
+        } else {
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                const int idx = lane * EPT + e;
+                bfloat16_t yb = bfloat16_t(acc[e] * inv) * paged_bf16_sigmoid(bfloat16_t(grow[idx]));
+                if constexpr (GATE_MODE == 2) {
+                    yb = paged_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value);
+                }
+                orow[idx] = T(yb);
+            }
+        }
     }
 }
 
@@ -645,7 +727,7 @@ inline void paged_attention_merge_impl(
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
     bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
-    bool APPEND = false>
+    bool APPEND = false, int GATE_MODE = 0>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -662,7 +744,11 @@ inline void paged_attention_onepass_impl(
     uint lane,
     const device int32_t* tree_meta = nullptr,
     const device T* knew = nullptr,
-    const device T* vnew = nullptr
+    const device T* vnew = nullptr,
+    const device T* gate = nullptr,
+    float fp8_m0 = 0.0f,
+    float fp8_m1 = 0.0f,
+    float fp8_bound = 0.0f
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     static_assert(!(APPEND && DYN_TREE), "the fused append serves linear rows only");
@@ -752,6 +838,8 @@ inline void paged_attention_onepass_impl(
         constexpr int E4 = EPT < 4 ? EPT : 4;
         const int first = lo + state;
         const int count = first < hi ? (hi - first + NSG - 1) / NSG : 0;
+        const bool has_tree_tail =
+            DYN_TREE && (tree_anc != 0u) && ((attend_start + hi - 1) >= tree_base);
         int cur_lpage = -1;
         const device T* cur_key = nullptr;
         const device T* cur_value = nullptr;
@@ -762,11 +850,10 @@ inline void paged_attention_onepass_impl(
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
                     const int raw_pos = attend_start + first + (j0 + u) * NSG;
-                    const uint upos = uint(DYN_TREE
-                        ? ((tree_anc != 0u && raw_pos >= tree_base)
+                    const uint upos = uint(
+                        (DYN_TREE && has_tree_tail && raw_pos >= tree_base)
                             ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
-                            : raw_pos)
-                        : raw_pos);
+                            : raw_pos);
                     if (APPEND && (int)upos >= pending_start) {
                         const size_t base =
                             ((size_t)((int)upos - pending_start) * kvh + kv_head) * D + lane * EPT;
@@ -947,10 +1034,41 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t ooff = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + ooff;
+            if constexpr (GATE_MODE == 0) {
 #pragma unroll
-            for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                for (int e = 0; e < EPT; e++) {
+                    orow[lane * EPT + e] = T(gacc[e] * inv);
+                }
+            } else {
+                const device T* grow = gate + ooff;
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                if constexpr (EPT == 4) {
+                    const vec<T, 4> g4 = *reinterpret_cast<const device vec<T, 4>*>(grow + lane * 4);
+                    vec<T, 4> o4;
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        bfloat16_t yb =
+                            bfloat16_t(gacc[e] * inv) * paged_bf16_sigmoid(bfloat16_t(g4[e]));
+                        if constexpr (GATE_MODE == 2) {
+                            yb = paged_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value);
+                        }
+                        o4[e] = T(yb);
+                    }
+                    *reinterpret_cast<device vec<T, 4>*>(orow + lane * 4) = o4;
+                } else {
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        const int idx = lane * EPT + e;
+                        bfloat16_t yb =
+                            bfloat16_t(gacc[e] * inv) * paged_bf16_sigmoid(bfloat16_t(grow[idx]));
+                        if constexpr (GATE_MODE == 2) {
+                            yb = paged_bf16_cast_fp8(yb, fp8_m0, fp8_m1, fp8_bound, nan_value);
+                        }
+                        orow[idx] = T(yb);
+                    }
+                }
             }
         }
     }

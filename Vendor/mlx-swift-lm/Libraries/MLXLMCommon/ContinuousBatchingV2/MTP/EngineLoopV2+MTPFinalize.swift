@@ -728,7 +728,9 @@ extension EngineLoopV2 {
                 acceptedDepth: observedAccepted,
                 committedTokens: confirmed,
                 rejectionObserved: rejectionObserved,
-                endedByTruncation: acceptanceTruncated)
+                endedByTruncation: acceptanceTruncated,
+                verifyDraftWidth: k,
+                outputTruncated: confirmed <= observedAccepted && confirmed < k)
             mtp.updateTreeCooldown(
                 for: id, wasTree: verifyTree != nil,
                 chainDepth: verifyTree?.chainDepth ?? k,
@@ -941,8 +943,12 @@ extension EngineLoopV2 {
         let draftTokens: MLXArray? =
             Self.mtpOutcomeSpeculation && mtp.inLowAcceptanceRegime(id)
             ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
+        CBv2DraftRegime.lowAcceptance = mtp.inLowAcceptanceRegime(id)
+        defer { CBv2DraftRegime.lowAcceptance = false }
         CBv2DraftRegime.xnorDraftHeadEligible = mtp.inDeepLowAcceptanceRegime(id)
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
+        CBv2DraftRegime.deepLowAcceptance = mtp.inDeepLowVerifyRegime(id)
+        defer { CBv2DraftRegime.deepLowAcceptance = false }
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,
             draftsBlock: draftsBlock, draftTokens: draftTokens,

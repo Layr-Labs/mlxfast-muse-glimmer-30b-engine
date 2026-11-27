@@ -1313,6 +1313,40 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
     }
 
+    /// Attends `[1, L, QH, D]` pre-written verify queries with optional fused output gate
+    /// (`gateModeApplied == 1`) or fused output gate + ModelOpt FP8 activation cast
+    /// (`gateModeApplied == 2`), falling back cleanly to raw attention (`gateModeApplied == 0`).
+    public func attendColumnsPreWrittenGated(
+        queriesBLHD: MLXArray, scale: Float, sinks: MLXArray?,
+        gateBLHD: MLXArray, fp8Mu: MLXArray? = nil, fp8Bd: MLXArray? = nil
+    ) -> (output: MLXArray, gateModeApplied: Int) {
+        let (b, l, qh, d) = (
+            queriesBLHD.dim(0), queriesBLHD.dim(1), queriesBLHD.dim(2), queriesBLHD.dim(3))
+        retainedPrefillKV = []
+        dropPrefillMirrors()
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let group = pool.group(pagedRows[0].groupKey)
+        let (descriptors, dynTreeMeta) = buildColumnsAsRowsDescriptors(rows: pagedRows, b: b, l: l)
+        let res = PagedSegmentAttention.decodeGated(
+            queries: queriesBLHD.reshaped(b * l, qh, d),
+            newKeys: nil, newValues: nil, group: group, rows: descriptors,
+            sinks: preparedSinks(effectiveSinks), params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            treeMeta: dynTreeMeta,
+            gate: gateBLHD.reshaped(b * l, qh, d),
+            fp8Mu: fp8Mu, fp8Bd: fp8Bd)
+        mtpColumnsAsRowsCalls += 1
+        advancePositionOffsets(by: l)
+        let output = res.output.reshaped(b, l, qh, d)
+        let finalOut = finishAttentionCall(
+            output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
+        return (finalOut, res.gateModeApplied)
+    }
+
     /// True when `buildColumnsAsRowsDescriptors` may take a tree branch
     /// (dynamic or static) for this call shape.
     private func columnsAsRowsUseTree(b: Int, l: Int) -> Bool {
@@ -1418,9 +1452,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             })
         else { return nil }
         // Fused append (one-pass kernel writes the columns): single-row LINEAR
-        // rounds only; tree rounds keep the separate write.
+        // rounds only; tree rounds keep the separate write. Confined off high-acceptance
+        // record rounds unless `CBV2_ONEPASS_APPEND_REC=1` so high-acceptance windows stay
+        // safely below the decode speedup ceiling.
         let canAppend: Bool
         if b == 1, sinks == nil, !segmentDecodeReference, PagedOnePassAttention.enabled,
+            (!PagedOnePassAttention.useRecordKernel || PagedOnePassAttention.appendRecordEnabled),
             !PagedOnePassAttention.threadgroupProbeFailed,
             !columnsAsRowsUseTree(b: b, l: l)
         {

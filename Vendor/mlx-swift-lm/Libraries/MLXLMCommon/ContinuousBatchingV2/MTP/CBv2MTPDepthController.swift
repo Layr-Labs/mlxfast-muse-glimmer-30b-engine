@@ -605,6 +605,12 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     private(set) var roundAcceptanceFraction = 1.0
     private(set) var observedRegimeRounds = 0
     private(set) var enteredLowAcceptanceRegime = false
+    /// Tree-invariant per-slot acceptance EWMA (`accepted / verifyDraftWidth`) updated on
+    /// every non-output-truncated round (including terminal tree branch hits), so tree rounds
+    /// with short `chainDepth` never falsely exit low-acceptance regimes.
+    private(set) var slotAcceptanceFraction = 1.0
+    private(set) var observedSlotRounds = 0
+    private(set) var enteredLowSlotRegime = false
     private static let regimeAlpha = 0.15
     static let lowAcceptanceRegimeThreshold = 0.75
     static let lowAcceptanceExitThreshold = 0.85
@@ -612,8 +618,24 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         ProcessInfo.processInfo.environment["CBV2_FAST_REGIME_V2"] != "0"
     static let regimeHysteresisEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_REGIME_HYST"] != "0"
+    static let slotRegimeEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_SLOT_REGIME"] != "0"
+
+    var meanCommittedPerRound: Double {
+        ceilingRounds > 0 ? Double(ceilingCommittedTokens) / Double(ceilingRounds) : 8.0
+    }
+
+    static let deepLowMaxMeanCommitted: Double = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MAX_COMMIT"].flatMap(Double.init) ?? 5.0
+    }()
 
     var inLowAcceptanceRegime: Bool {
+        if Self.slotRegimeEnabled {
+            if Self.regimeHysteresisEnabled && enteredLowSlotRegime {
+                return slotAcceptanceFraction < Self.lowAcceptanceExitThreshold
+            }
+            return slotAcceptanceFraction < Self.lowAcceptanceRegimeThreshold
+        }
         if Self.regimeHysteresisEnabled && enteredLowAcceptanceRegime {
             return roundAcceptanceFraction < Self.lowAcceptanceExitThreshold
         }
@@ -628,13 +650,39 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     }()
 
     /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// requires at least `deepLowAcceptanceMinRounds` observed rounds, an EWMA slot
+    /// acceptance fraction strictly below `deepLowAcceptanceThreshold`, and mean committed
+    /// tokens per round strictly below `deepLowMaxMeanCommitted` so high-acceptance windows
+    /// never invoke approximate Stage-1 screening.
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+        if Self.slotRegimeEnabled {
+            return inLowAcceptanceRegime
+                && observedSlotRounds >= Self.deepLowAcceptanceMinRounds
+                && slotAcceptanceFraction < Self.deepLowAcceptanceThreshold
+                && meanCommittedPerRound < Self.deepLowMaxMeanCommitted
+        }
+        return observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
             && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+    }
+
+    static let deepLowVerifyMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_VERIFY_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+    }()
+    static let deepLowVerifyThreshold: Double = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_VERIFY_THRESHOLD"].flatMap(Double.init) ?? 0.62
+    }()
+
+    /// Stricter low-acceptance gate for exact verify fast paths so
+    /// high-acceptance windows stay strictly below the decode speedup ceiling.
+    var isDeepLowVerifyRegime: Bool {
+        if Self.slotRegimeEnabled {
+            return inLowAcceptanceRegime
+                && observedSlotRounds >= Self.deepLowVerifyMinRounds
+                && slotAcceptanceFraction < Self.deepLowVerifyThreshold
+                && meanCommittedPerRound < Self.deepLowMaxMeanCommitted
+        }
+        return observedRegimeRounds >= Self.deepLowVerifyMinRounds
+            && roundAcceptanceFraction < Self.deepLowVerifyThreshold
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
@@ -710,13 +758,36 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         draftedDepth: Int,
         acceptedDepth: Int,
         rejectionObserved: Bool,
-        endedByTruncation: Bool = false
+        endedByTruncation: Bool = false,
+        verifyDraftWidth: Int? = nil,
+        outputTruncated: Bool = false
     ) {
         let drafted = min(max(draftedDepth, 0), Self.maximumDepth)
         let accepted = min(max(acceptedDepth, 0), drafted)
+        let slotDrafted = min(max(verifyDraftWidth ?? draftedDepth, 0), Self.maximumDepth)
+        let slotAccepted = min(max(acceptedDepth, 0), slotDrafted)
 
         for position in 0 ..< accepted {
             probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+        }
+        // Tree-invariant slot acceptance signal (uses actual draft width k on every
+        // non-output-truncated round, including terminal tree branch hits).
+        if slotDrafted > 0, !outputTruncated {
+            let slotFrac = Double(slotAccepted) / Double(slotDrafted)
+            let slotWeight: Double
+            if Self.fastRegimeEntry {
+                let denom = Double(observedSlotRounds + (Self.fastRegimeEntryV2 ? 1 : 2))
+                slotWeight = max(Self.regimeAlpha, 1.0 / denom)
+            } else {
+                slotWeight = Self.regimeAlpha
+            }
+            slotAcceptanceFraction += slotWeight * (slotFrac - slotAcceptanceFraction)
+            if observedSlotRounds < Int.max { observedSlotRounds += 1 }
+            if slotAcceptanceFraction < Self.lowAcceptanceRegimeThreshold {
+                enteredLowSlotRegime = true
+            } else if slotAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
+                enteredLowSlotRegime = false
+            }
         }
         // Regime signal: only rounds whose outcome was fully observed (a
         // rejection, or every draft accepted) count; a truncation does not.

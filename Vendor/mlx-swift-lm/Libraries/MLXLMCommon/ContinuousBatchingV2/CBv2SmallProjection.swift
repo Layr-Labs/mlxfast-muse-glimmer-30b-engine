@@ -291,7 +291,7 @@ public enum CBv2SmallProjection {
         // reuse) or one simdgroup per TM rows (stock BN = 1, eight simdgroups
         // per threadgroup). `out_vec` is the output's first column for this
         // segment; NOUT its row stride.
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, bool DV, int PF, bool VO, int RG>
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int DV_MODE, int PF, bool VO, int RG>
         inline void cbv2_sp_fp8(
             const device uint8_t* mat, float weight_scale, const device T* in_vec,
             device T* out_vec, int tile, uint simd_gid, uint simd_lid,
@@ -307,7 +307,7 @@ public enum CBv2SmallProjection {
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
             constexpr uint LOW = (1u << SH) - 1u;
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float dscale = DV ? weight_scale * 256.0f : weight_scale;
+            const float dscale = (DV_MODE != 0) ? weight_scale * 256.0f : weight_scale;
             const uint rg = SPLIT ? (simd_gid / 8u) : 0u;
             const uint g = SPLIT ? (simd_gid % 8u) : 0u;
             const int orig_row = SPLIT ? (tile * RG + int(rg)) * TM : (tile * 8 + int(simd_gid)) * TM;
@@ -323,8 +323,149 @@ public enum CBv2SmallProjection {
             for (int i = 0; i < P2; i++) {
                 r[i] = 0;
             }
-            // Weight words are loaded PD iterations at a time, ahead of
-            // their use (more loads in flight; the arithmetic is unchanged).
+            // Weight words are loaded ahead of their use (more loads in flight;
+            // the arithmetic is unchanged). For non-SPLIT (`BN = 1`, e.g. o_proj)
+            // with `PF == 2`, keep a 1-step rolling prefetch in flight every
+            // iteration using only `2 * TM` registers.
+            if constexpr (!SPLIT && PF == 2 && n_iter > 0) {
+              uint w_cur[TM];
+              CBV2_SP_UNROLL
+              for (int tm = 0; tm < TM; tm++) {
+                w_cur[tm] = *(const device uint*)(rows + tm * K + bn);
+              }
+              for (int i0 = 0; i0 < n_iter; i0++) {
+                uint w_next[TM];
+                if (i0 + 1 < n_iter) {
+                  CBV2_SP_UNROLL
+                  for (int tm = 0; tm < TM; tm++) {
+                    w_next[tm] = *(const device uint*)(rows + tm * K + bn + blockN);
+                  }
+                }
+                if constexpr (VO && (DV_MODE == 0 || DV_MODE == 2)) {
+                  T inter[TM][TN];
+                  CBV2_SP_UNROLL
+                  for (int tm = 0; tm < TM; tm++) {
+                    const uint w = w_cur[tm];
+                    if constexpr (DV_MODE == 2) {
+                      const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                      const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                      const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                      const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                      inter[tm][0] = static_cast<T>(f02.x);
+                      inter[tm][1] = static_cast<T>(f13.x);
+                      inter[tm][2] = static_cast<T>(f02.y);
+                      inter[tm][3] = static_cast<T>(f13.y);
+                    } else {
+                      CBV2_SP_UNROLL
+                      for (int tn = 0; tn < TN; tn++) {
+                        const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
+                        const float decoded =
+                            (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                        inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                      }
+                    }
+                  }
+                  CBV2_SP_UNROLL
+                  for (int v = 0; v < V; v++) {
+                    const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                      const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                      CBV2_SP_UNROLL
+                      for (int tm = 0; tm < TM; tm++) {
+                        r[v * TM + tm] += inter[tm][tn] * a;
+                      }
+                    }
+                  }
+                } else {
+                  float dec[TM][TN];
+                  CBV2_SP_UNROLL
+                  for (int tm = 0; tm < TM; tm++) {
+                    const uint w = w_cur[tm];
+                    if constexpr (DV_MODE == 2) {
+                      const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                      const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                      const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                      const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                      dec[tm][0] = f02.x; dec[tm][1] = f13.x;
+                      dec[tm][2] = f02.y; dec[tm][3] = f13.y;
+                    } else if constexpr (DV_MODE == 1) {
+                      const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                      const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                      const half2 h02 = as_type<half2>(lo);
+                      const half2 h13 = as_type<half2>(hi);
+                      dec[tm][0] = static_cast<float>(h02.x);
+                      dec[tm][1] = static_cast<float>(h13.x);
+                      dec[tm][2] = static_cast<float>(h02.y);
+                      dec[tm][3] = static_cast<float>(h13.y);
+                      if ((((w & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u) != 0) {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                          if (((w >> (8 * tn)) & 0x7Fu) == 0x7Fu) { dec[tm][tn] = nan_value; }
+                        }
+                      }
+                    } else {
+                      CBV2_SP_UNROLL
+                      for (int tn = 0; tn < TN; tn++) {
+                        const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
+                        dec[tm][tn] =
+                            (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                      }
+                    }
+                  }
+                  if constexpr (VO) {
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                      CBV2_SP_UNROLL
+                      for (int tn = 0; tn < TN; tn++) {
+                        inter[tm][tn] = static_cast<T>(dec[tm][tn] * dscale);
+                      }
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                      const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                      CBV2_SP_UNROLL
+                      for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                          r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                      }
+                    }
+                  } else {
+                    ushort4 av[V];
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                      av[v] = *(const device ushort4*)(in_vec + v * K + bn);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                      T inter[TM];
+                      CBV2_SP_UNROLL
+                      for (int tm = 0; tm < TM; tm++) {
+                        inter[tm] = static_cast<T>(
+                            (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
+                      }
+                      CBV2_SP_UNROLL
+                      for (int v = 0; v < V; v++) {
+                        const float a = static_cast<float>(as_type<T>(av[v][tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                          r[v * TM + tm] += inter[tm] * a;
+                        }
+                      }
+                    }
+                  }
+                }
+                if (i0 + 1 < n_iter) {
+                  CBV2_SP_UNROLL
+                  for (int tm = 0; tm < TM; tm++) { w_cur[tm] = w_next[tm]; }
+                }
+                bn += blockN;
+              }
+            } else {
             constexpr int PD = PF <= 1 ? 1 : (PF >= n_iter ? (n_iter > 0 ? n_iter : 1) : PF);
             for (int i0 = 0; i0 < n_iter; i0 += PD) {
               uint wblk[PD][TM];
@@ -342,19 +483,30 @@ public enum CBv2SmallProjection {
                     break;
                 }
                 thread const uint* wq = wblk[d];
-                if constexpr (VO && !DV) {
+                if constexpr (VO && (DV_MODE == 0 || DV_MODE == 2)) {
                     // Decode FP8 weights straight into `T inter[TM][TN]` (skipping
                     // the 16-float `dec` buffer) and load activations one row at a time.
                     T inter[TM][TN];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
                         const uint w = wq[tm];
-                        CBV2_SP_UNROLL
-                        for (int tn = 0; tn < TN; tn++) {
-                            const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
-                            const float decoded =
-                                (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                            inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                        if constexpr (DV_MODE == 2) {
+                            const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                            const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                            inter[tm][0] = static_cast<T>(f02.x);
+                            inter[tm][1] = static_cast<T>(f13.x);
+                            inter[tm][2] = static_cast<T>(f02.y);
+                            inter[tm][3] = static_cast<T>(f13.y);
+                        } else {
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
+                                const float decoded =
+                                    (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                            }
                         }
                     }
                     CBV2_SP_UNROLL
@@ -370,7 +522,7 @@ public enum CBv2SmallProjection {
                         }
                     }
                 } else {
-                // Decoded weights of the four codes of each row's word. DV:
+                // Decoded weights of the four codes of each row's word. DV_MODE!=0:
                 // the half bits of two codes per bit operation (codes 0 and 2,
                 // then 1 and 3) with the sign in the half's sign bit, and the
                 // exact factor 256 of `modelopt_e4m3_value` moved into the
@@ -380,7 +532,16 @@ public enum CBv2SmallProjection {
                 CBV2_SP_UNROLL
                 for (int tm = 0; tm < TM; tm++) {
                     const uint w = wq[tm];
-                    if (DV) {
+                    if constexpr (DV_MODE == 2) {
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        dec[tm][0] = f02.x;
+                        dec[tm][1] = f13.x;
+                        dec[tm][2] = f02.y;
+                        dec[tm][3] = f13.y;
+                    } else if constexpr (DV_MODE == 1) {
                         const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                         const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                         const half2 h02 = as_type<half2>(lo);
@@ -407,8 +568,6 @@ public enum CBv2SmallProjection {
                     }
                 }
                 if constexpr (VO) {
-                    // Rows of activations outermost, loaded one row at a time so
-                    // `av` holds 1 ushort4 instead of V (saving 14 regs at V = 8).
                     T inter[TM][TN];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
@@ -440,7 +599,8 @@ public enum CBv2SmallProjection {
                     T inter[TM];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
-                        inter[tm] = static_cast<T>(dec[tm][tn] * dscale);
+                        inter[tm] = static_cast<T>(
+                            (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
                     }
                     CBV2_SP_UNROLL
                     for (int v = 0; v < V; v++) {
@@ -456,13 +616,23 @@ public enum CBv2SmallProjection {
                 bn += blockN;
               }
             }
+            }
             if constexpr (leftover > 0) {
                 T inter[TM][TN];
                 if (bn + TN <= K) {
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
                         const uint w = *(const device uint*)(rows + tm * K + bn);
-                        if constexpr (DV) {
+                        if constexpr (DV_MODE == 2) {
+                            const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                            const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                            inter[tm][0] = static_cast<T>(f02.x);
+                            inter[tm][1] = static_cast<T>(f13.x);
+                            inter[tm][2] = static_cast<T>(f02.y);
+                            inter[tm][3] = static_cast<T>(f13.y);
+                        } else if constexpr (DV_MODE == 1) {
                             const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                             const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                             const half2 h02 = as_type<half2>(lo);
@@ -502,6 +672,11 @@ public enum CBv2SmallProjection {
                                 r[v * TM + tm] += inter[tm][tn] * a;
                             }
                         }
+                    }
+                } else if constexpr (leftover % 128 == 0) {
+                    CBV2_SP_UNROLL
+                    for (int i = 0; i < P; i++) {
+                        r[i] += 0.0f;
                     }
                 } else {
                     CBV2_SP_UNROLL
@@ -581,7 +756,7 @@ public enum CBv2SmallProjection {
     }
 
     struct FP8Shape: Hashable {
-        var vectorDecode: Bool
+        var vectorDecodeMode: Int
         var rowsOuter: Bool
         var rowGroups: Int
         var weights: Int
@@ -616,7 +791,7 @@ public enum CBv2SmallProjection {
                 let end = offset + s.tiles(rowGroups: 1)
                 body += """
                     \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                        cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter)>(
+                        cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecodeMode != 0), \(s.prefetch), \(shape.rowsOuter)>(
                             m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                             xc + size_t(\(s.input)) * V * K,
                             y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -645,7 +820,7 @@ public enum CBv2SmallProjection {
             let end = offset + s.tiles(rowGroups: rg)
             body += """
                 \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
+                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecodeMode), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
                         m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                         xc + size_t(\(s.input)) * V * K,
                         y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -676,12 +851,112 @@ public enum CBv2SmallProjection {
         return 2
     }
 
-    /// Two codes per bit operation in the weight decode, with the exact
-    /// factor 256 moved into the scale.
+    /// Two codes per bit operation in the weight decode (mode 1: with per-word
+    /// NaN check; mode 2: branchless after load-time NaN-byte + scale-range
+    /// verification).
     nonisolated(unsafe) static var vectorDecode = false
-    /// `CBV2_FP8_DV=1` enables vectorized two-code E4M3 decode on low-acceptance verify rows.
+    /// `CBV2_FP8_DV=1` enables vectorized two-code E4M3 decode (with NaN check) on low-acceptance verify rows.
     private static let vectorDecodeEnv: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_DV"] == "1"
+    /// `CBV2_FP8_BRANCHLESS`: `0` = off, `1` = on for deep-low-acceptance verify rounds
+    /// (default), `2` = always on (requires load-time NaN-free + scale-safe verification).
+    public static let fp8BranchlessMode: Int =
+        ProcessInfo.processInfo.environment["CBV2_FP8_BRANCHLESS"].flatMap(Int.init) ?? 1
+
+    private static func isScaleSafeFor256(_ scale: Float) -> Bool {
+        guard scale.isFinite else { return false }
+        let a = abs(scale)
+        return a == 0 || (a >= Float.leastNormalMagnitude && a <= 1e35)
+    }
+
+    /// Batch-verifies frozen FP8 layers once at load time in one GPU sync:
+    /// checks that `weight` contains zero `0x7F`/`0xFF` NaN bytes and that
+    /// `outputScale * 256.0f` neither overflows nor rounds as a subnormal.
+    public static func warmFP8BranchlessSafe(_ layers: [ModelOptCalibratedLinear]) {
+        guard fp8BranchlessMode != 0 else { return }
+        var pending: [(id: ObjectIdentifier, hasNaN: MLXArray, scale: MLXArray)] = []
+        fastLock.withLockUnchecked { box in
+            for layer in layers {
+                let id = ObjectIdentifier(layer)
+                guard box.fp8Safe[id] == nil,
+                    layer.format == .fp8, layer.weight.dtype == .uint8,
+                    let constants = layer.graphConstants,
+                    constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+                else { continue }
+                let w = layer.weight
+                let hasNaN = MLX.any(
+                    logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF)))))
+                pending.append((id, hasNaN, constants.outputScale))
+            }
+        }
+        guard !pending.isEmpty else { return }
+        eval(pending.flatMap { [$0.hasNaN, $0.scale] })
+        let results: [(ObjectIdentifier, Bool)] = pending.map { item in
+            let safe = !item.hasNaN.item(Bool.self)
+                && isScaleSafeFor256(item.scale.item(Float.self))
+            return (item.id, safe)
+        }
+        fastLock.withLockUnchecked { box in
+            for (id, safe) in results {
+                box.fp8Safe[id] = safe
+            }
+        }
+    }
+
+    /// True when `layer` has been proven NaN-byte-free and scale-safe (checked
+    /// once per layer and cached).
+    public static func isFP8BranchlessSafe(_ layer: ModelOptCalibratedLinear) -> Bool {
+        let id = ObjectIdentifier(layer)
+        if let cached = fastLock.withLockUnchecked({ $0.fp8Safe[id] }) {
+            return cached
+        }
+        guard layer.format == .fp8, layer.weight.dtype == .uint8,
+            let constants = layer.graphConstants,
+            constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+        else {
+            fastLock.withLockUnchecked { $0.fp8Safe[id] = false }
+            return false
+        }
+        let scaleVal = constants.outputScale.item(Float.self)
+        guard isScaleSafeFor256(scaleVal) else {
+            fastLock.withLockUnchecked { $0.fp8Safe[id] = false }
+            return false
+        }
+        let w = layer.weight
+        let hasNaN = MLX.any(
+            logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF))))
+        ).item(Bool.self)
+        let safe = !hasNaN
+        fastLock.withLockUnchecked { $0.fp8Safe[id] = safe }
+        return safe
+    }
+
+    /// True when every layer in `layers` is proven NaN-byte-free and scale-safe
+    /// and branchless FP8 decode is active for the current verify regime.
+    public static func shouldUseBranchlessFP8(for layers: [ModelOptCalibratedLinear]) -> Bool {
+        let allowed: Bool
+        switch fp8BranchlessMode {
+        case 0: allowed = false
+        case 2: allowed = true
+        default: allowed = CBv2DraftRegime.deepLowVerify
+        }
+        return allowed && layers.allSatisfy(isFP8BranchlessSafe)
+    }
+
+    private static func resolveFP8VectorDecodeMode(
+        _ layers: [ModelOptCalibratedLinear], lowVerify: Bool, deepLow: Bool
+    ) -> Int {
+        let branchlessAllowed: Bool
+        switch fp8BranchlessMode {
+        case 0: branchlessAllowed = false
+        case 2: branchlessAllowed = true
+        default: branchlessAllowed = deepLow
+        }
+        if branchlessAllowed && layers.allSatisfy(isFP8BranchlessSafe) {
+            return 2
+        }
+        return (vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0
+    }
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -749,10 +1024,44 @@ public enum CBv2SmallProjection {
         let isFloat16: Bool
     }
 
+    private struct FP8SwiGLULaunchKey: Hashable {
+        let dtype: DType
+        let inputs: Int
+        let outputs: Int
+        let rows: Int
+        let rowGroups: Int
+        let dvMode: Int
+        let castFP8: Bool
+    }
+
+    private struct FP8SwiGLUPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let fp8ID: ObjectIdentifier?
+        let inputs: Int
+        let rows: Int
+        let dtype: DType
+        let rowGroups: Int
+        let dvMode: Int
+    }
+
+    private struct FP8SwiGLUPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let fp8Mu: MLXArray
+        let fp8Bd: MLXArray
+        let outputs: Int
+    }
+
     private final class FastFP8CacheBox: @unchecked Sendable {
         var fp8: [FP8GroupPlanKey: FP8GroupPlan] = [:]
         var dense: [DenseGroupPlanKey: DenseGroupPlan] = [:]
         var sharedCast: [SharedCastKey: (multipliers: MLXArray, overflowBound: MLXArray)?] = [:]
+        var fp8Safe: [ObjectIdentifier: Bool] = [:]
+        var fp8SwiGLULaunches: [FP8SwiGLULaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var fp8SwiGLUPlans: [FP8SwiGLUPlanKey: FP8SwiGLUPlan] = [:]
+        var fp8SwiGLUVerified = false
+        var fp8SwiGLUPlainVerified = false
     }
 
     private static let fastLock = OSAllocatedUnfairLock(initialState: FastFP8CacheBox())
@@ -824,7 +1133,7 @@ public enum CBv2SmallProjection {
         let dtype: DType
         let rowsOuter: Bool
         let rowGroups: Int
-        let vectorDecode: Bool
+        let vectorDecodeMode: Int
         let lowVerify: Bool
         let sharedInput: Bool
     }
@@ -864,25 +1173,48 @@ public enum CBv2SmallProjection {
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let deepLow = CBv2DraftRegime.deepLowVerify
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
-        let useVectorDecode = vectorDecode || (vectorDecodeEnv && lowVerify)
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         let canUseFastPlan =
             lowVerify && rowsPerThreadOverride == nil && prefetchOverride == nil
             && ModelOptRowExact.geometryOverride == nil
         if canUseFastPlan {
-            let planKey = FP8GroupPlanKey(
-                id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
-                count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
-                lowVerify: lowVerify, sharedInput: sharedInput)
-            if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
+            let branchlessAllowed =
+                fp8BranchlessMode == 2 || (fp8BranchlessMode != 0 && deepLow)
+            let fallbackDV = (vectorDecode || vectorDecodeEnv) ? 1 : 0
+            if let plan = fastLock.withLockUnchecked({ box -> FP8GroupPlan? in
+                let dvMode: Int
+                if branchlessAllowed {
+                    var allSafe = true
+                    for layer in layers {
+                        guard let safe = box.fp8Safe[ObjectIdentifier(layer)] else { return nil }
+                        if !safe { allSafe = false }
+                    }
+                    dvMode = allSafe ? 2 : fallbackDV
+                } else {
+                    dvMode = fallbackDV
+                }
+                let planKey = FP8GroupPlanKey(
+                    id0: ObjectIdentifier(layers[0]),
+                    idLast: ObjectIdentifier(layers[layers.count - 1]),
+                    count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
+                    rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecodeMode: dvMode,
+                    lowVerify: lowVerify, sharedInput: sharedInput)
+                return box.fp8[planKey]
+            }) {
                 var args = plan.weightArrays
                 args.append(cast)
                 return plan.launch(args)
             }
+            let dvMode = resolveFP8VectorDecodeMode(layers, lowVerify: lowVerify, deepLow: deepLow)
+            let planKey = FP8GroupPlanKey(
+                id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
+                count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
+                rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecodeMode: dvMode,
+                lowVerify: lowVerify, sharedInput: sharedInput)
             var segments = [FP8Segment]()
             var weightArrays = [MLXArray]()
             weightArrays.reserveCapacity(layers.count * 2 + 1)
@@ -904,7 +1236,7 @@ public enum CBv2SmallProjection {
             }
             let rg = segments.allSatisfy(\.split) ? targetRG : 1
             let shape = FP8Shape(
-                vectorDecode: useVectorDecode, rowsOuter: useRowsOuter, rowGroups: rg,
+                vectorDecodeMode: dvMode, rowsOuter: useRowsOuter, rowGroups: rg,
                 weights: layers.count, outputs: layers.count, segments: segments)
             let outputDims = layers.map(\.outputDimensions)
             let launchKey = FP8LaunchKey(
@@ -929,6 +1261,9 @@ public enum CBv2SmallProjection {
             args.append(cast)
             return launch(args)
         }
+        let dvMode = lowVerify
+            ? resolveFP8VectorDecodeMode(layers, lowVerify: lowVerify, deepLow: deepLow)
+            : (vectorDecode ? 1 : 0)
         var segments = [FP8Segment]()
         var arrays = [MLXArray]()
         arrays.reserveCapacity(layers.count * 2 + 1)
@@ -950,7 +1285,7 @@ public enum CBv2SmallProjection {
         arrays.append(cast)
         let rg = segments.allSatisfy(\.split) ? targetRG : 1
         let shape = FP8Shape(
-            vectorDecode: useVectorDecode, rowsOuter: useRowsOuter, rowGroups: rg,
+            vectorDecodeMode: dvMode, rowsOuter: useRowsOuter, rowGroups: rg,
             weights: layers.count, outputs: layers.count, segments: segments,
             record: !lowVerify)
         let outputDims = layers.map(\.outputDimensions)
@@ -983,20 +1318,37 @@ public enum CBv2SmallProjection {
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let deepLow = CBv2DraftRegime.deepLowVerify
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
-        let useVectorDecode = vectorDecode || (vectorDecodeEnv && lowVerify)
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
-        if rowsPerThreadOverride == nil && prefetchOverride == nil
+        if lowVerify && rowsPerThreadOverride == nil && prefetchOverride == nil
             && ModelOptRowExact.geometryOverride == nil
         {
-            let planKey = FP8GroupPlanKey(
-                id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
-                count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecode: useVectorDecode,
-                lowVerify: lowVerify, sharedInput: true)
-            if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
+            let branchlessAllowed =
+                fp8BranchlessMode == 2 || (fp8BranchlessMode != 0 && deepLow)
+            let fallbackDV = (vectorDecode || vectorDecodeEnv) ? 1 : 0
+            if let plan = fastLock.withLockUnchecked({ box -> FP8GroupPlan? in
+                let dvMode: Int
+                if branchlessAllowed {
+                    var allSafe = true
+                    for layer in layers {
+                        guard let safe = box.fp8Safe[ObjectIdentifier(layer)] else { return nil }
+                        if !safe { allSafe = false }
+                    }
+                    dvMode = allSafe ? 2 : fallbackDV
+                } else {
+                    dvMode = fallbackDV
+                }
+                let planKey = FP8GroupPlanKey(
+                    id0: ObjectIdentifier(layers[0]),
+                    idLast: ObjectIdentifier(layers[layers.count - 1]),
+                    count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
+                    rowsOuter: useRowsOuter, rowGroups: targetRG, vectorDecodeMode: dvMode,
+                    lowVerify: lowVerify, sharedInput: true)
+                return box.fp8[planKey]
+            }) {
                 let flat = preCast.reshaped(rows, inputs)
                 var args = plan.weightArrays
                 args.append(flat)
@@ -1883,6 +2235,482 @@ public enum CBv2SmallProjection {
         for count in rows {
             let zeros = MLXArray.zeros([1, count, inputs], dtype: dtype)
             if let outputs = fp8Products(layers, zeros) { eval(outputs) }
+        }
+    }
+
+    // MARK: Fused RG=4 Branchless FP8 Gate + Up + SwiGLU (+ optional inline FP8 cast)
+
+    /// `CBV2_FP8_FUSED_SWIGLU=0` disables fused FP8 gate+up+SwiGLU (7 FP8 MLP layers).
+    public static let fp8SwiGLUEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_FUSED_SWIGLU"] != "0"
+
+    nonisolated(unsafe) private static let dummyFP8SwiGLUMu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummyFP8SwiGLUBound: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    public static var fp8SwiGLUActive: Bool {
+        fp8SwiGLUEnvEnabled && fastLock.withLockUnchecked { $0.fp8SwiGLUVerified }
+    }
+
+    public static var fp8SwiGLUPlainActive: Bool {
+        fp8SwiGLUEnvEnabled && fastLock.withLockUnchecked { $0.fp8SwiGLUPlainVerified }
+    }
+
+    private static let fp8SwiGLUSource = """
+        constexpr int BN = 8;
+        constexpr int TN = 4;
+        constexpr int blockN = BN * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        constexpr int P = V;
+        static_assert(P <= 8, "at most 8 verify rows");
+        constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : 8;
+        constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : 2;
+        constexpr uint LOW = (1u << SH) - 1u;
+        const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+        const float scale_g = wsg[0];
+        const float scale_u = wsu[0];
+        const float dscale_g = (DV_MODE != 0) ? (scale_g * 256.0f) : scale_g;
+        const float dscale_u = (DV_MODE != 0) ? (scale_u * 256.0f) : scale_u;
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint rg_idx = simd_gid / 8u;
+        const uint g = simd_gid % 8u;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int orig_row = tile * RG + int(rg_idx);
+        const bool active = orig_row < N;
+        const int out_row = active ? orig_row : (N - 1);
+        int bn = (32 * int(g) + int(simd_lid)) * TN;
+        const device uint8_t* row_g = mg + size_t(out_row) * K;
+        const device uint8_t* row_u = mu + size_t(out_row) * K;
+        float rg[P2];
+        float ru[P2];
+        CBV2_SP_UNROLL
+        for (int i = 0; i < P2; i++) {
+            rg[i] = 0;
+            ru[i] = 0;
+        }
+        for (int i0 = 0; i0 < n_iter; i0++) {
+            const uint wg = *(const device uint*)(row_g + bn);
+            const uint wu = *(const device uint*)(row_u + bn);
+            T ig[TN];
+            T iu[TN];
+            if constexpr (DV_MODE == 2) {
+                const uint lo_g = ((wg & 0x007F007Fu) << 7) | ((wg & 0x00800080u) << 8);
+                const uint hi_g = ((wg >> 1) & 0x3F803F80u) | (wg & 0x80008000u);
+                const float2 fg02 = float2(as_type<half2>(lo_g)) * dscale_g;
+                const float2 fg13 = float2(as_type<half2>(hi_g)) * dscale_g;
+                ig[0] = static_cast<T>(fg02.x);
+                ig[1] = static_cast<T>(fg13.x);
+                ig[2] = static_cast<T>(fg02.y);
+                ig[3] = static_cast<T>(fg13.y);
+                const uint lo_u = ((wu & 0x007F007Fu) << 7) | ((wu & 0x00800080u) << 8);
+                const uint hi_u = ((wu >> 1) & 0x3F803F80u) | (wu & 0x80008000u);
+                const float2 fu02 = float2(as_type<half2>(lo_u)) * dscale_u;
+                const float2 fu13 = float2(as_type<half2>(hi_u)) * dscale_u;
+                iu[0] = static_cast<T>(fu02.x);
+                iu[1] = static_cast<T>(fu13.x);
+                iu[2] = static_cast<T>(fu02.y);
+                iu[3] = static_cast<T>(fu13.y);
+            } else {
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    const uint8_t cg = uint8_t((wg >> (8 * tn)) & 0xFF);
+                    const float dg = (cg & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cg);
+                    ig[tn] = static_cast<T>(dg * scale_g);
+                    const uint8_t cu = uint8_t((wu >> (8 * tn)) & 0xFF);
+                    const float du = (cu & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cu);
+                    iu[tn] = static_cast<T>(du * scale_u);
+                }
+            }
+            CBV2_SP_UNROLL
+            for (int v = 0; v < V; v++) {
+                const ushort4 av_v = *(const device ushort4*)(xc + v * K + bn);
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                    rg[v] += ig[tn] * a;
+                    ru[v] += iu[tn] * a;
+                }
+            }
+            bn += blockN;
+        }
+        if constexpr (leftover > 0) {
+            T ig[TN];
+            T iu[TN];
+            if (bn + TN <= K) {
+                const uint wg = *(const device uint*)(row_g + bn);
+                const uint wu = *(const device uint*)(row_u + bn);
+                if constexpr (DV_MODE == 2) {
+                    const uint lo_g = ((wg & 0x007F007Fu) << 7) | ((wg & 0x00800080u) << 8);
+                    const uint hi_g = ((wg >> 1) & 0x3F803F80u) | (wg & 0x80008000u);
+                    const float2 fg02 = float2(as_type<half2>(lo_g)) * dscale_g;
+                    const float2 fg13 = float2(as_type<half2>(hi_g)) * dscale_g;
+                    ig[0] = static_cast<T>(fg02.x);
+                    ig[1] = static_cast<T>(fg13.x);
+                    ig[2] = static_cast<T>(fg02.y);
+                    ig[3] = static_cast<T>(fg13.y);
+                    const uint lo_u = ((wu & 0x007F007Fu) << 7) | ((wu & 0x00800080u) << 8);
+                    const uint hi_u = ((wu >> 1) & 0x3F803F80u) | (wu & 0x80008000u);
+                    const float2 fu02 = float2(as_type<half2>(lo_u)) * dscale_u;
+                    const float2 fu13 = float2(as_type<half2>(hi_u)) * dscale_u;
+                    iu[0] = static_cast<T>(fu02.x);
+                    iu[1] = static_cast<T>(fu13.x);
+                    iu[2] = static_cast<T>(fu02.y);
+                    iu[3] = static_cast<T>(fu13.y);
+                } else {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const uint8_t cg = uint8_t((wg >> (8 * tn)) & 0xFF);
+                        const float dg = (cg & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cg);
+                        ig[tn] = static_cast<T>(dg * scale_g);
+                        const uint8_t cu = uint8_t((wu >> (8 * tn)) & 0xFF);
+                        const float du = (cu & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cu);
+                        iu[tn] = static_cast<T>(du * scale_u);
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av_v = *(const device ushort4*)(xc + v * K + bn);
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                        rg[v] += ig[tn] * a;
+                        ru[v] += iu[tn] * a;
+                    }
+                }
+            } else if constexpr (leftover % 128 == 0) {
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    rg[v] += 0.0f;
+                    ru[v] += 0.0f;
+                }
+            } else {
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    if (bn + tn < K) {
+                        const uint8_t cg = row_g[bn + tn];
+                        const float dg = (cg & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cg);
+                        ig[tn] = static_cast<T>(dg * scale_g);
+                        const uint8_t cu = row_u[bn + tn];
+                        const float du = (cu & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(cu);
+                        iu[tn] = static_cast<T>(du * scale_u);
+                    } else {
+                        ig[tn] = T(0);
+                        iu[tn] = T(0);
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a =
+                            bn + tn < K ? static_cast<float>(xc[v * K + bn + tn]) : 0.0f;
+                        rg[v] += ig[tn] * a;
+                        ru[v] += iu[tn] * a;
+                    }
+                }
+            }
+        }
+        const ushort lid = ushort(simd_lid);
+        cbv2_sp_tree_step<P2, 16>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(rg, lid);
+        cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(rg, lid);
+        cbv2_sp_tree_step<1, 1>(rg, lid);
+
+        cbv2_sp_tree_step<P2, 16>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(ru, lid);
+        cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(ru, lid);
+        cbv2_sp_tree_step<1, 1>(ru, lid);
+
+        threadgroup float tgp_g[RG * 8 * 32];
+        threadgroup float tgp_u[RG * 8 * 32];
+        threadgroup float* row_tgp_g = tgp_g + rg_idx * 256u;
+        threadgroup float* row_tgp_u = tgp_u + rg_idx * 256u;
+        const bool holds = (simd_lid & LOW) == 0;
+        const int i = int(simd_lid >> SH);
+        if (holds) {
+            row_tgp_g[g * 32 + i] = rg[0];
+            row_tgp_u[g * 32 + i] = ru[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g == 0 && holds && i < P && active) {
+            float res_g = rg[0];
+            float res_u = ru[0];
+            for (int s = 1; s < BN; s++) {
+                res_g += row_tgp_g[s * 32 + i];
+                res_u += row_tgp_u[s * 32 + i];
+            }
+            const bfloat16_t gv = static_cast<bfloat16_t>(res_g);
+            const bfloat16_t uv = static_cast<bfloat16_t>(res_u);
+            const bfloat16_t zero_bf = bfloat16_t(0.0f);
+            const bfloat16_t one_bf = bfloat16_t(1.0f);
+            const bfloat16_t ax = (gv < zero_bf) ? -gv : gv;
+            const bfloat16_t ey = static_cast<bfloat16_t>(
+                metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t sy = one_bf / (one_bf + ey);
+            const bfloat16_t sig = (gv < zero_bf) ? sy : (one_bf - sy);
+            bfloat16_t act = (gv * sig) * uv;
+            if constexpr (CAST_FP8) {
+                const float scaled = static_cast<float>(act) * fp8_mu[0];
+                const uint8_t bits = modelopt_e4m3_bits(scaled);
+                const float decoded =
+                    (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > fp8_bd[0];
+                act = static_cast<bfloat16_t>(invalid ? nan_value : decoded * fp8_mu[1]);
+            }
+            y[size_t(i) * N + out_row] = static_cast<T>(act);
+        }
+        """
+
+    private static let fp8SwiGLUKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_swiglu_rg",
+        inputNames: ["mg", "wsg", "mu", "wsu", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8SwiGLUSource,
+        header: ModelOptActivationKernels.header + fp8Helper)
+
+    /// Fused `RG=4` branchless `silu(gate(preCast)) * up(preCast)` (+ optional inline FP8
+    /// activation cast) in a single dispatch for pure-SPLIT FP8 MLP gate+up pairs.
+    public static func fp8SwiGLUPreCast(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear, preCast: MLXArray,
+        fp8Multipliers: MLXArray? = nil, fp8OverflowBound: MLXArray? = nil,
+        fp8LayerID: ObjectIdentifier? = nil
+    ) -> MLXArray? {
+        let inputs = preCast.dim(-1)
+        guard inputs > 0, preCast.dtype == .bfloat16 else { return nil }
+        let rows = preCast.size / inputs
+        guard (1 ... maximumRows).contains(rows) else { return nil }
+        let castFP8 = fp8Multipliers != nil && fp8OverflowBound != nil
+        let rg = rows >= 2 ? fp8RowGroups : 1
+        let canUsePlan = (!castFP8 || fp8LayerID != nil) && ModelOptRowExact.geometryOverride == nil
+        if canUsePlan {
+            let branchlessAllowed = fp8BranchlessMode != 0
+            if let plan = fastLock.withLockUnchecked({ box -> FP8SwiGLUPlan? in
+                let dvMode: Int
+                if branchlessAllowed {
+                    guard let sg = box.fp8Safe[ObjectIdentifier(gate)],
+                        let su = box.fp8Safe[ObjectIdentifier(up)]
+                    else { return nil }
+                    dvMode = (sg && su) ? 2 : 0
+                } else {
+                    dvMode = 0
+                }
+                let pkey = FP8SwiGLUPlanKey(
+                    gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+                    fp8ID: castFP8 ? fp8LayerID : nil, inputs: inputs, rows: rows,
+                    dtype: preCast.dtype, rowGroups: rg, dvMode: dvMode)
+                return box.fp8SwiGLUPlans[pkey]
+            }) {
+                var args = plan.weightArrays
+                args.append(preCast.reshaped(rows, inputs))
+                args.append(plan.fp8Mu)
+                args.append(plan.fp8Bd)
+                let result = plan.launch(args)[0]
+                if preCast.ndim == 3 {
+                    return result.reshaped(preCast.dim(0), preCast.dim(1), plan.outputs)
+                }
+                return result.reshaped(Array(preCast.shape.dropLast()) + [plan.outputs])
+            }
+        }
+        let outputs = gate.outputDimensions
+        guard up.outputDimensions == outputs,
+            fp8Takes(gate, inputs: inputs, dtype: preCast.dtype),
+            fp8Takes(up, inputs: inputs, dtype: preCast.dtype)
+        else { return nil }
+        let runsG = fp8Runs(gate)
+        let runsU = fp8Runs(up)
+        guard runsG.count == 1, runsU.count == 1,
+            runsG[0].split, runsU[0].split,
+            runsG[0].rows == 0 ..< outputs, runsU[0].rows == 0 ..< outputs
+        else { return nil }
+        let dvMode =
+            resolveFP8VectorDecodeMode([gate, up], lowVerify: true, deepLow: true) == 2 ? 2 : 0
+        let lkey = FP8SwiGLULaunchKey(
+            dtype: preCast.dtype, inputs: inputs, outputs: outputs, rows: rows,
+            rowGroups: rg, dvMode: dvMode, castFP8: castFP8)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = fastLock.withLockUnchecked({ $0.fp8SwiGLULaunches[lkey] }) {
+            launch = hit
+        } else {
+            let tiles = (outputs + rg - 1) / rg
+            let made = fp8SwiGLUKernel.prepare(
+                template: [
+                    ("T", preCast.dtype), ("K", inputs), ("V", rows), ("N", outputs),
+                    ("RG", rg), ("DV_MODE", dvMode), ("CAST_FP8", castFP8),
+                ],
+                grid: (32, 8 * rg * tiles, 1), threadGroup: (32, 8 * rg, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [preCast.dtype])
+            fastLock.withLockUnchecked { $0.fp8SwiGLULaunches[lkey] = made }
+            launch = made
+        }
+        let weightArrays = [
+            gate.weight, gate.graphConstants!.outputScale,
+            up.weight, up.graphConstants!.outputScale,
+        ]
+        let mu = fp8Multipliers ?? dummyFP8SwiGLUMu
+        let bd = fp8OverflowBound ?? dummyFP8SwiGLUBound
+        if canUsePlan {
+            let pkey = FP8SwiGLUPlanKey(
+                gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+                fp8ID: castFP8 ? fp8LayerID : nil, inputs: inputs, rows: rows,
+                dtype: preCast.dtype, rowGroups: rg, dvMode: dvMode)
+            let plan = FP8SwiGLUPlan(
+                launch: launch, weightArrays: weightArrays, fp8Mu: mu, fp8Bd: bd, outputs: outputs)
+            fastLock.withLockUnchecked { $0.fp8SwiGLUPlans[pkey] = plan }
+        }
+        var args = weightArrays
+        args.append(preCast.reshaped(rows, inputs))
+        args.append(mu)
+        args.append(bd)
+        let result = launch(args)[0]
+        if preCast.ndim == 3 {
+            return result.reshaped(preCast.dim(0), preCast.dim(1), outputs)
+        }
+        return result.reshaped(Array(preCast.shape.dropLast()) + [outputs])
+    }
+
+    public static func fp8SwiGLUPreCast(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear, preCast: MLXArray,
+        fp8Down: ModelOptCalibratedLinear
+    ) -> MLXArray? {
+        guard let constants = fp8Down.graphConstants,
+            case .fp8(let mu, let bd) = constants.storage
+        else { return nil }
+        return fp8SwiGLUPreCast(
+            gate: gate, up: up, preCast: preCast, fp8Multipliers: mu, fp8OverflowBound: bd,
+            fp8LayerID: ObjectIdentifier(fp8Down))
+    }
+
+    /// Load-time 0-ULP parity check and warmup for `fp8SwiGLUPreCast` across `[2, 8]` rows
+    /// for both plain BF16 and inline-FP8-cast outputs, failing closed on any bit mismatch.
+    public static func verifyAndWarmFP8SwiGLU(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear,
+        down: ModelOptCalibratedLinear?, dtype: DType,
+        rows: ClosedRange<Int> = 1 ... maximumRows
+    ) {
+        guard fp8SwiGLUEnvEnabled, dtype == .bfloat16 else { return }
+        let width = gate.inputDimensions
+        let prevLow = CBv2DraftRegime.lowAcceptance
+        let prevDeep = CBv2DraftRegime.deepLowAcceptance
+        CBv2DraftRegime.lowAcceptance = true
+        CBv2DraftRegime.deepLowAcceptance = true
+        defer {
+            CBv2DraftRegime.lowAcceptance = prevLow
+            CBv2DraftRegime.deepLowAcceptance = prevDeep
+        }
+        var failReason = ""
+        let (plainOK, castOK): (Bool, Bool)
+        do {
+            (plainOK, castOK) = try MLX.withError { errors -> (Bool, Bool) in
+                var pPass = true
+                var cPass = (down != nil)
+                let downParams: (mu: MLXArray, bd: MLXArray)?
+                if let down, let constants = down.graphConstants,
+                    case .fp8(let mu, let bd) = constants.storage
+                {
+                    downParams = (mu, bd)
+                } else {
+                    downParams = nil
+                    cPass = false
+                }
+                for testRows in [2, 8] {
+                    var vals = [Float]()
+                    vals.reserveCapacity(testRows * width)
+                    for i in 0 ..< (testRows * width) {
+                        vals.append(Float(((i * 7 + 3) % 29) - 14) * 0.125)
+                    }
+                    let x = MLXArray(vals, [1, testRows, width]).asType(.bfloat16)
+                    guard let refPair = fp8ProductsPreCast([gate, up], preCast: x),
+                        let fusedPlain = fp8SwiGLUPreCast(gate: gate, up: up, preCast: x)
+                    else {
+                        pPass = false
+                        cPass = false
+                        failReason += "fp8SwiGLU@\(testRows) nil "
+                        break
+                    }
+                    let refAct = compiledSiluProduct(refPair[0], refPair[1])
+                    let diffPlain = (
+                        contiguous(fusedPlain).view(dtype: .uint16)
+                            .!= contiguous(refAct).view(dtype: .uint16)
+                    ).asType(.int32).sum()
+                    eval(diffPlain)
+                    try errors.check()
+                    let dp = diffPlain.item(Int.self)
+                    if dp != 0 {
+                        pPass = false
+                        cPass = false
+                        failReason += "fp8SwiGLU@\(testRows) diff=\(dp) "
+                        break
+                    }
+                    if cPass, let down, let dpParams = downParams {
+                        if let refCast = VerifyFusedNorms.fusedSiluProductCastFP8(
+                            gate: refPair[0], up: refPair[1], layer: down),
+                            let fusedCast = fp8SwiGLUPreCast(
+                                gate: gate, up: up, preCast: x,
+                                fp8Multipliers: dpParams.mu, fp8OverflowBound: dpParams.bd)
+                        {
+                            let diffCast = (
+                                contiguous(fusedCast).view(dtype: .uint16)
+                                    .!= contiguous(refCast).view(dtype: .uint16)
+                            ).asType(.int32).sum()
+                            eval(diffCast)
+                            try errors.check()
+                            let dc = diffCast.item(Int.self)
+                            if dc != 0 {
+                                cPass = false
+                                failReason += "fp8SwiGLUCast@\(testRows) diff=\(dc) "
+                            }
+                        } else {
+                            cPass = false
+                            failReason += "fp8SwiGLUCast@\(testRows) nil "
+                        }
+                    }
+                }
+                if pPass {
+                    var warm = [MLXArray]()
+                    for r in rows {
+                        let z = MLXArray.zeros([1, r, width], dtype: dtype)
+                        if let y = fp8SwiGLUPreCast(gate: gate, up: up, preCast: z) {
+                            warm.append(y)
+                        }
+                        if cPass, let dpParams = downParams,
+                            let yc = fp8SwiGLUPreCast(
+                                gate: gate, up: up, preCast: z,
+                                fp8Multipliers: dpParams.mu, fp8OverflowBound: dpParams.bd)
+                        {
+                            warm.append(yc)
+                        }
+                    }
+                    if !warm.isEmpty { eval(warm) }
+                    try errors.check()
+                }
+                return (pPass, cPass)
+            }
+        } catch {
+            failReason += "error=\(error)"
+            (plainOK, castOK) = (false, false)
+        }
+        fastLock.withLockUnchecked {
+            $0.fp8SwiGLUPlainVerified = plainOK
+            $0.fp8SwiGLUVerified = castOK
+        }
+        if ProcessInfo.processInfo.environment["DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ_SELFTEST"] == "1"
+            || !failReason.isEmpty
+        {
+            FileHandle.standardError.write(
+                Data(
+                    "[fp8-swiglu-check] plain=\(plainOK) cast=\(castOK) rg=\(fp8RowGroups) \(failReason)\n"
+                        .utf8))
         }
     }
 }

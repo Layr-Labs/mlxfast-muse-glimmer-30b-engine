@@ -865,6 +865,9 @@ extension EngineLoopV2 {
         CBv2DraftRegime.xnorDraftHeadEligible =
             batch == 1 && mtp.inDeepLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
+        CBv2DraftRegime.deepLowAcceptance =
+            batch == 1 && mtp.inDeepLowVerifyRegime(verifyRows[0].rec.id)
+        defer { CBv2DraftRegime.deepLowAcceptance = false }
         let treeEligible =
             batch == 1 && CBv2DraftRegime.verifyTreeMode != 0
             && mtp.shouldUseVerifyTree(for: verifyRows[0].rec.id)
@@ -943,8 +946,10 @@ extension EngineLoopV2 {
                     if stateful.requiresDraftHiddenEvaluation {
                         stepEvalTargets.append(result.hidden)
                     }
-                    stepEvalTargets.append(
-                        contentsOf: stateful.evaluationTargets(for: requestState))
+                    if draftIndex == 0 || stateful.requiresDraftHiddenEvaluation {
+                        stepEvalTargets.append(
+                            contentsOf: stateful.evaluationTargets(for: requestState))
+                    }
                 }
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation, and every generation for a
