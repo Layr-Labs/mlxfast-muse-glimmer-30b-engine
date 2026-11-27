@@ -1729,14 +1729,15 @@ public enum CBv2DraftRegime {
         }
         return dynamicTreeMaxLeavesAt5
     }()
-    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
+    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 3; 1 = leaves only).
+    /// Above 1 a chosen branch node may carry the next row's argmax below it.
     public static let dynamicTreeMaxBranchLen: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
             let v = Int(raw), (1 ... 4).contains(v)
         {
             return v
         }
-        return 1
+        return 3
     }()
     /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.75).
     public static let dynamicTreeContDecay: Float = {
@@ -1747,14 +1748,14 @@ public enum CBv2DraftRegime {
         }
         return 0.75
     }()
-    /// Maximum parent chain depth allowed to host branch leaves (`CBV2_DYN_TREE_MAX_DEPTH`, default 5).
+    /// Maximum parent chain depth allowed to host branch leaves (`CBV2_DYN_TREE_MAX_DEPTH`, default 6).
     public static let dynamicTreeMaxLeafDepth: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_MAX_DEPTH"],
             let v = Int(raw), (1 ... 6).contains(v)
         {
             return v
         }
-        return 5
+        return 6
     }()
     /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.17).
     public static let dynamicTreeTemp: Float = {

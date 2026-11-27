@@ -56,17 +56,24 @@ public enum PagedOnePassAttention {
     /// Set by `warm` when the `DYN_TREE = true` one-pass variant fails the threadgroup probe;
     /// leaves `DYN_TREE = false` unaffected and falls back to two-pass only for dynamic-tree rounds.
     nonisolated(unsafe) private(set) static var dynTreeProbeFailed = false
+    /// `CBV2_ONEPASS_APPEND=0`: linear rectangular verify keeps the separate K/V
+    /// scatter instead of the write-owning one-pass variant (same bytes either way).
+    static let appendEnabled = environment["CBV2_ONEPASS_APPEND"] != "0"
+    /// True once `warm` qualified at least one write-owning variant.
+    static var appendWarmed: Bool { appendEnabled && lock.withLock { !appendVariants.isEmpty } }
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
     /// pipeline holds, to exercise the two-pass fallback (a self-test).
     private static let forceProbeFailure = environment["MUSE_PAGED_ONEPASS_PROBE_FAIL"] == "1"
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var appendVariants: Set<AppendKey> = []
     nonisolated(unsafe) private static var checked = 0
     nonisolated(unsafe) private static var differing = 0
+    nonisolated(unsafe) private static var appendedChecks = 0
 
     /// Self-test bookkeeping: evaluates both results and counts elements
     /// whose bits differ.
-    static func compare(onePass: MLXArray, twoPass: MLXArray) {
+    static func compare(onePass: MLXArray, twoPass: MLXArray, appended: Bool = false) {
         let a = onePass.asType(.float32).asArray(Float.self)
         let b = twoPass.asType(.float32).asArray(Float.self)
         var bad = a.count == b.count ? 0 : max(a.count, b.count)
@@ -75,11 +82,12 @@ public enum PagedOnePassAttention {
         }
         lock.withLock {
             checked += 1
+            if appended { appendedChecks += 1 }
             differing += bad
             if bad != 0 || checked % 500 == 0 {
                 FileHandle.standardError.write(
                     Data(
-                        "[onepass-check] dispatches=\(checked) rows=\(onePass.dim(0)) elements=\(a.count) differing=\(bad) total_differing=\(differing)\n"
+                        "[onepass-check] dispatches=\(checked) rows=\(onePass.dim(0)) elements=\(a.count) differing=\(bad) total_differing=\(differing) appends=\(appendedChecks)\n"
                             .utf8))
             }
         }
@@ -112,6 +120,9 @@ public enum PagedOnePassAttention {
         var record = [Int32](repeating: 0, count: PagedSegmentDispatchPlan.recordStride)
         record[3] = 1
         record[6] = 1
+        // The write-owning variant writes its scratch page: its own contiguous storage.
+        let appendStorage = contiguous(MLXArray.zeros([2 * pageElements], dtype: dtype))
+        let pending = MLXArray.zeros([1, kvHeads, headDim], dtype: dtype)
         var outputs = [MLXArray]()
         defer {
             if !outputs.isEmpty { eval(outputs) }
@@ -184,8 +195,59 @@ public enum PagedOnePassAttention {
                         treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true)
                     outputs += [dynResult.fence, dynResult.out]
                 }
+                if appendEnabled {
+                    outputs += warmAppend(
+                        q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
+                        params: params, previous: previous, valueOffsets: MLXArray(offsets),
+                        records: MLXArray(record), pending: pending, dtype: dtype,
+                        headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+                        hpt: hpt, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                        source: source, maxPart: mp)
+                }
             }
         }
+    }
+
+    /// Probes and compiles the write-owning (linear-only) variant at one
+    /// MAXPART on scratch pages; a variant that fails its probe is not used.
+    private static func warmAppend(
+        q: MLXArray, storage: MLXArray, bindings: Int, seqinfo: MLXArray, params: MLXArray,
+        previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, pending: MLXArray,
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, source: String, maxPart: Int
+    ) -> [MLXArray] {
+        let backing = [MLXArray](repeating: storage, count: bindings)
+        let held =
+            (try? withError { () -> Bool in
+                let probed = segments(
+                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: valueOffsets, records: records,
+                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+                    source: source, probe: true, maxPart: maxPart, forceMaxPart: true,
+                    pending: (pending, pending))
+                eval(probed.fence, probed.out)
+                return true
+            }) ?? false
+        if logs {
+            FileHandle.standardError.write(
+                Data(
+                    "[onepass] append probe bindings=\(bindings) maxpart=\(maxPart) held=\(held)\n"
+                        .utf8))
+        }
+        guard held else { return [] }
+        let result = segments(
+            queries: q, backing: backing, seqinfo: seqinfo, params: params,
+            previous: previous, valueOffsets: valueOffsets, records: records, dtype: dtype,
+            kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
+            partitionTokens: partitionTokens, softcap: softcap, source: source,
+            maxPart: maxPart, forceMaxPart: true, pending: (pending, pending))
+        let key = AppendKey(
+            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            softcap: softcap, maxPart: maxPart, bindings: bindings)
+        lock.withLock { _ = appendVariants.insert(key) }
+        return [result.fence, result.out]
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
@@ -236,8 +298,11 @@ public enum PagedOnePassAttention {
 
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
-    private static func segmentBody(bindings: Int) -> String {
+    private static func segmentBody(bindings: Int, appending: Bool = false) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        // The read-only source stays byte-identical; only the append variant adds arguments.
+        let append = appending ? ", true" : ""
+        let pending = appending ? ", knew, vnew" : ""
         return """
             const int row = threadgroup_position_in_grid.y;
             int first = 0;
@@ -256,10 +321,10 @@ public enum PagedOnePassAttention {
             \(scratch)
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
-                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE>(
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE\(append)>(
                 q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
-                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta);
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta\(pending));
             """
     }
 
@@ -335,6 +400,46 @@ public enum PagedOnePassAttention {
         let softcap: Bool
         let bindings: Int
         let dynTree: Bool
+        let append: Bool
+    }
+
+    private struct AppendKey: Hashable {
+        let dtype: DType
+        let headDim: Int
+        let kvHeads: Int
+        let gqa: Int
+        let pageSize: Int
+        let hpt: Int
+        let simdgroups: Int
+        let partitionTokens: Int
+        let softcap: Bool
+        let maxPart: Int
+        let bindings: Int
+    }
+
+    /// The MAXPART `segments` compiles for a call (one rule for launch and lookup).
+    private static func resolvedMaxPart(_ maxPart: Int?, probe: Bool, forceMaxPart: Bool) -> Int {
+        let allowDynPart =
+            dynamicMaxPartitions
+            && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+        return ((!probe || forceMaxPart) && allowDynPart)
+            ? min(maxPartitions, max(1, maxPart ?? maxPartitions))
+            : maxPartitions
+    }
+
+    /// Whether `warm` qualified the write-owning variant a live `segments` call
+    /// with these arguments would launch.
+    static func supportsAppend(
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int?, bindings: Int
+    ) -> Bool {
+        guard appendEnabled else { return false }
+        let key = AppendKey(
+            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+            maxPart: resolvedMaxPart(maxPart, probe: false, forceMaxPart: false),
+            bindings: bindings)
+        return lock.withLock { appendVariants.contains(key) }
     }
 
     nonisolated(unsafe) private static var segLaunchCache: [SegLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
@@ -346,28 +451,29 @@ public enum PagedOnePassAttention {
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
         softcap: Bool, source: String, probe: Bool = false, treeMeta: MLXArray? = nil,
-        maxPart: Int? = nil, forceMaxPart: Bool = false
+        maxPart: Int? = nil, forceMaxPart: Bool = false,
+        pending: (keys: MLXArray, values: MLXArray)? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
         let bindings = backing.count
-        let allowDynPart =
-            dynamicMaxPartitions
-            && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
-        let mp =
-            (!probe && allowDynPart)
-            ? min(maxPartitions, max(1, maxPart ?? maxPartitions))
-            : maxPartitions
+        let mp = resolvedMaxPart(maxPart, probe: probe, forceMaxPart: forceMaxPart)
         let dynTree = treeMeta != nil
-        let inputs =
+        let appending = pending != nil
+        precondition(!(appending && dynTree), "the fused append serves linear rows only")
+        var inputs =
             [queries] + backing + [
                 seqinfo, params, previous, valueOffsets, records, treeMeta ?? dummyTreeMeta,
             ]
+        if let pending {
+            inputs += [pending.keys, pending.values]
+        }
         if !probe {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree)
+                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
+                append: appending)
             if let hit = lock.withLock({ segLaunchCache[lkey] }) {
                 let outputs = hit(inputs)
                 return (outputs[0], outputs[1])
@@ -377,18 +483,22 @@ public enum PagedOnePassAttention {
             name(
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                softcap: softcap, maxPart: mp)
+                softcap: softcap, maxPart: mp) + (appending ? "_append" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
                 FileHandle.standardError.write(Data("[onepass] new kernel \(kernelName)\n".utf8))
             }
+            let segmentNames = (0 ..< bindings).map { "segment\($0)" }
             let made = MLXFast.metalKernel(
                 name: kernelName,
-                inputNames: ["q"] + (0 ..< bindings).map { "segment\($0)" }
-                    + ["seqinfo", "params", "previous", "value_offsets", "records", "tree_meta"],
-                outputNames: ["fence", "out"], source: segmentBody(bindings: bindings),
-                header: source, ensureRowContiguous: true)
+                inputNames: ["q"] + segmentNames
+                    + ["seqinfo", "params", "previous", "value_offsets", "records", "tree_meta"]
+                    + (appending ? ["knew", "vnew"] : []),
+                outputNames: ["fence", "out"],
+                source: segmentBody(bindings: bindings, appending: appending),
+                header: source, ensureRowContiguous: true,
+                mutableInputs: appending ? segmentNames : [])
             kernels[kernelName] = made
             return made
         }
@@ -404,7 +514,8 @@ public enum PagedOnePassAttention {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree)
+                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
+                append: appending)
             let launch = kernel.prepare(
                 template: template,
                 grid: (kvHeads * (gqa / hpt) * tg, b, 1),
