@@ -1313,6 +1313,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             output.dtype == queriesBLHD.dtype ? output : output.asType(queriesBLHD.dtype))
     }
 
+    /// True when `buildColumnsAsRowsDescriptors` may take a tree branch
+    /// (dynamic or static) for this call shape.
+    private func columnsAsRowsUseTree(b: Int, l: Int) -> Bool {
+        guard b == 1 else { return false }
+        if CBv2DraftRegime.activeDynamicTreeK > 0, l == CBv2DraftRegime.activeDynamicTreeK + 1 {
+            return true
+        }
+        if let tree = CBv2DraftRegime.activeVerifyTree, l == tree.totalSlots { return true }
+        return false
+    }
+
     private func buildColumnsAsRowsDescriptors(rows: [PagedSequenceKV], b: Int, l: Int)
         -> (descriptors: [PagedSegmentDispatchPlan.Row], dynTreeMeta: MLXArray?)
     {
@@ -1406,11 +1417,41 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
             })
         else { return nil }
-        for (index, row) in rows.enumerated() {
-            row.write(keys: keys[index], values: values[index])
+        // Fused append (one-pass kernel writes the columns): single-row LINEAR
+        // rounds only; tree rounds keep the separate write.
+        let canAppend: Bool
+        if b == 1, sinks == nil, !segmentDecodeReference, PagedOnePassAttention.enabled,
+            !PagedOnePassAttention.threadgroupProbeFailed,
+            !columnsAsRowsUseTree(b: b, l: l)
+        {
+            let row = rows[0]
+            let length = row.absoluteOffset + l - row.baseOffset
+            let partition = PagedSegmentDispatchPlan.boundedPartitionTokens(
+                PagedAttentionKernel.partitionTokens, pageSize: group.pageSize)
+            canAppend = min(length, row.windowSize ?? length)
+                <= PagedOnePassAttention.maxPartitions * partition
+                && PagedOnePassAttention.appendWarmed
+        } else {
+            canAppend = false
+        }
+        if canAppend {
+            guard rows[0].prepareDecodeAppend(count: l) else { return faultOutput(queries) }
+        } else {
+            for (index, row) in rows.enumerated() {
+                row.write(keys: keys[index], values: values[index])
+            }
         }
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         let (descriptors, dynTreeMeta) = buildColumnsAsRowsDescriptors(rows: rows, b: b, l: l)
+        if canAppend {
+            let start = rows[0].absoluteOffset - l
+            for (t, row) in descriptors.enumerated() {
+                precondition(
+                    dynTreeMeta == nil && !row.info.isDynamicTree && row.info.treeAncPacked == 0
+                        && row.info.attendStart + row.info.attendLength - 1 == start + t,
+                    "fused append on a non-linear verify row")
+            }
+        }
         let result = PagedSegmentAttention.decode(
             queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
             newKeys: nil, newValues: nil, group: group, rows: descriptors,
@@ -1420,7 +1461,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
             mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
-            treeMeta: dynTreeMeta)
+            treeMeta: dynTreeMeta,
+            pending: canAppend ? (keys.squeezed(axis: 0), values.squeezed(axis: 0)) : nil)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
