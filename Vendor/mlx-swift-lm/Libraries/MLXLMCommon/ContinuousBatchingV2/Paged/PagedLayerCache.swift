@@ -1291,8 +1291,26 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
             })
         else { return nil }
-        for (index, row) in rows.enumerated() {
-            row.write(keys: keys[index], values: values[index])
+        let canAppend: Bool
+        if b == 1, sinks == nil, !segmentDecodeReference,
+            !PagedOnePassAttention.threadgroupProbeFailed
+        {
+            let row = rows[0]
+            let length = row.absoluteOffset + l - row.baseOffset
+            let partition = PagedSegmentDispatchPlan.boundedPartitionTokens(
+                PagedAttentionKernel.partitionTokens, pageSize: group.pageSize)
+            canAppend = min(length, row.windowSize ?? length)
+                <= PagedOnePassAttention.maxPartitions * partition
+                && PagedOnePassAttention.appendWarmed
+        } else {
+            canAppend = false
+        }
+        if canAppend {
+            guard rows[0].prepareDecodeAppend(count: l) else { return faultOutput(queries) }
+        } else {
+            for (index, row) in rows.enumerated() {
+                row.write(keys: keys[index], values: values[index])
+            }
         }
         guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
         var descriptors: [PagedSegmentDispatchPlan.Row] = []
@@ -1315,7 +1333,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
-            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch)
+            mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
+            pending: canAppend ? (keys.squeezed(axis: 0), values.squeezed(axis: 0)) : nil)
         mtpColumnsAsRowsCalls += 1
         let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)

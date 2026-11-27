@@ -488,7 +488,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
             at: s.context.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
-            draftCount: settings.maximumDraftTokens)
+            draftCount: settings.maximumDraftTokens,
+            submitsLayers: Self.submitsLowAcceptanceLayersEarly && CBv2DraftRegime.lowAcceptance)
         let logits = draftHeadProduct(rows, readout: s.selection != nil)
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
@@ -1029,6 +1030,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    /// A low-acceptance round's `startRound` submits its block layer by
+    /// layer (`fastDraftBlockRows(submitsLayers:)`). No next block is drafted
+    /// behind a low-acceptance verify, so the round builds its block on the
+    /// critical path: about 0.35-0.43 ms of host time for the five layers,
+    /// the head and the argmax (M4), and under the DFlash rounds' command
+    /// buffer limits (100 operations, `MuseGlimmerDecodeCommandBuffers`) the
+    /// device gets nothing until 100 of the block's operations are encoded.
+    /// High-acceptance rounds keep one submission.
+    /// `CBV2_DFLASH_EARLY_BLOCK_SUBMIT=0` turns it off.
+    private static let submitsLowAcceptanceLayersEarly =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_EARLY_BLOCK_SUBMIT"] != "0"
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -1036,10 +1049,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// slices queries, attention, O-proj, MLP and final norm to only the
     /// `draftCount` active rows (7 instead of 16), cutting final-layer work
     /// in half with mathematically identical proposals.
+    ///
+    /// `submitsLayers` (a low-acceptance round's own block in `startRound`,
+    /// on the critical path between the verify readback and the next
+    /// verify): submit each layer before the final one as soon as its graph
+    /// exists, so the device runs it while the host builds and encodes the
+    /// next. Only when the work is submitted changes; every operation, shape
+    /// and kernel is the same, so the proposals are bit for bit the same.
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
-        draftCount: Int
+        draftCount: Int, submitsLayers: Bool = false
     ) -> MLXArray {
         let c = model.configuration
         let block = c.blockSize
@@ -1103,6 +1123,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             hidden =
                 hidden
                 + draftMLP(index, layer.mlp, mx)
+            if submitsLayers {
+                // Nonblocking; the round's fence still joins the proposals.
+                asyncEval(hidden)
+            }
         }
         return model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
     }
