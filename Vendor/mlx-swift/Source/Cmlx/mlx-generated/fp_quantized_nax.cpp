@@ -1610,7 +1610,53 @@ template <
         }
       }
     } else {
-      for (int k = simd_gid * BK; k < K; k += WK * BK) {
+      // Software-pipelined over the K loop: the next block's packed weights
+      // and scales are requested before the current block's activation loads,
+      // dequantization and MMAs, so device-memory latency overlaps the math
+      // instead of opening every iteration. Same values, same MMA order.
+      const int k0 = simd_gid * BK;
+      uint4 ws_next[TN][2];
+      ushort ss_next[TN][2];
+      if (k0 < K) {
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            const int row = 16 * t + 8 * r;
+            ws_next[t][r] = *(const device uint4*)(
+                wl + row * static_cast<int64_t>(row_bytes) + k0 / 2);
+            ss_next[t][r] = *(const device ushort*)(
+                scales + row * static_cast<int64_t>(row_scales) + k0 / 16);
+          }
+        }
+      }
+      for (int k = k0; k < K; k += WK * BK) {
+        uint4 ws[TN][2];
+        ushort ss[TN][2];
+        half sc0[TN][2];
+        half sc1[TN][2];
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
+          STEEL_PRAGMA_UNROLL
+          for (short r = 0; r < 2; r++) {
+            ws[t][r] = ws_next[t][r];
+            ss[t][r] = ss_next[t][r];
+          }
+        }
+        const int kn = k + WK * BK;
+        if (kn < K) {
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            STEEL_PRAGMA_UNROLL
+            for (short r = 0; r < 2; r++) {
+              const int row = 16 * t + 8 * r;
+              ws_next[t][r] = *(const device uint4*)(
+                  wl + row * static_cast<int64_t>(row_bytes) + kn / 2);
+              ss_next[t][r] = *(const device ushort*)(
+                  scales + row * static_cast<int64_t>(row_scales) + kn / 16);
+            }
+          }
+        }
         vec<T, 8> xs[2][4];
         STEEL_PRAGMA_UNROLL
         for (short r = 0; r < 2; r++) {
@@ -1622,19 +1668,10 @@ template <
                 : vec<T, 8>(0);
           }
         }
-        uint4 ws[TN][2];
-        ushort ss[TN][2];
-        half sc0[TN][2];
-        half sc1[TN][2];
         STEEL_PRAGMA_UNROLL
         for (short t = 0; t < TN; t++) {
           STEEL_PRAGMA_UNROLL
           for (short r = 0; r < 2; r++) {
-            const int row = 16 * t + 8 * r;
-            ws[t][r] = *(const device uint4*)(
-                wl + row * static_cast<int64_t>(row_bytes) + k / 2);
-            ss[t][r] = *(const device ushort*)(
-                scales + row * static_cast<int64_t>(row_scales) + k / 16);
             sc0[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r]));
             sc1[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r] >> 8));
           }
@@ -1678,7 +1715,64 @@ template <
       }
     }
   } else {
-  for (int k = simd_gid * BK; k < K; k += WK * BK) {
+  // Same software pipeline as the nvfp4 branch: the next block's packed
+  // weights and scales are requested before the current block's dequant and
+  // MMAs, overlapping device-memory latency with the math. Identical values
+  // and accumulation order.
+  const int k0p = simd_gid * BK;
+  uint4 wn[TN][2][loads];
+  scale_bits_t sn[TN][2];
+  if (k0p < K) {
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        const int row = 16 * t + 8 * r;
+        const device uint8_t* wt =
+            wl + row * static_cast<int64_t>(row_bytes) + k0p / pack_factor;
+        const device uint8_t* st =
+            scales + row * static_cast<int64_t>(row_scales) + k0p / group_size;
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          wn[t][r][l] = *(const device uint4*)(wt + 16 * l);
+        }
+        sn[t][r] = *(const device scale_bits_t*)st;
+      }
+    }
+  }
+  for (int k = k0p; k < K; k += WK * BK) {
+    uint4 ws[TN][2][loads];
+    scale_bits_t ss[TN][2];
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          ws[t][r][l] = wn[t][r][l];
+        }
+        ss[t][r] = sn[t][r];
+      }
+    }
+    const int kn = k + WK * BK;
+    if (kn < K) {
+      STEEL_PRAGMA_UNROLL
+      for (short t = 0; t < TN; t++) {
+        STEEL_PRAGMA_UNROLL
+        for (short r = 0; r < 2; r++) {
+          const int row = 16 * t + 8 * r;
+          const device uint8_t* wt =
+              wl + row * static_cast<int64_t>(row_bytes) + kn / pack_factor;
+          const device uint8_t* st =
+              scales + row * static_cast<int64_t>(row_scales) + kn / group_size;
+          STEEL_PRAGMA_UNROLL
+          for (short l = 0; l < loads; l++) {
+            wn[t][r][l] = *(const device uint4*)(wt + 16 * l);
+          }
+          sn[t][r] = *(const device scale_bits_t*)st;
+        }
+      }
+    }
     vec<T, 8> xs[2][4];
     STEEL_PRAGMA_UNROLL
     for (short r = 0; r < 2; r++) {
@@ -1688,24 +1782,6 @@ template <
             ? *(const device vec<T, 8>*)(x + r * 8 * static_cast<int64_t>(K) +
                                          k + 8 * i)
             : vec<T, 8>(0);
-      }
-    }
-    uint4 ws[TN][2][loads];
-    scale_bits_t ss[TN][2];
-    STEEL_PRAGMA_UNROLL
-    for (short t = 0; t < TN; t++) {
-      STEEL_PRAGMA_UNROLL
-      for (short r = 0; r < 2; r++) {
-        const int row = 16 * t + 8 * r;
-        const device uint8_t* wt =
-            wl + row * static_cast<int64_t>(row_bytes) + k / pack_factor;
-        const device uint8_t* st =
-            scales + row * static_cast<int64_t>(row_scales) + k / group_size;
-        STEEL_PRAGMA_UNROLL
-        for (short l = 0; l < loads; l++) {
-          ws[t][r][l] = *(const device uint4*)(wt + 16 * l);
-        }
-        ss[t][r] = *(const device scale_bits_t*)st;
       }
     }
 
