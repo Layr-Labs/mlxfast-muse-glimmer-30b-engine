@@ -1049,7 +1049,10 @@ final class CBv2MTPRoundDriver {
             shouldUseVerifyTree(for: id)
         {
             let leaves = max(1, CBv2DraftRegime.dynamicTreeMaxLeaves)
-            let target = max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
+            let target =
+                (CBv2DraftRegime.treeFullCeilingDeepLow && acceptance.isDeepLowAcceptanceRegime)
+                ? ceiling
+                : max(CBv2DraftRegime.dynamicTreeMinWidth, depth + leaves)
             depth = min(ceiling, min(remainingTokens - 1, min(verificationLimit, target)))
         }
         return max(1, depth)
@@ -1739,23 +1742,23 @@ public enum CBv2DraftRegime {
         }
         return dynamicTreeMaxLeavesAt5
     }()
-    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
+    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 2; 1 = leaves only).
     public static let dynamicTreeMaxBranchLen: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
             let v = Int(raw), (1 ... 4).contains(v)
         {
             return v
         }
-        return 1
+        return 2
     }()
-    /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.75).
+    /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.70).
     public static let dynamicTreeContDecay: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_CONT_DECAY"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 2.0
         {
             return v
         }
-        return 0.75
+        return 0.70
     }()
     /// Maximum parent chain depth allowed to host branch leaves (`CBV2_DYN_TREE_MAX_DEPTH`, default 5).
     public static let dynamicTreeMaxLeafDepth: Int = {
@@ -1766,14 +1769,14 @@ public enum CBv2DraftRegime {
         }
         return 5
     }()
-    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.17).
+    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.15).
     public static let dynamicTreeTemp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TEMP"],
             let v = Float(raw), v.isFinite, v > 0.05, v <= 10.0
         {
             return v
         }
-        return 0.17
+        return 0.15
     }()
     /// Chain EV multiplier (`CBV2_DYN_TREE_BONUS`, default 1.0; `0.0` forces best EV leaf(s)).
     public static let dynamicTreeChainBonus: Float = {
@@ -1843,4 +1846,7 @@ public enum CBv2DraftRegime {
     /// Reserve dynamic-tree leaf slots additively instead of shrinking chain depth (`CBV2_TREE_ADDITIVE != "0"`, default on).
     public static let treeAdditiveSlot: Bool =
         ProcessInfo.processInfo.environment["CBV2_TREE_ADDITIVE"] != "0"
+    /// Use full verify ceiling (`k = 7`) on deep-low dynamic tree rounds (`CBV2_TREE_FULL_CEILING != "0"`, default on).
+    public static let treeFullCeilingDeepLow: Bool =
+        ProcessInfo.processInfo.environment["CBV2_TREE_FULL_CEILING"] != "0"
 }

@@ -1422,6 +1422,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let canAppend: Bool
         if b == 1, sinks == nil, !segmentDecodeReference, PagedOnePassAttention.enabled,
             !PagedOnePassAttention.threadgroupProbeFailed,
+            (!PagedOnePassAttention.useRecordKernel || layerIndex < 48),
             !columnsAsRowsUseTree(b: b, l: l)
         {
             let row = rows[0]
