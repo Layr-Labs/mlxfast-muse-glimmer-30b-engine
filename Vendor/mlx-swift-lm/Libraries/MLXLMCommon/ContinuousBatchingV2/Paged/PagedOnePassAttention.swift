@@ -342,15 +342,16 @@ public enum PagedOnePassAttention {
     /// Segmented entry for a single-bucket plan. Returns the next fence and
     /// the attention output.
     static func segments(
-        queries: MLXArray, backing: [MLXArray], seqinfo: MLXArray, params: MLXArray,
+        queries: MLXArray, backing: some Collection<MLXArray>, seqinfo: MLXArray, params: MLXArray,
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
         softcap: Bool, source: String, probe: Bool = false, treeMeta: MLXArray? = nil,
-        maxPart: Int? = nil, forceMaxPart: Bool = false
+        maxPart: Int? = nil, forceMaxPart: Bool = false, bindingClass: Int? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
-        let bindings = backing.count
+        let backingCount = backing.count
+        let bindings = bindingClass ?? backingCount
         let allowDynPart =
             dynamicMaxPartitions
             && (forceMaxPart || !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
@@ -359,19 +360,27 @@ public enum PagedOnePassAttention {
             ? min(maxPartitions, max(1, maxPart ?? maxPartitions))
             : maxPartitions
         let dynTree = treeMeta != nil
-        let inputs =
-            [queries] + backing + [
-                seqinfo, params, previous, valueOffsets, records, treeMeta ?? dummyTreeMeta,
-            ]
-        if !probe {
-            let lkey = SegLaunchKey(
-                dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
-                hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree)
-            if let hit = lock.withLock({ segLaunchCache[lkey] }) {
-                let outputs = hit(inputs)
-                return (outputs[0], outputs[1])
-            }
+        var inputs: [MLXArray] = []
+        inputs.reserveCapacity(7 + bindings)
+        inputs.append(queries)
+        inputs.append(contentsOf: backing)
+        if bindings > backingCount {
+            let firstBinding = inputs[1]
+            inputs.append(contentsOf: repeatElement(firstBinding, count: bindings - backingCount))
+        }
+        inputs.append(seqinfo)
+        inputs.append(params)
+        inputs.append(previous)
+        inputs.append(valueOffsets)
+        inputs.append(records)
+        inputs.append(treeMeta ?? dummyTreeMeta)
+        let launchKey = probe ? nil : SegLaunchKey(
+            dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree)
+        if let launchKey, let hit = lock.withLock({ segLaunchCache[launchKey] }) {
+            let outputs = hit(inputs)
+            return (outputs[0], outputs[1])
         }
         let kernelName =
             name(
@@ -400,17 +409,13 @@ public enum PagedOnePassAttention {
             ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
             ("DYN_TREE", dynTree),
         ]
-        if !probe {
-            let lkey = SegLaunchKey(
-                dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
-                hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
-                maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree)
+        if let launchKey {
             let launch = kernel.prepare(
                 template: template,
                 grid: (kvHeads * (gqa / hpt) * tg, b, 1),
                 threadGroup: (tg, 1, 1),
                 outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
-            lock.withLock { segLaunchCache[lkey] = launch }
+            lock.withLock { segLaunchCache[launchKey] = launch }
             let outputs = launch(inputs)
             return (outputs[0], outputs[1])
         }
