@@ -173,7 +173,7 @@ enum PagedSegmentAttention {
         }
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
-            let heads = PagedOnePassAttention.eligible(
+            let onePass = PagedOnePassAttention.eligible(
                 headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b)
         {
             let bucket = plan.buckets[0]
@@ -184,8 +184,9 @@ enum PagedSegmentAttention {
                 queries: q, backing: backing, seqinfo: seqinfo, params: params,
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
-                pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                pageSize: group.pageSize, hpt: onePass.heads, simdgroups: nsg,
+                partitionTokens: ptok, softcap: softcap, source: source,
+                capacity: onePass.capacity)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
