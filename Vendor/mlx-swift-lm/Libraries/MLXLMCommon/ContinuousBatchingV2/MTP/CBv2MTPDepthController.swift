@@ -605,6 +605,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     private(set) var roundAcceptanceFraction = 1.0
     private(set) var observedRegimeRounds = 0
     private(set) var enteredLowAcceptanceRegime = false
+    private(set) var enteredDeepLowAcceptanceRegime = false
     private static let regimeAlpha = 0.15
     static let lowAcceptanceRegimeThreshold = 0.75
     static let lowAcceptanceExitThreshold = 0.85
@@ -626,15 +627,39 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowAcceptanceCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_MIN_ROUNDS"].flatMap(Int.init) ?? 6
+    }()
+    static let deepLowAcceptanceMaxCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_MAX_COMMITTED"].flatMap(Int.init) ?? 360
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
+    /// Stricter low-acceptance gate with sticky hysteresis for approximate
+    /// Stage-1 draft-head screening and deep-low-acc verify speedups:
+    /// enters when EITHER:
+    /// 1) `observedRegimeRounds >= 3 && roundAcceptanceFraction < 0.55` (early cold-start
+    ///    entry, empirically 0% false positive on high-acceptance Pair 1), OR
+    /// 2) `inLowAcceptanceRegime && ceilingRounds >= 6 && committed / rounds < 3.60`
+    ///    (tree-invariant entry: dynamic tree rounds divide by `chainDepth = 3`, lifting
+    ///    `roundAcceptanceFraction` to ~0.59 on ~2.8 tok/rd requests, whereas Pair 1 has
+    ///    already exited `inLowAcceptanceRegime` or sits well above 4.0 tok/rd by round 6).
+    /// Remains sticky while `inLowAcceptanceRegime` (exits only above 0.85).
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        enteredDeepLowAcceptanceRegime && inLowAcceptanceRegime
+    }
+
+    private mutating func updateDeepLowAcceptanceRegime() {
+        if (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowAcceptanceCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowAcceptanceMaxCommittedHundredths * ceilingRounds)
+        {
+            enteredDeepLowAcceptanceRegime = true
+        } else if roundAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
+            enteredDeepLowAcceptanceRegime = false
+        }
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
@@ -678,6 +703,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         guard draftedDepth > 0 else { return }
         ceilingRounds += 1
         ceilingCommittedTokens += max(committedTokens, 0)
+        updateDeepLowAcceptanceRegime()
     }
 
     /// The largest draft count k <= `offeredDepth` whose full acceptance
@@ -740,6 +766,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
             } else if roundAcceptanceFraction >= Self.lowAcceptanceExitThreshold {
                 enteredLowAcceptanceRegime = false
             }
+            updateDeepLowAcceptanceRegime()
         }
         if rejectionObserved, accepted < drafted {
             probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
