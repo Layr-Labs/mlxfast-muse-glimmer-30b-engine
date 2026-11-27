@@ -3791,6 +3791,18 @@ extension MuseGlimmerDFlashDrafter {
                 return float(as_type<half>(ushort(p)) * 16384.0h);
             }
 
+            inline uint dflash_xnor_mismatches(uint4 a, uint4 b, uint4 xa, uint4 xb) {
+                ushort count = ushort(popcount(a.x ^ xa.x));
+                count += ushort(popcount(a.y ^ xa.y));
+                count += ushort(popcount(a.z ^ xa.z));
+                count += ushort(popcount(a.w ^ xa.w));
+                count += ushort(popcount(b.x ^ xb.x));
+                count += ushort(popcount(b.y ^ xb.y));
+                count += ushort(popcount(b.z ^ xb.z));
+                count += ushort(popcount(b.w ^ xb.w));
+                return uint(count);
+            }
+
             inline void dflash_xnor_insert_top2(
                 thread float& v0, thread int& i0,
                 thread float& v1, thread int& i1,
@@ -3938,18 +3950,6 @@ extension MuseGlimmerDFlashDrafter {
                 const device uint4* w1_bits4 = (const device uint4*)w1_bits;
                 const device uint4* x_bits4 = (const device uint4*)x_bits;
 
-                threadgroup uint4 sh_x[K256_][R_][4];
-                threadgroup half sh_xs[K256_][R_];
-                constexpr uint total_x4 = uint(K256_) * uint(R_) * 4u;
-                for (uint i = lid; i < total_x4; i += 256u) {
-                    ((threadgroup uint4*)sh_x)[i] = x_bits4[i];
-                }
-                constexpr uint total_xs = uint(K256_) * uint(R_);
-                for (uint i = lid; i < total_xs; i += 256u) {
-                    ((threadgroup half*)sh_xs)[i] = x_scale[i];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
                 float s0[R_], s1[R_];
                 int id0 = -1, id1 = -1;
                 const device uint4* tg_w4 = w1_bits4 + size_t(tg) * size_t(K256_ * 2 * STRIDE_);
@@ -3974,12 +3974,11 @@ extension MuseGlimmerDFlashDrafter {
                         const uint4 wb = tg_w4[(g * 2u + 1u) * uint(STRIDE_) + slot];
                         #pragma unroll
                         for (uint r = 0u; r < uint(R_); ++r) {
-                            const uint4 ph = popcount(wa ^ sh_x[g][r][0]) + popcount(wb ^ sh_x[g][r][1]);
-                            const uint4 pl = popcount(wa ^ sh_x[g][r][2]) + popcount(wb ^ sh_x[g][r][3]);
-                            const uint p_hi = (ph.x + ph.y) + (ph.z + ph.w);
-                            const uint p_lo = (pl.x + pl.y) + (pl.z + pl.w);
+                            const uint xoff = (g * uint(R_) + r) * 4u;
+                            const uint p_hi = dflash_xnor_mismatches(wa, wb, x_bits4[xoff], x_bits4[xoff + 1u]);
+                            const uint p_lo = dflash_xnor_mismatches(wa, wb, x_bits4[xoff + 2u], x_bits4[xoff + 3u]);
                             const float dot_g = 386.56f - 1.963f * float(p_hi) - 1.057f * float(p_lo);
-                            acc[r] = fma(dot_g, sc_w * float(sh_xs[g][r]), acc[r]);
+                            acc[r] = fma(dot_g, sc_w * float(x_scale[g * uint(R_) + r]), acc[r]);
                         }
                     }
                     for (uint r = 0u; r < uint(R_); ++r) {
@@ -3987,8 +3986,7 @@ extension MuseGlimmerDFlashDrafter {
                     }
                 }
 
-                threadgroup float sh_v[8][2];
-                threadgroup int sh_i[8][2];
+                threadgroup int4 sh_top2[R_][8];
                 for (uint r = 0u; r < uint(R_); ++r) {
                     float v0 = -INFINITY, v1 = -INFINITY;
                     int i0 = -1, i1 = -1;
@@ -4003,32 +4001,30 @@ extension MuseGlimmerDFlashDrafter {
                         }
                     }
                     if (lane == 0u) {
-                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
-                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                        sh_top2[r][sg] = int4(as_type<int>(v0), as_type<int>(v1), i0, i1);
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (sg == 0u) {
-                        if (lane < 8u) {
-                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
-                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
-                        } else {
-                            v0 = v1 = -INFINITY; i0 = i1 = -1;
-                        }
-                        for (ushort off = 4u; off > 0u; off >>= 1u) {
-                            const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
-                            const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
-                            if (lane < off) {
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
-                            }
-                        }
-                        if (lane == 0u) {
-                            const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
-                            cand_ids[base + 0u] = i0;
-                            cand_ids[base + 1u] = i1;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Match the old eight-way shuffle tree; only its owning SIMD group changes.
+                if (sg < uint(R_)) {
+                    const uint r = sg;
+                    const int absent = as_type<int>(float(-INFINITY));
+                    const int4 pair = lane < 8u ? sh_top2[r][lane] : int4(absent, absent, -1, -1);
+                    float v0 = as_type<float>(pair.x), v1 = as_type<float>(pair.y);
+                    int i0 = pair.z, i1 = pair.w;
+                    for (ushort off = 4u; off > 0u; off >>= 1u) {
+                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
+                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
+                        if (lane < off) {
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
+                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0u) {
+                        const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
+                        cand_ids[base + 0u] = i0;
+                        cand_ids[base + 1u] = i1;
+                    }
                 }
                 """,
             header: header)
