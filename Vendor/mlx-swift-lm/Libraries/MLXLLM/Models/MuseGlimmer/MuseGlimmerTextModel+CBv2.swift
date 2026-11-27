@@ -305,6 +305,7 @@ extension MuseGlimmerTextModel {
         guard VerifyFusedQK.enabled,
             VerifyFusedQK.supports(headDim: a.headDimensions, dtype: x.dtype)
         else {
+            if CBv2VerifyTree.active(columns: length) != nil { CBv2VerifyTree.failed = true }
             return a(x, mask: .none, cache: attending as? KVCache, ropeOffsets: ropeOffsets)
         }
         let theta = configuration.layerRopeTheta[layerIndex]
@@ -346,7 +347,14 @@ extension MuseGlimmerTextModel {
         Self.fusedVerifyWarmLock.lock()
         let claimed = Self.fusedVerifyWarmed.insert(ObjectIdentifier(self)).inserted
         Self.fusedVerifyWarmLock.unlock()
-        guard claimed, VerifyFusedNorms.enabled, let first = model.layers.first else { return }
+        guard claimed else { return }
+        // Draft trees: every layer masks its attention, every RoPE layer
+        // applies the branch positions, once per window.
+        let thetaCount = min(configuration.layerRopeTheta.count, model.layers.count)
+        CBv2VerifyTree.expectedCalls = (
+            model.layers.count,
+            configuration.layerRopeTheta[0 ..< thetaCount].filter { $0 != 0 }.count)
+        guard VerifyFusedNorms.enabled, let first = model.layers.first else { return }
         let dtype = activationDType
         let width = first.inputLayerNorm.weight.dim(-1)
         guard VerifyFusedNorms.supports(width: width, rows: 1, dtype: dtype) else { return }
@@ -386,9 +394,30 @@ extension MuseGlimmerTextModel {
                     }
                 }
             }
+            // Draft-tree windows: the per-row position variant of each width.
+            if let rope {
+                for layout in CBv2VerifyTree.reachableLayouts(maxDrafts: CBv2VerifyTree.maxDrafts) {
+                    let rows = layout.columns
+                    let out = CBv2VerifyTree.building(layout) {
+                        VerifyFusedQK.apply(
+                            queries: MLXArray.zeros(
+                                [1, rows, a.heads * a.headDimensions], dtype: dtype),
+                            keys: MLXArray.zeros(
+                                [1, rows, a.kvHeads * a.headDimensions], dtype: dtype),
+                            heads: a.heads, kvHeads: a.kvHeads,
+                            headDim: a.headDimensions, eps: a.qkNorm.eps,
+                            queryScale: a.qkScaleFactor, ropeBase: rope,
+                            offsets: MLXArray.zeros([1], type: Int32.self))
+                    }
+                    warm += [out.queries, out.keys]
+                }
+            }
         }
+        // GPU-built draft trees: the caterpillar builder at every width.
+        warm += CBv2VerifyTreeBuilder.warm()
         eval(warm)
         warmVerifyProjections(dtype: dtype)
+        CBv2KernelLog.markWarmComplete()
     }
 }
 

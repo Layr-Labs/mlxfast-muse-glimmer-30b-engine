@@ -130,7 +130,9 @@ enum PagedSegmentAttention {
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
-        mergeScratch: PagedSegmentMergeScratch? = nil
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        holes: Bool = false,
+        deviceHoles: MLXArray? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -174,7 +176,8 @@ enum PagedSegmentAttention {
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
             let heads = PagedOnePassAttention.eligible(
-                headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b)
+                headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b,
+                holes: holes)
         {
             let bucket = plan.buckets[0]
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
@@ -185,7 +188,7 @@ enum PagedSegmentAttention {
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
-                softcap: softcap, source: source)
+                softcap: softcap, source: source, holes: holes, deviceHoles: deviceHoles)
             if PagedOnePassAttention.checks {
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
@@ -198,6 +201,8 @@ enum PagedSegmentAttention {
             group.writeFence = result.fence
             return result.out
         }
+        // Only the one-pass kernel has a draft-tree variant.
+        if holes { CBv2VerifyTree.failed = true }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
         let metaCount = max(8, b * qh * plan.maxPartitions * 2)
@@ -245,6 +250,13 @@ enum PagedSegmentAttention {
                 ("STRIDE", PagedSegmentDispatchPlan.recordStride),
             ]
             let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+            if CBv2KernelLog.enabled {
+                CBv2KernelLog.observe(
+                    "segment_part_\(partKey)_\(bindingCount)_\(kvh)",
+                    template: "PTOK\(ptok),HPT\(hpt),NSG\(nsg),WRITE\(newKeys != nil)",
+                    inputs: inputs + (partials.map { [$0] } ?? []) + (meta.map { [$0] } ?? []),
+                    outputs: [.int32])
+            }
             if let partials, let meta {
                 group.writeFence =
                     kernel(
@@ -674,6 +686,11 @@ enum PagedMultiQueryAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
+        if CBv2KernelLog.enabled {
+            CBv2KernelLog.observe(
+                "segment_merge_\(mergeKey)", template: "PTOK\(ptok),SINKS\(sinks != nil)",
+                inputs: [partials, meta, seqinfo, zeroSinks, group.writeFence], outputs: [dtype])
+        }
         return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
             [partials, meta, seqinfo, zeroSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],

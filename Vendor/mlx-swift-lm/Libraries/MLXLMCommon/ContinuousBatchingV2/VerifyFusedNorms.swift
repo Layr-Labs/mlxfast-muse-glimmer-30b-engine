@@ -272,11 +272,101 @@ public enum VerifyFusedQK {
         }
         """
 
+    /// The same chain with each row at its draft-tree depth (`rowpos`).
+    static let treeSource = """
+        uint lane = thread_position_in_threadgroup.x;
+        uint g = threadgroup_position_in_grid.y;
+        constexpr int HT = H_ + KVH_;
+        int head = int(g) % HT;
+        int tok = int(g) / HT;
+        int b = tok / L_;
+        uint l = uint(tok % L_);
+        bool isq = head < H_;
+        const device bfloat16_t* src = isq
+            ? q + size_t(tok) * H_ * D_ + size_t(head) * D_
+            : k + size_t(tok) * KVH_ * D_ + size_t(head - H_) * D_;
+        device bfloat16_t* dst = isq
+            ? qo + size_t(tok) * H_ * D_ + size_t(head) * D_
+            : ko + size_t(tok) * KVH_ * D_ + size_t(head - H_) * D_;
+        const float eps = params[0];
+        const float qscale = params[1];
+        const float base = params[2];
+        const float scale = params[3];
+        const uint axis_size = D_;
+
+        float thread_x[4];
+        float acc = 0;
+        src += lane * 4;
+        for (int i = 0; i < 4; i++) {
+          thread_x[i] = src[i];
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        float part = (lane == 0) ? acc : 0.0f;
+        acc = simd_sum(part);
+        float inv_mean = metal::precise::rsqrt(acc / axis_size + eps);
+
+        bfloat16_t one = static_cast<bfloat16_t>(1.0f);
+        float v[4];
+        for (int i = 0; i < 4; i++) {
+          bfloat16_t n = one * static_cast<bfloat16_t>(thread_x[i] * inv_mean);
+          if (isq) {
+            n = static_cast<bfloat16_t>(static_cast<float>(n) * qscale);
+          }
+          v[i] = static_cast<float>(n);
+        }
+        dst += lane * 4;
+        if (ROPE_) {
+          const uint half_dims = D_ / 2;
+          bool low = lane < 16;
+          int batch_offset = offsets[b * OFFB_];
+          float L = scale * static_cast<float>(rowpos[l] + batch_offset);
+          for (int i = 0; i < 4; i++) {
+            float other = simd_shuffle_xor(v[i], ushort(16));
+            uint px = (low ? lane : lane - 16) * 4 + i;
+            float d = static_cast<float>(px) / static_cast<float>(half_dims);
+            float inv_freq = metal::exp2(-d * base);
+            float theta = L * inv_freq;
+            float costheta = metal::fast::cos(theta);
+            float sintheta = metal::fast::sin(theta);
+            float x1 = low ? v[i] : other;
+            float x2 = low ? other : v[i];
+            float rx1 = x1 * costheta - x2 * sintheta;
+            float rx2 = x1 * sintheta + x2 * costheta;
+            dst[i] = static_cast<bfloat16_t>(low ? rx1 : rx2);
+          }
+        } else {
+          for (int i = 0; i < 4; i++) {
+            dst[i] = static_cast<bfloat16_t>(v[i]);
+          }
+        }
+        """
+
     static let kernel = MLXFast.metalKernel(
         name: "verify_qk_norm_rope",
         inputNames: ["q", "k", "offsets", "params"],
         outputNames: ["qo", "ko"],
         source: source)
+
+    static let treeKernel = MLXFast.metalKernel(
+        name: "verify_qk_norm_rope_tree",
+        inputNames: ["q", "k", "offsets", "params", "rowpos"],
+        outputNames: ["qo", "ko"],
+        source: treeSource)
+
+    /// Keyed by the per-column offsets: dynamic trees share them across ranks.
+    nonisolated(unsafe) private static var treeRows: [[Int32]: MLXArray] = [:]
+    private static let treeRowsLock = NSLock()
+
+    static func treeRowPositions(_ tree: CBv2VerifyTreeLayout) -> MLXArray {
+        let offsets = CBv2VerifyTree.rowOffsets(tree)
+        treeRowsLock.lock()
+        defer { treeRowsLock.unlock() }
+        if let cached = treeRows[offsets] { return cached }
+        let made = MLXArray(offsets)
+        treeRows[offsets] = made
+        return made
+    }
 
     public static func supports(headDim: Int, dtype: DType) -> Bool {
         headDim == 128 && dtype == .bfloat16
@@ -293,6 +383,33 @@ public enum VerifyFusedQK {
         let offs = offsets.map { $0.dtype == .int32 ? $0 : $0.asType(.int32) }
             ?? MLXArray.zeros([1], type: Int32.self)
         let params = MLXArray([eps, queryScale, log2(ropeBase ?? 1), ropeScale])
+        if ropeBase != nil, let tree = CBv2VerifyTree.active(columns: l) {
+            CBv2VerifyTree.rowPositionCalls += 1
+            // GPU-built tree: the builder's device `[columns]` depths.
+            let rowpos = CBv2VerifyTree.deviceTopology?.rowOffsets ?? treeRowPositions(tree)
+            if CBv2KernelLog.enabled {
+                CBv2KernelLog.observe(
+                    "verify_qk_norm_rope_tree", template: "H\(heads),KVH\(kvHeads),L\(l)",
+                    inputs: [queries, keys, offs, params, rowpos],
+                    outputs: [queries.dtype, keys.dtype])
+            }
+            let out = treeKernel(
+                [queries, keys, offs, params, rowpos],
+                template: [
+                    ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
+                    ("ROPE_", true), ("OFFB_", offs.size == 1 ? 0 : 1),
+                ],
+                grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
+                outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
+                outputDTypes: [queries.dtype, keys.dtype])
+            return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+        }
+        if CBv2KernelLog.enabled {
+            CBv2KernelLog.observe(
+                "verify_qk_norm_rope",
+                template: "H\(heads),KVH\(kvHeads),L\(l),ROPE\(ropeBase != nil),OFFB\(offs.size == 1 ? 0 : 1)",
+                inputs: [queries, keys, offs, params], outputs: [queries.dtype, keys.dtype])
+        }
         let out = kernel(
             [queries, keys, offs, params],
             template: [
