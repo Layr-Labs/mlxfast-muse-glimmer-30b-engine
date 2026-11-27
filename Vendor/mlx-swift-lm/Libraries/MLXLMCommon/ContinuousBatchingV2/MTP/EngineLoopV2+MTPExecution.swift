@@ -861,7 +861,11 @@ extension EngineLoopV2 {
         // Low-acceptance rounds draft with the drafter's cheaper form.
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
-        defer { CBv2DraftRegime.lowAcceptance = false }
+        CBv2DraftRegime.plannedDepth = k
+        defer {
+            CBv2DraftRegime.lowAcceptance = false
+            CBv2DraftRegime.plannedDepth = 0
+        }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,

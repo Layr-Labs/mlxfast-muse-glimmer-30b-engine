@@ -982,11 +982,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             copies.append((gate, up, down))
         }
         // Compile the copies' kernels at load for the block's row counts
-        // (16 rows; 7 active rows in the last layer), not in a timed round.
+        // (16 rows; 7 active rows in the last layer, or 3 to 6 at a
+        // low-acceptance round's planned depth: `finalActiveRows`), not in a
+        // timed round. The copies serve low-acceptance rounds only.
         if let first = copies.first {
             let width = model.configuration.hiddenSize
             var warm = [MLXArray]()
-            for rows in [model.configuration.blockSize, 7] {
+            for rows in [model.configuration.blockSize, 7, 3, 4, 5, 6] {
                 let x = MLXArray.zeros([1, rows, width], dtype: model.activationDType)
                 warm.append(first.down(compiledSiluProduct(first.gate(x), first.up(x))))
             }
@@ -1029,6 +1031,60 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    /// The fewest final-layer rows a low-acceptance round computes. With the
+    /// drafter's 32 query and 2 key/value heads, MLX's fused `sdpa_vector`
+    /// takes at most 2 query rows (`query rows * 16 <= 32`); from 3 rows to
+    /// `draftCount` (7) the final layer's attention runs MLX's unfused
+    /// fallback (`q k^T`, softmax, `p v`), so 3 is the smallest count whose
+    /// rows keep the 7-row layer's operations.
+    private static let lowAcceptanceMinimumFinalRows = 3
+    private static let lowAcceptancePlannedFinalRows =
+        ProcessInfo.processInfo.environment["CBV2_DFLASH_LOW_PLANNED_ROWS"] != "0"
+
+    /// The final layer's active rows for this block: `draftCount`, or in a
+    /// low-acceptance round (`CBv2DraftRegime.lowAcceptance`) the round's
+    /// verify depth `k` (`CBv2DraftRegime.plannedDepth`), at least
+    /// `lowAcceptanceMinimumFinalRows`.
+    ///
+    /// Why: the verify reads only drafts `0 ..< k` of the block (`draftStep`
+    /// hands out memo rows `0 ..< k`), and a low-acceptance round's window
+    /// is usually 2 to 4 drafts, while the final layer's q, o and 3-bit MLP
+    /// (about 233 MB) run on MLX's `affine_qmv_wide` below 8 rows, whose
+    /// arithmetic grows with the row count. Fewer rows, less of it.
+    ///
+    /// Exact: every operation of the final layer is row by row with the same
+    /// kernel at 3 to 7 rows (`affine_qmv_wide` gives each row the same bits
+    /// whatever the tile's row count; RMSNorm and RoPE are per row; the
+    /// attention fallback's batched products take MLX's one regular GEMM
+    /// configuration for these shapes, whose rows are independent), so
+    /// rows `0 ..< finalActiveRows` are bit for bit the 7-row layer's.
+    /// `fastDraftBlockRows` repeats them up to `draftCount` rows, so the head
+    /// runs at its usual 7 rows and its first rows are unchanged too. The
+    /// proposals the verify reads, and so every round, are the record's.
+    /// High-acceptance rounds and the post-verify speculated block keep
+    /// `draftCount`. `CBV2_DFLASH_LOW_PLANNED_ROWS=0` turns it off.
+    private static func finalActiveRows(_ draftCount: Int) -> Int {
+        let k = CBv2DraftRegime.plannedDepth
+        guard CBv2DraftRegime.lowAcceptance, lowAcceptancePlannedFinalRows, k > 0 else {
+            return draftCount
+        }
+        return min(draftCount, max(k, lowAcceptanceMinimumFinalRows))
+    }
+
+    /// `x` `[n, width]` followed by copies of its own rows up to `rows` rows.
+    private static func repeatedRows(_ x: MLXArray, to rows: Int) -> MLXArray {
+        let n = x.dim(0)
+        guard n > 0, n < rows else { return x }
+        var parts = [x]
+        var have = n
+        while have < rows {
+            let take = min(n, rows - have)
+            parts.append(take == n ? x : x[0 ..< take, 0...])
+            have += take
+        }
+        return concatenated(parts, axis: 0)
+    }
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -1036,6 +1092,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// slices queries, attention, O-proj, MLP and final norm to only the
     /// `draftCount` active rows (7 instead of 16), cutting final-layer work
     /// in half with mathematically identical proposals.
+    ///
+    /// In a low-acceptance round the final layer computes only the rows the
+    /// round's verify reads (`finalActiveRows`) and repeats them up to
+    /// `draftCount` rows, so the head and every later shape are unchanged.
     private func fastDraftBlockRows(
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
@@ -1048,6 +1108,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ? embeddings : embeddings.asType(model.activationDType)
         var hidden = act.reshaped([1, block, c.hiddenSize])
         let lastIndex = model.layers.count - 1
+        let finalRows = Self.finalActiveRows(draftCount)
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
             let x = layer.inputNorm(hidden)
@@ -1064,12 +1125,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 values = concatenated([context.values[index ..< index + 1], values], axis: 2)
             }
             if index == lastIndex {
-                let active = 1 ..< (1 + draftCount)
+                let rows = finalRows
+                let active = 1 ..< (1 + rows)
                 let xActive = x[0..., active, 0...]
                 let queries = MLXFast.RoPE(
                     attention.qNorm(
                         attention.qProj(xActive).reshaped([
-                            1, draftCount, c.attentionHeads, c.headDimensions,
+                            1, rows, c.attentionHeads, c.headDimensions,
                         ]).transposed(0, 2, 1, 3)),
                     dimensions: c.headDimensions, traditional: false,
                     base: c.ropeTheta, scale: 1, offset: position + 1)
@@ -1079,11 +1141,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 var h = hidden[0..., active, 0...]
                     + attention.oProj(
                         attended.transposed(0, 2, 1, 3).reshaped([
-                            1, draftCount, c.attentionHeads * c.headDimensions,
+                            1, rows, c.attentionHeads * c.headDimensions,
                         ]))
                 let mx = layer.postAttentionNorm(h)
                 h = h + draftMLP(index, layer.mlp, mx)
-                return model.norm(h).reshaped([draftCount, c.hiddenSize])
+                let out = model.norm(h).reshaped([rows, c.hiddenSize])
+                return rows < draftCount ? Self.repeatedRows(out, to: draftCount) : out
             }
             let queries = MLXFast.RoPE(
                 attention.qNorm(

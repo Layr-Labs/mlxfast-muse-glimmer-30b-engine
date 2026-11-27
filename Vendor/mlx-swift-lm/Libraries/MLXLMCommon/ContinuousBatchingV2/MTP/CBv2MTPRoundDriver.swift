@@ -1486,4 +1486,8 @@ enum CBv2MTPHiddenIndex {
 /// drafter can draft those rounds more cheaply. Never read for target work.
 public enum CBv2DraftRegime {
     nonisolated(unsafe) public static var lowAcceptance = false
+    /// The round's verify depth `k` (drafts the verify reads), set beside
+    /// `lowAcceptance` while the round drafts; 0 outside a round's draft.
+    /// Never read for target work.
+    nonisolated(unsafe) public static var plannedDepth = 0
 }
