@@ -949,6 +949,20 @@ extension MuseGlimmerTextModel {
         }
         let prevLow = CBv2DraftRegime.lowAcceptance
         defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        // Batch-verify all frozen FP8 target weight tensors once at boot for
+        // zero NaN bytes (0x7F/0xFF) and normal non-overflowing scale so
+        // branchless half2 FP8 decode needs zero per-step host syncs.
+        var allFP8Layers: [ModelOptCalibratedLinear] = []
+        for layer in model.layers {
+            let a = layer.selfAttention
+            let mlp = layer.mlp
+            for proj in [a.queryProj, a.keyProj, a.valueProj, a.gateProj, a.outputProj, mlp.gateProj, mlp.upProj, mlp.downProj] {
+                if let fp8 = proj as? ModelOptCalibratedLinear, fp8.format == .fp8 {
+                    allFP8Layers.append(fp8)
+                }
+            }
+        }
+        CBv2SmallProjection.warmFP8BranchlessSafe(allFP8Layers)
         var seen = Set<String>()
         for layer in model.layers {
             let a = layer.selfAttention
