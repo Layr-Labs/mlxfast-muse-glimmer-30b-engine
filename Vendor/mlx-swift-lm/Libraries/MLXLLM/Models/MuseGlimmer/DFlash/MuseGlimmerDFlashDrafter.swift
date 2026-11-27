@@ -134,7 +134,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     public let settings: Settings
     /// `[1, hiddenSize]`, the target's raw embedding of the mask token.
     private let maskEmbedding: MLXArray
-    /// Low-acceptance rounds' MLP: 3-bit group-32 copies of each layer's pinned 5-bit
+    /// Low-acceptance rounds' MLP: optional (default off: 5 = pinned) low-bit group-32 copies of each layer's pinned 5-bit
     /// gate, up and down (`CBV2_DRAFTER_LOW_MLP_BITS`, 5 disables). Empty
     /// when disabled or when a projection is not the pinned affine form.
     private let lowMLP: [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
@@ -1591,7 +1591,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return readout ? draftHead(rows) : draftHead.unscaledProduct(rows)
     }
 
-    /// Layer `index`'s MLP: the 3-bit copy while a low-acceptance round
+    /// Layer `index`'s MLP: the optional low-bit copy (off by default) while a low-acceptance round
     /// drafts (`CBv2DraftRegime.lowAcceptance`), the pinned one otherwise.
     private func draftMLP(_ index: Int, _ mlp: MuseGlimmerDFlashMLP, _ x: MLXArray) -> MLXArray {
         if CBv2DraftRegime.lowAcceptance, index < lowMLP.count {
@@ -1605,7 +1605,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         -> [(gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear)]
     {
         let bits = ProcessInfo.processInfo.environment["CBV2_DRAFTER_LOW_MLP_BITS"]
-            .flatMap { Int($0) }.map { min(max($0, 2), 5) } ?? 3
+            .flatMap { Int($0) }.map { min(max($0, 2), 5) } ?? 5
         guard bits < 5 else { return [] }
         func low(_ linear: Linear) -> QuantizedLinear? {
             guard let ql = linear as? QuantizedLinear, ql.mode == .affine, ql.bits > bits else {
