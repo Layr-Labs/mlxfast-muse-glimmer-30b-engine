@@ -70,7 +70,10 @@ public enum CBv2SmallProjection {
         // stock BN = 8) or one simdgroup per TM rows (stock BN = 1, eight
         // simdgroups per threadgroup). `out_vec` is the output's first column
         // for this segment; NOUT its row stride.
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, bool DV, int PF, bool VO>
+        // DV_MODE: 0 = scalar e4m3 decode, 1 = half2 decode with per-word NaN
+        // check, 2 = branchless half2 + float2 SIMD scale (load-time verified
+        // NaN-free weights and non-overflowing normal outputScale).
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int DV_MODE, int PF, bool VO>
         inline void cbv2_sp_fp8(
             const device uint8_t* mat, float weight_scale, const device T* in_vec,
             device T* out_vec, int tile, uint simd_gid, uint simd_lid,
@@ -86,7 +89,7 @@ public enum CBv2SmallProjection {
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
             constexpr uint LOW = (1u << SH) - 1u;
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float dscale = DV ? weight_scale * 256.0f : weight_scale;
+            const float dscale = (DV_MODE != 0) ? weight_scale * 256.0f : weight_scale;
             int out_row = SPLIT ? tile * TM : (tile * 8 + int(simd_gid)) * TM;
             if (!SPLIT && out_row >= N) {
                 return;
@@ -124,17 +127,29 @@ public enum CBv2SmallProjection {
                     av[v] = ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn));
                 }
                 thread const uint* wq = wblk[d];
-                // Decoded weights of the four codes of each row's word. DV:
+                // Decoded weights of the four codes of each row's word. DV_MODE!=0:
                 // the half bits of two codes per bit operation (codes 0 and 2,
                 // then 1 and 3) with the sign in the half's sign bit, and the
                 // exact factor 256 of `modelopt_e4m3_value` moved into the
                 // scale: x * (256 s) and (256 x) * s round the same real
                 // product once, and -(256 x) == 256 (-x).
+                // When DV_MODE == 2, load-time verification proved zero 0x7F/0xFF
+                // bytes and a normal non-overflowing scale, so dec[tm][tn] holds
+                // the already-scaled float value with zero branches.
                 float dec[TM][TN];
                 CBV2_SP_UNROLL
                 for (int tm = 0; tm < TM; tm++) {
                     const uint w = wq[tm];
-                    if (DV) {
+                    if constexpr (DV_MODE == 2) {
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        dec[tm][0] = f02.x;
+                        dec[tm][1] = f13.x;
+                        dec[tm][2] = f02.y;
+                        dec[tm][3] = f13.y;
+                    } else if constexpr (DV_MODE == 1) {
                         const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                         const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                         const half2 h02 = as_type<half2>(lo);
@@ -168,7 +183,8 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         CBV2_SP_UNROLL
                         for (int tn = 0; tn < TN; tn++) {
-                            inter[tm][tn] = static_cast<T>(dec[tm][tn] * dscale);
+                            inter[tm][tn] = static_cast<T>(
+                                (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
                         }
                     }
                     CBV2_SP_UNROLL
@@ -188,7 +204,8 @@ public enum CBv2SmallProjection {
                     T inter[TM];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
-                        inter[tm] = static_cast<T>(dec[tm][tn] * dscale);
+                        inter[tm] = static_cast<T>(
+                            (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
                     }
                     CBV2_SP_UNROLL
                     for (int v = 0; v < V; v++) {
@@ -276,7 +293,7 @@ public enum CBv2SmallProjection {
     }
 
     struct FP8Shape: Hashable {
-        var vectorDecode: Bool
+        var vectorDecodeMode: Int
         var rowsOuter: Bool
         var weights: Int
         var outputs: Int
@@ -306,7 +323,7 @@ public enum CBv2SmallProjection {
             let end = offset + s.tiles
             body += """
                 \(index == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecode), \(s.prefetch), \(shape.rowsOuter)>(
+                    cbv2_sp_fp8<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.outputWidth), \(shape.vectorDecodeMode), \(s.prefetch), \(shape.rowsOuter)>(
                         m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
                         xc + size_t(\(s.input)) * V * K,
                         y\(s.output) + \(s.column0), tg - \(offset), sg, sl, sp_tgp);
@@ -337,11 +354,101 @@ public enum CBv2SmallProjection {
         return 2
     }
 
-    /// Two codes per bit operation in the weight decode, with the exact
-    /// factor 256 moved into the scale. Measured no faster and never used:
-    /// in-module experiments only (it is one rounding of the same real
-    /// product except where `256 * scale` overflows or is subnormal).
+    /// Two codes per bit operation in the weight decode (mode 1: with per-word
+    /// NaN check; mode 2: branchless after load-time NaN-byte + scale-range
+    /// verification).
     nonisolated(unsafe) static var vectorDecode = false
+
+    /// `CBV2_FP8_BRANCHLESS`: `0` = off, `1` = on for low-acceptance rounds
+    /// (default), `2` = always on (requires load-time NaN-free + scale-safe
+    /// verification of every layer in the group).
+    public static let fp8BranchlessMode: Int =
+        ProcessInfo.processInfo.environment["CBV2_FP8_BRANCHLESS"].flatMap(Int.init) ?? 1
+
+    private static let fp8SafeLock = NSLock()
+    nonisolated(unsafe) private static var fp8SafeCache: [ObjectIdentifier: Bool] = [:]
+
+    private static func isScaleSafeFor256(_ scale: Float) -> Bool {
+        guard scale.isFinite else { return false }
+        let a = abs(scale)
+        return a == 0 || (a >= Float.leastNormalMagnitude && a <= 1e35)
+    }
+
+    /// Batch-verifies frozen FP8 layers once at load time in one GPU sync:
+    /// checks that `weight` contains zero `0x7F`/`0xFF` NaN bytes and that
+    /// `outputScale * 256.0f` neither overflows nor rounds as a subnormal.
+    public static func warmFP8BranchlessSafe(_ layers: [ModelOptCalibratedLinear]) {
+        guard fp8BranchlessMode != 0 else { return }
+        var pending: [(id: ObjectIdentifier, hasNaN: MLXArray, scale: MLXArray)] = []
+        fp8SafeLock.withLock {
+            for layer in layers {
+                let id = ObjectIdentifier(layer)
+                guard fp8SafeCache[id] == nil,
+                    layer.format == .fp8, layer.weight.dtype == .uint8,
+                    let constants = layer.graphConstants,
+                    constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+                else { continue }
+                let w = layer.weight
+                let hasNaN = MLX.any(
+                    logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF)))))
+                pending.append((id, hasNaN, constants.outputScale))
+            }
+        }
+        guard !pending.isEmpty else { return }
+        eval(pending.flatMap { [$0.hasNaN, $0.scale] })
+        let results: [(ObjectIdentifier, Bool)] = pending.map { item in
+            let safe = !item.hasNaN.item(Bool.self)
+                && isScaleSafeFor256(item.scale.item(Float.self))
+            return (item.id, safe)
+        }
+        fp8SafeLock.withLock {
+            for (id, safe) in results {
+                fp8SafeCache[id] = safe
+            }
+        }
+    }
+
+    /// True when `layer` has been proven NaN-byte-free and scale-safe (checked
+    /// once per layer and cached).
+    public static func isFP8BranchlessSafe(_ layer: ModelOptCalibratedLinear) -> Bool {
+        let id = ObjectIdentifier(layer)
+        if let cached = fp8SafeLock.withLock({ fp8SafeCache[id] }) {
+            return cached
+        }
+        guard layer.format == .fp8, layer.weight.dtype == .uint8,
+            let constants = layer.graphConstants,
+            constants.outputScale.dtype == .float32, constants.outputScale.size == 1
+        else {
+            fp8SafeLock.withLock { fp8SafeCache[id] = false }
+            return false
+        }
+        let scaleVal = constants.outputScale.item(Float.self)
+        guard isScaleSafeFor256(scaleVal) else {
+            fp8SafeLock.withLock { fp8SafeCache[id] = false }
+            return false
+        }
+        let w = layer.weight
+        let hasNaN = MLX.any(
+            logicalOr(equal(w, MLXArray(UInt8(0x7F))), equal(w, MLXArray(UInt8(0xFF))))
+        ).item(Bool.self)
+        let safe = !hasNaN
+        fp8SafeLock.withLock { fp8SafeCache[id] = safe }
+        return safe
+    }
+
+    /// True when branchless half2 FP8 decode should run for `layers` in the
+    /// current regime (low-acc gated by default, load-time NaN/scale verified).
+    public static func shouldUseBranchlessFP8(for layers: [ModelOptCalibratedLinear]) -> Bool {
+        guard !layers.isEmpty else { return false }
+        let modeAllowed: Bool
+        switch fp8BranchlessMode {
+        case 0: modeAllowed = false
+        case 2: modeAllowed = true
+        default: modeAllowed = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        }
+        guard modeAllowed else { return false }
+        return layers.allSatisfy(isFP8BranchlessSafe)
+    }
 
     /// Weight words loaded ahead, in iterations: none for K-split tiles
     /// (deeper measured slower: registers), 4 (up to 4 rows) or 2 for the
@@ -473,8 +580,9 @@ public enum CBv2SmallProjection {
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5
                 && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance))
+        let dvMode = shouldUseBranchlessFP8(for: layers) ? 2 : (vectorDecode ? 1 : 0)
         let shape = FP8Shape(
-            vectorDecode: vectorDecode, rowsOuter: useRowsOuter, weights: layers.count,
+            vectorDecodeMode: dvMode, rowsOuter: useRowsOuter, weights: layers.count,
             outputs: layers.count, segments: segments)
         let outputDims = layers.map(\.outputDimensions)
         let launchKey = FP8LaunchKey(

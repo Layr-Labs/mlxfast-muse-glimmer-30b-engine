@@ -574,6 +574,7 @@ public enum CBv2VerifyScales {
         let outputs: Int
         let rows: Int
         let packedDecode: Bool
+        let branchlessDecode: Bool
         let vectorWeights: Bool
         let vectorActivations: Bool
     }
@@ -690,7 +691,17 @@ public enum CBv2VerifyScales {
             }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                if (PD) {
+                if constexpr (BLD) {
+                    const uint word = *(const device uint*)(rows + mat_offset + bn);
+                    const uint lo = ((word & 0x007F007Fu) << 7) | ((word & 0x00800080u) << 8);
+                    const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
+                    const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
+                    const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
+                    inter[0] = static_cast<T>(even.x);
+                    inter[1] = static_cast<T>(odd.x);
+                    inter[2] = static_cast<T>(even.y);
+                    inter[3] = static_cast<T>(odd.y);
+                } else if (PD) {
                     const uint word = *(const device uint*)(rows + mat_offset + bn);
                     if (((word & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u) {
                         for (int tn = 0; tn < TN; tn++) {
@@ -821,8 +832,8 @@ public enum CBv2VerifyScales {
     /// `vectorActivations` choose the load and decode form.
     public static func fp8Product(
         _ mat: MLXArray, scale: MLXArray, vectors: MLXArray, splitsK: Bool,
-        rowGroups: Int = 1, packedDecode: Bool = true, vectorWeights: Bool = true,
-        vectorActivations: Bool = true
+        rowGroups: Int = 1, packedDecode: Bool = true, branchlessDecode: Bool = false,
+        vectorWeights: Bool = true, vectorActivations: Bool = true
     ) -> MLXArray {
         let (outputs, inputs) = (mat.dim(0), mat.dim(1))
         let count = vectors.dim(0)
@@ -833,8 +844,8 @@ public enum CBv2VerifyScales {
         let bm = rowGroups
         let key = FP8LaunchKey(
             dtype: vectors.dtype, bm: bm, bn: bn, inputs: inputs, outputs: outputs, rows: count,
-            packedDecode: packedDecode, vectorWeights: vectorWeights,
-            vectorActivations: vectorActivations)
+            packedDecode: packedDecode, branchlessDecode: branchlessDecode,
+            vectorWeights: vectorWeights, vectorActivations: vectorActivations)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = launchLock.withLock({ fp8LaunchCache[key] }) {
             launch = hit
@@ -842,7 +853,8 @@ public enum CBv2VerifyScales {
             let groups = (outputs + bm * 2 - 1) / (bm * 2)
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("K", inputs), ("N", outputs),
-                ("V", count), ("PD", packedDecode), ("WV", vectorWeights), ("AV", vectorActivations),
+                ("V", count), ("PD", packedDecode), ("BLD", branchlessDecode),
+                ("WV", vectorWeights), ("AV", vectorActivations),
             ]
             let made = fp8Kernel.prepare(
                 template: template,
@@ -921,7 +933,8 @@ public enum CBv2VerifyScales {
                 rowGroups: {
                     fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
                 },
-                packedDecode: false)
+                packedDecode: false,
+                branchlessDecode: CBv2SmallProjection.shouldUseBranchlessFP8(for: [l]))
         }
         return nil
     }
@@ -948,7 +961,9 @@ public enum CBv2VerifyScales {
             rowGroups: {
                 fp8RowGroups(splitsK: $0, rows: rows, inputs: inputs, runRows: $1)
             },
-            packedDecode: false, preCast: true)
+            packedDecode: false,
+            branchlessDecode: CBv2SmallProjection.shouldUseBranchlessFP8(for: [l]),
+            preCast: true)
     }
 
     /// `product` for every layer, or nil unless it applies to all of them.
@@ -1000,6 +1015,7 @@ public enum CBv2VerifyScales {
         _ layer: ModelOptCalibratedLinear, _ x: MLXArray, stock: Bool = false,
         rowGroups: (_ splitsK: Bool, _ runRows: Int) -> Int = { _, _ in 1 },
         packedDecode: Bool = true,
+        branchlessDecode: Bool = false,
         vectorWeights: Bool = true, vectorActivations: Bool = true,
         preCast: Bool = false
     ) -> MLXArray? {
@@ -1025,6 +1041,7 @@ public enum CBv2VerifyScales {
                 : fp8Product(
                     mat, scale: constants.outputScale, vectors: vectors, splitsK: run.splitsK,
                     rowGroups: rowGroups(run.splitsK, run.rows.count), packedDecode: packedDecode,
+                    branchlessDecode: branchlessDecode,
                     vectorWeights: vectorWeights, vectorActivations: vectorActivations)
         }
         let result = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)

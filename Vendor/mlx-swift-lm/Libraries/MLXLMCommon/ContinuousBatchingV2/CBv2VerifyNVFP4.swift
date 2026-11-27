@@ -45,9 +45,21 @@ public enum CBv2VerifyNVFP4 {
         }
     }
 
-    /// `CBV2_NVFP4_COALESCED=1` enables coalesced `uint4` weight + `uint` scale loads (off by default).
-    public static let coalescedEnabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_NVFP4_COALESCED"] == "1"
+    /// `CBV2_NVFP4_COALESCED`: `"0"` = off, `"1"` = force on for `TN == 1, PF == 0`,
+    /// unset (default) = on for `TN == 1, PF == 0` on low-acceptance rounds only
+    /// (`!lowOnlyVerifySpeedups || lowAcceptance`), keeping `TN == 2` (`mlp.down`
+    /// at 7..8 rows) uncoalesced to avoid register spills and leaving high-acc
+    /// ceiling-bound rounds untouched.
+    public static let coalescedMode: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["CBV2_NVFP4_COALESCED"] else {
+            return 1
+        }
+        if raw == "0" { return 0 }
+        if raw == "1" { return 2 }
+        return 1
+    }()
+
+    public static var coalescedEnabled: Bool { coalescedMode != 0 }
 
     private static let prefetchEnv: Int? =
         ProcessInfo.processInfo.environment["CBV2_NVFP4_PF"].flatMap(Int.init)
@@ -55,10 +67,12 @@ public enum CBv2VerifyNVFP4 {
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
 
-    /// Coalesced `uint4` + aligned `uint` scale schedule with 5-reg prefetch on M5 Max.
+    /// Tile schedule: `TN == 1, PF == 0` for `mlp.gate_up`, `attn`, and `mlp.down`
+    /// below 7 rows (paired with coalesced `uint4` + `uint` loads on low-acc rounds
+    /// without prefetch register pressure); `TN == 2` for `mlp.down` at 7..8 rows.
     public static func geometry(rows: Int, inputs: Int) -> Geometry {
         if let geometryOverride { return geometryOverride }
-        let pf = prefetchEnv ?? (coalescedEnabled ? 1 : (inputs >= 16384 && rows >= 8 ? 1 : 0))
+        let pf = prefetchEnv ?? (inputs >= 16384 && rows >= 8 ? 1 : 0)
         if inputs >= 16384 && rows >= 7 { return Geometry(fragments: 2, prefetch: pf) }
         return Geometry(fragments: 1, prefetch: pf)
     }
@@ -400,7 +414,14 @@ public enum CBv2VerifyNVFP4 {
         segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
         scaled: Bool, outputs: [Int]
     ) -> MLXFast.MLXFastKernel.Launch {
-        let coal = coalescedEnabled
+        let coal: Bool = {
+            guard fragments == 1 && prefetch == 0 else { return false }
+            switch coalescedMode {
+            case 0: return false
+            case 2: return true
+            default: return !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+            }
+        }()
         let key = LaunchKey(
             segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
             prefetch: prefetch, scaled: scaled, coalesced: coal, outputs: outputs)
