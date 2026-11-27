@@ -514,22 +514,6 @@ public enum CBv2SmallProjection {
         }
     }
 
-    /// Dedicated single-segment FP8 activation cast (no integer division).
-    private static let castKernel1 = MLXFast.metalKernel(
-        name: "cbv2_small_fp8_activation_1",
-        inputNames: ["x", "mu0", "bd0"],
-        outputNames: ["out"],
-        source: """
-            const uint i = thread_position_in_grid.x;
-            const float scaled = static_cast<float>(x[i]) * mu0[0];
-            const uint8_t bits = modelopt_e4m3_bits(scaled);
-            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
-            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bd0[0];
-            out[i] = static_cast<T>(invalid ? nan_value : decoded * mu0[1]);
-            """,
-        header: ModelOptActivationKernels.header)
-
     /// The activation cast of `ModelOptActivationKernels.fp8` for each layer's
     /// own multipliers and bound, one launch (`CBv2GroupedProjection`'s cast).
     private static func castKernel(segments: Int) -> MLXFast.MLXFastKernel {
@@ -560,6 +544,21 @@ public enum CBv2SmallProjection {
             name: "cbv2_small_fp8_activation_\(segments)", inputNames: inputs,
             outputNames: ["out"], source: source, header: ModelOptActivationKernels.header)
     }
+
+    private static let castKernel1 = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_activation_1",
+        inputNames: ["x", "mu0", "bd0"],
+        outputNames: ["out"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const float scaled = static_cast<float>(x[i]) * mu0[0];
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bd0[0];
+            out[i] = static_cast<T>(invalid ? nan_value : decoded * mu0[1]);
+            """,
+        header: ModelOptActivationKernels.header)
 
     nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
         1: castKernel1, 2: castKernel(segments: 2), 4: castKernel(segments: 4),

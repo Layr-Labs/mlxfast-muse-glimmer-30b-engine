@@ -240,6 +240,8 @@ extension MuseGlimmerTextModel {
             lowVerify && routesVerifyProjections && !MuseGlimmerVerifyProjections.selfTest
             && (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows)
         let flushLayer = MuseGlimmerVerifyProjections.midTrunkFlushLayer
+        let addNormNorm = VerifyFusedNorms.PreparedAddNormNorm(
+            like: h, eps1: configuration.postNormEps, eps2: configuration.rmsNormEps)
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -273,6 +275,11 @@ extension MuseGlimmerTextModel {
                     multipliers: fp8Params.multipliers, overflowBound: fp8Params.overflowBound)
                 mid = m
                 feed = groupedVerifyFeed(layer.mlp, feedCast, preCastFP8: true)
+            } else if post.eps == configuration.postNormEps && pre.eps == configuration.rmsNormEps {
+                let (m, feedInput) = addNormNorm(
+                    residual: h, x: attention, w1: post.weight, w2: pre.weight)
+                mid = m
+                feed = groupedVerifyFeed(layer.mlp, feedInput)
             } else {
                 let (m, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
                     residual: h, x: attention, w1: post.weight, eps1: post.eps,
@@ -297,6 +304,12 @@ extension MuseGlimmerTextModel {
                         w2: next.weight, eps2: next.eps,
                         multipliers: fp8Params.multipliers, overflowBound: fp8Params.overflowBound)
                     layerInputPreCastFP8 = true
+                } else if postFF.eps == configuration.postNormEps
+                    && next.eps == configuration.rmsNormEps
+                {
+                    (h, layerInput) = addNormNorm(
+                        residual: mid, x: feed, w1: postFF.weight, w2: next.weight)
+                    layerInputPreCastFP8 = false
                 } else {
                     (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
                         residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
@@ -1047,6 +1060,11 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            CBv2VerifyScales.verifyAndWarmNVFP4ReadoutTopTwo(
+                lmHead, width: width, dtype: dtype,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping,
+                rows: 2 ... CBv2VerifyScales.maxFusedLMHeadRows)
         }
     }
 }

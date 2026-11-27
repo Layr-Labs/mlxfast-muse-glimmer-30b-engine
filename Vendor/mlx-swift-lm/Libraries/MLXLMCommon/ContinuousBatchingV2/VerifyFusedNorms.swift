@@ -243,6 +243,52 @@ public enum VerifyFusedNorms {
         }
     }
 
+    public struct PreparedAddNormNorm {
+        private struct CacheKey: Hashable {
+            let shape: [Int]
+            let dtype: DType
+            let eps1Bits: UInt32
+            let eps2Bits: UInt32
+        }
+
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var cache:
+            [CacheKey: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)] = [:]
+
+        private let launch: MLXFast.MLXFastKernel.Launch
+        private let params: MLXArray
+
+        public init(like x: MLXArray, eps1: Float, eps2: Float) {
+            let key = CacheKey(
+                shape: x.shape, dtype: x.dtype, eps1Bits: eps1.bitPattern,
+                eps2Bits: eps2.bitPattern)
+            if let hit = Self.lock.withLock({ Self.cache[key] }) {
+                self.launch = hit.launch
+                self.params = hit.params
+                return
+            }
+            let width = x.dim(-1)
+            let rows = x.size / width
+            let tg = VerifyFusedNorms.threadgroupSize(width: width)
+            let blocks = width / (tg * VerifyFusedNorms.readsPerThread)
+            let madeParams = MLXArray([Float(1.0 / Double(width)), eps1, eps2])
+            let madeLaunch = VerifyFusedNorms.kernel.prepare(
+                template: [("D_", width), ("BLOCKS_", blocks)],
+                grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype])
+            Self.lock.withLock { Self.cache[key] = (madeLaunch, madeParams) }
+            self.launch = madeLaunch
+            self.params = madeParams
+        }
+
+        public func callAsFunction(residual: MLXArray, x: MLXArray, w1: MLXArray, w2: MLXArray)
+            -> (h: MLXArray, y: MLXArray)
+        {
+            let out = launch([residual, x, w1, w2, params])
+            return (out[0], out[1])
+        }
+    }
+
     /// `(residual + centeredRMSNorm(x, w1, eps1), centeredRMSNorm(that, w2, eps2))`.
     /// `residual` and `x` are `[..., width]` BF16 with fewer than 32 rows.
     public static func fusedAddNormNorm(
@@ -836,5 +882,82 @@ public enum VerifyFusedQK {
         }
         let out = launch([queries, keys, offs, params, treeMeta ?? dummyTreeMeta])
         return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+    }
+
+    public final class Prepared {
+        private struct Key: Hashable {
+            let batch: Int
+            let length: Int
+            let heads: Int
+            let kvHeads: Int
+            let headDim: Int
+            let queryDType: DType
+            let keyDType: DType
+            let rope: Bool
+            let offsetsPerRow: Bool
+            let paramBits: [UInt32]
+        }
+
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var sharedLaunches:
+            [Key: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)] = [:]
+        nonisolated(unsafe) private static let sharedZeroOffsets = MLXArray.zeros(
+            [1], type: Int32.self)
+        nonisolated(unsafe) private static let sharedTreeMeta: MLXArray = {
+            let arr = MLXArray([Int32(bitPattern: 0x7654_3210)])
+            eval(arr)
+            return arr
+        }()
+
+        private var localLaunches:
+            [Key: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)] = [:]
+
+        public init() {}
+
+        public var preparedCount: Int { localLaunches.count }
+
+        public func callAsFunction(
+            queries: MLXArray, keys: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
+            eps: Float, queryScale: Float, ropeBase: Float?, ropeScale: Float = 1,
+            offsets: MLXArray?
+        ) -> (queries: MLXArray, keys: MLXArray) {
+            let (b, l) = (queries.dim(0), queries.dim(1))
+            let offs: MLXArray
+            if let offsets {
+                offs = offsets.dtype == .int32 ? offsets : offsets.asType(.int32)
+            } else {
+                offs = Self.sharedZeroOffsets
+            }
+            let values: [Float] = [eps, queryScale, log2(ropeBase ?? 1), ropeScale]
+            let key = Key(
+                batch: b, length: l, heads: heads, kvHeads: kvHeads, headDim: headDim,
+                queryDType: queries.dtype, keyDType: keys.dtype, rope: ropeBase != nil,
+                offsetsPerRow: offs.size != 1, paramBits: values.map(\.bitPattern))
+            let entry: (launch: MLXFast.MLXFastKernel.Launch, params: MLXArray)
+            if let hit = localLaunches[key] {
+                entry = hit
+            } else if let shared = Self.lock.withLock({ Self.sharedLaunches[key] }) {
+                localLaunches[key] = shared
+                entry = shared
+            } else {
+                let made = (
+                    launch: VerifyFusedQK.kernel.prepare(
+                        template: [
+                            ("H_", heads), ("KVH_", kvHeads), ("D_", headDim), ("L_", l),
+                            ("ROPE_", key.rope), ("OFFB_", key.offsetsPerRow ? 1 : 0),
+                            ("TREE_POS_", Int(0x7654_3210)), ("DYN_TREE_", false),
+                        ],
+                        grid: (32, b * l * (heads + kvHeads), 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[b, l, heads, headDim], [b, l, kvHeads, headDim]],
+                        outputDTypes: [queries.dtype, keys.dtype]),
+                    params: MLXArray(values)
+                )
+                Self.lock.withLock { Self.sharedLaunches[key] = made }
+                localLaunches[key] = made
+                entry = made
+            }
+            let out = entry.launch([queries, keys, offs, entry.params, Self.sharedTreeMeta])
+            return (out[0].transposed(0, 2, 1, 3), out[1].transposed(0, 2, 1, 3))
+        }
     }
 }

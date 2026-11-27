@@ -545,3 +545,82 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
         outputs[2].reshaped([batch, width])
     )
 }
+
+private let cbv2BuildReadoutLUTKernel = MLXFast.metalKernel(
+    name: "cbv2_build_readout_lut",
+    inputNames: ["params"],
+    outputNames: ["lut"],
+    source: """
+        const uint idx = thread_position_in_grid.x;
+        const bfloat16_t mult = bfloat16_t(params[0]);
+        const bfloat16_t cap = bfloat16_t(params[1]);
+        const bool has_cap = params[1] > 0.0f;
+        const bfloat16_t value = cbv2_readout(as_type<bfloat16_t>(ushort(idx)), mult, cap, has_cap);
+        uint nf = 0u;
+        const uint key = cbv2_readout_key(value, 0u, nf);
+        lut[idx] = (key & 0xffff0000u) | (nf & 1u);
+        """,
+    header: cbv2PackedReadoutHeader
+)
+
+private enum CBv2ReadoutLUTCache {
+    static let enabled = ProcessInfo.processInfo.environment["CBV2_TOP2_READOUT_LUT"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var tables = [UInt64: MLXArray]()
+    nonisolated(unsafe) private static var failed = Set<UInt64>()
+    nonisolated(unsafe) private static var paramsCache = [UInt64: MLXArray]()
+
+    static func paramsArray(outputMultiplier: Float, softcap: Float) -> MLXArray {
+        let key = (UInt64(outputMultiplier.bitPattern) << 32) | UInt64(softcap.bitPattern)
+        if let hit = lock.withLock({ paramsCache[key] }) { return hit }
+        let made = MLXArray([outputMultiplier, softcap])
+        lock.withLock { paramsCache[key] = made }
+        return made
+    }
+
+    static func table(outputMultiplier: Float, softcap: Float, params: MLXArray) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu else { return nil }
+        let key = (UInt64(outputMultiplier.bitPattern) << 32) | UInt64(softcap.bitPattern)
+        if let existing = lock.withLock({ tables[key] }) { return existing }
+        if lock.withLock({ failed.contains(key) }) { return nil }
+        let built: MLXArray? = (try? MLX.withError { errors -> MLXArray? in
+            let lut = cbv2BuildReadoutLUTKernel(
+                [params],
+                grid: (65536, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[65536]],
+                outputDTypes: [.uint32])[0]
+            eval(lut)
+            try errors.check()
+            return lut
+        }) ?? nil
+        lock.withLock {
+            if let built {
+                tables[key] = built
+            } else {
+                failed.insert(key)
+            }
+        }
+        return built
+    }
+}
+
+package func cbv2ReadoutLUT(outputMultiplier: Float, softcap: Float) -> MLXArray? {
+    let params = CBv2ReadoutLUTCache.paramsArray(
+        outputMultiplier: outputMultiplier, softcap: softcap)
+    return CBv2ReadoutLUTCache.table(
+        outputMultiplier: outputMultiplier, softcap: softcap, params: params)
+}
+
+package func cbv2ReadoutParams(outputMultiplier: Float, softcap: Float) -> MLXArray {
+    CBv2ReadoutLUTCache.paramsArray(outputMultiplier: outputMultiplier, softcap: softcap)
+}
+
+public func cbv2FusedReadoutTopTwoFinalize(
+    partialIDs: MLXArray, partialValues: MLXArray, partialNonFinite: MLXArray,
+    chunks: Int, batch: Int, width: Int
+) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
+    return cbv2FusedReadoutTopTwoMergePartials(
+        partialIDs: partialIDs, partialValues: partialValues, partialNF: partialNonFinite,
+        batch: batch, width: width, chunks: chunks)
+}
