@@ -420,8 +420,19 @@ extension MuseGlimmerTextModel {
                 posDeltas: treePos,
                 treeMeta: dynTreeMeta,
                 target: target)
-            let outputBLHD = paged.attendColumnsPreWritten(
-                queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil)
+            let useFusedOutGate =
+                !(a.outputProj is ModelOptCalibratedLinear)
+                && PagedOnePassAttention.outputGateEnabled
+                && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.xnorDraftHeadEligible)
+                && x.dtype == .bfloat16
+            let gate3D: MLXArray? =
+                useFusedOutGate ? p[3].reshaped(batch * length, a.heads, a.headDimensions) : nil
+            let (outputBLHD, gateApplied) = paged.attendColumnsPreWrittenWithGate(
+                queriesBLHD: queriesBLHD, scale: a.scale, sinks: nil, outputGate: gate3D)
+            if gateApplied {
+                let gated = outputBLHD.reshaped(batch, length, -1)
+                return verifyOutputProjection(a.outputProj, gated)
+            }
             let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
             if let fp8 = a.outputProj as? ModelOptCalibratedLinear,
                 verifyRows(p[3]) != nil,

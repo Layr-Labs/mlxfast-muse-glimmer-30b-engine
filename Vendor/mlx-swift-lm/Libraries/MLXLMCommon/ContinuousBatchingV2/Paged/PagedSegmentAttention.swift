@@ -233,14 +233,40 @@ enum PagedSegmentAttention {
         treeMeta: MLXArray? = nil,
         pending: (keys: MLXArray, values: MLXArray)? = nil
     ) -> MLXArray {
+        decodeWithOutputGate(
+            queries: queries, newKeys: newKeys, newValues: newValues, group: group, rows: rows,
+            sinks: sinks, params: params, softcap: softcap, source: source,
+            dispatchCache: dispatchCache, zeroFilledScratch: zeroFilledScratch,
+            seqinfoCache: seqinfoCache, mergeScratch: mergeScratch, treeMeta: treeMeta,
+            pending: pending, outputGate: nil).out
+    }
+
+    static func decodeWithOutputGate(
+        queries: MLXArray,
+        newKeys: MLXArray?,
+        newValues: MLXArray?,
+        group: PagedKVGroup,
+        rows: [PagedSegmentDispatchPlan.Row],
+        sinks: MLXArray?,
+        params: MLXArray,
+        softcap: Bool,
+        source: String,
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        zeroFilledScratch: Bool = false,
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil,
+        mergeScratch: PagedSegmentMergeScratch? = nil,
+        treeMeta: MLXArray? = nil,
+        pending: (keys: MLXArray, values: MLXArray)? = nil,
+        outputGate: MLXArray?
+    ) -> (out: MLXArray, gateApplied: Bool) {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
-        guard !group.writeValidation.isFaulted else { return q }
+        guard !group.writeValidation.isFaulted else { return (q, false) }
         precondition(pending == nil || treeMeta == nil, "the fused append serves linear rows only")
         if let newKeys, let newValues {
             guard
                 group.writeValidation.validate(
                     keys: newKeys, values: newValues, expected: group.dtype)
-            else { return q }
+            else { return (q, false) }
         }
         precondition(q.ndim == 3 && q.dim(0) == rows.count)
         precondition((newKeys == nil) == (newValues == nil))
@@ -298,8 +324,19 @@ enum PagedSegmentAttention {
                     maxPart: plan.maxPartitions, bindings: bucket.bindingClass)
             {
                 scatterPending(pending)
-                guard !group.writeValidation.isFaulted else { return q }
+                guard !group.writeValidation.isFaulted else { return (q, false) }
                 fusedPending = nil
+            }
+            var fusedOutGate: MLXArray? = nil
+            if fusedPending == nil, !PagedOnePassAttention.checks, let outputGate,
+                outputGate.dtype == dtype, outputGate.shape == [b, qh, d],
+                PagedOnePassAttention.supportsOutputGate(
+                    dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
+                    hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass,
+                    dynTree: treeMeta != nil)
+            {
+                fusedOutGate = outputGate
             }
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
             backing.append(
@@ -313,7 +350,8 @@ enum PagedSegmentAttention {
                 maxPart: plan.maxPartitions,
                 pending: fusedPending.map {
                     ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
-                })
+                },
+                outputGate: fusedOutGate)
             if PagedOnePassAttention.checks {
                 // The reference reads the pages this dispatch wrote.
                 if fusedPending != nil { group.writeFence = result.fence }
@@ -324,14 +362,14 @@ enum PagedSegmentAttention {
                     dispatchCache: nil, zeroFilledScratch: true, treeMeta: treeMeta)
                 PagedOnePassAttention.compare(
                     onePass: result.out, twoPass: reference, appended: fusedPending != nil)
-                return reference
+                return (reference, false)
             }
             group.writeFence = result.fence
-            return result.out
+            return (result.out, fusedOutGate != nil)
         }
         if let pending {
             scatterPending(pending)
-            guard !group.writeValidation.isFaulted else { return q }
+            guard !group.writeValidation.isFaulted else { return (q, false) }
         }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
@@ -405,7 +443,7 @@ enum PagedSegmentAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
-        return mergeKernel(key: mergeKey, source: source)(
+        let out = mergeKernel(key: mergeKey, source: source)(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence, treeMeta ?? dummyTreeMeta],
             template: [
                 ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
@@ -413,6 +451,7 @@ enum PagedSegmentAttention {
             ],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+        return (out, false)
     }
 }
 

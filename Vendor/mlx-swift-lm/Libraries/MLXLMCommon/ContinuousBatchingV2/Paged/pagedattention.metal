@@ -642,10 +642,18 @@ inline void paged_attention_merge_impl(
 // APPEND (linear rows only): the call's new K/V columns arrive as token-major
 // knew/vnew; each row's terminal position is also its write slot, and positions
 // from row 0's terminal position on are read from knew/vnew, not the pages.
+inline bfloat16_t cbv2_bf16_sigmoid(bfloat16_t x) {
+    const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+    const bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+    const bfloat16_t one = bfloat16_t(1.0f);
+    const bfloat16_t y = one / (one + ey);
+    return (x < bfloat16_t(0.0f)) ? y : (one - y);
+}
+
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
     bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
-    bool APPEND = false>
+    bool APPEND = false, bool OUT_GATE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -662,10 +670,12 @@ inline void paged_attention_onepass_impl(
     uint lane,
     const device int32_t* tree_meta = nullptr,
     const device T* knew = nullptr,
-    const device T* vnew = nullptr
+    const device T* vnew = nullptr,
+    const device T* out_gate = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     static_assert(!(APPEND && DYN_TREE), "the fused append serves linear rows only");
+    static_assert(!(APPEND && OUT_GATE), "fused output gate serves pre-written rows only");
     constexpr int SPLITS = GQA / HPT;
     constexpr int EPT = D / 32;
     constexpr int RSTRIDE = D + 2;
@@ -947,10 +957,17 @@ inline void paged_attention_onepass_impl(
                 }
             }
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
-            device T* orow = out + ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            const size_t ooff = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+            device T* orow = out + ooff;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
-                orow[lane * EPT + e] = T(gacc[e] * inv);
+                T oval = T(gacc[e] * inv);
+                if constexpr (OUT_GATE) {
+                    if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                        oval = oval * cbv2_bf16_sigmoid(out_gate[ooff + lane * EPT + e]);
+                    }
+                }
+                orow[lane * EPT + e] = oval;
             }
         }
     }
