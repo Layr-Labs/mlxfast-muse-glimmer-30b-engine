@@ -1287,7 +1287,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// Attends `[1, L, QH, D]` verify queries whose K/V columns were already written into the
     /// paged KV segment by `VerifyFusedQK.applyAndWrite`, returning `[1, L, QH, D]` directly.
     public func attendColumnsPreWritten(
-        queriesBLHD: MLXArray, scale: Float, sinks: MLXArray?
+        queriesBLHD: MLXArray, scale: Float, sinks: MLXArray?,
+        outputGate: (input: MLXArray, fallback: (MLXArray, MLXArray) -> MLXArray)? = nil
     ) -> MLXArray {
         let (b, l, qh, d) = (
             queriesBLHD.dim(0), queriesBLHD.dim(1), queriesBLHD.dim(2), queriesBLHD.dim(3))
@@ -1305,7 +1306,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             zeroFilledScratch: true,
             seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo,
             mergeScratch: segmentDecodeReference ? nil : columnsAsRowsScratch,
-            treeMeta: dynTreeMeta)
+            treeMeta: dynTreeMeta,
+            outputGate: outputGate.map { ($0.input.reshaped(b * l, qh, d), $0.fallback) })
         mtpColumnsAsRowsCalls += 1
         advancePositionOffsets(by: l)
         let output = result.reshaped(b, l, qh, d)
@@ -1422,6 +1424,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let canAppend: Bool
         if b == 1, sinks == nil, !segmentDecodeReference, PagedOnePassAttention.enabled,
             !PagedOnePassAttention.threadgroupProbeFailed,
+            (!PagedOnePassAttention.useRecordKernel || layerIndex < 48),
             !columnsAsRowsUseTree(b: b, l: l)
         {
             let row = rows[0]

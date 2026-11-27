@@ -228,6 +228,33 @@ public enum PagedOnePassAttention {
                         treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec)
                     outputs += [dynResult.fence, dynResult.out]
                 }
+                if !useRec, dtype == .bfloat16 {
+                    for meta in warmDynTree && !dynTreeProbeFailedFor(record: false)
+                        ? [nil, dummyTreeMeta] as [MLXArray?] : [nil]
+                    {
+                        let held = (try? withError { () -> Bool in
+                            let probed = segments(
+                                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                                seqinfo: seqinfo, params: params, previous: previous,
+                                valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, probe: true, treeMeta: meta, maxPart: mp,
+                                forceMaxPart: true, record: false, gate: q)
+                            eval(probed.fence, probed.out)
+                            return true
+                        }) ?? false
+                        if held {
+                            let key = GateKey(
+                                geometry: AppendKey(
+                                    dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa,
+                                    pageSize: pageSize, hpt: hpt, simdgroups: nsg,
+                                    partitionTokens: ptok, softcap: softcap, maxPart: mp,
+                                    bindings: bindings, record: false), dynTree: meta != nil)
+                            lock.withLock { _ = gateVariants.insert(key) }
+                        }
+                    }
+                }
                 if appendEnabled {
                     outputs += warmAppend(
                         q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
@@ -357,12 +384,11 @@ public enum PagedOnePassAttention {
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
     private static func segmentBody(
-        bindings: Int, appending: Bool = false, record: Bool = false
+        bindings: Int, appending: Bool = false, record: Bool = false, gated: Bool = false
     ) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
-        // The read-only source stays byte-identical; only the append variant adds arguments.
-        let append = appending ? ", true" : ""
-        let pending = appending ? ", knew, vnew" : ""
+        let append = gated ? ", false, true" : (appending ? ", true" : "")
+        let pending = gated ? ", nullptr, nullptr, gate" : (appending ? ", knew, vnew" : "")
         return """
             const int row = threadgroup_position_in_grid.y;
             int first = 0;
@@ -463,6 +489,7 @@ public enum PagedOnePassAttention {
         let bindings: Int
         let dynTree: Bool
         let append: Bool
+        let gated: Bool
         let record: Bool
     }
 
@@ -479,6 +506,31 @@ public enum PagedOnePassAttention {
         let maxPart: Int
         let bindings: Int
         let record: Bool
+    }
+
+    private struct GateKey: Hashable {
+        let geometry: AppendKey
+        let dynTree: Bool
+    }
+
+    nonisolated(unsafe) private static var gateVariants: Set<GateKey> = []
+
+    static func supportsOutputGate(
+        dtype: DType, headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int,
+        simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int, bindings: Int,
+        dynTree: Bool
+    ) -> Bool {
+        guard !useRecordKernel, dtype == .bfloat16,
+            CBv2DraftRegime.pastFirstRound || !CBv2DraftRegime.lowOnlyVerifySpeedups
+        else { return false }
+        let geometry = AppendKey(
+            dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            softcap: softcap, maxPart: resolvedMaxPart(maxPart, probe: false, forceMaxPart: false),
+            bindings: bindings, record: false)
+        return lock.withLock {
+            gateVariants.contains(GateKey(geometry: geometry, dynTree: dynTree))
+        }
     }
 
     /// The MAXPART `segments` compiles for a call (one rule for launch and lookup).
@@ -498,7 +550,7 @@ public enum PagedOnePassAttention {
         simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int?, bindings: Int,
         record: Bool = useRecordKernel
     ) -> Bool {
-        guard appendEnabled else { return false }
+        guard appendEnabled, !record else { return false }
         let key = AppendKey(
             dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
             hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
@@ -517,7 +569,8 @@ public enum PagedOnePassAttention {
         kvHeads: Int, pageSize: Int, hpt: Int, simdgroups: Int, partitionTokens: Int,
         softcap: Bool, source: String, probe: Bool = false, treeMeta: MLXArray? = nil,
         maxPart: Int? = nil, forceMaxPart: Bool = false,
-        pending: (keys: MLXArray, values: MLXArray)? = nil, record: Bool = useRecordKernel
+        pending: (keys: MLXArray, values: MLXArray)? = nil, record: Bool = useRecordKernel,
+        gate: MLXArray? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
@@ -525,7 +578,9 @@ public enum PagedOnePassAttention {
         let mp = resolvedMaxPart(maxPart, probe: probe, forceMaxPart: forceMaxPart)
         let dynTree = treeMeta != nil
         let appending = pending != nil
+        let gated = gate != nil
         precondition(!(appending && dynTree), "the fused append serves linear rows only")
+        precondition(!gated || (!appending && !record && dtype == .bfloat16))
         var inputs =
             [queries] + backing + [
                 seqinfo, params, previous, valueOffsets, records, treeMeta ?? dummyTreeMeta,
@@ -533,12 +588,13 @@ public enum PagedOnePassAttention {
         if let pending {
             inputs += [pending.keys, pending.values]
         }
+        if let gate { inputs.append(gate) }
         if !probe {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, record: record)
+                append: appending, gated: gated, record: record)
             if let hit = lock.withLock({ segLaunchCache[lkey] }) {
                 let outputs = hit(inputs)
                 return (outputs[0], outputs[1])
@@ -549,7 +605,7 @@ public enum PagedOnePassAttention {
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 softcap: softcap, maxPart: mp) + (appending ? "_append" : "")
-            + (record ? "_rec" : "")
+            + (record ? "_rec" : "") + (gated ? "_outgate" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -560,9 +616,9 @@ public enum PagedOnePassAttention {
                 name: kernelName,
                 inputNames: ["q"] + segmentNames
                     + ["seqinfo", "params", "previous", "value_offsets", "records", "tree_meta"]
-                    + (appending ? ["knew", "vnew"] : []),
+                    + (appending ? ["knew", "vnew"] : []) + (gated ? ["gate"] : []),
                 outputNames: ["fence", "out"],
-                source: segmentBody(bindings: bindings, appending: appending, record: record),
+                source: segmentBody(bindings: bindings, appending: appending, record: record, gated: gated),
                 header: source, ensureRowContiguous: true,
                 mutableInputs: appending ? segmentNames : [])
             kernels[kernelName] = made
@@ -581,7 +637,7 @@ public enum PagedOnePassAttention {
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, record: record)
+                append: appending, gated: gated, record: record)
             let launch = kernel.prepare(
                 template: template,
                 grid: (kvHeads * (gqa / hpt) * tg, b, 1),

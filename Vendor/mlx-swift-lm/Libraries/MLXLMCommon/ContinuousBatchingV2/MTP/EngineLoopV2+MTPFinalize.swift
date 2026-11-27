@@ -910,10 +910,10 @@ extension EngineLoopV2 {
     /// round; the shared commit work is always submitted. 0 disables the
     /// gate.
     static var mtpSpeculativeBlockMinimumFullAcceptance: Double { 0.5 }
-    /// `CBV2_MTP_OUTCOME_SPEC=1`: enable device-outcome post-verify drafting
-    /// on low-acceptance rounds (off by default to avoid masked-SDPA contention).
+    /// `CBV2_MTP_OUTCOME_SPEC`: enable device-outcome post-verify drafting strictly
+    /// on deep-low-acceptance rounds (0% Pair-1 impact; hides host sync/graph bubble).
     static let mtpOutcomeSpeculation =
-        ProcessInfo.processInfo.environment["CBV2_MTP_OUTCOME_SPEC"] == "1"
+        ProcessInfo.processInfo.environment["CBV2_MTP_OUTCOME_SPEC"] != "0"
 
     /// Submit the drafter's next-round work behind a verify.
     /// One-row rounds only (a batched round's drafter pass has other
@@ -939,7 +939,7 @@ extension EngineLoopV2 {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
         let draftTokens: MLXArray? =
-            Self.mtpOutcomeSpeculation && mtp.inLowAcceptanceRegime(id)
+            Self.mtpOutcomeSpeculation && mtp.inDeepLowAcceptanceRegime(id)
             ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
         CBv2DraftRegime.xnorDraftHeadEligible = mtp.inDeepLowAcceptanceRegime(id)
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
