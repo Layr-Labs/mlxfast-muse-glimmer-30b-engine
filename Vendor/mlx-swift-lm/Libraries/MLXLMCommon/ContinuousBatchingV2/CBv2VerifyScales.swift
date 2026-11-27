@@ -479,8 +479,14 @@ public enum CBv2VerifyScales {
     nonisolated(unsafe) private static var nvfp4TopTwoLaunchCache:
         [NVFP4TopTwoLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
-    public static let fusedLMHeadEnabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] == "1"
+    private static let fusedLMHeadEnvEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] != "0"
+
+    nonisolated(unsafe) private(set) static var fusedLMHeadVerified: Bool = false
+
+    public static var fusedLMHeadEnabled: Bool {
+        fusedLMHeadEnvEnabled && fusedLMHeadVerified
+    }
 
     public static let fusedLMHeadChunks: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_CHUNKS"],
@@ -491,13 +497,10 @@ public enum CBv2VerifyScales {
         return 512
     }()
 
-    /// Zero-logit-materialization NVFP4 `lm_head` + readout + exact top-2 + non-finite
-    /// for 1 to 8 rows (`[B, L, H]`), bit-exact to `product(lmHead, x)` followed by
-    /// `cbv2FusedReadoutTopTwoAndNonFinite`.
-    public static func nvfp4ReadoutTopTwo(
+    private static func nvfp4ReadoutTopTwoUnchecked(
         _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float
     ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray)? {
-        guard fusedLMHeadEnabled, x.ndim == 3, x.dtype == .bfloat16,
+        guard x.ndim == 3, x.dtype == .bfloat16,
             let l = layer as? ModelOptWeightOnlyNVFP4Linear
         else { return nil }
         let batch = x.dim(0)
@@ -540,6 +543,87 @@ public enum CBv2VerifyScales {
         return cbv2FusedReadoutTopTwoMergePartials(
             partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
             batch: batch, width: width, chunks: chunks)
+    }
+
+    /// Zero-logit-materialization NVFP4 `lm_head` + readout + exact top-2 + non-finite
+    /// for 2 to 8 rows (`[B, L, H]`), bit-exact to `product(lmHead, x)` followed by
+    /// `cbv2FusedReadoutTopTwoAndNonFinite`. Active only after load-time 0-ULP verification.
+    public static func nvfp4ReadoutTopTwo(
+        _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float
+    ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray)? {
+        guard fusedLMHeadEnabled else { return nil }
+        return nvfp4ReadoutTopTwoUnchecked(
+            layer, x, outputMultiplier: outputMultiplier, softcap: softcap)
+    }
+
+    /// Load-time 0-ULP bit-exact verification and warmup for `nvfp4ReadoutTopTwo`
+    /// on the live `lm_head` weights across `rows = 2` and `rows = 8`. Activates the
+    /// fused zero-logit readout only if every top-2 id, float32 value bit, and non-finite
+    /// flag matches `product(layer, x)` + `cbv2FusedReadoutTopTwoAndNonFinite` with 0 diffs.
+    public static func verifyAndWarmNVFP4ReadoutTopTwo(
+        _ layer: any UnaryLayer, outputMultiplier: Float, softcap: Float,
+        dtype: DType, rows: ClosedRange<Int> = 2 ... 8
+    ) {
+        guard fusedLMHeadEnvEnabled, dtype == .bfloat16,
+            Device.defaultDevice().deviceType == .gpu,
+            let l = layer as? ModelOptWeightOnlyNVFP4Linear
+        else { return }
+        let inputs = l.inputDimensions
+        guard inputs > 0 else { return }
+        let ok = (try? MLX.withError { errors -> Bool in
+            for testRows in [2, min(8, rows.upperBound)] {
+                let n = testRows * inputs
+                let vals: [Float] = (0 ..< n).map { idx in
+                    switch idx % 11 {
+                    case 0: return 0.0
+                    case 1: return -0.000244140625
+                    case 2: return 0.000244140625
+                    case 3: return 3.5
+                    case 4: return -3.5
+                    default: return Float(((idx * 17 + 7) % 67) - 33) * 0.125
+                    }
+                }
+                let x = MLXArray(vals, [1, testRows, inputs]).asType(dtype)
+                guard let got = nvfp4ReadoutTopTwoUnchecked(
+                    layer, x, outputMultiplier: outputMultiplier, softcap: softcap),
+                    let refProd = product(layer, x),
+                    refProd.ndim == 3, refProd.dtype == .bfloat16
+                else { return false }
+                let ref = cbv2FusedReadoutTopTwoAndNonFinite(
+                    refProd, outputMultiplier: outputMultiplier, softcap: softcap)
+                let idDiff = (
+                    contiguous(got.ids).view(dtype: .uint32)
+                        .!= contiguous(ref.ids).view(dtype: .uint32)
+                ).asType(.int32).sum()
+                let valDiff = (
+                    contiguous(got.values).view(dtype: .uint32)
+                        .!= contiguous(ref.values).view(dtype: .uint32)
+                ).asType(.int32).sum()
+                let nfDiff = (
+                    contiguous(got.nonFinite).view(dtype: .uint32)
+                        .!= contiguous(ref.nonFinite).view(dtype: .uint32)
+                ).asType(.int32).sum()
+                eval(idDiff, valDiff, nfDiff)
+                try errors.check()
+                guard idDiff.item(Int.self) == 0,
+                    valDiff.item(Int.self) == 0,
+                    nfDiff.item(Int.self) == 0
+                else { return false }
+            }
+            return true
+        }) ?? false
+        guard ok else { return }
+        var warmOuts = [MLXArray]()
+        for r in rows {
+            let z = MLXArray.zeros([1, r, inputs], dtype: dtype)
+            if let res = nvfp4ReadoutTopTwoUnchecked(
+                layer, z, outputMultiplier: outputMultiplier, softcap: softcap)
+            {
+                warmOuts += [res.ids, res.values, res.nonFinite]
+            }
+        }
+        if !warmOuts.isEmpty { eval(warmOuts) }
+        launchLock.withLock { fusedLMHeadVerified = true }
     }
 
     private static let nvfp4Kernel = MLXFast.metalKernel(
