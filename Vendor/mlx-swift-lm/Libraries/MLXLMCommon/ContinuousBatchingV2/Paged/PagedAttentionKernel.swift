@@ -536,6 +536,31 @@ public enum PagedAttentionKernel {
     ) -> MLXFast.MLXFastKernel {
         cache.kernel(for: key, source: source)
     }
+    private struct DecodePartLaunchID: Hashable {
+        let kernel: PagedAttentionKernelKey
+        let hpt: Int
+        let kvHeads: Int
+        let batch: Int
+        let queryHeads: Int
+        let maxParts: Int
+    }
+
+    private struct DecodeMergeLaunchID: Hashable {
+        let kernel: PagedAttentionKernelKey
+        let batch: Int
+        let queryHeads: Int
+    }
+
+    nonisolated(unsafe) private static var decodePartLaunches:
+        [DecodePartLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var decodeMergeLaunches:
+        [DecodeMergeLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    private static let decodeLaunchLock = NSLock()
+    private static let decodeLaunchLimit = 1024
+
+    private static func decodeLaunchCacheable(batch: Int) -> Bool {
+        (1 ... 8).contains(batch)
+    }
 
     /// Shared dummy sinks (the generated signature keeps a `device` input
     /// even when HAS_SINKS is false). Read-only after creation; MLXArray is
@@ -752,45 +777,104 @@ public enum PagedAttentionKernel {
         // space; the merge implementation expects a device pointer. Keep even
         // a one-head/one-partition probe on the same legal interface.
         let metaShape = [max(8, b * queryHeads * maxParts * 2)]
-        let partOut = kernel(for: partKey, source: kernelSource)(
-            partInputs,
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("S", pageSize),
-                ("GQA", gqa),
-                ("HPT", hpt),
-                ("NSG", nsg),
-                ("PTOK", ptok),
-                ("HAS_SOFTCAP", softcap),
-            ],
-            grid: (kvHeads * splits * tg, b, maxParts),
-            threadGroup: (tg, 1, 1),
-            outputShapes: hasWrite
-                ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
-                : [[b, queryHeads, maxParts, headDim], metaShape],
-            outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32],
-            stream: stream
-        )
+        let partTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", dtype),
+            ("D", headDim),
+            ("S", pageSize),
+            ("GQA", gqa),
+            ("HPT", hpt),
+            ("NSG", nsg),
+            ("PTOK", ptok),
+            ("HAS_SOFTCAP", softcap),
+        ]
+        let partGrid = (kvHeads * splits * tg, b, maxParts)
+        let partThreadGroup = (tg, 1, 1)
+        let partShapes: [[Int]] = hasWrite
+            ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
+            : [[b, queryHeads, maxParts, headDim], metaShape]
+        let partDTypes: [DType] = hasWrite ? [.float32, .float32, .int32] : [.float32, .float32]
+        let cacheable = decodeLaunchCacheable(batch: b)
+        let partLaunchID = cacheable
+            ? DecodePartLaunchID(
+                kernel: partKey, hpt: hpt, kvHeads: kvHeads, batch: b,
+                queryHeads: queryHeads, maxParts: maxParts)
+            : nil
+        let partOut: [MLXArray]
+        if let partLaunchID,
+            let launch = decodeLaunchLock.withLock({ decodePartLaunches[partLaunchID] })
+        {
+            partOut = launch(partInputs, stream: stream)
+        } else {
+            let partKernel = kernel(for: partKey, source: kernelSource)
+            if let partLaunchID {
+                let launch = partKernel.prepare(
+                    template: partTemplate, grid: partGrid, threadGroup: partThreadGroup,
+                    outputShapes: partShapes, outputDTypes: partDTypes)
+                decodeLaunchLock.withLock {
+                    if decodePartLaunches.count < decodeLaunchLimit {
+                        decodePartLaunches[partLaunchID] = launch
+                    }
+                }
+                partOut = launch(partInputs, stream: stream)
+            } else {
+                partOut = partKernel(
+                    partInputs,
+                    template: partTemplate,
+                    grid: partGrid,
+                    threadGroup: partThreadGroup,
+                    outputShapes: partShapes,
+                    outputDTypes: partDTypes,
+                    stream: stream
+                )
+            }
+        }
 
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false,
             partitionTokens: ptok)
-        let outputs = kernel(for: mergeKey, source: kernelSource)(
-            [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("PTOK", ptok),
-                ("HAS_SINKS", sinks != nil),
-            ],
-            grid: (queryHeads * 32, b, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[b, queryHeads, headDim]],
-            outputDTypes: [dtype],
-            stream: stream
-        )
+        let mergeInputs = [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks]
+        let mergeTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", dtype),
+            ("D", headDim),
+            ("PTOK", ptok),
+            ("HAS_SINKS", sinks != nil),
+        ]
+        let mergeGrid = (queryHeads * 32, b, 1)
+        let mergeThreadGroup = (32, 1, 1)
+        let mergeShapes: [[Int]] = [[b, queryHeads, headDim]]
+        let mergeLaunchID = cacheable
+            ? DecodeMergeLaunchID(kernel: mergeKey, batch: b, queryHeads: queryHeads)
+            : nil
+        let outputs: [MLXArray]
+        if let mergeLaunchID,
+            let launch = decodeLaunchLock.withLock({ decodeMergeLaunches[mergeLaunchID] })
+        {
+            outputs = launch(mergeInputs, stream: stream)
+        } else {
+            let mergeKernelValue = kernel(for: mergeKey, source: kernelSource)
+            if let mergeLaunchID {
+                let launch = mergeKernelValue.prepare(
+                    template: mergeTemplate, grid: mergeGrid, threadGroup: mergeThreadGroup,
+                    outputShapes: mergeShapes, outputDTypes: [dtype])
+                decodeLaunchLock.withLock {
+                    if decodeMergeLaunches.count < decodeLaunchLimit {
+                        decodeMergeLaunches[mergeLaunchID] = launch
+                    }
+                }
+                outputs = launch(mergeInputs, stream: stream)
+            } else {
+                outputs = mergeKernelValue(
+                    mergeInputs,
+                    template: mergeTemplate,
+                    grid: mergeGrid,
+                    threadGroup: mergeThreadGroup,
+                    outputShapes: mergeShapes,
+                    outputDTypes: [dtype],
+                    stream: stream
+                )
+            }
+        }
         return (outputs[0], hasWrite ? partOut[2] : nil)
     }
 
