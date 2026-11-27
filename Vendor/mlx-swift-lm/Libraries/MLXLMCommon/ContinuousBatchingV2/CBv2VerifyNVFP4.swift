@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// The weight-only NVFP4 row-exact product of verify windows (1 to 8 rows)
 /// on a finer launch geometry.
@@ -15,23 +16,17 @@ import MLXNN
 /// `i` outer, `c` inside the MMA), the same join `((acc0 + acc1) + ...) + acc7`
 /// through threadgroup memory, the same rounding to the activation dtype and
 /// the same tensor scale. Only the schedule differs:
-/// - `TN` output fragments of 8 rows per simdgroup (stock: 4), so a
-///   threadgroup covers `8 * TN` outputs and the launch has 4x (or 2x) as
-///   many threadgroups, which keeps every core busy and fits more of them;
-/// - `PF 1`: the next chunk's weight words and scale bytes are loaded into a
-///   rolling register buffer right after the current chunk's are consumed
-///   (prefetch one chunk ahead), for the long 19,968-input rows;
-/// - activations are kept as their raw bf16 bits until each MMA converts them
-///   (the same float values the stock kernel's float4 holds).
+/// - `TN` output fragments of 8 rows per simdgroup (`8 * TN` outputs per
+///   threadgroup);
+/// - `WC`: loads all 4 blocks of a 128-input chunk upfront and decodes two
+///   E4M3 scales per op (`cbv2_vn_e4m3x2`), optionally via one aligned 8-byte
+///   `uint2` scale load (`SV`);
+/// - `PF 1`: rolling register buffer prefetching the next chunk's weight words
+///   and packed scales for long 19,968-input rows;
+/// - activations are kept as their raw bf16 bits until each MMA converts them.
 /// Rows past V repeat row V - 1, as in the stock kernel; their columns are
-/// never stored. Groups of sibling projections (MLP gate and up) run in one
-/// launch, one segment per projection, as `CBv2GroupedProjection` does.
-///
-/// The Muse Glimmer fused verify forward routes its NVFP4 MLP here
-/// (`DARKBLOOM_MUSE_GLIMMER_VERIFY_PROJ`). Only bfloat16 activations, whole
-/// chunks (K % 128 == 0) and GPU generations where the matrix kernel serves
-/// the row count are taken; anything else returns nil and the caller keeps
-/// the stock product.
+/// never stored. Groups of sibling projections (MLP gate and up; attention
+/// q, k, v and gate) run in one launch, one segment per projection.
 public enum CBv2VerifyNVFP4 {
     public static let maximumRows = 8
 
@@ -45,22 +40,43 @@ public enum CBv2VerifyNVFP4 {
         }
     }
 
-    /// `CBV2_NVFP4_COALESCED=1` enables coalesced `uint4` weight + `uint` scale loads (off by default).
-    public static let coalescedEnabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_NVFP4_COALESCED"] == "1"
-
-    private static let prefetchEnv: Int? =
-        ProcessInfo.processInfo.environment["CBV2_NVFP4_PF"].flatMap(Int.init)
+    private static let env = ProcessInfo.processInfo.environment
+    private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
+    private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
+    private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
+    private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
 
-    /// Coalesced `uint4` + aligned `uint` scale schedule with 5-reg prefetch on M5 Max.
+    /// Per-shape fragment and prefetch schedule.
     public static func geometry(rows: Int, inputs: Int) -> Geometry {
         if let geometryOverride { return geometryOverride }
-        let pf = prefetchEnv ?? (coalescedEnabled ? 1 : (inputs >= 16384 && rows >= 8 ? 1 : 0))
+        let pf = prefetchEnv ?? (inputs >= 16384 && rows >= 8 ? 1 : 0)
         if inputs >= 16384 && rows >= 7 { return Geometry(fragments: 2, prefetch: pf) }
         return Geometry(fragments: 1, prefetch: pf)
+    }
+
+    private static func schedule(
+        rows: Int, inputs: Int, lowVerify: Bool
+    ) -> (fragments: Int, prefetch: Int, wholeChunk: Bool, scaleVec: Bool) {
+        if let o = geometryOverride {
+            let wc = wholeChunkEnv ?? lowVerify
+            let sv = scaleVecEnv ?? wc
+            return (o.fragments, o.prefetch, wc, sv)
+        }
+        let wc = wholeChunkEnv ?? lowVerify
+        let sv = scaleVecEnv ?? wc
+        if inputs >= 16384 {
+            // MLP down (K = 19968): WC + PF=1 + SV=1 on low-acceptance verify rows;
+            // keep high-acceptance Pair 1 at PF=0 to stay safely below the decode ceiling.
+            let tn = rows >= 7 ? 2 : 1
+            let defaultPF = (lowVerify && wc) ? (downPrefetchEnv ?? (rows >= 8 ? 1 : 0)) : 0
+            let pf = prefetchEnv ?? defaultPF
+            return (tn, pf, wc, sv)
+        }
+        let pf = prefetchEnv ?? 0
+        return (1, pf, wc, sv)
     }
 
     static let tileHelper = """
@@ -72,24 +88,9 @@ public enum CBv2VerifyNVFP4 {
             return as_type<half2>(u) * half2(256.0h);
         }
 
-        inline void cbv2_vn_transpose4(uint4 v, bool odd, bool hi, thread uint* q) {
-            const uint r_lo = simd_shuffle_xor(odd ? v.x : v.y, ushort(1));
-            const uint r_hi = simd_shuffle_xor(odd ? v.z : v.w, ushort(1));
-            const uint a0 = odd ? r_lo : v.x;
-            const uint a1 = odd ? v.y : r_lo;
-            const uint b0 = odd ? r_hi : v.z;
-            const uint b1 = odd ? v.w : r_hi;
-            const uint p0 = simd_shuffle_xor(hi ? a0 : b0, ushort(8));
-            const uint p1 = simd_shuffle_xor(hi ? a1 : b1, ushort(8));
-            q[0] = hi ? p0 : a0;
-            q[1] = hi ? p1 : a1;
-            q[2] = hi ? b0 : p0;
-            q[3] = hi ? b1 : p1;
-        }
-
         // One tile of 8 * TN outputs of one projection: the stock matrix
-        // kernel's arithmetic (see CBv2VerifyNVFP4) on 8 * TN rows.
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool COAL>
+        // kernel's arithmetic (see CBv2VerifyNVFP4).
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
@@ -101,9 +102,11 @@ public enum CBv2VerifyNVFP4 {
             constexpr int row_bytes = K / 2;
             constexpr int row_scales = K / 16;
             static_assert(K % BK == 0, "whole chunks only");
+            const uint sg = simd_gid;
             const short qid = simd_lid / 4;
             const short fm = (qid & 4) + ((simd_lid / 2) % 4);
             const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+            const uint scale_shift = (fn & 4u) << 1;
             const int y_col = tile * ROWS;
 
             const device T* xr[TM][2];
@@ -119,62 +122,119 @@ public enum CBv2VerifyNVFP4 {
                     C[t][mt] = float2(0);
                 }
             }
-            if constexpr (COAL) {
-                const short c = fn >> 1;
-                const bool odd = (simd_lid & 1) != 0;
-                const bool hi = (simd_lid & 8) != 0;
-                const uint sshift = hi ? 8u : 0u;
-                const device uint4* w4l[TN];
-                const device uint* s4l[TN];
-                MO_WO_UNROLL
-                for (short t = 0; t < TN; t++) {
-                    const int row = min(y_col + fm + 8 * t, N - 1);
-                    w4l[t] = (const device uint4*)(
-                        (const device uint8_t*)w + size_t(row) * row_bytes) + c;
-                    s4l[t] = (const device uint*)(
-                        scales + size_t(row) * row_scales) + (hi ? 1 : 0);
-                }
-                uint4 w_cur[TN];
-                uint s_cur[TN];
-                if (PF == 1 && int(simd_gid) * BK < K) {
-                    const int k0 = int(simd_gid) * BK;
+            const device uint* wl[TN];
+            const device uint8_t* sl[TN];
+            MO_WO_UNROLL
+            for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wl[t] = (const device uint*)(
+                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = scales + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
+            }
+
+            if constexpr (WC && PF == 0) {
+                for (int k = int(sg) * BK; k < K; k += WK * BK) {
+                    uint qa[4][TN];
+                    ushort4 xa[4][TM][2];
                     MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        w_cur[t] = w4l[t][k0 / 32];
-                        s_cur[t] = s4l[t][k0 / 64];
-                    }
-                }
-                for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
-                    uint4 w_use[TN];
-                    uint s_use[TN];
-                    MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        if (PF == 1) {
-                            w_use[t] = w_cur[t];
-                            s_use[t] = s_cur[t];
-                        } else {
-                            w_use[t] = w4l[t][k / 32];
-                            s_use[t] = s4l[t][k / 64];
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                            }
                         }
                     }
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                            hs[t][0] = cbv2_vn_e4m3x2(sv.x >> scale_shift);
+                            hs[t][1] = cbv2_vn_e4m3x2(sv.y >> scale_shift);
+                        } else {
+                            const uint sa0 = uint(sl[t][k / 16]) | (uint(sl[t][k / 16 + 2]) << 16);
+                            const uint sa1 = uint(sl[t][k / 16 + 4]) | (uint(sl[t][k / 16 + 6]) << 16);
+                            hs[t][0] = cbv2_vn_e4m3x2(sa0);
+                            hs[t][1] = cbv2_vn_e4m3x2(sa1);
+                        }
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            float2 bf[TM];
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                bf[mt] = float2(
+                                    float(as_type<bfloat>(xa[block][mt][0][i])),
+                                    float(as_type<bfloat>(xa[block][mt][1][i])));
+                            }
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (WC && PF == 1) {
+                uint qb[4][TN];
+                uint2 sb[TN];
+                if (int(sg) * BK < K) {
+                    const int k0 = int(sg) * BK;
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k0 + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qb[block][t] = wl[t][b / 8]; }
+                    }
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            sb[t] = *(const device uint2*)(sl[t] + (k0 / 16));
+                        } else {
+                            sb[t] = uint2(
+                                uint(sl[t][k0 / 16]) | (uint(sl[t][k0 / 16 + 2]) << 16),
+                                uint(sl[t][k0 / 16 + 4]) | (uint(sl[t][k0 / 16 + 6]) << 16));
+                        }
+                    }
+                }
+                for (int k = int(sg) * BK; k < K; k += WK * BK) {
                     const int kn = k + WK * BK;
-                    if (PF == 1 && kn < K) {
+                    const bool more = kn < K;
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                            hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                        } else {
+                            hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                            hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                        }
+                    }
+                    if (more) {
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
-                            w_cur[t] = w4l[t][kn / 32];
-                            s_cur[t] = s4l[t][kn / 64];
+                            if constexpr (SV) {
+                                sb[t] = *(const device uint2*)(sl[t] + (kn / 16));
+                            } else {
+                                sb[t] = uint2(
+                                    uint(sl[t][kn / 16]) | (uint(sl[t][kn / 16 + 2]) << 16),
+                                    uint(sl[t][kn / 16 + 4]) | (uint(sl[t][kn / 16 + 6]) << 16));
+                            }
                         }
-                    }
-                    uint q[TN][4];
-                    half2 hs0[TN], hs1[TN];
-                    MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        cbv2_vn_transpose4(w_use[t], odd, hi, q[t]);
-                        const uint s_peer = simd_shuffle_xor(s_use[t], ushort(8));
-                        const uint s_lo = hi ? s_peer : s_use[t];
-                        const uint s_hi = hi ? s_use[t] : s_peer;
-                        hs0[t] = cbv2_vn_e4m3x2((s_lo >> sshift) & 0x00FF00FFu);
-                        hs1[t] = cbv2_vn_e4m3x2((s_hi >> sshift) & 0x00FF00FFu);
                     }
                     MO_WO_UNROLL
                     for (short block = 0; block < 4; block++) {
@@ -184,13 +244,22 @@ public enum CBv2VerifyNVFP4 {
                         for (short mt = 0; mt < TM; mt++) {
                             MO_WO_UNROLL
                             for (short j = 0; j < 2; j++) {
-                                xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                                xv[mt][j] = *(const device ushort4*)(xr[mt][j] + b);
                             }
                         }
+                        uint q[TN];
                         half s[TN];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
-                            s[t] = (block < 2) ? hs0[t][block] : hs1[t][block - 2];
+                            q[t] = qb[block][t];
+                            s[t] = hs[t][block / 2][block % 2];
+                        }
+                        if (more) {
+                            const int bn = kn + 32 * block;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                qb[block][t] = wl[t][bn / 8];
+                            }
                         }
                         MO_WO_UNROLL
                         for (short i = 0; i < 4; i++) {
@@ -203,7 +272,7 @@ public enum CBv2VerifyNVFP4 {
                             }
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) {
-                                const float2 a = mo_wo_pair(q[t][block], i, s[t]);
+                                const float2 a = mo_wo_pair(q[t], i, s[t]);
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     mo_wo_mma(C[t][mt], a, bf[mt]);
@@ -213,33 +282,23 @@ public enum CBv2VerifyNVFP4 {
                     }
                 }
             } else {
-            const device uint* wl[TN];
-            const device uint8_t* sl[TN];
-            MO_WO_UNROLL
-            for (short t = 0; t < TN; t++) {
-                const int row = min(y_col + fm + 8 * t, N - 1);
-                wl[t] = (const device uint*)(
-                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
-                sl[t] = scales + size_t(row) * row_scales + fn / 4;
-            }
-
             // Rolling buffer (PF 1): slot `block` holds this chunk's block and is
             // refilled with the next chunk's block once read.
             uint qb[4][TN];
             uint sb[4][TN];
-            if (PF == 1 && int(simd_gid) * BK < K) {
-                const int k0 = simd_gid * BK;
+            if (PF == 1 && int(sg) * BK < K) {
+                const int k0 = int(sg) * BK;
                 MO_WO_UNROLL
                 for (short block = 0; block < 4; block++) {
                     const int b = k0 + 32 * block;
                     MO_WO_UNROLL
                     for (short t = 0; t < TN; t++) {
                         qb[block][t] = wl[t][b / 8];
-                        sb[block][t] = sl[t][b / 16];
+                        sb[block][t] = sl[t][b / 16 + (SV ? (fn / 4) : 0)];
                     }
                 }
             }
-            for (int k = simd_gid * BK; k < K; k += WK * BK) {
+            for (int k = int(sg) * BK; k < K; k += WK * BK) {
                 const int kn = k + WK * BK;
                 const bool more = kn < K;
                 MO_WO_UNROLL
@@ -250,7 +309,7 @@ public enum CBv2VerifyNVFP4 {
                     for (short mt = 0; mt < TM; mt++) {
                         MO_WO_UNROLL
                         for (short j = 0; j < 2; j++) {
-                            xv[mt][j] = ushort4(*(const device packed_ushort4*)(xr[mt][j] + b));
+                            xv[mt][j] = *(const device ushort4*)(xr[mt][j] + b);
                         }
                     }
                     uint q[TN];
@@ -262,7 +321,7 @@ public enum CBv2VerifyNVFP4 {
                             s[t] = mo_wo_e4m3(sb[block][t]);
                         } else {
                             q[t] = wl[t][b / 8];
-                            s[t] = mo_wo_e4m3(sl[t][b / 16]);
+                            s[t] = mo_wo_e4m3(sl[t][b / 16 + (SV ? (fn / 4) : 0)]);
                         }
                     }
                     if (PF == 1 && more) {
@@ -270,7 +329,7 @@ public enum CBv2VerifyNVFP4 {
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
                             qb[block][t] = wl[t][bn / 8];
-                            sb[block][t] = sl[t][bn / 16];
+                            sb[block][t] = sl[t][bn / 16 + (SV ? (fn / 4) : 0)];
                         }
                     }
                     MO_WO_UNROLL
@@ -296,8 +355,8 @@ public enum CBv2VerifyNVFP4 {
             }
 
             constexpr int tile_elems = TN * TM * 2;
-            if (simd_gid > 0) {
-                threadgroup float* p = partials + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+            if (sg > 0) {
+                threadgroup float* p = partials + (sg - 1) * tile_elems * 32 + simd_lid;
                 MO_WO_UNROLL
                 for (short t = 0; t < TN; t++) {
                     MO_WO_UNROLL
@@ -310,7 +369,7 @@ public enum CBv2VerifyNVFP4 {
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_gid == 0) {
+            if (sg == 0) {
                 for (int s = 0; s < WK - 1; s++) {
                     const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
                     MO_WO_UNROLL
@@ -344,7 +403,7 @@ public enum CBv2VerifyNVFP4 {
         }
         """
 
-    /// Segment `i` takes tiles `[sum of tiles before, + ceil(N_i / (8 * TN)))`
+    /// Segment `i` takes tiles `[sum of tiles before, + ceil(N_i / (8 * TN * RG)))`
     /// of the grid's y axis.
     private static func kernel(segments: Int) -> MLXFast.MLXFastKernel {
         var inputs = [String](), outputs = [String]()
@@ -363,7 +422,7 @@ public enum CBv2VerifyNVFP4 {
             let tiles = "((N\(i) + 8 * TN - 1) / (8 * TN))"
             body += """
                 \(i == 0 ? "" : "else ")if (tg < \(offset) + \(tiles)) {
-                    cbv2_vn_tile<T, V, K, N\(i), TN, PF, SCALED, COAL>(
+                    cbv2_vn_tile<T, V, K, N\(i), TN, PF, SCALED, WC, SV>(
                         w\(i), sc\(i), x, ts\(i)[0], y\(i), tg - (\(offset)), sg, sl, partials);
                 }
 
@@ -389,26 +448,50 @@ public enum CBv2VerifyNVFP4 {
         let fragments: Int
         let prefetch: Int
         let scaled: Bool
-        let coalesced: Bool
+        let wholeChunk: Bool
+        let scaleVec: Bool
         let outputs: [Int]
     }
 
-    private static let launchLock = NSLock()
-    nonisolated(unsafe) private static var launchCache: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    private struct PlanKey: Hashable {
+        let id0: ObjectIdentifier
+        let idLast: ObjectIdentifier
+        let count: Int
+        let inputs: Int
+        let rows: Int
+        let dtype: DType
+        let fragments: Int
+        let prefetch: Int
+        let wholeChunk: Bool
+        let scaleVec: Bool
+    }
+
+    private struct Plan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let outputDims: [Int]
+    }
+
+    private final class CacheBox: @unchecked Sendable {
+        var launches: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var plans: [PlanKey: Plan] = [:]
+    }
+
+    private static let cacheLock = OSAllocatedUnfairLock(initialState: CacheBox())
 
     private static func preparedLaunch(
         segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
-        scaled: Bool, outputs: [Int]
+        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int]
     ) -> MLXFast.MLXFastKernel.Launch {
-        let coal = coalescedEnabled
         let key = LaunchKey(
             segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
-            prefetch: prefetch, scaled: scaled, coalesced: coal, outputs: outputs)
-        if let hit = launchLock.withLock({ launchCache[key] }) { return hit }
+            prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk, scaleVec: scaleVec,
+            outputs: outputs)
+        if let hit = cacheLock.withLockUnchecked({ $0.launches[key] }) { return hit }
         let tile = 8 * fragments
         var template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
-            ("SCALED", scaled), ("COAL", coal),
+            ("SCALED", scaled), ("WC", wholeChunk), ("SV", scaleVec),
         ]
         var shapes = [[Int]]()
         shapes.reserveCapacity(outputs.count)
@@ -419,9 +502,10 @@ public enum CBv2VerifyNVFP4 {
             tiles += (n + tile - 1) / tile
         }
         let made = kernels[segments]!.prepare(
-            template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            template: template,
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
             outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
-        launchLock.withLock { launchCache[key] = made }
+        cacheLock.withLockUnchecked { $0.launches[key] = made }
         return made
     }
 
@@ -458,20 +542,66 @@ public enum CBv2VerifyNVFP4 {
             takes(weight: weight, blockScales: blockScales, tensorScale: tensorScale, inputs: inputs)
         else { return nil }
         let outputs = weight.dim(0)
-        let g = geometry(rows: rows, inputs: inputs)
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let launch = preparedLaunch(
-            segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: g.fragments,
-            prefetch: g.prefetch, scaled: tensorScale != nil, outputs: [outputs])
+            segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: s.fragments,
+            prefetch: s.prefetch, scaled: tensorScale != nil,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: [outputs])
         let result = launch([
             weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs),
         ])[0]
+        if x.ndim == 3 {
+            return result.reshaped(x.dim(0), x.dim(1), outputs)
+        }
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
     /// `layer.rowExactProduct(x)` of the Muse Glimmer tower for a weight-only
     /// NVFP4 layer, or nil.
     public static func product(_ layer: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray) -> MLXArray? {
-        product(x, weight: layer.weight, blockScales: layer.weightScale, tensorScale: layer.weightScale2)
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let id = ObjectIdentifier(layer)
+        let pkey = PlanKey(
+            id0: id, idLast: id, count: 1, inputs: inputs, rows: rows, dtype: x.dtype,
+            fragments: s.fragments, prefetch: s.prefetch,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
+        if lowVerify && geometryOverride == nil, let plan = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
+            var args = plan.weightArrays
+            args.append(x.reshaped(rows, inputs))
+            let result = plan.launch(args)[0]
+            if x.ndim == 3 {
+                return result.reshaped(x.dim(0), x.dim(1), plan.outputDims[0])
+            }
+            return result.reshaped(Array(x.shape.dropLast()) + [plan.outputDims[0]])
+        }
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            layer.inputDimensions == inputs,
+            takes(
+                weight: layer.weight, blockScales: layer.weightScale,
+                tensorScale: layer.weightScale2, inputs: inputs)
+        else { return nil }
+        let outputs = layer.weight.dim(0)
+        let launch = preparedLaunch(
+            segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: s.fragments,
+            prefetch: s.prefetch, scaled: true,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: [outputs])
+        let weightArrays = [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
+        if lowVerify && geometryOverride == nil {
+            let plan = Plan(launch: launch, weightArrays: weightArrays, outputDims: [outputs])
+            cacheLock.withLockUnchecked { $0.plans[pkey] = plan }
+        }
+        var args = weightArrays
+        args.append(x.reshaped(rows, inputs))
+        let result = launch(args)[0]
+        if x.ndim == 3 {
+            return result.reshaped(x.dim(0), x.dim(1), outputs)
+        }
+        return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
     /// The products of sibling NVFP4 layers of one input (MLP gate and
@@ -486,6 +616,24 @@ public enum CBv2VerifyNVFP4 {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let pkey = PlanKey(
+            id0: ObjectIdentifier(nv[0]), idLast: ObjectIdentifier(nv[nv.count - 1]),
+            count: nv.count, inputs: inputs, rows: rows, dtype: x.dtype,
+            fragments: s.fragments, prefetch: s.prefetch,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
+        if lowVerify && geometryOverride == nil, let plan = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
+            var args = plan.weightArrays
+            args.append(x.reshaped(rows, inputs))
+            let results = plan.launch(args)
+            if x.ndim == 3 {
+                let b = x.dim(0), l = x.dim(1)
+                return (0 ..< results.count).map { results[$0].reshaped(b, l, plan.outputDims[$0]) }
+            }
+            let lead = Array(x.shape.dropLast())
+            return zip(results, plan.outputDims).map { $0.reshaped(lead + [$1]) }
+        }
         guard supports(rows: rows, inputs: inputs, dtype: x.dtype) else { return nil }
         for layer in nv {
             guard layer.inputDimensions == inputs,
@@ -493,23 +641,32 @@ public enum CBv2VerifyNVFP4 {
                     tensorScale: layer.weightScale2, inputs: inputs)
             else { return nil }
         }
-        let g = geometry(rows: rows, inputs: inputs)
-        var arrays = [MLXArray]()
-        arrays.reserveCapacity(nv.count * 3 + 1)
+        var weightArrays = [MLXArray]()
+        weightArrays.reserveCapacity(nv.count * 3 + 1)
         var outputDims = [Int]()
         outputDims.reserveCapacity(nv.count)
         for layer in nv {
             let outputs = layer.weight.dim(0)
-            arrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
+            weightArrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
             outputDims.append(outputs)
         }
-        arrays.append(x.reshaped(rows, inputs))
         let launch = preparedLaunch(
             segments: nv.count, dtype: x.dtype, rows: rows, inputs: inputs,
-            fragments: g.fragments, prefetch: g.prefetch, scaled: true, outputs: outputDims)
-        let results = launch(arrays)
+            fragments: s.fragments, prefetch: s.prefetch, scaled: true,
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: outputDims)
+        if lowVerify && geometryOverride == nil {
+            let plan = Plan(launch: launch, weightArrays: weightArrays, outputDims: outputDims)
+            cacheLock.withLockUnchecked { $0.plans[pkey] = plan }
+        }
+        var args = weightArrays
+        args.append(x.reshaped(rows, inputs))
+        let results = launch(args)
+        if x.ndim == 3 {
+            let b = x.dim(0), l = x.dim(1)
+            return (0 ..< results.count).map { results[$0].reshaped(b, l, outputDims[$0]) }
+        }
         let lead = Array(x.shape.dropLast())
-        return zip(results, nv).map { $0.reshaped(lead + [$1.weight.dim(0)]) }
+        return zip(results, outputDims).map { $0.reshaped(lead + [$1]) }
     }
 
     /// Compiles the kernels for rows 1 to 8 of these MLP layers (gate and up

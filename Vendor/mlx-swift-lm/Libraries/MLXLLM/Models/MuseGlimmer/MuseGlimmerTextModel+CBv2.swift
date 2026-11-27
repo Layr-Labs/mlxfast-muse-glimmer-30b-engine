@@ -231,14 +231,30 @@ extension MuseGlimmerTextModel {
         let capture = mtpHiddenLayerIDs
         var captured = [Int: MLXArray]()
         var shared: (positions: [Int], offsets: MLXArray)?
-        var layerInput = layers[0].inputLayerNorm(h)
-        var layerInputPreCastFP8 = false
         let width = h.dim(-1)
         let dtype = h.dtype
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         let allowPreCastFP8 =
             lowVerify && routesVerifyProjections && !MuseGlimmerVerifyProjections.selfTest
             && (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows)
+        var layerInput: MLXArray
+        var layerInputPreCastFP8 = false
+        let attn0 = layers[0].selfAttention
+        let attn0Layers: [any UnaryLayer] = [
+            attn0.queryProj, attn0.keyProj, attn0.valueProj, attn0.gateProj,
+        ]
+        if allowPreCastFP8, let fp8Attn0 = attn0Layers as? [ModelOptCalibratedLinear],
+            let fp8Params0 = CBv2SmallProjection.sharedFP8CastParams(
+                fp8Attn0, inputs: width, dtype: dtype),
+            let cast0 = VerifyFusedNorms.fusedNormCastFP8(
+                x: h, w: layers[0].inputLayerNorm.weight, eps: layers[0].inputLayerNorm.eps,
+                multipliers: fp8Params0.multipliers, overflowBound: fp8Params0.overflowBound)
+        {
+            layerInput = cast0
+            layerInputPreCastFP8 = true
+        } else {
+            layerInput = layers[0].inputLayerNorm(h)
+        }
         let flushLayer = MuseGlimmerVerifyProjections.midTrunkFlushLayer
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
@@ -276,7 +292,7 @@ extension MuseGlimmerTextModel {
             } else {
                 let (m, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
                     residual: h, x: attention, w1: post.weight, eps1: post.eps,
-                    w2: pre.weight, eps2: pre.eps)
+                    w2: pre.weight, eps2: pre.eps, fastVec: lowVerify)
                 mid = m
                 feed = groupedVerifyFeed(layer.mlp, feedInput)
             }
@@ -300,7 +316,7 @@ extension MuseGlimmerTextModel {
                 } else {
                     (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
                         residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
-                        w2: next.weight, eps2: next.eps)
+                        w2: next.weight, eps2: next.eps, fastVec: lowVerify)
                     layerInputPreCastFP8 = false
                 }
             } else {
@@ -473,10 +489,13 @@ extension MuseGlimmerTextModel {
         let zero = MLXArray.zeros([1, 1, width], dtype: dtype)
         let post = first.postAttentionLayerNorm
         let pre = first.preFeedforwardLayerNorm
-        let norms = VerifyFusedNorms.fusedAddNormNorm(
+        let normsScalar = VerifyFusedNorms.fusedAddNormNorm(
             residual: zero, x: zero, w1: post.weight, eps1: post.eps,
-            w2: pre.weight, eps2: pre.eps)
-        warm += [norms.h, norms.y]
+            w2: pre.weight, eps2: pre.eps, fastVec: false)
+        let normsVec = VerifyFusedNorms.fusedAddNormNorm(
+            residual: zero, x: zero, w1: post.weight, eps1: post.eps,
+            w2: pre.weight, eps2: pre.eps, fastVec: true)
+        warm += [normsScalar.h, normsScalar.y, normsVec.h, normsVec.y]
         let dummyMu = MLXArray([Float(1), Float(1)])
         let dummyBound = MLXArray([Float(448)])
         let normsCast = VerifyFusedNorms.fusedAddNormNormCastFP8(
@@ -484,6 +503,12 @@ extension MuseGlimmerTextModel {
             w2: pre.weight, eps2: pre.eps,
             multipliers: dummyMu, overflowBound: dummyBound)
         warm += [normsCast.h, normsCast.yCast]
+        if let singleCast = VerifyFusedNorms.fusedNormCastFP8(
+            x: zero, w: first.inputLayerNorm.weight, eps: first.inputLayerNorm.eps,
+            multipliers: dummyMu, overflowBound: dummyBound)
+        {
+            warm.append(singleCast)
+        }
         let a = first.selfAttention
         // One-pass paged verify attention: one variant per binding class.
         PagedOnePassAttention.warm(
@@ -555,17 +580,18 @@ extension MuseGlimmerTextModel {
     func groupedVerifyFeed(
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
-        let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
             let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
                 gate: gu[0], up: gu[1], layer: fp8)
         {
+            let useSmallDown = rows < 6 || MuseGlimmerVerifyProjections.fp8DownSmallEnabled
             let projected: MLXArray? =
-                rows >= 6
-                ? CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast)
-                : CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first
+                useSmallDown
+                ? CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first
+                : CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast)
             if let projected {
                 if MuseGlimmerVerifyProjections.selfTest {
                     let refAct = compiledSiluProduct(gu[0], gu[1])
@@ -679,6 +705,10 @@ enum MuseGlimmerVerifyProjections {
         environment["CBV2_NVFP4_LMHEAD"] == "1"
     static let denseGroupedEnabled: Bool =
         environment["CBV2_DENSE_GROUPED"] != "0"
+    static let fp8DownSmallEnabled: Bool = {
+        if let raw = environment["CBV2_FP8_DOWN_SMALL"] { return raw != "0" }
+        return CBv2SmallProjection.fp8RowGroups >= 2
+    }()
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var checkedOutputs = 0
@@ -861,10 +891,12 @@ extension MuseGlimmerTextModel {
                     : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.down"
             } else if let fp8 = layer as? ModelOptCalibratedLinear {
+                let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+                let useSmallDown = rows < 6 || (lowVerify && MuseGlimmerVerifyProjections.fp8DownSmallEnabled)
                 routed =
-                    rows >= 6
-                    ? CBv2VerifyScales.product(layer, x)
-                    : CBv2SmallProjection.fp8Products([fp8], x)?.first
+                    useSmallDown
+                    ? CBv2SmallProjection.fp8Products([fp8], x)?.first
+                    : CBv2VerifyScales.product(layer, x)
                 kind = "fp8.down"
             }
             if let routed {
@@ -1012,9 +1044,11 @@ extension MuseGlimmerTextModel {
                                 let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
                                     gate: x, up: x, layer: fp8)
                             {
-                                if rows >= 6, let y = CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast) {
+                                if rows >= 6 && !MuseGlimmerVerifyProjections.fp8DownSmallEnabled,
+                                    let y = CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: preCast)
+                                {
                                     outputs.append(y)
-                                } else if rows < 6, let y = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first {
+                                } else if let y = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first {
                                     outputs.append(y)
                                 }
                             }

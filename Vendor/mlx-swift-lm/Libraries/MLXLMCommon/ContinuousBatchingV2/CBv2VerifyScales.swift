@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// Verify-row projections with the stock row-exact arithmetic on another
 /// schedule. Each output element keeps the order of operations and rounding
@@ -225,59 +226,6 @@ public enum CBv2VerifyScales {
 
     private static let nvfp4TopTwoHeader = nvfp4Header + """
 
-        struct cbv2_lm_top2_state {
-            float first_value;
-            float second_value;
-            uint first_id;
-            uint second_id;
-            uint count;
-        };
-
-        inline cbv2_lm_top2_state cbv2_lm_top2_empty() {
-            cbv2_lm_top2_state s;
-            s.first_value = 0.0f;
-            s.second_value = 0.0f;
-            s.first_id = 0u;
-            s.second_id = 0u;
-            s.count = 0u;
-            return s;
-        }
-
-        inline bool cbv2_lm_top2_better(
-            float cand_val, uint cand_id, float cur_val, uint cur_id
-        ) {
-            const bool cnan = isnan(cand_val);
-            const bool rnan = isnan(cur_val);
-            if (cnan != rnan) { return !cnan; }
-            if (cand_val > cur_val) { return true; }
-            if (cand_val < cur_val) { return false; }
-            return cand_id < cur_id;
-        }
-
-        inline void cbv2_lm_top2_insert(
-            thread cbv2_lm_top2_state& st, float val, uint id
-        ) {
-            if (st.count > 0u && st.first_id == id) { return; }
-            if (st.count > 1u && st.second_id == id) { return; }
-            if (st.count == 0u
-                || cbv2_lm_top2_better(val, id, st.first_value, st.first_id)) {
-                if (st.count > 0u) {
-                    st.second_value = st.first_value;
-                    st.second_id = st.first_id;
-                }
-                st.first_value = val;
-                st.first_id = id;
-                st.count = min(st.count + 1u, 2u);
-                return;
-            }
-            if (st.count == 1u
-                || cbv2_lm_top2_better(val, id, st.second_value, st.second_id)) {
-                st.second_value = val;
-                st.second_id = id;
-                st.count = 2u;
-            }
-        }
-
         inline bfloat16_t cbv2_lm_readout(
             bfloat16_t raw, bfloat16_t mult, bfloat16_t cap, bool has_cap
         ) {
@@ -290,25 +238,60 @@ public enum CBv2VerifyScales {
             return scaled;
         }
 
-        inline void cbv2_lm_xor_reduce(
-            thread cbv2_lm_top2_state& st, thread uint& nf
+        // Packed exact ordering key: high 16 bits order BF16 values descending
+        // (NaNs last at rank 1, empty at 0), low 16 bits break ties by smaller
+        // chunk-local offset. Exact BF16 bit pattern is stored alongside in
+        // `ushort2 bts` to preserve -0.0 sign and NaN payload bit-for-bit.
+        inline uint cbv2_lm_key(bfloat16_t value, uint offset, thread uint& nf) {
+            const uint bits = uint(as_type<ushort>(value));
+            const uint mag = bits & 0x7fffu;
+            nf |= uint(mag >= 0x7f80u);
+            uint rank = (bits & 0x8000u) ? (bits ^ 0xffffu) : (bits ^ 0x8000u);
+            rank = (mag == 0u) ? 0x8000u : rank;
+            rank = (mag > 0x7f80u) ? 1u : rank;
+            return (rank << 16) | (0xffffu - offset);
+        }
+
+        inline float cbv2_lm_skip_bound(uint key, float inv_mult) {
+            const uint rank = key >> 16;
+            if (rank <= 0x8000u || rank >= 0xff80u) { return -INFINITY; }
+            const uint bits = rank ^ 0x8000u;
+            const float v = float(as_type<bfloat16_t>(ushort(bits)));
+            return (v * 0.90f) * inv_mult;
+        }
+
+        inline void cbv2_lm_insert_packed(
+            thread uint2& keys, thread ushort2& bts, uint key, ushort val_bits
+        ) {
+            if (key > keys.y) {
+                if (key > keys.x) {
+                    keys.y = keys.x;
+                    bts.y = bts.x;
+                    keys.x = key;
+                    bts.x = val_bits;
+                } else if (key != keys.x) {
+                    keys.y = key;
+                    bts.y = val_bits;
+                }
+            }
+        }
+
+        inline void cbv2_lm_xor_reduce_packed(
+            thread uint2& keys, thread ushort2& bts, thread uint& nf
         ) {
             const ushort offs[3] = { 2u, 4u, 16u };
             MO_WO_UNROLL
             for (int step = 0; step < 3; ++step) {
                 const ushort off = offs[step];
-                cbv2_lm_top2_state other;
-                other.first_value = simd_shuffle_xor(st.first_value, off);
-                other.second_value = simd_shuffle_xor(st.second_value, off);
-                other.first_id = simd_shuffle_xor(st.first_id, off);
-                other.second_id = simd_shuffle_xor(st.second_id, off);
-                other.count = simd_shuffle_xor(st.count, off);
+                const uint okx = simd_shuffle_xor(keys.x, off);
+                const uint oky = simd_shuffle_xor(keys.y, off);
+                const uint obp = simd_shuffle_xor(uint(bts.x) | (uint(bts.y) << 16), off);
                 nf |= simd_shuffle_xor(nf, off);
-                if (other.count > 0u) {
-                    cbv2_lm_top2_insert(st, other.first_value, other.first_id);
+                if (okx != 0u) {
+                    cbv2_lm_insert_packed(keys, bts, okx, ushort(obp & 0xffffu));
                 }
-                if (other.count > 1u) {
-                    cbv2_lm_top2_insert(st, other.second_value, other.second_id);
+                if (oky != 0u) {
+                    cbv2_lm_insert_packed(keys, bts, oky, ushort(obp >> 16));
                 }
             }
         }
@@ -318,15 +301,18 @@ public enum CBv2VerifyScales {
     private static let nvfp4TopTwoSource = """
         constexpr int WK = 8;
         constexpr int BK = 128;
+        constexpr int ROWS = 8 * TN;
         constexpr int row_bytes = K / 2;
         constexpr int row_scales = K / 16;
         static_assert(K % BK == 0, "whole chunks only");
         static_assert(V >= 1 && V <= 8, "1..8 rows");
+        static_assert(TN == 1 || TN == 2, "TN must be 1 or 2");
         const uint simd_gid = simdgroup_index_in_threadgroup;
         const uint simd_lid = thread_index_in_simdgroup;
         const short qid = simd_lid / 4;
         const short fm = (qid & 4) + ((simd_lid / 2) % 4);
         const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+        const uint scale_shift = (fn & 4u) << 1;
 
         const device T* xr0 = x + size_t(min(int(fn), V - 1)) * K + 4 * fm;
         const device T* xr1 = x + size_t(min(int(fn + 1), V - 1)) * K + 4 * fm;
@@ -339,94 +325,141 @@ public enum CBv2VerifyScales {
         const float inv_mult = can_skip ? (1.0f / fmult) : 0.0f;
         const float ts = tensor_scale[0];
 
-        constexpr int total_tiles = (N + 7) / 8;
+        constexpr int total_tiles = (N + ROWS - 1) / ROWS;
         constexpr int tiles_per_chunk = (total_tiles + C_ - 1) / C_;
         const int chunk = int(threadgroup_position_in_grid.z);
         const int t_start = chunk * tiles_per_chunk;
         const int t_end = min(total_tiles, t_start + tiles_per_chunk);
+        const uint chunk_start_id = uint(t_start * ROWS);
 
-        cbv2_lm_top2_state st0 = cbv2_lm_top2_empty();
-        cbv2_lm_top2_state st1 = cbv2_lm_top2_empty();
+        uint2 keys0 = uint2(0u);
+        uint2 keys1 = uint2(0u);
+        ushort2 bts0 = ushort2(0u);
+        ushort2 bts1 = ushort2(0u);
         uint nf0 = 0u, nf1 = 0u;
         float skip0 = -INFINITY, skip1 = -INFINITY;
 
-        // Double-buffered partial join (3.5 KB): 1 barrier per tile.
-        threadgroup float partials[2][7 * 2 * 32];
+        // Double-buffered partial join (3.5 KB at TN=1, 7 KB at TN=2): 1 barrier per tile.
+        threadgroup float partials[2][TN][7 * 2 * 32];
 
         for (int tile = t_start; tile < t_end; ++tile) {
-            const int y_col = tile * 8;
-            const int row = min(y_col + fm, N - 1);
-            const device uint* wl = (const device uint*)(
-                (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
-            const device uint8_t* sl = scales + size_t(row) * row_scales + fn / 4;
+            const int y_col = tile * ROWS;
+            const device uint* wl[TN];
+            const device uint8_t* sl[TN];
+            float2 C[TN];
+            MO_WO_UNROLL
+            for (short t = 0; t < TN; t++) {
+                const int row = min(y_col + fm + 8 * t, N - 1);
+                wl[t] = (const device uint*)(
+                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = scales + size_t(row) * row_scales;
+                C[t] = float2(0);
+            }
 
-            float2 C = float2(0);
             for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
-                uint qa[4];
-                float4 xa[4][2];
+                uint qa[4][TN];
+                ushort4 xa[4][2];
                 MO_WO_UNROLL
                 for (short block = 0; block < 4; block++) {
                     const int b = k + 32 * block;
-                    qa[block] = wl[b / 8];
-                    xa[block][0] = mo_wo_load4(xr0 + b);
-                    xa[block][1] = mo_wo_load4(xr1 + b);
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
+                    xa[block][0] = *(const device ushort4*)(xr0 + b);
+                    xa[block][1] = *(const device ushort4*)(xr1 + b);
                 }
-                const uint sa0 = uint(sl[k / 16]) | (uint(sl[k / 16 + 2]) << 16);
-                const uint sa1 = uint(sl[k / 16 + 4]) | (uint(sl[k / 16 + 6]) << 16);
-                const half2 hs0 = cb_sc_e4m3x2(sa0);
-                const half2 hs1 = cb_sc_e4m3x2(sa1);
+                half2 hs[TN][2];
+                MO_WO_UNROLL
+                for (short t = 0; t < TN; t++) {
+                    const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                    hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
+                    hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
+                }
                 MO_WO_UNROLL
                 for (short block = 0; block < 4; block++) {
-                    const half s = (block < 2) ? hs0[block] : hs1[block - 2];
+                    half s[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
                     MO_WO_UNROLL
                     for (short i = 0; i < 4; i++) {
-                        const float2 bf = float2(xa[block][0][i], xa[block][1][i]);
-                        const float2 a = mo_wo_pair(qa[block], i, s);
-                        mo_wo_mma(C, a, bf);
+                        const float2 bf = float2(
+                            float(as_type<bfloat>(xa[block][0][i])),
+                            float(as_type<bfloat>(xa[block][1][i])));
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                            mo_wo_mma(C[t], a, bf);
+                        }
                     }
                 }
             }
 
             const int buf = tile & 1;
-            if (simd_gid > 0) {
-                threadgroup float* p = partials[buf] + (simd_gid - 1) * 64 + simd_lid;
-                p[0] = C[0];
-                p[32] = C[1];
+            if constexpr (TN == 1) {
+                if (simd_gid > 0u) {
+                    threadgroup float* p = partials[buf][0] + (simd_gid - 1u) * 64u + simd_lid;
+                    p[0] = C[0][0];
+                    p[32] = C[0][1];
+                }
+            } else {
+                if (simd_gid != 0u) {
+                    threadgroup float* p0 = partials[buf][0] + (simd_gid - 1u) * 64u + simd_lid;
+                    p0[0] = C[0][0];
+                    p0[32] = C[0][1];
+                }
+                if (simd_gid != 1u) {
+                    const uint slot = (simd_gid == 0u) ? 0u : (simd_gid - 1u);
+                    threadgroup float* p1 = partials[buf][1] + slot * 64u + simd_lid;
+                    p1[0] = C[1][0];
+                    p1[32] = C[1][1];
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_gid == 0) {
-                for (int s = 0; s < WK - 1; s++) {
-                    const threadgroup float* p = partials[buf] + s * 64 + simd_lid;
-                    C[0] += p[0];
-                    C[1] += p[32];
+            if (simd_gid < uint(TN)) {
+                const uint t = simd_gid;
+                float2 acc;
+                if (t == 0u) {
+                    acc = C[0];
+                    for (int s = 0; s < WK - 1; s++) {
+                        const threadgroup float* p = partials[buf][0] + s * 64 + simd_lid;
+                        acc[0] += p[0];
+                        acc[1] += p[32];
+                    }
+                } else {
+                    // Exact sg0 + sg1 + sg2 + ... + sg7 order even for NaN payloads.
+                    const threadgroup float* p0 = partials[buf][1] + simd_lid;
+                    acc = float2(p0[0], p0[32]) + C[1];
+                    for (int s = 1; s < WK - 1; s++) {
+                        const threadgroup float* p = partials[buf][1] + s * 64 + simd_lid;
+                        acc[0] += p[0];
+                        acc[1] += p[32];
+                    }
                 }
-                const int out_id = y_col + fm;
+                const int out_id = y_col + int(t) * 8 + fm;
                 if (out_id < N) {
+                    const uint off = uint(out_id) - chunk_start_id;
                     if (fn < V) {
-                        const bfloat16_t raw0 = mo_wo_result<bfloat16_t>(C[0], SCALED, ts);
+                        const bfloat16_t raw0 = mo_wo_result<bfloat16_t>(acc[0], SCALED, ts);
                         const float fr0 = float(raw0);
                         if (!(can_skip && fr0 < skip0 && fr0 > -1e20f)) {
                             const bfloat16_t val0 = cbv2_lm_readout(raw0, mult, cap, has_cap);
-                            const uint mag0 = uint(as_type<ushort>(val0)) & 0x7fffu;
-                            nf0 |= uint(mag0 >= 0x7f80u);
-                            cbv2_lm_top2_insert(st0, float(val0), uint(out_id));
-                            if (can_skip && st0.count == 2u && !isnan(st0.second_value)
-                                && st0.second_value > 0.0f) {
-                                skip0 = (st0.second_value * 0.90f) * inv_mult;
+                            const uint k0 = cbv2_lm_key(val0, off, nf0);
+                            const uint old_y = keys0.y;
+                            cbv2_lm_insert_packed(keys0, bts0, k0, as_type<ushort>(val0));
+                            if (can_skip && keys0.y != old_y) {
+                                skip0 = cbv2_lm_skip_bound(keys0.y, inv_mult);
                             }
                         }
                     }
                     if (fn + 1 < V) {
-                        const bfloat16_t raw1 = mo_wo_result<bfloat16_t>(C[1], SCALED, ts);
+                        const bfloat16_t raw1 = mo_wo_result<bfloat16_t>(acc[1], SCALED, ts);
                         const float fr1 = float(raw1);
                         if (!(can_skip && fr1 < skip1 && fr1 > -1e20f)) {
                             const bfloat16_t val1 = cbv2_lm_readout(raw1, mult, cap, has_cap);
-                            const uint mag1 = uint(as_type<ushort>(val1)) & 0x7fffu;
-                            nf1 |= uint(mag1 >= 0x7f80u);
-                            cbv2_lm_top2_insert(st1, float(val1), uint(out_id));
-                            if (can_skip && st1.count == 2u && !isnan(st1.second_value)
-                                && st1.second_value > 0.0f) {
-                                skip1 = (st1.second_value * 0.90f) * inv_mult;
+                            const uint k1 = cbv2_lm_key(val1, off, nf1);
+                            const uint old_y = keys1.y;
+                            cbv2_lm_insert_packed(keys1, bts1, k1, as_type<ushort>(val1));
+                            if (can_skip && keys1.y != old_y) {
+                                skip1 = cbv2_lm_skip_bound(keys1.y, inv_mult);
                             }
                         }
                     }
@@ -434,28 +467,62 @@ public enum CBv2VerifyScales {
             }
         }
 
-        if (simd_gid == 0) {
-            cbv2_lm_xor_reduce(st0, nf0);
-            cbv2_lm_xor_reduce(st1, nf1);
-            if (fm == 0) {
-                const float sentinel_val = as_type<float>(0x7fc00000u);
-                const uint sentinel_id = uint(N) + uint(chunk) * 2u;
-                if (fn < V) {
-                    const uint base = (uint(fn) * uint(C_) + uint(chunk)) * 2u;
-                    partial_ids[base] = st0.count > 0u ? int(st0.first_id) : int(sentinel_id);
-                    partial_ids[base + 1] = st0.count > 1u ? int(st0.second_id) : int(sentinel_id + 1u);
-                    partial_values[base] = st0.count > 0u ? st0.first_value : sentinel_val;
-                    partial_values[base + 1] = st0.count > 1u ? st0.second_value : sentinel_val;
-                    partial_nf[uint(fn) * uint(C_) + uint(chunk)] = int(nf0);
-                }
-                if (fn + 1 < V) {
-                    const uint base = (uint(fn + 1) * uint(C_) + uint(chunk)) * 2u;
-                    partial_ids[base] = st1.count > 0u ? int(st1.first_id) : int(sentinel_id);
-                    partial_ids[base + 1] = st1.count > 1u ? int(st1.second_id) : int(sentinel_id + 1u);
-                    partial_values[base] = st1.count > 0u ? st1.first_value : sentinel_val;
-                    partial_values[base + 1] = st1.count > 1u ? st1.second_value : sentinel_val;
-                    partial_nf[uint(fn + 1) * uint(C_) + uint(chunk)] = int(nf1);
-                }
+        if (simd_gid < uint(TN)) {
+            cbv2_lm_xor_reduce_packed(keys0, bts0, nf0);
+            cbv2_lm_xor_reduce_packed(keys1, bts1, nf1);
+        }
+        if constexpr (TN == 2) {
+            threadgroup uint merge_buf[4 * 8];
+            if (simd_gid == 1u && fm == 0) {
+                const uint b = (uint(fn) >> 1) * 8u;
+                merge_buf[b + 0] = keys0.x;
+                merge_buf[b + 1] = keys0.y;
+                merge_buf[b + 2] = uint(bts0.x) | (uint(bts0.y) << 16);
+                merge_buf[b + 3] = nf0;
+                merge_buf[b + 4] = keys1.x;
+                merge_buf[b + 5] = keys1.y;
+                merge_buf[b + 6] = uint(bts1.x) | (uint(bts1.y) << 16);
+                merge_buf[b + 7] = nf1;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0u && fm == 0) {
+                const uint b = (uint(fn) >> 1) * 8u;
+                const uint m0x = merge_buf[b + 0], m0y = merge_buf[b + 1], m0b = merge_buf[b + 2];
+                nf0 |= merge_buf[b + 3];
+                if (m0x != 0u) { cbv2_lm_insert_packed(keys0, bts0, m0x, ushort(m0b & 0xffffu)); }
+                if (m0y != 0u) { cbv2_lm_insert_packed(keys0, bts0, m0y, ushort(m0b >> 16)); }
+                const uint m1x = merge_buf[b + 4], m1y = merge_buf[b + 5], m1b = merge_buf[b + 6];
+                nf1 |= merge_buf[b + 7];
+                if (m1x != 0u) { cbv2_lm_insert_packed(keys1, bts1, m1x, ushort(m1b & 0xffffu)); }
+                if (m1y != 0u) { cbv2_lm_insert_packed(keys1, bts1, m1y, ushort(m1b >> 16)); }
+            }
+        }
+        if (simd_gid == 0u && fm == 0) {
+            const float sentinel_val = as_type<float>(0x7fc00000u);
+            const uint sentinel_id = uint(N) + uint(chunk) * 2u;
+            if (fn < V) {
+                const uint base = (uint(fn) * uint(C_) + uint(chunk)) * 2u;
+                partial_ids[base] = keys0.x != 0u
+                    ? int(chunk_start_id + (0xffffu - (keys0.x & 0xffffu))) : int(sentinel_id);
+                partial_ids[base + 1] = keys0.y != 0u
+                    ? int(chunk_start_id + (0xffffu - (keys0.y & 0xffffu))) : int(sentinel_id + 1u);
+                partial_values[base] = keys0.x != 0u
+                    ? float(as_type<bfloat16_t>(bts0.x)) : sentinel_val;
+                partial_values[base + 1] = keys0.y != 0u
+                    ? float(as_type<bfloat16_t>(bts0.y)) : sentinel_val;
+                partial_nf[uint(fn) * uint(C_) + uint(chunk)] = int(nf0);
+            }
+            if (fn + 1 < V) {
+                const uint base = (uint(fn + 1) * uint(C_) + uint(chunk)) * 2u;
+                partial_ids[base] = keys1.x != 0u
+                    ? int(chunk_start_id + (0xffffu - (keys1.x & 0xffffu))) : int(sentinel_id);
+                partial_ids[base + 1] = keys1.y != 0u
+                    ? int(chunk_start_id + (0xffffu - (keys1.y & 0xffffu))) : int(sentinel_id + 1u);
+                partial_values[base] = keys1.x != 0u
+                    ? float(as_type<bfloat16_t>(bts1.x)) : sentinel_val;
+                partial_values[base + 1] = keys1.y != 0u
+                    ? float(as_type<bfloat16_t>(bts1.y)) : sentinel_val;
+                partial_nf[uint(fn + 1) * uint(C_) + uint(chunk)] = int(nf1);
             }
         }
         """
@@ -474,21 +541,48 @@ public enum CBv2VerifyScales {
         let outputs: Int
         let scaled: Bool
         let chunks: Int
+        let tn: Int
     }
 
-    nonisolated(unsafe) private static var nvfp4TopTwoLaunchCache:
-        [NVFP4TopTwoLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    private struct NVFP4TopTwoPlanKey: Hashable {
+        let id: ObjectIdentifier
+        let rows: Int
+        let inputs: Int
+        let dtype: DType
+        let chunks: Int
+        let tn: Int
+    }
+
+    private struct NVFP4TopTwoPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weight: MLXArray
+        let weightScale: MLXArray
+        let weightScale2: MLXArray
+        let chunks: Int
+    }
+
+    private final class TopTwoCacheBox: @unchecked Sendable {
+        var launches: [NVFP4TopTwoLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var plans: [NVFP4TopTwoPlanKey: NVFP4TopTwoPlan] = [:]
+    }
+
+    private static let topTwoLock = OSAllocatedUnfairLock(initialState: TopTwoCacheBox())
 
     public static let fusedLMHeadEnabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] == "1"
+        ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] != "0"
 
     public static let fusedLMHeadChunks: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_CHUNKS"],
-            let v = Int(raw), [64, 128, 256, 512, 1024].contains(v)
+            let v = Int(raw), [64, 128, 256, 512, 1024, 2048, 4096].contains(v)
         {
             return v
         }
-        return 512
+        return 2048
+    }()
+
+    public static let fusedLMHeadTN: Int = {
+        let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_TN"].flatMap(Int.init) ?? 1
+        return (raw == 1 || raw == 2) ? raw : 1
     }()
 
     /// Zero-logit-materialization NVFP4 `lm_head` + readout + exact top-2 + non-finite
@@ -504,7 +598,23 @@ public enum CBv2VerifyScales {
         let width = x.dim(1)
         let inputs = x.dim(2)
         let rows = batch * width
+        let tn = fusedLMHeadTN
         let outputs = l.outputDimensions
+        let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
+        let minChunksFor16BitOffset = max(1, (outputs + 65_533) / 65_534)
+        let chunks = min(totalTiles, max(fusedLMHeadChunks, minChunksFor16BitOffset))
+        let pkey = NVFP4TopTwoPlanKey(
+            id: ObjectIdentifier(l), rows: rows, inputs: inputs, dtype: x.dtype,
+            chunks: chunks, tn: tn)
+        if let plan = topTwoLock.withLockUnchecked({ $0.plans[pkey] }) {
+            let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
+            let partials = plan.launch([
+                plan.weight, plan.weightScale, x.reshaped(rows, inputs), plan.weightScale2, params,
+            ])
+            return cbv2FusedReadoutTopTwoMergePartials(
+                partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
+                batch: batch, width: width, chunks: plan.chunks)
+        }
         guard inputs > 0, l.inputDimensions == inputs, outputs >= 8,
             rows > ModelOptWeightOnlyNVFP4RowExact.scalarRows,
             ModelOptWeightOnlyNVFP4RowExact.supports(rows: rows, inputs: inputs, dtype: x.dtype),
@@ -513,29 +623,32 @@ public enum CBv2VerifyScales {
             l.weightScale.dtype == .uint8, l.weightScale.shape == [outputs, inputs / 16],
             l.weightScale2.dtype == .float32, l.weightScale2.size == 1
         else { return nil }
-        let chunks = min(fusedLMHeadChunks, max(1, (outputs + 7) / 8))
         let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
         let key = NVFP4TopTwoLaunchKey(
             dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs,
-            scaled: true, chunks: chunks)
+            scaled: true, chunks: chunks, tn: tn)
         let launch: MLXFast.MLXFastKernel.Launch
-        if let hit = launchLock.withLock({ nvfp4TopTwoLaunchCache[key] }) {
+        if let hit = topTwoLock.withLockUnchecked({ $0.launches[key] }) {
             launch = hit
         } else {
             let made = nvfp4TopTwoKernel.prepare(
                 template: [
                     ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
-                    ("SCALED", true), ("C_", chunks),
+                    ("SCALED", true), ("C_", chunks), ("TN", tn),
                 ],
                 grid: (32, 8, chunks), threadGroup: (32, 8, 1),
                 outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],
                 outputDTypes: [.int32, .float32, .int32])
-            launchLock.withLock { nvfp4TopTwoLaunchCache[key] = made }
+            topTwoLock.withLockUnchecked { $0.launches[key] = made }
             launch = made
         }
+        let ws2 = l.weightScale2.reshaped(1)
+        let plan = NVFP4TopTwoPlan(
+            launch: launch, weight: l.weight, weightScale: l.weightScale,
+            weightScale2: ws2, chunks: chunks)
+        topTwoLock.withLockUnchecked { $0.plans[pkey] = plan }
         let partials = launch([
-            l.weight, l.weightScale, x.reshaped(rows, inputs),
-            l.weightScale2.reshaped(1), params,
+            l.weight, l.weightScale, x.reshaped(rows, inputs), ws2, params,
         ])
         return cbv2FusedReadoutTopTwoMergePartials(
             partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],

@@ -634,8 +634,9 @@ inline void paged_attention_merge_impl(
 // Requires ceil(attendLen / PTOK) <= MAXPART for every row (host-checked).
 // Grid: threads = (KVH * (GQA/HPT) * 32 * NSG * MAXPART, B, 1),
 //       tg = (32 * NSG * MAXPART, 1, 1).
-// Threadgroup memory: q_smem[HPT * D], red_smem[MAXPART * NSG * HPT * (D + 2)],
-// part_smem[MAXPART * HPT * (D + 2)] floats.
+// Threadgroup memory: red_smem[MAXPART * NSG * HPT * (D + 2)] floats
+// (partition merge writes back into slot s=0 of each partition's red_smem;
+// queries stay in registers qv[HPT][EPT]).
 // BLOCK > 1 (D == 128 only): a state loads K/V for BLOCK tokens, then runs their
 // unchanged updates in token order. BLOCK == 1 is the per-token loop.
 template <
@@ -649,9 +650,7 @@ inline void paged_attention_onepass_impl(
     const device float* params,
     const int kvh,
     const int maxp,
-    threadgroup float* q_smem,
     threadgroup float* red_smem,
-    threadgroup float* part_smem,
     device T* out,
     uint3 tgpig,
     uint3 tpitg,
@@ -662,7 +661,6 @@ inline void paged_attention_onepass_impl(
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
     constexpr int EPT = D / 32;
-    constexpr int TG = 32 * NSG * MAXPART;
     constexpr int RSTRIDE = D + 2;
 
     const int kv_head = tgpig.x / SPLITS;
@@ -670,7 +668,6 @@ inline void paged_attention_onepass_impl(
     const int b = tgpig.y;
     const int part = (int)sgitg / NSG;
     const int state = (int)sgitg % NSG;
-    const int lin = tpitg.x;
 
     const device int32_t* info = seqinfo + b * 8;
     int attend_start = info[0];
@@ -700,12 +697,23 @@ inline void paged_attention_onepass_impl(
 
     const int q_head0 = kv_head * GQA + hgroup * HPT;
     const int64_t qr = (int64_t)(kvh * GQA) * D;
-    for (int i = lin; i < HPT * D; i += TG) {
-        const int64_t offset = (int64_t)b * qr + (q_head0 + i / D) * (int64_t)D + (i % D);
-        const float value = float(q[offset]);
-        q_smem[i] = value * scale;
+    float qv[HPT][EPT];
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        const device T* qrow = q + (int64_t)b * qr + (int64_t)(q_head0 + g) * D + lane * EPT;
+        if constexpr (EPT == 4) {
+            const vec<T, 4> q4 = *reinterpret_cast<const device vec<T, 4>*>(qrow);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                qv[g][e] = float(q4[e]) * scale;
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                qv[g][e] = float(qrow[e]) * scale;
+            }
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m[HPT];
     float l[HPT];
@@ -736,13 +744,13 @@ inline void paged_attention_onepass_impl(
             for (int u = 0; u < BLOCK; u++) {
                 if (j0 + u < count) {
                     const int raw_pos = attend_start + first + (j0 + u) * NSG;
-                    const int pos = DYN_TREE
+                    const uint upos = uint(DYN_TREE
                         ? ((tree_anc != 0u && raw_pos >= tree_base)
                             ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
                             : raw_pos)
-                        : raw_pos;
-                    const int lpage = pos / S;
-                    const int slot = pos % S;
+                        : raw_pos);
+                    const int lpage = int(upos / uint(S));
+                    const uint slot = upos % uint(S);
                     if (lpage != cur_lpage) {
                         const auto page = cache.read_page(table, lpage, table_len);
                         cur_key = page.key;
@@ -768,7 +776,7 @@ inline void paged_attention_onepass_impl(
                         float partial = 0.0f;
 #pragma unroll
                         for (int e = 0; e < EPT; e++) {
-                            partial += q_smem[g * D + lane * EPT + e] * kf[e];
+                            partial += qv[g][e] * kf[e];
                         }
                         float qk = simd_sum(partial);
                         if (HAS_SOFTCAP) {
@@ -792,13 +800,13 @@ inline void paged_attention_onepass_impl(
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
             const int raw_pos = attend_start + i;
-            const int pos = DYN_TREE
+            const uint upos = uint(DYN_TREE
                 ? ((tree_anc != 0u && raw_pos >= tree_base)
                     ? (tree_base + int((tree_anc >> ((raw_pos - tree_base) * 4)) & 0xFu))
                     : raw_pos)
-                : raw_pos;
-            const int lpage = pos / S;
-            const int slot = pos % S;
+                : raw_pos);
+            const int lpage = int(upos / uint(S));
+            const uint slot = upos % uint(S);
             const auto page = cache.read_page(table, lpage, table_len);
             const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
             page.template load<EPT>(base, lane, kf, vf);
@@ -808,7 +816,7 @@ inline void paged_attention_onepass_impl(
                 float partial = 0.0f;
 #pragma unroll
                 for (int e = 0; e < EPT; e++) {
-                    partial += q_smem[g * D + lane * EPT + e] * kf[e];
+                    partial += qv[g][e] * kf[e];
                 }
                 float qk = simd_sum(partial);
                 if (HAS_SOFTCAP) {
@@ -844,28 +852,36 @@ inline void paged_attention_onepass_impl(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Partition merge (pass A's tail), into threadgroup memory.
+    // Partition merge (pass A's tail), stored in-place into slot s=0 of red_smem.
     if (active) {
-        const threadgroup float* red = red_smem + (size_t)(part * NSG * HPT) * RSTRIDE;
+        threadgroup float* red = red_smem + (size_t)(part * NSG * HPT) * RSTRIDE;
         for (int g = state; g < HPT; g += NSG) {
             float pm = -FLT_MAX;
             for (int s = 0; s < NSG; s++) {
                 pm = max(pm, red[(size_t)(s * HPT + g) * RSTRIDE + D]);
             }
+            float w_s[NSG];
             float pl = 0.0f;
             for (int s = 0; s < NSG; s++) {
                 const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
                 const float ls = red[(size_t)(s * HPT + g) * RSTRIDE + D + 1];
-                pl += ls * exp2(ms - pm);
+                w_s[s] = exp2(ms - pm);
+                pl += ls * w_s[s];
             }
-            threadgroup float* prow = part_smem + (size_t)(part * HPT + g) * RSTRIDE;
-            for (int e = (int)lane; e < D; e += 32) {
+            float p_out[EPT];
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                const int col = int(lane) + e * 32;
                 float v = 0.0f;
                 for (int s = 0; s < NSG; s++) {
-                    const float ms = red[(size_t)(s * HPT + g) * RSTRIDE + D];
-                    v += red[(size_t)(s * HPT + g) * RSTRIDE + e] * exp2(ms - pm);
+                    v += red[(size_t)(s * HPT + g) * RSTRIDE + col] * w_s[s];
                 }
-                prow[e] = v;
+                p_out[e] = v;
+            }
+            threadgroup float* prow = red + (size_t)g * RSTRIDE;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                prow[int(lane) + e * 32] = p_out[e];
             }
             if (lane == 0) {
                 prow[D] = pm;
@@ -880,7 +896,7 @@ inline void paged_attention_onepass_impl(
         for (int g = state; g < HPT; g += NSG) {
             float gm = -FLT_MAX;
             for (int p = 0; p < parts; p++) {
-                gm = max(gm, part_smem[(size_t)(p * HPT + g) * RSTRIDE + D]);
+                gm = max(gm, red_smem[(size_t)(p * NSG * HPT + g) * RSTRIDE + D]);
             }
             float gl = 0.0f;
             float gacc[EPT];
@@ -889,7 +905,7 @@ inline void paged_attention_onepass_impl(
                 gacc[e] = 0.0f;
             }
             for (int p = 0; p < parts; p++) {
-                const threadgroup float* pp = part_smem + (size_t)(p * HPT + g) * RSTRIDE;
+                const threadgroup float* pp = red_smem + (size_t)(p * NSG * HPT + g) * RSTRIDE;
                 const float ms = pp[D];
                 const float ls = pp[D + 1];
                 const float w = exp2(ms - gm);

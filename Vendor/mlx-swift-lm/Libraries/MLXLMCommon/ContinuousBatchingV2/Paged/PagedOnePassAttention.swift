@@ -193,9 +193,7 @@ public enum PagedOnePassAttention {
     static func headsPerThreadgroup(headDim: Int, gqa: Int, simdgroups: Int) -> Int? {
         var hpt = min(gqa, requestedHeads)
         while hpt >= 1 {
-            let floats =
-                hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                + maxPartitions * hpt * (headDim + 2)
+            let floats = maxPartitions * simdgroups * hpt * (headDim + 2)
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -216,9 +214,7 @@ public enum PagedOnePassAttention {
     }
 
     private static let scratch = """
-        threadgroup float q_smem[HPT * D];
         threadgroup float red_smem[MAXPART * NSG * HPT * (D + 2)];
-        threadgroup float part_smem[MAXPART * HPT * (D + 2)];
         """
 
     private static let slabBody = """
@@ -229,7 +225,7 @@ public enum PagedOnePassAttention {
         cbv2::paged_attention_onepass_impl<
             T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP, cbv2::PagedSlabAccessor<T>,
             BLOCK>(
-            q, cache, tables, seqinfo, params, kvh, maxp, q_smem, red_smem, part_smem, out,
+            q, cache, tables, seqinfo, params, kvh, maxp, red_smem, out,
             threadgroup_position_in_grid, thread_position_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """
@@ -257,7 +253,7 @@ public enum PagedOnePassAttention {
             cbv2::paged_attention_onepass_impl<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
                 cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE>(
-                q, cache, seqinfo, seqinfo, params, KVH, 0, q_smem, red_smem, part_smem, out,
+                q, cache, seqinfo, seqinfo, params, KVH, 0, red_smem, out,
                 threadgroup_position_in_grid, thread_position_in_threadgroup,
                 simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta);
             """
