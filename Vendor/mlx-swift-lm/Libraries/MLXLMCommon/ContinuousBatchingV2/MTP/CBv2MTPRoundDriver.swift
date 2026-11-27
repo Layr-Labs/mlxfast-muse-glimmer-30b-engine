@@ -1668,6 +1668,47 @@ public enum CBv2DraftRegime {
     /// `[0] = packedPosDeltas`, `[1...8] = ancPacked[0...7]`, `[9...16] = depth[0...7]`,
     /// `[17] = packedParents`.
     nonisolated(unsafe) public static var activeDynamicTreeMeta: MLXArray? = nil
+    /// Prompt-lookup hints for the active dynamic-tree round: int32 `[8]`,
+    /// `[0...6]` = the tokens that followed the most recent earlier match of the
+    /// history's last 2-4 tokens (-1 = none), `[7]` = the match length.
+    /// Hints only reorder or add drafter candidates; the target verifies all.
+    nonisolated(unsafe) public static var activeDynamicTreeHints: MLXArray? = nil
+    /// `CBV2_LOOKUP_HINTS=0` disables prompt-lookup hints.
+    public static let lookupHintsEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_LOOKUP_HINTS"] != "0"
+    nonisolated(unsafe) public static let noLookupHints: MLXArray = MLXArray([Int32](repeating: -1, count: 8))
+
+    /// The hints for `history` (prompt + confirmed tokens, ending at the round's
+    /// anchor): the longest suffix of 4, 3 or 2 tokens that occurred earlier in
+    /// the last `window` tokens, its most recent occurrence, and up to 7 tokens after it.
+    public static func lookupHints(_ history: [Int], window: Int = 2048) -> [Int32]? {
+        let n = history.count
+        guard n >= 3 else { return nil }
+        let lo = max(0, n - window)
+        for m in stride(from: 4, through: 2, by: -1) where n > m {
+            let suffixStart = n - m
+            var j = suffixStart - 1
+            while j - m + 1 >= lo {
+                var equal = true
+                for o in 0 ..< m where history[j - m + 1 + o] != history[suffixStart + o] {
+                    equal = false
+                    break
+                }
+                if equal {
+                    var out = [Int32](repeating: -1, count: 8)
+                    var r = 0
+                    while r < 7, j + 1 + r < n {
+                        out[r] = Int32(truncatingIfNeeded: history[j + 1 + r])
+                        r += 1
+                    }
+                    out[7] = Int32(m)
+                    return r > 0 ? out : nil
+                }
+                j -= 1
+            }
+        }
+        return nil
+    }
     /// `CBV2_TREE_LOW=0` disables tree verification on low-acceptance rounds.
     public static let verifyTreeMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1

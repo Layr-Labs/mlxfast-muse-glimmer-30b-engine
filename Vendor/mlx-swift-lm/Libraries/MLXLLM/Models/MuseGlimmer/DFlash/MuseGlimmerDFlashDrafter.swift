@@ -2305,7 +2305,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private static let fastDynTreeStage2Kernel = MLXFast.metalKernel(
         name: "dflash_fast_dyntree_s2",
-        inputNames: ["p_val", "p_idx", "p_sum", "tparams"],
+        inputNames: ["p_val", "p_idx", "p_sum", "tparams", "hints"],
         outputNames: ["tokens", "tree_meta"],
         source: """
             constexpr uint CHUNKS = 64;
@@ -2407,6 +2407,38 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
 
             if (lid == 0) {
+              // Prompt-lookup hints: hints[r] continues the chain only while the
+              // chain so far equals hints[0 ..< r]. A hint raises its candidate to
+              // a prior by match length, or takes the weakest candidate's slot.
+              const int hint_len = hints[7];
+              if (hint_len >= 2) {
+                const float prior = (hint_len >= 4) ? 0.45f : ((hint_len == 3) ? 0.35f : 0.22f);
+                const int last_c = top_k_use - 1;
+                for (int r = 0; r < R_; ++r) {
+                  const int h = hints[r];
+                  if (h < 0 || h >= ivocab) { break; }
+                  int at = -1;
+                  for (int c = 0; c < 5; ++c) {
+                    if (row_ids[r][c] == h) { at = c; break; }
+                  }
+                  if (at < 0) {
+                    if (row_probs[r][last_c] < prior) {
+                      row_ids[r][last_c] = h;
+                      row_probs[r][last_c] = prior;
+                      at = last_c;
+                    }
+                  } else if (row_probs[r][at] < prior) {
+                    row_probs[r][at] = prior;
+                  }
+                  if (at > 0) {
+                    for (int c = at; c > 0 && row_probs[r][c] > row_probs[r][c - 1]; --c) {
+                      const float tp = row_probs[r][c]; row_probs[r][c] = row_probs[r][c - 1]; row_probs[r][c - 1] = tp;
+                      const int ti = row_ids[r][c]; row_ids[r][c] = row_ids[r][c - 1]; row_ids[r][c - 1] = ti;
+                    }
+                  }
+                  if (row_ids[r][0] != h) { break; }
+                }
+              }
               for (int s = 0; s < R_; ++s) {
                 tokens[s] = row_ids[s][0];
               }
@@ -2828,7 +2860,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             dynTreeLock.withLock { dynTreeS2Cache[key] = made }
             launch = made
         }
-        let out = launch([pVal, pIdx, pSum, params])
+        let hints = CBv2DraftRegime.activeDynamicTreeHints ?? CBv2DraftRegime.noLookupHints
+        let out = launch([pVal, pIdx, pSum, params, hints])
         return (out[0], out[1])
     }
 
