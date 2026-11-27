@@ -862,6 +862,25 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        let treeEligible =
+            batch == 1 && CBv2DraftRegime.verifyTreeMode != 0
+            && mtp.shouldUseVerifyTree(for: verifyRows[0].rec.id)
+            && mtp.config.verificationMode != .serialTarget
+            && verifyRows[0].rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+            && verifyRows[0].rec.request.tokenConstraint == nil
+            && rowMetadata[0].freeSpan == nil
+            && CBv2DraftRegime.dynamicTreeMinWidth <= CBv2DraftRegime.dynamicTreeMaxWidth
+            && (CBv2DraftRegime.dynamicTreeMinWidth ... CBv2DraftRegime.dynamicTreeMaxWidth).contains(k)
+        let useDynamicTree = treeEligible && CBv2DraftRegime.dynamicTreeEnabled
+        let verifyTree: CBv2VerifyTree? = nil
+        CBv2DraftRegime.activeVerifyTree = verifyTree
+        CBv2DraftRegime.activeDynamicTreeK = useDynamicTree ? k : 0
+        CBv2DraftRegime.activeDynamicTreeMeta = nil
+        defer {
+            CBv2DraftRegime.activeVerifyTree = nil
+            CBv2DraftRegime.activeDynamicTreeK = 0
+            CBv2DraftRegime.activeDynamicTreeMeta = nil
+        }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
             if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
@@ -991,12 +1010,16 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
+        let dynTreeMeta = CBv2DraftRegime.activeDynamicTreeMeta
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
         if let accept = target.accept {
             packetParts.append(accept.asType(.int32).reshaped([-1]))
+        }
+        if let dynTreeMeta {
+            packetParts.append(dynTreeMeta[17 ..< 18])
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -1013,6 +1036,9 @@ extension EngineLoopV2 {
         result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.verifyTree = verifyTree
+        result.hasDynamicTree = dynTreeMeta != nil
+        result.dynTreeMeta = dynTreeMeta
         return result
     }
 

@@ -5200,11 +5200,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 (host, nonFiniteIndices) = CBv2NonFiniteLogits.split(
                     readback.asArray(Int32.self), rows: step.sampledRows.count)
                 CBv2CoreInstrumentation.recordHostSync()
+                engineWorkInterval.hostWorkBegan()
             } else if !step.evalTargets.isEmpty {
                 eval(step.evalTargets)
                 CBv2CoreInstrumentation.recordHostSync()
+                engineWorkInterval.hostWorkBegan()
             }
-            engineWorkInterval.hostWorkBegan()
         }
         var pagedAttentionFailure: Error?
         if let work = step.pagedAttentionWork {

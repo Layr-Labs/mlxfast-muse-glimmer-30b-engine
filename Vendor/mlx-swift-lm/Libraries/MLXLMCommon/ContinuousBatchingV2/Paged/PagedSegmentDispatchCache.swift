@@ -65,6 +65,7 @@ final class PagedSegmentDispatchCache {
             let lastPage: Int
             let partitions: Int
             let writePage: Int32?
+            let isDynamicTree: Bool
         }
         let rows: [Row]
         let pageSize: Int
@@ -128,7 +129,7 @@ final class PagedSegmentDispatchCache {
             guard let identity = row.identity, info.attendStart >= 0, info.attendLength > 0,
                 info.tableLength > 0, row.pages.count <= info.tableLength
             else { return nil }
-            let lastPage = (info.attendStart + info.attendLength - 1) / pageSize
+            let lastPage = info.maxAttendedPos / pageSize
             // A full row's table is never addressed modulo its length.
             if info.attendStart == 0, info.tableLength == row.pages.count {
                 guard lastPage < info.tableLength else { return nil }
@@ -139,7 +140,8 @@ final class PagedSegmentDispatchCache {
                     firstPage: info.attendStart / pageSize,
                     alignedStart: info.attendStart % pageSize == 0, lastPage: lastPage,
                     partitions: (info.attendLength - 1) / partitionTokens + 1,
-                    writePage: hasWrite ? info.writePage : nil))
+                    writePage: hasWrite ? info.writePage : nil,
+                    isDynamicTree: info.isDynamicTree))
         }
         return Key(
             rows: identities, pageSize: group.pageSize,
