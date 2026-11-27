@@ -438,7 +438,7 @@ extension MuseGlimmerTextModel {
             treeMeta: dynTreeMeta)
         let values = p[2]
             .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
-        var output = attending.updateAndAttend(
+        let output = attending.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
         // Gate the `[B, L, H, D]` view of the attention output directly: the
         // elementwise kernel reads it strided and writes contiguous rows, so
@@ -446,9 +446,25 @@ extension MuseGlimmerTextModel {
         // first materializes a copy per layer (one more dispatch and a full
         // read and write of the output). Same elements, same expression.
         let gate = p[3].reshaped(batch, length, a.heads, a.headDimensions)
-        output = MuseGlimmerFusion.sigmoidGate([output.transposed(0, 2, 1, 3), gate])[0]
+        let outputBLHD = output.transposed(0, 2, 1, 3)
+        if batch == 1, verifyRows(p[3]) != nil,
+            let fp8 = a.outputProj as? ModelOptCalibratedLinear,
+            let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(
+                output: outputBLHD, gate: gate,
+                outShape: [batch, length, a.heads * a.headDimensions],
+                layer: fp8, strided: true),
+            let projected = CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: preCast)?.first
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let ref = MuseGlimmerFusion.sigmoidGate([outputBLHD, gate])[0]
+                    .reshaped(batch, length, -1)
+                checkRouted([projected], [fp8], ref, kind: "fp8.o.strided_fusedgate")
+            }
+            return projected
+        }
+        let gated = MuseGlimmerFusion.sigmoidGate([outputBLHD, gate])[0]
             .reshaped(batch, length, -1)
-        return verifyOutputProjection(a.outputProj, output)
+        return verifyOutputProjection(a.outputProj, gated)
     }
 }
 
@@ -998,6 +1014,19 @@ extension MuseGlimmerTextModel {
                                     [fp8], preCast: preCast)
                             {
                                 outputs += pre
+                            }
+                            if !lowAcc, let fp8 = group[0] as? ModelOptCalibratedLinear,
+                                width == a.heads * a.headDimensions
+                            {
+                                let attention = MLXArray.zeros(
+                                    [1, a.heads, rows, a.headDimensions], dtype: dtype)
+                                let gate = x.reshaped(1, rows, a.heads, a.headDimensions)
+                                if let preCast = VerifyFusedNorms.fusedSigmoidGateCastFP8(
+                                    output: attention.transposed(0, 2, 1, 3), gate: gate,
+                                    outShape: x.shape, layer: fp8, strided: true)
+                                {
+                                    outputs.append(preCast)
+                                }
                             }
                         case "gate_up":
                             outputs += verifyFeedInputProjections(group, x)

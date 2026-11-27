@@ -284,65 +284,100 @@ public enum VerifyFusedNorms {
         }
         """
 
-    private static let elemFP8Kernel = MLXFast.metalKernel(
-        name: "verify_fused_elem_fp8",
-        inputNames: ["a", "b", "fp8_mu", "fp8_bd"],
-        outputNames: ["y"],
-        source: """
-            const uint idx4 = thread_position_in_grid.x;
-            const uint n4 = uint(N4_);
-            if (idx4 >= n4) { return; }
-            const device vec<bfloat16_t, 4>* a4 = (const device vec<bfloat16_t, 4>*)a;
-            const device vec<bfloat16_t, 4>* b4 = (const device vec<bfloat16_t, 4>*)b;
-            device vec<bfloat16_t, 4>* y4 = (device vec<bfloat16_t, 4>*)y;
-            const vec<bfloat16_t, 4> av = a4[idx4];
-            const vec<bfloat16_t, 4> bv = b4[idx4];
-            const float m0 = fp8_mu[0];
-            const float m1 = fp8_mu[1];
-            const float bound = fp8_bd[0];
-            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            vec<bfloat16_t, 4> out;
+    private static func makeElemFP8Kernel(stridedGate: Bool) -> MLXFast.MLXFastKernel {
+        let load = if stridedGate {
+            """
+            const uint c = (idx4 * 4) % D_;
+            const uint head = (idx4 * 4 / D_) % H_;
+            const uint token = (idx4 * 4 / (D_ * H_)) % L_;
+            const uint batch = idx4 * 4 / (D_ * H_ * L_);
+            const int64_t ai = batch * a_strides[0] + token * a_strides[1]
+                + head * a_strides[2] + c * a_strides[3];
+            const int64_t bi = batch * b_strides[0] + token * b_strides[1]
+                + head * b_strides[2] + c * b_strides[3];
+            vec<bfloat16_t, 4> av, bv;
             #pragma unroll
             for (int k = 0; k < 4; ++k) {
-              bfloat16_t yb;
-              if constexpr (MODE_ == 0) {
-                yb = av[k] * verify_bf16_sigmoid(bv[k]);
-              } else {
-                const bfloat16_t g = av[k];
-                yb = (g * verify_bf16_sigmoid(g)) * bv[k];
-              }
-              out[k] = verify_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
+              av[k] = a[ai + k * a_strides[3]];
+              bv[k] = b[bi + k * b_strides[3]];
             }
-            y4[idx4] = out;
-            """,
-        header: ModelOptActivationKernels.header + elemFP8Header,
-        ensureRowContiguous: true)
+            """
+        } else {
+            """
+            const device vec<bfloat16_t, 4>* a4 = (const device vec<bfloat16_t, 4>*)a;
+            const device vec<bfloat16_t, 4>* b4 = (const device vec<bfloat16_t, 4>*)b;
+            const vec<bfloat16_t, 4> av = a4[idx4];
+            const vec<bfloat16_t, 4> bv = b4[idx4];
+            """
+        }
+        return MLXFast.metalKernel(
+            name: stridedGate ? "verify_fused_strided_gate_fp8" : "verify_fused_elem_fp8",
+            inputNames: ["a", "b", "fp8_mu", "fp8_bd"],
+            outputNames: ["y"],
+            source: """
+                const uint idx4 = thread_position_in_grid.x;
+                const uint n4 = uint(N4_);
+                if (idx4 >= n4) { return; }
+                \(load)
+                device vec<bfloat16_t, 4>* y4 = (device vec<bfloat16_t, 4>*)y;
+                const float m0 = fp8_mu[0];
+                const float m1 = fp8_mu[1];
+                const float bound = fp8_bd[0];
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                vec<bfloat16_t, 4> out;
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                  bfloat16_t yb;
+                  if constexpr (MODE_ == 0) {
+                    yb = av[k] * verify_bf16_sigmoid(bv[k]);
+                  } else {
+                    const bfloat16_t g = av[k];
+                    yb = (g * verify_bf16_sigmoid(g)) * bv[k];
+                  }
+                  out[k] = verify_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
+                }
+                y4[idx4] = out;
+                """,
+            header: ModelOptActivationKernels.header + elemFP8Header,
+            ensureRowContiguous: !stridedGate)
+    }
+
+    private static let elemFP8Kernel = makeElemFP8Kernel(stridedGate: false)
+    private static let stridedGateFP8Kernel = makeElemFP8Kernel(stridedGate: true)
 
     private struct ElemFP8LaunchKey: Hashable {
         let shape: [Int]
         let mode: Int
+        let stridedShape: [Int]?
     }
 
     nonisolated(unsafe) private static var elemFP8LaunchCache: [ElemFP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     private static func runElemFP8(
         _ a: MLXArray, _ b: MLXArray, outShape: [Int],
-        multipliers: MLXArray, overflowBound: MLXArray, mode: Int
+        multipliers: MLXArray, overflowBound: MLXArray, mode: Int,
+        stridedGate: Bool = false
     ) -> MLXArray? {
         guard fusedElementwiseFP8Enabled,
             a.dtype == .bfloat16, b.dtype == .bfloat16,
             a.size == b.size, a.size > 0, a.size % 4 == 0
         else { return nil }
         let n4 = a.size / 4
-        let key = ElemFP8LaunchKey(shape: outShape, mode: mode)
+        let key = ElemFP8LaunchKey(
+            shape: outShape, mode: mode, stridedShape: stridedGate ? a.shape : nil)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = cacheLock.withLock({ elemFP8LaunchCache[key] }) {
             launch = hit
         } else {
             let tg = min(256, max(32, ((n4 + 31) / 32) * 32))
             let gridX = ((n4 + tg - 1) / tg) * tg
-            let made = elemFP8Kernel.prepare(
-                template: [("N4_", n4), ("MODE_", mode)],
+            var template: [(String, any KernelTemplateArg)] = [("N4_", n4), ("MODE_", mode)]
+            if let shape = key.stridedShape {
+                template += [("L_", shape[1]), ("H_", shape[2]), ("D_", shape[3])]
+            }
+            let kernel = stridedGate ? stridedGateFP8Kernel : elemFP8Kernel
+            let made = kernel.prepare(
+                template: template,
                 grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
                 outputShapes: [outShape], outputDTypes: [.bfloat16])
             cacheLock.withLock { elemFP8LaunchCache[key] = made }
@@ -354,14 +389,18 @@ public enum VerifyFusedNorms {
     /// Fuses `output * sigmoid(gate)` + ModelOpt FP8 activation cast (0-ULP).
     public static func fusedSigmoidGateCastFP8(
         output: MLXArray, gate: MLXArray, outShape: [Int],
-        layer: ModelOptCalibratedLinear
+        layer: ModelOptCalibratedLinear, strided: Bool = false
     ) -> MLXArray? {
         guard let constants = layer.graphConstants,
             case .fp8(let multipliers, let overflowBound) = constants.storage
         else { return nil }
+        if strided {
+            guard output.ndim == 4, gate.shape == output.shape, output.dim(3) % 4 == 0
+            else { return nil }
+        }
         return runElemFP8(
             output, gate, outShape: outShape, multipliers: multipliers,
-            overflowBound: overflowBound, mode: 0)
+            overflowBound: overflowBound, mode: 0, stridedGate: strided)
     }
 
     /// Fuses `silu(gate) * up` + ModelOpt FP8 activation cast (0-ULP).
