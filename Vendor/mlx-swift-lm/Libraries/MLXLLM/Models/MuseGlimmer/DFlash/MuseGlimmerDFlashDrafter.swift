@@ -3310,33 +3310,25 @@ extension MuseGlimmerDFlashDrafter {
                 threadgroup uint4 sh_x[K256_][R_][4];
                 threadgroup half sh_xs[K256_][R_];
                 constexpr uint total_x4 = uint(K256_) * uint(R_) * 4u;
-                for (uint i = lid; i < total_x4; i += 256u) {
+                for (uint i = lid; i < total_x4; i += 224u) {
                     ((threadgroup uint4*)sh_x)[i] = x_bits4[i];
                 }
                 constexpr uint total_xs = uint(K256_) * uint(R_);
-                for (uint i = lid; i < total_xs; i += 256u) {
+                for (uint i = lid; i < total_xs; i += 224u) {
                     ((threadgroup half*)sh_xs)[i] = x_scale[i];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                float s0[R_], s1[R_];
-                int id0 = -1, id1 = -1;
                 const device uint4* tg_w4 = w1_bits4 + size_t(tg) * size_t(K256_ * 2 * STRIDE_);
                 const device half* tg_sc = g256_sc + size_t(tg) * size_t(K256_ * STRIDE_);
 
-                for (uint it = 0u; it < 2u; ++it) {
-                    const uint slot = it * 256u + lid;
-                    const int v = (slot < uint(STRIDE_)) ? int(slot * uint(NUM_TGS_) + tg) : -1;
-                    const bool valid = (v >= 0 && v < int(V_));
-                    if (it == 0u) { id0 = valid ? v : -1; } else { id1 = valid ? v : -1; }
-                    if (!valid) {
-                        for (uint r = 0u; r < uint(R_); ++r) {
-                            if (it == 0u) { s0[r] = -INFINITY; } else { s1[r] = -INFINITY; }
-                        }
-                        continue;
-                    }
-                    float acc[R_];
-                    for (uint r = 0u; r < uint(R_); ++r) { acc[r] = 0.0f; }
+                const uint slot = lid;
+                const int v = (slot < uint(STRIDE_)) ? int(slot * uint(NUM_TGS_) + tg) : -1;
+                const bool valid = (v >= 0 && v < int(V_));
+                const int my_id = valid ? v : -1;
+                float acc[R_];
+                for (uint r = 0u; r < uint(R_); ++r) { acc[r] = valid ? 0.0f : -INFINITY; }
+                if (valid) {
                     for (uint g = 0u; g < uint(K256_); ++g) {
                         const float sc_w = float(tg_sc[g * uint(STRIDE_) + slot]);
                         const uint4 wa = tg_w4[(g * 2u + 0u) * uint(STRIDE_) + slot];
@@ -3351,53 +3343,41 @@ extension MuseGlimmerDFlashDrafter {
                             acc[r] = fma(dot_g, sc_w * float(sh_xs[g][r]), acc[r]);
                         }
                     }
-                    for (uint r = 0u; r < uint(R_); ++r) {
-                        if (it == 0u) { s0[r] = acc[r]; } else { s1[r] = acc[r]; }
-                    }
                 }
 
-                threadgroup float sh_v[8][2];
-                threadgroup int sh_i[8][2];
+                threadgroup float sh_v[R_][7];
+                threadgroup int sh_i[R_][7];
                 for (uint r = 0u; r < uint(R_); ++r) {
-                    float v0 = -INFINITY, v1 = -INFINITY;
-                    int i0 = -1, i1 = -1;
-                    dflash_xnor_insert_top2(v0, i0, v1, i1, s0[r], id0);
-                    dflash_xnor_insert_top2(v0, i0, v1, i1, s1[r], id1);
+                    float mv = acc[r];
+                    int mi = my_id;
                     for (ushort off = 16u; off > 0u; off >>= 1u) {
-                        const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
-                        const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
-                        if (lane < off) {
-                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
-                            dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
+                        const float ov = simd_shuffle_down(mv, off);
+                        const int oi = simd_shuffle_down(mi, off);
+                        if (lane < off && oi >= 0 && (ov > mv || (ov == mv && (mi < 0 || oi < mi)))) {
+                            mv = ov;
+                            mi = oi;
                         }
                     }
                     if (lane == 0u) {
-                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
-                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                        sh_v[r][sg] = mv;
+                        sh_i[r][sg] = mi;
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (sg == 0u) {
-                        if (lane < 8u) {
-                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
-                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
-                        } else {
-                            v0 = v1 = -INFINITY; i0 = i1 = -1;
-                        }
-                        for (ushort off = 4u; off > 0u; off >>= 1u) {
-                            const float ov0 = simd_shuffle_down(v0, off); const int oi0 = simd_shuffle_down(i0, off);
-                            const float ov1 = simd_shuffle_down(v1, off); const int oi1 = simd_shuffle_down(i1, off);
-                            if (lane < off) {
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov0, oi0);
-                                dflash_xnor_insert_top2(v0, i0, v1, i1, ov1, oi1);
-                            }
-                        }
-                        if (lane == 0u) {
-                            const uint base = (r * uint(NUM_TGS_) + tg) * 2u;
-                            cand_ids[base + 0u] = i0;
-                            cand_ids[base + 1u] = i1;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg < uint(R_)) {
+                    float mv = (lane < 7u) ? sh_v[sg][lane] : -INFINITY;
+                    int mi = (lane < 7u) ? sh_i[sg][lane] : -1;
+                    for (ushort off = 4u; off > 0u; off >>= 1u) {
+                        const float ov = simd_shuffle_down(mv, off);
+                        const int oi = simd_shuffle_down(mi, off);
+                        if (lane < off && oi >= 0 && (ov > mv || (ov == mv && (mi < 0 || oi < mi)))) {
+                            mv = ov;
+                            mi = oi;
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane == 0u) {
+                        cand_ids[sg * uint(NUM_TGS_) + tg] = mi;
+                    }
                 }
                 """,
             header: header)
@@ -3524,9 +3504,9 @@ extension MuseGlimmerDFlashDrafter {
             guard Self.enabled else { return nil }
             let v = head.outputDimensions
             let k = head.inputDimensions
-            let tgs = 512
+            let tgs = 1024
             let st = (((v + tgs - 1) / tgs) + 15) & ~15
-            guard v >= 4096, k >= 256, k % 256 == 0, st <= 512,
+            guard v >= 4096, k >= 256, k % 256 == 0, st <= 224,
                 head.weight.dtype == .uint32, head.weight.shape == [v, k / 8],
                 head.weightScale.dtype == .uint8, head.weightScale.shape == [v, k / 16]
             else { return nil }
@@ -3577,9 +3557,9 @@ extension MuseGlimmerDFlashDrafter {
                         ("R_", rows), ("V_", vocab), ("K256_", k256),
                         ("NUM_TGS_", numTGs), ("STRIDE_", stride),
                     ],
-                    grid: (256 * numTGs, 1, 1),
-                    threadGroup: (256, 1, 1),
-                    outputShapes: [[rows, numTGs * 2]],
+                    grid: (224 * numTGs, 1, 1),
+                    threadGroup: (224, 1, 1),
+                    outputShapes: [[rows, numTGs]],
                     outputDTypes: [.int32])
                 let s2 = Self.stage2Kernel.prepare(
                     template: [("V_", vocab), ("K_", hidden)],

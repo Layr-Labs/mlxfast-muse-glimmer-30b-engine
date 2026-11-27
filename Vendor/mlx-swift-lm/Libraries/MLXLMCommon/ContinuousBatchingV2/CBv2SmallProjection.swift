@@ -175,7 +175,41 @@ public enum CBv2SmallProjection {
                         }
                     }
                 }
-                if (VO) {
+                if constexpr (DV_MODE == 2) {
+                    float wf[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            wf[tm][tn] = static_cast<float>(static_cast<T>(dec[tm][tn]));
+                        }
+                    }
+                    if (VO) {
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const float4 af = float4(as_type<vec<T, 4>>(av[v]));
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += wf[tm][tn] * af[tn];
+                                }
+                            }
+                        }
+                    } else {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            CBV2_SP_UNROLL
+                            for (int v = 0; v < V; v++) {
+                                const float a = static_cast<float>(as_type<T>(av[v][tn]));
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += wf[tm][tn] * a;
+                                }
+                            }
+                        }
+                    }
+                } else if (VO) {
                     // Rows of activations outermost: each chain still takes
                     // its four inputs in order, with fewer values live.
                     T inter[TM][TN];
@@ -183,8 +217,7 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         CBV2_SP_UNROLL
                         for (int tn = 0; tn < TN; tn++) {
-                            inter[tm][tn] = static_cast<T>(
-                                (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
+                            inter[tm][tn] = static_cast<T>(dec[tm][tn] * dscale);
                         }
                     }
                     CBV2_SP_UNROLL
@@ -204,8 +237,7 @@ public enum CBv2SmallProjection {
                     T inter[TM];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
-                        inter[tm] = static_cast<T>(
-                            (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * dscale));
+                        inter[tm] = static_cast<T>(dec[tm][tn] * dscale);
                     }
                     CBV2_SP_UNROLL
                     for (int v = 0; v < V; v++) {
@@ -228,7 +260,7 @@ public enum CBv2SmallProjection {
                         for (int v = 0; v < V; v++) {
                             av[v] = ushort4(*(const device packed_ushort4*)(in_vec + v * K + bn));
                         }
-                        float dec[TM][TN];
+                        float wf[TM][TN];
                         CBV2_SP_UNROLL
                         for (int tm = 0; tm < TM; tm++) {
                             const uint w = *(const device uint*)(rows + tm * K + bn);
@@ -236,45 +268,32 @@ public enum CBv2SmallProjection {
                             const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
                             const float2 f02 = float2(as_type<half2>(lo)) * dscale;
                             const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                            dec[tm][0] = f02.x;
-                            dec[tm][1] = f13.x;
-                            dec[tm][2] = f02.y;
-                            dec[tm][3] = f13.y;
+                            wf[tm][0] = static_cast<float>(static_cast<T>(f02.x));
+                            wf[tm][1] = static_cast<float>(static_cast<T>(f13.x));
+                            wf[tm][2] = static_cast<float>(static_cast<T>(f02.y));
+                            wf[tm][3] = static_cast<float>(static_cast<T>(f13.y));
                         }
                         if (VO) {
-                            T inter[TM][TN];
-                            CBV2_SP_UNROLL
-                            for (int tm = 0; tm < TM; tm++) {
-                                CBV2_SP_UNROLL
-                                for (int tn = 0; tn < TN; tn++) {
-                                    inter[tm][tn] = static_cast<T>(dec[tm][tn]);
-                                }
-                            }
                             CBV2_SP_UNROLL
                             for (int v = 0; v < V; v++) {
+                                const float4 af = float4(as_type<vec<T, 4>>(av[v]));
                                 CBV2_SP_UNROLL
                                 for (int tn = 0; tn < TN; tn++) {
-                                    const float a = static_cast<float>(as_type<T>(av[v][tn]));
                                     CBV2_SP_UNROLL
                                     for (int tm = 0; tm < TM; tm++) {
-                                        r[v * TM + tm] += inter[tm][tn] * a;
+                                        r[v * TM + tm] += wf[tm][tn] * af[tn];
                                     }
                                 }
                             }
                         } else {
                             CBV2_SP_UNROLL
                             for (int tn = 0; tn < TN; tn++) {
-                                T inter[TM];
-                                CBV2_SP_UNROLL
-                                for (int tm = 0; tm < TM; tm++) {
-                                    inter[tm] = static_cast<T>(dec[tm][tn]);
-                                }
                                 CBV2_SP_UNROLL
                                 for (int v = 0; v < V; v++) {
                                     const float a = static_cast<float>(as_type<T>(av[v][tn]));
                                     CBV2_SP_UNROLL
                                     for (int tm = 0; tm < TM; tm++) {
-                                        r[v * TM + tm] += inter[tm] * a;
+                                        r[v * TM + tm] += wf[tm][tn] * a;
                                     }
                                 }
                             }
@@ -1440,15 +1459,44 @@ public enum CBv2SmallProjection {
                     }
                 }
             }
-            if (VO) {
+            if constexpr (DV_MODE == 2) {
+                float wf[2][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < 2; tm++) {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        wf[tm][tn] = static_cast<float>(static_cast<T>(dec[tm][tn]));
+                    }
+                }
+                if (VO) {
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const float4 af = float4(as_type<vec<T, 4>>(av[v]));
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            r[v * 2 + 0] += wf[0][tn] * af[tn];
+                            r[v * 2 + 1] += wf[1][tn] * af[tn];
+                        }
+                    }
+                } else {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const float a = static_cast<float>(as_type<T>(av[v][tn]));
+                            r[v * 2 + 0] += wf[0][tn] * a;
+                            r[v * 2 + 1] += wf[1][tn] * a;
+                        }
+                    }
+                }
+            } else if (VO) {
                 T inter[2][TN];
                 CBV2_SP_UNROLL
                 for (int tm = 0; tm < 2; tm++) {
                     const float ds = dscales[tm];
                     CBV2_SP_UNROLL
                     for (int tn = 0; tn < TN; tn++) {
-                        inter[tm][tn] = static_cast<T>(
-                            (DV_MODE == 2) ? dec[tm][tn] : (dec[tm][tn] * ds));
+                        inter[tm][tn] = static_cast<T>(dec[tm][tn] * ds);
                     }
                 }
                 CBV2_SP_UNROLL
@@ -1463,10 +1511,8 @@ public enum CBv2SmallProjection {
             } else {
                 CBV2_SP_UNROLL
                 for (int tn = 0; tn < TN; tn++) {
-                    const T ig = static_cast<T>(
-                        (DV_MODE == 2) ? dec[0][tn] : (dec[0][tn] * dscale_g));
-                    const T iu = static_cast<T>(
-                        (DV_MODE == 2) ? dec[1][tn] : (dec[1][tn] * dscale_u));
+                    const T ig = static_cast<T>(dec[0][tn] * dscale_g);
+                    const T iu = static_cast<T>(dec[1][tn] * dscale_u);
                     CBV2_SP_UNROLL
                     for (int v = 0; v < V; v++) {
                         const float a = static_cast<float>(as_type<T>(av[v][tn]));
@@ -1529,17 +1575,35 @@ public enum CBv2SmallProjection {
                             }
                         }
                     }
-                    CBV2_SP_UNROLL
-                    for (int tn = 0; tn < TN; tn++) {
-                        const T ig = static_cast<T>(
-                            (DV_MODE == 2) ? dec[0][tn] : (dec[0][tn] * dscale_g));
-                        const T iu = static_cast<T>(
-                            (DV_MODE == 2) ? dec[1][tn] : (dec[1][tn] * dscale_u));
+                    if constexpr (DV_MODE == 2) {
+                        float wf[2][TN];
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < 2; tm++) {
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                wf[tm][tn] = static_cast<float>(static_cast<T>(dec[tm][tn]));
+                            }
+                        }
                         CBV2_SP_UNROLL
                         for (int v = 0; v < V; v++) {
-                            const float a = static_cast<float>(as_type<T>(av[v][tn]));
-                            r[v * 2 + 0] += ig * a;
-                            r[v * 2 + 1] += iu * a;
+                            const float4 af = float4(as_type<vec<T, 4>>(av[v]));
+                            CBV2_SP_UNROLL
+                            for (int tn = 0; tn < TN; tn++) {
+                                r[v * 2 + 0] += wf[0][tn] * af[tn];
+                                r[v * 2 + 1] += wf[1][tn] * af[tn];
+                            }
+                        }
+                    } else {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const T ig = static_cast<T>(dec[0][tn] * dscale_g);
+                            const T iu = static_cast<T>(dec[1][tn] * dscale_u);
+                            CBV2_SP_UNROLL
+                            for (int v = 0; v < V; v++) {
+                                const float a = static_cast<float>(as_type<T>(av[v][tn]));
+                                r[v * 2 + 0] += ig * a;
+                                r[v * 2 + 1] += iu * a;
+                            }
                         }
                     }
                 } else {

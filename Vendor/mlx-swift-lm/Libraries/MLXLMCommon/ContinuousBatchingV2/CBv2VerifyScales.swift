@@ -697,10 +697,18 @@ public enum CBv2VerifyScales {
                     const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
                     const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
                     const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
-                    inter[0] = static_cast<T>(even.x);
-                    inter[1] = static_cast<T>(odd.x);
-                    inter[2] = static_cast<T>(even.y);
-                    inter[3] = static_cast<T>(odd.y);
+                    const float wf0 = static_cast<float>(static_cast<T>(even.x));
+                    const float wf1 = static_cast<float>(static_cast<T>(odd.x));
+                    const float wf2 = static_cast<float>(static_cast<T>(even.y));
+                    const float wf3 = static_cast<float>(static_cast<T>(odd.y));
+                    for (int v = 0; v < V; v++) {
+                        result[v][tm] += wf0 * v_coeff[v][0];
+                        result[v][tm] += wf1 * v_coeff[v][1];
+                        result[v][tm] += wf2 * v_coeff[v][2];
+                        result[v][tm] += wf3 * v_coeff[v][3];
+                    }
+                    mat_offset += K;
+                    continue;
                 } else if (PD) {
                     const uint word = *(const device uint*)(rows + mat_offset + bn);
                     if (((word & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u) {
@@ -757,29 +765,20 @@ public enum CBv2VerifyScales {
                     }
                     int mat_offset = 0;
                     for (int tm = 0; tm < TM; tm++) {
-                        if constexpr (BLD) {
-                            const uint word = *(const device uint*)(rows + mat_offset + bn);
-                            const uint lo = ((word & 0x007F007Fu) << 7) | ((word & 0x00800080u) << 8);
-                            const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
-                            const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
-                            const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
-                            inter[0] = static_cast<T>(even.x);
-                            inter[1] = static_cast<T>(odd.x);
-                            inter[2] = static_cast<T>(even.y);
-                            inter[3] = static_cast<T>(odd.y);
-                        } else {
-                            const uint word = *(const device uint*)(rows + mat_offset + bn);
-                            for (int tn = 0; tn < TN; tn++) {
-                                const uint8_t code = uint8_t(word >> (8 * tn));
-                                const float decoded =
-                                    (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                                inter[tn] = static_cast<T>(decoded * weight_scale);
-                            }
-                        }
+                        const uint word = *(const device uint*)(rows + mat_offset + bn);
+                        const uint lo = ((word & 0x007F007Fu) << 7) | ((word & 0x00800080u) << 8);
+                        const uint hi = ((word >> 1) & 0x3F803F80u) | (word & 0x80008000u);
+                        const float2 even = float2(as_type<half2>(lo)) * weight_scale_256;
+                        const float2 odd = float2(as_type<half2>(hi)) * weight_scale_256;
+                        const float wf0 = static_cast<float>(static_cast<T>(even.x));
+                        const float wf1 = static_cast<float>(static_cast<T>(odd.x));
+                        const float wf2 = static_cast<float>(static_cast<T>(even.y));
+                        const float wf3 = static_cast<float>(static_cast<T>(odd.y));
                         for (int v = 0; v < V; v++) {
-                            for (int tn = 0; tn < TN; tn++) {
-                                result[v][tm] += inter[tn] * v_coeff[v][tn];
-                            }
+                            result[v][tm] += wf0 * v_coeff[v][0];
+                            result[v][tm] += wf1 * v_coeff[v][1];
+                            result[v][tm] += wf2 * v_coeff[v][2];
+                            result[v][tm] += wf3 * v_coeff[v][3];
                         }
                         mat_offset += K;
                     }

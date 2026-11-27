@@ -354,7 +354,10 @@ extension MuseGlimmerTextModel {
             return (fused.ids, fused.values, fused.nonFinite, trunk.hidden)
         }
         let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear
-        guard let product = (MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled ? nvHead.flatMap({ CBv2VerifyNVFP4.product($0, trunk.normed) }) : nil)
+        let useNVHead =
+            lowVerify && CBv2DraftRegime.xnorDraftHeadEligible
+            && MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled
+        guard let product = (useNVHead ? nvHead.flatMap({ CBv2VerifyNVFP4.product($0, trunk.normed) }) : nil)
             ?? CBv2VerifyScales.product(lmHead, trunk.normed),
             product.ndim == 3, product.dtype == .bfloat16
         else { return nil }
@@ -739,7 +742,7 @@ enum MuseGlimmerVerifyProjections {
     static let nvfp4AllEnabled: Bool =
         environment["CBV2_NVFP4_ALL"] != "0"
     static let nvfp4LMHeadEnabled: Bool =
-        environment["CBV2_NVFP4_LMHEAD"] == "1"
+        environment["CBV2_NVFP4_LMHEAD"] != "0"
     static let denseGroupedEnabled: Bool =
         environment["CBV2_DENSE_GROUPED"] != "0"
 
@@ -1011,7 +1014,11 @@ extension MuseGlimmerTextModel {
             return (layer as? Linear)?.weight.dim(1)
         }
         let prevLow = CBv2DraftRegime.lowAcceptance
-        defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let prevDeepLow = CBv2DraftRegime.xnorDraftHeadEligible
+        defer {
+            CBv2DraftRegime.lowAcceptance = prevLow
+            CBv2DraftRegime.xnorDraftHeadEligible = prevDeepLow
+        }
         // Batch-verify all frozen FP8 target weight tensors once at boot for
         // zero NaN bytes (0x7F/0xFF) and normal non-overflowing scale so
         // branchless half2 FP8 decode needs zero per-step host syncs.
@@ -1057,6 +1064,7 @@ extension MuseGlimmerTextModel {
                 var outputs = [MLXArray]()
                 for lowAcc in [false, true] {
                     CBv2DraftRegime.lowAcceptance = lowAcc
+                    CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
                     for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                         let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                         switch site {
@@ -1138,6 +1146,16 @@ extension MuseGlimmerTextModel {
                 (1 ... MuseGlimmerVerifyProjections.maximumRows).map {
                     verifyOutputLogits(MLXArray.zeros([1, $0, width], dtype: dtype))
                 })
+            if MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled,
+                let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear
+            {
+                CBv2DraftRegime.lowAcceptance = true
+                CBv2DraftRegime.xnorDraftHeadEligible = true
+                let nvHeadWarm = (1 ... MuseGlimmerVerifyProjections.maximumRows).compactMap {
+                    CBv2VerifyNVFP4.product(nvHead, MLXArray.zeros([1, $0, width], dtype: dtype))
+                }
+                if !nvHeadWarm.isEmpty { eval(nvHeadWarm) }
+            }
             if CBv2VerifyScales.fusedLMHeadEnabled {
                 var fusedWarm = [MLXArray]()
                 for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
