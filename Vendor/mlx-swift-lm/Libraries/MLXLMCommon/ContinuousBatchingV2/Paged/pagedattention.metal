@@ -395,6 +395,9 @@ inline void paged_attention_part_cached_impl(
     for (int i = lo + (int)sgitg; i < hi; i += NSG) {
         const int absolute_position = attend_start + i;
         if (uses_visible_range && (absolute_position < info[3] || absolute_position >= info[4])) continue;
+#ifdef CBV2_TREE_HOLES
+        if (absolute_position >= info[6] && absolute_position < info[7]) continue;
+#endif
         if (allowed_mask != nullptr && !allowed_mask[int64_t(qi) * mask_query_stride + int64_t(i) * mask_key_stride]) continue;
         if (HAS_WRITE && i == attend_len - 1) {
             // The newest position: read the step's tile from the INPUTS,
@@ -621,11 +624,13 @@ inline void paged_attention_onepass_impl(
     threadgroup float* q_smem,
     threadgroup float* red_smem,
     threadgroup float* part_smem,
+    threadgroup float* leaf_smem,
     device T* out,
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
-    uint lane
+    uint lane,
+    const device int32_t* hole_rel = nullptr
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT;
@@ -644,6 +649,33 @@ inline void paged_attention_onepass_impl(
     const int attend_start = info[0];
     const int attend_len = info[1];
     const int table_len = info[2];
+#ifdef CBV2_TREE_HOLES
+    // Draft-tree branch rows skip [hole_lo, hole_hi).
+#ifdef CBV2_TREE_DEVICE_HOLES
+    // GPU-built tree: `hole_rel` [rows, 2] holds each row's hole relative to
+    // the seed column (row b is verify column b, (0, 0) for chain columns),
+    // so seqinfo stays the chain's. Row b's query sits at seed + b, the last
+    // position it attends.
+    const int seed_pos = attend_start + attend_len - 1 - b;
+    const int hole_lo = seed_pos + hole_rel[2 * b];
+    const int hole_hi = seed_pos + hole_rel[2 * b + 1];
+#else
+    const int hole_lo = info[6];
+    const int hole_hi = info[7];
+#endif
+    // A branch row's tail (its branch's columns up to its own key) is stored
+    // after the skipped span but sits logically from hole_lo on. The row must
+    // reduce exactly like a plain decode at its logical position, whose keys
+    // are the prefix and then the tail at indices hole_lo - attend_start + t:
+    // the same (partition, strided state) slots, each last in its state's
+    // order. The main loops therefore skip everything from hole_lo on, and
+    // the tail's updates are applied below in their logical slots, in order.
+    const bool leaf_row = hole_hi > hole_lo && hole_lo >= attend_start
+        && hole_hi < attend_start + attend_len;
+    const int skip_hi = leaf_row ? attend_start + attend_len : hole_hi;
+    const int tail_count = leaf_row ? attend_start + attend_len - hole_hi : 0;
+    const int leaf_index = hole_lo - attend_start;
+#endif
     const int parts = (attend_len + PTOK - 1) / PTOK;
     const int lo = part * PTOK;
     const int hi = min(attend_len, lo + PTOK);
@@ -706,7 +738,12 @@ inline void paged_attention_onepass_impl(
             }
 #pragma unroll
             for (int u = 0; u < BLOCK; u++) {
+#ifdef CBV2_TREE_HOLES
+                const int upos = attend_start + first + (j0 + u) * NSG;
+                if (j0 + u < count && !(upos >= hole_lo && upos < skip_hi)) {
+#else
                 if (j0 + u < count) {
+#endif
 #pragma unroll
                     for (int e = 0; e < E4; e++) {
                         kf[e] = float(kr[u][e]);
@@ -742,6 +779,9 @@ inline void paged_attention_onepass_impl(
     } else if (active) {
         for (int i = lo + state; i < hi; i += NSG) {
             const int pos = attend_start + i;
+#ifdef CBV2_TREE_HOLES
+            if (pos >= hole_lo && pos < skip_hi) continue;
+#endif
             const int lpage = pos / S;
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
@@ -773,6 +813,45 @@ inline void paged_attention_onepass_impl(
             }
         }
     }
+
+#ifdef CBV2_TREE_HOLES
+    for (int t = 0; active && t < tail_count; t++) {
+        const int li = leaf_index + t;
+        const int lpart = li / PTOK;
+        if (part != lpart || state != (li - lpart * PTOK) % NSG) continue;
+        {
+            const int lpos = hole_hi + t;
+            const int lpage = lpos / S;
+            const int slot = lpos % S;
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+#pragma unroll
+            for (int g = 0; g < HPT; g++) {
+                float partial = 0.0f;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    partial += q_smem[g * D + lane * EPT + e] * kf[e];
+                }
+                float qk = simd_sum(partial);
+                if (HAS_SOFTCAP) {
+                    qk = softcap * precise::tanh(qk / softcap);
+                }
+                qk *= M_LOG2E_F;
+
+                const float m_new = max(m[g], qk);
+                const float corr = exp2(m[g] - m_new);
+                const float p = exp2(qk - m_new);
+                l[g] = l[g] * corr + p;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    acc[g][e] = acc[g][e] * corr + p * vf[e];
+                }
+                m[g] = m_new;
+            }
+        }
+    }
+#endif
 
     // Publish this (partition, state)'s online-softmax states.
     threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;
