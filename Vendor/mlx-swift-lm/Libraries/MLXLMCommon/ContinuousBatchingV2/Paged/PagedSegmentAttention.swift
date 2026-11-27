@@ -24,6 +24,27 @@ enum PagedSegmentAttention {
     nonisolated(unsafe) private static var mergeKernels:
         [PagedAttentionKernelKey: MLXFast.MLXFastKernel] = [:]
 
+    private struct PartLaunchID: Hashable {
+        let kernel: PartKernelID
+        let workCount: Int
+        let scratchRows: Int
+        let scratchPartitions: Int
+        let dynamicTree: Bool
+    }
+
+    private struct MergeLaunchID: Hashable {
+        let kernel: PagedAttentionKernelKey
+        let rows: Int
+        let queryHeads: Int
+        let dynamicTree: Bool
+    }
+
+    nonisolated(unsafe) private static var partLaunches:
+        [PartLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var mergeLaunches:
+        [MergeLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    private static let launchLimit = 1024
+
     /// `allocatesScratch` is the first bucket's variant: `partials` and `meta`
     /// are its uninitialized outputs instead of mutable inputs. The body and
     /// arithmetic are identical; only the buffers' origin differs.
@@ -230,10 +251,12 @@ enum PagedSegmentAttention {
         zeroFilledScratch: Bool = false,
         seqinfoCache: PagedSegmentSeqinfoCache? = nil,
         mergeScratch: PagedSegmentMergeScratch? = nil,
-        treeMeta: MLXArray? = nil
+        treeMeta: MLXArray? = nil,
+        pending: (keys: MLXArray, values: MLXArray)? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
+        precondition(pending == nil || treeMeta == nil, "the fused append serves linear rows only")
         if let newKeys, let newValues {
             guard
                 group.writeValidation.validate(
@@ -271,6 +294,16 @@ enum PagedSegmentAttention {
         if newKeys != nil {
             precondition(k.shape == [b, kvh, d] && v.shape == k.shape)
         }
+        // `pending` columns `[KVH, B, D]`: row r's terminal position is its slot.
+        func scatterPending(_ pending: (keys: MLXArray, values: MLXArray)) {
+            let slots = rows.map {
+                let position = $0.info.attendStart + $0.info.attendLength - 1
+                let page = $0.pages[(position / group.pageSize) % $0.info.tableLength]
+                return page * Int32(group.pageSize) + Int32(position % group.pageSize)
+            }
+            PagedSegmentTransfers.write(
+                group: group, slots: slots, keys: pending.keys, values: pending.values)
+        }
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
             let heads = PagedOnePassAttention.eligible(
@@ -278,27 +311,46 @@ enum PagedSegmentAttention {
                 dynTree: treeMeta != nil)
         {
             let bucket = plan.buckets[0]
-            var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
-            backing.append(
-                contentsOf: repeatElement(backing[0], count: bucket.bindingClass - backing.count))
+            var fusedPending = pending
+            if let pending,
+                !PagedOnePassAttention.supportsAppend(
+                    dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
+                    hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass)
+            {
+                scatterPending(pending)
+                guard !group.writeValidation.isFaulted else { return q }
+                fusedPending = nil
+            }
+            let backing = bucket.segmentIDs.lazy.map { group.segments[$0]!.storage }
             let result = PagedOnePassAttention.segments(
                 queries: q, backing: backing, seqinfo: seqinfo, params: params,
                 previous: group.writeFence, valueOffsets: prepared.metadata[0].valueOffsets,
                 records: prepared.metadata[0].records, dtype: dtype, kvHeads: kvh,
                 pageSize: group.pageSize, hpt: heads, simdgroups: nsg, partitionTokens: ptok,
                 softcap: softcap, source: source, treeMeta: treeMeta,
-                maxPart: plan.maxPartitions)
+                maxPart: plan.maxPartitions, bindingClass: bucket.bindingClass,
+                pending: fusedPending.map {
+                    ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
+                })
             if PagedOnePassAttention.checks {
+                // The reference reads the pages this dispatch wrote.
+                if fusedPending != nil { group.writeFence = result.fence }
                 // Self-test: the two-pass kernels on the same inputs, raw bits.
                 let reference = decode(
                     queries: q, newKeys: nil, newValues: nil, group: group, rows: rows,
                     sinks: nil, params: params, softcap: softcap, source: source,
                     dispatchCache: nil, zeroFilledScratch: true, treeMeta: treeMeta)
-                PagedOnePassAttention.compare(onePass: result.out, twoPass: reference)
+                PagedOnePassAttention.compare(
+                    onePass: result.out, twoPass: reference, appended: fusedPending != nil)
                 return reference
             }
             group.writeFence = result.fence
             return result.out
+        }
+        if let pending {
+            scatterPending(pending)
+            guard !group.writeValidation.isFaulted else { return q }
         }
         let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
@@ -327,43 +379,74 @@ enum PagedSegmentAttention {
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
             partitionTokens: ptok, hasWrite: newKeys != nil)
+        let cacheLaunches = dispatchCache != nil && newKeys == nil && (2 ... 8).contains(b)
+        let dynamicTree = treeMeta != nil
+        let boundTreeMeta = treeMeta ?? dummyTreeMeta
         for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
-            let segments = bucket.segmentIDs.map { group.segments[$0]! }
             let bindingCount = bucket.bindingClass
-            var backing = segments.map(\.storage)
-            // Empty records never select padded bindings. They alias an input,
-            // never a separately declared writable output.
-            backing.append(
-                contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
-            let inputs =
-                [q, k, v] + backing + [
-                    seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
-                    treeMeta ?? dummyTreeMeta,
-                ]
-            let template: [(String, any KernelTemplateArg)] = [
-                ("T", dtype), ("D", d), ("S", group.pageSize),
-                ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
-                ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
-                ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride),
-                ("DYN_TREE", treeMeta != nil),
-            ]
-            let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+            let allocatesScratch = partials == nil
+            var inputs: [MLXArray] = []
+            inputs.reserveCapacity(9 + bindingCount + (allocatesScratch ? 0 : 2))
+            inputs.append(q)
+            inputs.append(k)
+            inputs.append(v)
+            for segmentID in bucket.segmentIDs {
+                inputs.append(group.segments[segmentID]!.storage)
+            }
+            let firstBinding = inputs[3]
+            inputs.append(contentsOf: repeatElement(
+                firstBinding, count: bindingCount - bucket.segmentIDs.count))
+            inputs.append(seqinfo)
+            inputs.append(params)
+            inputs.append(group.writeFence)
+            inputs.append(metadata.valueOffsets)
+            inputs.append(metadata.records)
+            inputs.append(boundTreeMeta)
             if let partials, let meta {
-                group.writeFence =
-                    kernel(
-                        key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
-                        inputs + [partials, meta], template: template, grid: grid,
-                        threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[
-                        0]
+                inputs.append(partials)
+                inputs.append(meta)
+            }
+            let launchID = PartLaunchID(
+                kernel: PartKernelID(
+                    key: partKey, bindings: bindingCount, kvHeads: kvh,
+                    allocatesScratch: allocatesScratch),
+                workCount: bucket.workCount, scratchRows: allocatesScratch ? b : 0,
+                scratchPartitions: allocatesScratch ? plan.maxPartitions : 0,
+                dynamicTree: dynamicTree)
+            let outputs: [MLXArray]
+            if cacheLaunches, let launch = lock.withLock({ partLaunches[launchID] }) {
+                outputs = launch(inputs)
             } else {
-                let outputs = kernel(
+                let template: [(String, any KernelTemplateArg)] = [
+                    ("T", dtype), ("D", d), ("S", group.pageSize),
+                    ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
+                    ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
+                    ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("DYN_TREE", dynamicTree),
+                ]
+                let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+                let threads = (32 * nsg, 1, 1)
+                let shapes = allocatesScratch ? [[1], partialsShape, [metaCount]] : [[1]]
+                let dtypes: [DType] = allocatesScratch ? [.int32, .float32, .float32] : [.int32]
+                let part = kernel(
                     key: partKey, bindings: bindingCount, kvHeads: kvh, source: source,
-                    allocatesScratch: true)(
-                        inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
-                        outputShapes: [[1], partialsShape, [metaCount]],
-                        outputDTypes: [.int32, .float32, .float32])
-                group.writeFence = outputs[0]
+                    allocatesScratch: allocatesScratch)
+                if cacheLaunches {
+                    let launch = part.prepare(
+                        template: template, grid: grid, threadGroup: threads,
+                        outputShapes: shapes, outputDTypes: dtypes)
+                    lock.withLock {
+                        if partLaunches.count < launchLimit { partLaunches[launchID] = launch }
+                    }
+                    outputs = launch(inputs)
+                } else {
+                    outputs = part(
+                        inputs, template: template, grid: grid, threadGroup: threads,
+                        outputShapes: shapes, outputDTypes: dtypes)
+                }
+            }
+            group.writeFence = outputs[0]
+            if allocatesScratch {
                 partials = outputs[1]
                 meta = outputs[2]
             }
@@ -372,13 +455,28 @@ enum PagedSegmentAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
-        return mergeKernel(key: mergeKey, source: source)(
-            [partials!, meta!, seqinfo, mergeSinks, group.writeFence, treeMeta ?? dummyTreeMeta],
-            template: [
-                ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
-                ("DYN_TREE", treeMeta != nil),
-            ],
-            grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
+        let mergeInputs = [partials!, meta!, seqinfo, mergeSinks, group.writeFence, boundTreeMeta]
+        let mergeID = MergeLaunchID(
+            kernel: mergeKey, rows: b, queryHeads: qh, dynamicTree: dynamicTree)
+        if cacheLaunches, let launch = lock.withLock({ mergeLaunches[mergeID] }) {
+            return launch(mergeInputs)[0]
+        }
+        let merge = mergeKernel(key: mergeKey, source: source)
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
+            ("DYN_TREE", dynamicTree),
+        ]
+        if cacheLaunches {
+            let launch = merge.prepare(
+                template: template, grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[b, qh, d]], outputDTypes: [dtype])
+            lock.withLock {
+                if mergeLaunches.count < launchLimit { mergeLaunches[mergeID] = launch }
+            }
+            return launch(mergeInputs)[0]
+        }
+        return merge(
+            mergeInputs, template: template, grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
     }
 }
