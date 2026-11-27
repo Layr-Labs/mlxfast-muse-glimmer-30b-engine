@@ -862,6 +862,9 @@ extension EngineLoopV2 {
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        CBv2DraftRegime.pastFirstRound =
+            batch == 1 && mtp.isPastFirstRound(verifyRows[0].rec.id)
+        defer { CBv2DraftRegime.pastFirstRound = false }
         CBv2DraftRegime.xnorDraftHeadEligible =
             batch == 1 && mtp.inDeepLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }

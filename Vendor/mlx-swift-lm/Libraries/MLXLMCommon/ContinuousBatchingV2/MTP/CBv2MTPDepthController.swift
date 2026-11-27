@@ -626,15 +626,22 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let deepLowAcceptanceThreshold: Double = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
+    static let deepLowCommittedMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_MIN_ROUNDS"].flatMap(Int.init)
+            ?? 6
+    }()
+    static let deepLowCommittedPerRoundThreshold: Double = {
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_COMMITTED_THRESHOLD"].flatMap(Double.init)
+            ?? 3.9
+    }()
 
-    /// Stricter low-acceptance gate for approximate Stage-1 draft-head screening:
-    /// requires at least `deepLowAcceptanceMinRounds` fully observed rounds and an
-    /// EWMA acceptance fraction strictly below `deepLowAcceptanceThreshold`, so
-    /// high-acceptance windows with a transient early dip never invoke approximate
-    /// Stage-1 screening.
     var isDeepLowAcceptanceRegime: Bool {
-        observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
+            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
+            || (inLowAcceptanceRegime
+                && ceilingRounds >= Self.deepLowCommittedMinRounds
+                && Double(ceilingCommittedTokens)
+                    < Self.deepLowCommittedPerRoundThreshold * Double(ceilingRounds))
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
