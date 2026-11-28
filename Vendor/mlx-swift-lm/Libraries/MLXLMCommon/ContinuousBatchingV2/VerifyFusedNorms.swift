@@ -34,6 +34,12 @@ public protocol CBv2FusedVerifyReadoutForwarding: CBv2FusedVerifyForwarding {
         )?
 }
 
+package protocol CBv2FusedVerifyTargetForwarding: CBv2FusedVerifyReadoutForwarding {
+    func fusedVerifyForwardReadoutWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], includeTargetIDs: Bool
+    ) -> (readout: CBv2TopTwoReadout, lastHidden: MLXArray)?
+}
+
 public enum VerifyFusedNorms {
     /// `DARKBLOOM_VERIFY_FUSED_NORMS=0` turns the fused verify forward off.
     public static let enabled: Bool =
