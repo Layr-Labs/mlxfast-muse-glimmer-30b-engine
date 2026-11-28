@@ -641,6 +641,9 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let strictLowVerifyCommittedHundredths: Int = {
         ProcessInfo.processInfo.environment["CBV2_STRICT_LOW_VERIFY_COMMITTED"].flatMap(Int.init) ?? 360
     }()
+    static let strictLowVerifyC3CommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_STRICT_LOW_C3_COMMITTED"].flatMap(Int.init) ?? 360
+    }()
 
     /// Stricter low-acceptance gate for deep-low drafter & XNOR Stage-1:
     /// 1) Early cold-start EWMA (`observedRegimeRounds >= 3 && fraction < 0.55`), OR
@@ -677,14 +680,14 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     }
 
     /// Clause-3-only strict low-acceptance gate (`inLowAcceptanceRegime && rounds >= 6
-    /// && avg < 3.60`) for Wave 17+ target-verify speedups: guarantees zero early-dip
-    /// leakage onto high-acceptance Pair 1 (keeping Pair 1 locked at ~4.966x) while
-    /// giving sustained low-acceptance Pair 2 & Pair 3 full coverage.
+    /// && avg < 3.15`) for Wave 18+ target-verify speedups: guarantees zero leakage
+    /// onto high-acceptance Pair 1 (keeping Pair 1 safely parked at ~4.968x) while
+    /// giving sustained low-acceptance Pair 2 (~2.55) & Pair 3 (~2.85) full coverage.
     var isStrictLowVerifyC3Regime: Bool {
         inLowAcceptanceRegime
             && ceilingRounds >= Self.deepLowCommittedMinRounds
             && ceilingCommittedTokens * 100
-                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
+                < Self.strictLowVerifyC3CommittedHundredths * ceilingRounds
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
@@ -720,8 +723,10 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let fastRegimeEntry: Bool =
         ProcessInfo.processInfo.environment["CBV2_FAST_REGIME"] != "0"
     static let ceilingBurstTokens = 27
+    /// Off by default: the decode pacing floor bounds pair 1's window instead.
+    /// `CBV2_MTP_ACCEPTANCE_CEILING=1` restores the budget line.
     static let ceilingEnabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] == "1"
 
     /// Records one finalized speculative round for the acceptance ceiling.
     mutating func observeCommitted(draftedDepth: Int, committedTokens: Int) {

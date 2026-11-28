@@ -352,43 +352,71 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         wq[tm] = *(const device uint*)(rows + tm * K + bn);
                     }
-                    T inter[TM][TN];
-                    CBV2_SP_UNROLL
-                    for (int tm = 0; tm < TM; tm++) {
-                        const uint w = wq[tm];
-                        if constexpr (DV_MODE == 2) {
-                            const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-                            const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                            inter[tm][0] = static_cast<T>(f02.x);
-                            inter[tm][1] = static_cast<T>(f13.x);
-                            inter[tm][2] = static_cast<T>(f02.y);
-                            inter[tm][3] = static_cast<T>(f13.y);
-                        } else {
-                            CBV2_SP_UNROLL
-                            for (int tn = 0; tn < TN; tn++) {
-                                const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
-                                const float decoded =
-                                    (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                    if constexpr (DV_MODE == 2 && TM == 2) {
+                        const uint w0 = wq[0], w1 = wq[1];
+                        const float2 a0 = float2(as_type<half2>(((w0 & 0x007F007Fu) << 7) | ((w0 & 0x00800080u) << 8))) * dscale;
+                        const float2 b0 = float2(as_type<half2>(((w0 >> 1) & 0x3F803F80u) | (w0 & 0x80008000u))) * dscale;
+                        const float2 a1 = float2(as_type<half2>(((w1 & 0x007F007Fu) << 7) | ((w1 & 0x00800080u) << 8))) * dscale;
+                        const float2 b1 = float2(as_type<half2>(((w1 >> 1) & 0x3F803F80u) | (w1 & 0x80008000u))) * dscale;
+                        const float2 wf0 = float2(static_cast<float>(static_cast<T>(a0.x)), static_cast<float>(static_cast<T>(a1.x)));
+                        const float2 wf1 = float2(static_cast<float>(static_cast<T>(b0.x)), static_cast<float>(static_cast<T>(b1.x)));
+                        const float2 wf2 = float2(static_cast<float>(static_cast<T>(a0.y)), static_cast<float>(static_cast<T>(a1.y)));
+                        const float2 wf3 = float2(static_cast<float>(static_cast<T>(b0.y)), static_cast<float>(static_cast<T>(b1.y)));
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (it + 1 < n_iter && int(simd_gid) < V) {
+                            s_av[nxt * BUF_STRIDE + simd_gid * 32u + simd_lid] =
+                                *(const device ushort4*)(in_vec + simd_gid * K + bn + blockN);
+                        }
+                        CBV2_SP_UNROLL
+                        for (int v = 0; v < V; v++) {
+                            const float4 av = float4(as_type<vec<T, 4>>(s_av[cur * BUF_STRIDE + v * 32 + simd_lid]));
+                            float2 rv = float2(r[v * 2 + 0], r[v * 2 + 1]);
+                            rv = fma(wf0, av.x, rv);
+                            rv = fma(wf1, av.y, rv);
+                            rv = fma(wf2, av.z, rv);
+                            rv = fma(wf3, av.w, rv);
+                            r[v * 2 + 0] = rv.x;
+                            r[v * 2 + 1] = rv.y;
+                        }
+                    } else {
+                        T inter[TM][TN];
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            const uint w = wq[tm];
+                            if constexpr (DV_MODE == 2) {
+                                const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                                const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                                const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                                const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                                inter[tm][0] = static_cast<T>(f02.x);
+                                inter[tm][1] = static_cast<T>(f13.x);
+                                inter[tm][2] = static_cast<T>(f02.y);
+                                inter[tm][3] = static_cast<T>(f13.y);
+                            } else {
+                                CBV2_SP_UNROLL
+                                for (int tn = 0; tn < TN; tn++) {
+                                    const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
+                                    const float decoded =
+                                        (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                                    inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                                }
                             }
                         }
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (it + 1 < n_iter && int(simd_gid) < V) {
-                        s_av[nxt * BUF_STRIDE + simd_gid * 32u + simd_lid] =
-                            *(const device ushort4*)(in_vec + simd_gid * K + bn + blockN);
-                    }
-                    CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
-                        const ushort4 av_v = s_av[cur * BUF_STRIDE + v * 32 + simd_lid];
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (it + 1 < n_iter && int(simd_gid) < V) {
+                            s_av[nxt * BUF_STRIDE + simd_gid * 32u + simd_lid] =
+                                *(const device ushort4*)(in_vec + simd_gid * K + bn + blockN);
+                        }
                         CBV2_SP_UNROLL
-                        for (int tn = 0; tn < TN; tn++) {
-                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                        for (int v = 0; v < V; v++) {
+                            const ushort4 av_v = s_av[cur * BUF_STRIDE + v * 32 + simd_lid];
                             CBV2_SP_UNROLL
-                            for (int tm = 0; tm < TM; tm++) {
-                                r[v * TM + tm] += inter[tm][tn] * a;
+                            for (int tn = 0; tn < TN; tn++) {
+                                const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                                CBV2_SP_UNROLL
+                                for (int tm = 0; tm < TM; tm++) {
+                                    r[v * TM + tm] += inter[tm][tn] * a;
+                                }
                             }
                         }
                     }
@@ -687,6 +715,30 @@ public enum CBv2SmallProjection {
             float r[P2];
             CBV2_SP_UNROLL
             for (int i = 0; i < P2; i++) { r[i] = 0; }
+            #define CBV2_FP8_TM4_FMA(WQ, DS0, DS1, XV, XN) { \\
+                const uint w0 = (WQ)[0], w1 = (WQ)[1], w2 = (WQ)[2], w3 = (WQ)[3]; \\
+                const float2 a0 = float2(as_type<half2>(((w0 & 0x007F007Fu) << 7) | ((w0 & 0x00800080u) << 8))) * (DS0); \\
+                const float2 b0 = float2(as_type<half2>(((w0 >> 1) & 0x3F803F80u) | (w0 & 0x80008000u))) * (DS0); \\
+                const float2 a1 = float2(as_type<half2>(((w1 & 0x007F007Fu) << 7) | ((w1 & 0x00800080u) << 8))) * (DS0); \\
+                const float2 b1 = float2(as_type<half2>(((w1 >> 1) & 0x3F803F80u) | (w1 & 0x80008000u))) * (DS0); \\
+                const float2 a2 = float2(as_type<half2>(((w2 & 0x007F007Fu) << 7) | ((w2 & 0x00800080u) << 8))) * (DS1); \\
+                const float2 b2 = float2(as_type<half2>(((w2 >> 1) & 0x3F803F80u) | (w2 & 0x80008000u))) * (DS1); \\
+                const float2 a3 = float2(as_type<half2>(((w3 & 0x007F007Fu) << 7) | ((w3 & 0x00800080u) << 8))) * (DS1); \\
+                const float2 b3 = float2(as_type<half2>(((w3 >> 1) & 0x3F803F80u) | (w3 & 0x80008000u))) * (DS1); \\
+                const float4 wf0 = float4(static_cast<float>(static_cast<T>(a0.x)), static_cast<float>(static_cast<T>(a1.x)), static_cast<float>(static_cast<T>(a2.x)), static_cast<float>(static_cast<T>(a3.x))); \\
+                const float4 wf1 = float4(static_cast<float>(static_cast<T>(b0.x)), static_cast<float>(static_cast<T>(b1.x)), static_cast<float>(static_cast<T>(b2.x)), static_cast<float>(static_cast<T>(b3.x))); \\
+                const float4 wf2 = float4(static_cast<float>(static_cast<T>(a0.y)), static_cast<float>(static_cast<T>(a1.y)), static_cast<float>(static_cast<T>(a2.y)), static_cast<float>(static_cast<T>(a3.y))); \\
+                const float4 wf3 = float4(static_cast<float>(static_cast<T>(b0.y)), static_cast<float>(static_cast<T>(b1.y)), static_cast<float>(static_cast<T>(b2.y)), static_cast<float>(static_cast<T>(b3.y))); \\
+                CBV2_SP_UNROLL for (int v = 0; v < V; v++) { \\
+                    const float4 av = float4(*(const device vec<T, 4>*)((XV) + size_t(v) * K + (XN))); \\
+                    float4 rv = float4(r[v * 4 + 0], r[v * 4 + 1], r[v * 4 + 2], r[v * 4 + 3]); \\
+                    rv = fma(wf0, av.x, rv); \\
+                    rv = fma(wf1, av.y, rv); \\
+                    rv = fma(wf2, av.z, rv); \\
+                    rv = fma(wf3, av.w, rv); \\
+                    r[v * 4 + 0] = rv.x; r[v * 4 + 1] = rv.y; r[v * 4 + 2] = rv.z; r[v * 4 + 3] = rv.w; \\
+                } \\
+            }
             if constexpr (PEEL && n_iter > 0) {
                 uint wq[TM];
                 CBV2_SP_UNROLL
@@ -699,60 +751,12 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         wn[tm] = *(const device uint*)(rows + tm * K + bn + blockN);
                     }
-                    T inter[TM][TN];
-                    CBV2_SP_UNROLL
-                    for (int tm = 0; tm < TM; tm++) {
-                        const uint w = wq[tm];
-                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                        inter[tm][0] = static_cast<T>(f02.x);
-                        inter[tm][1] = static_cast<T>(f13.x);
-                        inter[tm][2] = static_cast<T>(f02.y);
-                        inter[tm][3] = static_cast<T>(f13.y);
-                    }
-                    CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
-                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
-                        CBV2_SP_UNROLL
-                        for (int tn = 0; tn < TN; tn++) {
-                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
-                            CBV2_SP_UNROLL
-                            for (int tm = 0; tm < TM; tm++) {
-                                r[v * TM + tm] += inter[tm][tn] * a;
-                            }
-                        }
-                    }
+                    CBV2_FP8_TM4_FMA(wq, dscale, dscale, in_vec, bn)
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) { wq[tm] = wn[tm]; }
                     bn += blockN;
                 }
-                T inter[TM][TN];
-                CBV2_SP_UNROLL
-                for (int tm = 0; tm < TM; tm++) {
-                    const uint w = wq[tm];
-                    const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-                    const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                    const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                    const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                    inter[tm][0] = static_cast<T>(f02.x);
-                    inter[tm][1] = static_cast<T>(f13.x);
-                    inter[tm][2] = static_cast<T>(f02.y);
-                    inter[tm][3] = static_cast<T>(f13.y);
-                }
-                CBV2_SP_UNROLL
-                for (int v = 0; v < V; v++) {
-                    const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
-                    CBV2_SP_UNROLL
-                    for (int tn = 0; tn < TN; tn++) {
-                        const float a = static_cast<float>(as_type<T>(av_v[tn]));
-                        CBV2_SP_UNROLL
-                        for (int tm = 0; tm < TM; tm++) {
-                            r[v * TM + tm] += inter[tm][tn] * a;
-                        }
-                    }
-                }
+                CBV2_FP8_TM4_FMA(wq, dscale, dscale, in_vec, bn)
                 bn += blockN;
             } else {
                 for (int it = 0; it < n_iter; it++) {
@@ -761,31 +765,7 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         wq[tm] = *(const device uint*)(rows + tm * K + bn);
                     }
-                    T inter[TM][TN];
-                    CBV2_SP_UNROLL
-                    for (int tm = 0; tm < TM; tm++) {
-                        const uint w = wq[tm];
-                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                        inter[tm][0] = static_cast<T>(f02.x);
-                        inter[tm][1] = static_cast<T>(f13.x);
-                        inter[tm][2] = static_cast<T>(f02.y);
-                        inter[tm][3] = static_cast<T>(f13.y);
-                    }
-                    CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
-                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
-                        CBV2_SP_UNROLL
-                        for (int tn = 0; tn < TN; tn++) {
-                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
-                            CBV2_SP_UNROLL
-                            for (int tm = 0; tm < TM; tm++) {
-                                r[v * TM + tm] += inter[tm][tn] * a;
-                            }
-                        }
-                    }
+                    CBV2_FP8_TM4_FMA(wq, dscale, dscale, in_vec, bn)
                     bn += blockN;
                 }
             }
@@ -796,31 +776,7 @@ public enum CBv2SmallProjection {
                     for (int tm = 0; tm < TM; tm++) {
                         wq[tm] = *(const device uint*)(rows + tm * K + bn);
                     }
-                    T inter[TM][TN];
-                    CBV2_SP_UNROLL
-                    for (int tm = 0; tm < TM; tm++) {
-                        const uint w = wq[tm];
-                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
-                        inter[tm][0] = static_cast<T>(f02.x);
-                        inter[tm][1] = static_cast<T>(f13.x);
-                        inter[tm][2] = static_cast<T>(f02.y);
-                        inter[tm][3] = static_cast<T>(f13.y);
-                    }
-                    CBV2_SP_UNROLL
-                    for (int v = 0; v < V; v++) {
-                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
-                        CBV2_SP_UNROLL
-                        for (int tn = 0; tn < TN; tn++) {
-                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
-                            CBV2_SP_UNROLL
-                            for (int tm = 0; tm < TM; tm++) {
-                                r[v * TM + tm] += inter[tm][tn] * a;
-                            }
-                        }
-                    }
+                    CBV2_FP8_TM4_FMA(wq, dscale, dscale, in_vec, bn)
                 } else {
                     const float nan_value = metal::numeric_limits<float>::quiet_NaN();
                     T inter[TM][TN];
@@ -851,6 +807,7 @@ public enum CBv2SmallProjection {
                     }
                 }
             }
+            #undef CBV2_FP8_TM4_FMA
             const ushort lid = ushort(simd_lid);
             cbv2_sp_tree_step<P2, 16>(r, lid);
             cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
@@ -996,7 +953,7 @@ public enum CBv2SmallProjection {
                 }
             }
             body += """
-                cbv2_sp_fp8_tm4<T, K, V, (K >= 16384)>(m, ws, in_v, y, nseg, nout, lt, sg, sl, sp_tgp);
+                cbv2_sp_fp8_tm4<T, K, V, true>(m, ws, in_v, y, nseg, nout, lt, sg, sl, sp_tgp);
                 """
             let name = "cbv2_small_fp8_" + stableName(body)
             let kernel = MLXFast.metalKernel(
@@ -1072,6 +1029,9 @@ public enum CBv2SmallProjection {
     /// `CBV2_FP8_TM4=0` disables single-body TM=4 RG=1 pure-SPLIT FP8 verify kernels on strict-C3 low-acceptance rows >= 5.
     public static let fp8TM4Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_TM4"] != "0"
+    /// `CBV2_FP8_FUSED_GU_SILU=0` disables fused TM=4 FP8 `gate_up + SiLU + FP8 cast` on strict-C3 low-acceptance rows >= 5.
+    public static let fp8FusedGateUpSiluEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_FUSED_GU_SILU"] != "0"
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -1144,6 +1104,263 @@ public enum CBv2SmallProjection {
         var dense: [DenseGroupPlanKey: DenseGroupPlan] = [:]
         var sharedCast: [SharedCastKey: (multipliers: MLXArray, overflowBound: MLXArray)?] = [:]
         var branchlessSafe: Set<ObjectIdentifier> = []
+        var fusedGULaunches: [FP8FusedGULaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var fusedGUPlans: [FP8FusedGUPlanKey: FP8FusedGUPlan] = [:]
+    }
+
+    private struct FP8FusedGULaunchKey: Hashable {
+        let inputs: Int
+        let rows: Int
+        let outputs: Int
+    }
+
+    private struct FP8FusedGUPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let downID: ObjectIdentifier
+        let inputs: Int
+        let rows: Int
+    }
+
+    private struct FP8FusedGUPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let outputs: Int
+    }
+
+    static let fusedSiluCastHeader = """
+
+        inline bfloat16_t cbv2_sp_bf16_sigmoid(bfloat16_t x) {
+            const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            const bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t one = bfloat16_t(1.0f);
+            const bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+
+        inline bfloat16_t cbv2_sp_bf16_cast_fp8(
+            bfloat16_t yb, float m0, float m1, float bound, float nan_value
+        ) {
+            const float scaled = static_cast<float>(yb) * m0;
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+            return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+        }
+
+        """
+
+    static let fp8FusedGateUpSiluSource = """
+        constexpr int TM = 4;
+        constexpr int BN = 8;
+        constexpr int TN = 4;
+        constexpr int blockN = BN * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        static_assert(V >= 5 && V <= 8, "5..8 rows");
+        constexpr int P2 = 32;
+        threadgroup float sp_tgp[8 * 32];
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint g = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        const int out_row = tile * 2;
+        int bn = (32 * int(g) + int(sl)) * TN;
+        const float ws_g = ws0[0];
+        const float ws_u = ws1[0];
+        const float dscale0 = ws_g * 256.0f;
+        const float dscale1 = ws_u * 256.0f;
+        const device uint8_t* r0 = m0 + size_t(out_row) * K;
+        const device uint8_t* r1 = m1 + size_t(out_row) * K;
+        float r[P2];
+        CBV2_SP_UNROLL
+        for (int i = 0; i < P2; i++) { r[i] = 0.0f; }
+        #define CBV2_FP8_GU_FMA(WQ, XN) { \\
+            const uint w0 = (WQ)[0], w1 = (WQ)[1], w2 = (WQ)[2], w3 = (WQ)[3]; \\
+            const float2 a0 = float2(as_type<half2>(((w0 & 0x007F007Fu) << 7) | ((w0 & 0x00800080u) << 8))) * dscale0; \\
+            const float2 b0 = float2(as_type<half2>(((w0 >> 1) & 0x3F803F80u) | (w0 & 0x80008000u))) * dscale0; \\
+            const float2 a1 = float2(as_type<half2>(((w1 & 0x007F007Fu) << 7) | ((w1 & 0x00800080u) << 8))) * dscale0; \\
+            const float2 b1 = float2(as_type<half2>(((w1 >> 1) & 0x3F803F80u) | (w1 & 0x80008000u))) * dscale0; \\
+            const float2 a2 = float2(as_type<half2>(((w2 & 0x007F007Fu) << 7) | ((w2 & 0x00800080u) << 8))) * dscale1; \\
+            const float2 b2 = float2(as_type<half2>(((w2 >> 1) & 0x3F803F80u) | (w2 & 0x80008000u))) * dscale1; \\
+            const float2 a3 = float2(as_type<half2>(((w3 & 0x007F007Fu) << 7) | ((w3 & 0x00800080u) << 8))) * dscale1; \\
+            const float2 b3 = float2(as_type<half2>(((w3 >> 1) & 0x3F803F80u) | (w3 & 0x80008000u))) * dscale1; \\
+            const float4 wf0 = float4(static_cast<float>(static_cast<bfloat16_t>(a0.x)), static_cast<float>(static_cast<bfloat16_t>(a1.x)), static_cast<float>(static_cast<bfloat16_t>(a2.x)), static_cast<float>(static_cast<bfloat16_t>(a3.x))); \\
+            const float4 wf1 = float4(static_cast<float>(static_cast<bfloat16_t>(b0.x)), static_cast<float>(static_cast<bfloat16_t>(b1.x)), static_cast<float>(static_cast<bfloat16_t>(b2.x)), static_cast<float>(static_cast<bfloat16_t>(b3.x))); \\
+            const float4 wf2 = float4(static_cast<float>(static_cast<bfloat16_t>(a0.y)), static_cast<float>(static_cast<bfloat16_t>(a1.y)), static_cast<float>(static_cast<bfloat16_t>(a2.y)), static_cast<float>(static_cast<bfloat16_t>(a3.y))); \\
+            const float4 wf3 = float4(static_cast<float>(static_cast<bfloat16_t>(b0.y)), static_cast<float>(static_cast<bfloat16_t>(b1.y)), static_cast<float>(static_cast<bfloat16_t>(b2.y)), static_cast<float>(static_cast<bfloat16_t>(b3.y))); \\
+            CBV2_SP_UNROLL for (int v = 0; v < V; v++) { \\
+                const float4 av = float4(*(const device vec<bfloat16_t, 4>*)(xc + size_t(v) * K + (XN))); \\
+                float4 rv = float4(r[v * 4 + 0], r[v * 4 + 1], r[v * 4 + 2], r[v * 4 + 3]); \\
+                rv = fma(wf0, av.x, rv); \\
+                rv = fma(wf1, av.y, rv); \\
+                rv = fma(wf2, av.z, rv); \\
+                rv = fma(wf3, av.w, rv); \\
+                r[v * 4 + 0] = rv.x; r[v * 4 + 1] = rv.y; r[v * 4 + 2] = rv.z; r[v * 4 + 3] = rv.w; \\
+            } \\
+        }
+        if constexpr (n_iter > 0) {
+            uint wq[TM];
+            wq[0] = *(const device uint*)(r0 + bn);
+            wq[1] = *(const device uint*)(r0 + K + bn);
+            wq[2] = *(const device uint*)(r1 + bn);
+            wq[3] = *(const device uint*)(r1 + K + bn);
+            for (int it = 0; it < n_iter - 1; it++) {
+                uint wn[TM];
+                wn[0] = *(const device uint*)(r0 + bn + blockN);
+                wn[1] = *(const device uint*)(r0 + K + bn + blockN);
+                wn[2] = *(const device uint*)(r1 + bn + blockN);
+                wn[3] = *(const device uint*)(r1 + K + bn + blockN);
+                CBV2_FP8_GU_FMA(wq, bn)
+                wq[0] = wn[0]; wq[1] = wn[1]; wq[2] = wn[2]; wq[3] = wn[3];
+                bn += blockN;
+            }
+            CBV2_FP8_GU_FMA(wq, bn)
+            bn += blockN;
+        }
+        if constexpr (leftover > 0) {
+            if (bn + TN <= K) {
+                uint wq[TM];
+                wq[0] = *(const device uint*)(r0 + bn);
+                wq[1] = *(const device uint*)(r0 + K + bn);
+                wq[2] = *(const device uint*)(r1 + bn);
+                wq[3] = *(const device uint*)(r1 + K + bn);
+                CBV2_FP8_GU_FMA(wq, bn)
+            } else {
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                bfloat16_t inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const device uint8_t* src_row = (tm < 2) ? (r0 + size_t(tm) * K) : (r1 + size_t(tm - 2) * K);
+                    const float ws_cur = (tm < 2) ? ws_g : ws_u;
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        if (bn + tn < K) {
+                            const uint8_t code = src_row[bn + tn];
+                            const float decoded =
+                                (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                            inter[tm][tn] = static_cast<bfloat16_t>(decoded * ws_cur);
+                        } else {
+                            inter[tm][tn] = bfloat16_t(0);
+                        }
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = bn + tn < K ? static_cast<float>(xc[size_t(v) * K + bn + tn]) : 0.0f;
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                    }
+                }
+            }
+        }
+        #undef CBV2_FP8_GU_FMA
+        const ushort lid = ushort(sl);
+        cbv2_sp_tree_step<32, 16>(r, lid);
+        cbv2_sp_tree_step<16, 8>(r, lid);
+        cbv2_sp_tree_step<8, 4>(r, lid);
+        cbv2_sp_tree_step<4, 2>(r, lid);
+        cbv2_sp_tree_step<2, 1>(r, lid);
+        sp_tgp[g * 32u + sl] = r[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g == 0u) {
+            float result = r[0];
+            for (int s = 1; s < BN; s++) {
+                result += sp_tgp[s * 32 + int(sl)];
+            }
+            const bfloat16_t val = static_cast<bfloat16_t>(result);
+            const ushort partner_bits = simd_shuffle_xor(as_type<ushort>(val), ushort(2));
+            if (int(sl) < V * 4 && (sl & 2u) == 0u) {
+                const bfloat16_t uval = as_type<bfloat16_t>(partner_bits);
+                const bfloat16_t act = (val * cbv2_sp_bf16_sigmoid(val)) * uval;
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                y[size_t(sl >> 2) * N + out_row + int(sl & 1u)] =
+                    cbv2_sp_bf16_cast_fp8(act, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_value);
+            }
+        }
+        """
+
+    private static let fp8FusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_fused_gu_silu_cast",
+        inputNames: ["m0", "ws0", "m1", "ws1", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8FusedGateUpSiluSource,
+        header: ModelOptActivationKernels.header + fp8Helper + fusedSiluCastHeader)
+
+    /// Fused TM=4 FP8 `fp8Cast(silu(gate(preCast)) * up(preCast))` for pure-SPLIT
+    /// FP8 MLPs on strict-C3 low-acceptance verify rounds (`rows in 5...8`).
+    /// Preserves the exact 9,984-TG grid while eliminating the intermediate `[V, N]`
+    /// gate/up round-trip and separate `fusedSiluProductCastFP8` dispatch.
+    public static func fp8FusedGateUpSiluCastFP8(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear, preCast: MLXArray,
+        downLayer: ModelOptCalibratedLinear
+    ) -> MLXArray? {
+        guard fp8FusedGateUpSiluEnabled, branchlessDVEnabled,
+            rowsPerThreadOverride == nil, prefetchOverride == nil,
+            ModelOptRowExact.geometryOverride == nil
+        else { return nil }
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        guard lowVerify, CBv2DraftRegime.verifyC3Kernels else { return nil }
+        let inputs = preCast.dim(-1)
+        guard inputs > 0, preCast.dtype == .bfloat16 else { return nil }
+        let rows = preCast.size / inputs
+        guard (5 ... maximumRows).contains(rows) else { return nil }
+        let pkey = FP8FusedGUPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+            downID: ObjectIdentifier(downLayer), inputs: inputs, rows: rows)
+        if let plan = fastLock.withLockUnchecked({ $0.fusedGUPlans[pkey] }) {
+            var args = plan.weightArrays
+            args += [preCast.reshaped(rows, inputs), plan.fp8Mu, plan.fp8Bound]
+            let raw = plan.launch(args)[0]
+            if preCast.ndim == 3 {
+                return raw.reshaped(preCast.dim(0), preCast.dim(1), plan.outputs)
+            }
+            return raw.reshaped(Array(preCast.shape.dropLast()) + [plan.outputs])
+        }
+        guard fp8Takes(gate, inputs: inputs, dtype: .bfloat16),
+            fp8Takes(up, inputs: inputs, dtype: .bfloat16),
+            gate.outputDimensions == up.outputDimensions,
+            gate.outputDimensions >= 2, gate.outputDimensions % 2 == 0,
+            allBranchlessSafe([gate, up]),
+            fp8Runs(gate).allSatisfy(\.split), fp8Runs(up).allSatisfy(\.split),
+            downLayer.format == .fp8,
+            let downConstants = downLayer.graphConstants,
+            case .fp8(let fp8Mu, let fp8Bound) = downConstants.storage
+        else { return nil }
+        let outputs = gate.outputDimensions
+        let lkey = FP8FusedGULaunchKey(inputs: inputs, rows: rows, outputs: outputs)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = fastLock.withLockUnchecked({ $0.fusedGULaunches[lkey] }) {
+            launch = hit
+        } else {
+            let tiles = outputs / 2
+            let made = fp8FusedGateUpSiluKernel.prepare(
+                template: [("K", inputs), ("V", rows), ("N", outputs)],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [.bfloat16])
+            fastLock.withLockUnchecked { $0.fusedGULaunches[lkey] = made }
+            launch = made
+        }
+        let weightArrays = [
+            gate.weight, gate.graphConstants!.outputScale,
+            up.weight, up.graphConstants!.outputScale,
+        ]
+        let plan = FP8FusedGUPlan(
+            launch: launch, weightArrays: weightArrays, fp8Mu: fp8Mu, fp8Bound: fp8Bound,
+            outputs: outputs)
+        fastLock.withLockUnchecked { $0.fusedGUPlans[pkey] = plan }
+        var args = weightArrays
+        args += [preCast.reshaped(rows, inputs), fp8Mu, fp8Bound]
+        let raw = launch(args)[0]
+        if preCast.ndim == 3 {
+            return raw.reshaped(preCast.dim(0), preCast.dim(1), outputs)
+        }
+        return raw.reshaped(Array(preCast.shape.dropLast()) + [outputs])
     }
 
     private static let fastLock = OSAllocatedUnfairLock(initialState: FastFP8CacheBox())
@@ -1311,8 +1528,8 @@ public enum CBv2SmallProjection {
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1456,8 +1673,8 @@ public enum CBv2SmallProjection {
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -2028,7 +2245,7 @@ public enum CBv2SmallProjection {
             return nil
         }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
