@@ -610,6 +610,30 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, preCastFP8, CBv2DraftRegime.strictLowVerifyEligible, let rows = verifyRows(x),
+            let gate = mlp.gateProj as? ModelOptCalibratedLinear,
+            let up = mlp.upProj as? ModelOptCalibratedLinear,
+            let down = mlp.downProj as? ModelOptCalibratedLinear,
+            let fused = CBv2SmallProjection.pairedFP8FeedPreCast(
+                gate: gate, up: up, down: down, preCast: x)
+        {
+            let useSmallDown = rows < 6 || MuseGlimmerVerifyProjections.fp8DownSmallEnabled
+            let projected: MLXArray? =
+                useSmallDown
+                ? CBv2SmallProjection.fp8ProductsPreCast([down], preCast: fused)?.first
+                : CBv2VerifyScales.fp8ProductPreCast(down, preCast: fused)
+            if let projected {
+                if MuseGlimmerVerifyProjections.selfTest,
+                    let separate = CBv2SmallProjection.fp8ProductsPreCast([gate, up], preCast: x),
+                    let reference = VerifyFusedNorms.fusedSiluProductCastFP8(
+                        gate: separate[0], up: separate[1], layer: down)
+                {
+                    MuseGlimmerVerifyProjections.requireEqualBits(
+                        [fused], [reference], kind: "fp8.pairedfeed", rows: rows)
+                }
+                return projected
+            }
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -1045,6 +1069,10 @@ extension MuseGlimmerTextModel {
                 let w = inputs(mlp.gateProj)
             {
                 _ = CBv2SmallProjection.sharedFP8CastParams(fp8Feed, inputs: w, dtype: dtype)
+                if let down = mlp.downProj as? ModelOptCalibratedLinear {
+                    CBv2SmallProjection.warmPairedFP8Feed(
+                        gate: fp8Feed[0], up: fp8Feed[1], down: down, dtype: dtype)
+                }
             }
             if let fp8Out = a.outputProj as? ModelOptCalibratedLinear,
                 let w = inputs(a.outputProj)

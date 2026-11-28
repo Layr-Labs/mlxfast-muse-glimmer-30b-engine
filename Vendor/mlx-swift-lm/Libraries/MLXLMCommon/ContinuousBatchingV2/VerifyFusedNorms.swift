@@ -564,7 +564,7 @@ public enum VerifyFusedNorms {
     public static let fusedElementwiseFP8Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_ELEM_FP8"] != "0"
 
-    private static let elemFP8Header = """
+    static let elemFP8Header = """
         inline bfloat16_t verify_bf16_sigmoid(bfloat16_t x) {
           bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
           bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));

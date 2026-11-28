@@ -261,7 +261,7 @@ public enum CBv2SmallProjection {
         }
         """
 
-    static let fp8Helper = """
+    static let fp8Helper = VerifyFusedNorms.elemFP8Header + """
 
         #define CBV2_SP_UNROLL _Pragma("clang loop unroll(full)")
 
@@ -296,11 +296,16 @@ public enum CBv2SmallProjection {
         // (load-time verified NaN-free weights and non-overflowing outputScale).
         // COOP: when !SPLIT && V >= 2, double-buffered 4 KB cooperative s_av
         // across all 8 simdgroups (8x fewer device activation loads, 1 barrier/iter).
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int DV_MODE, int PF, bool VO, int RG, bool COOP = false>
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT,
+                  int DV_MODE, int PF, bool VO, int RG, bool COOP = false, bool PAIRED = false>
         inline void cbv2_sp_fp8(
             const device uint8_t* mat, float weight_scale, const device T* in_vec,
             device T* out_vec, int tile, uint simd_gid, uint simd_lid,
-            threadgroup float* tgp) {
+            threadgroup float* tgp, const device uint8_t* up_mat = nullptr,
+            float up_scale = 0.0f, const device float* fp8_mu = nullptr,
+            const device float* fp8_bd = nullptr) {
+            static_assert(!PAIRED || (SPLIT && !COOP && TM % 2 == 0), "paired split-K tile");
+            constexpr int COLS = PAIRED ? TM / 2 : TM;
             constexpr int BN = SPLIT ? 8 : 1;
             constexpr int TN = 4;
             constexpr int blockN = BN * 32 * TN;
@@ -317,16 +322,18 @@ public enum CBv2SmallProjection {
             const float dscale = DV ? weight_scale * 256.0f : weight_scale;
             const uint rg = SPLIT ? (simd_gid / 8u) : 0u;
             const uint g = SPLIT ? (simd_gid % 8u) : 0u;
-            const int orig_row = SPLIT ? (tile * RG + int(rg)) * TM : (tile * 8 + int(simd_gid)) * TM;
+            const int orig_row = SPLIT ? (tile * RG + int(rg)) * COLS : (tile * 8 + int(simd_gid)) * COLS;
             if constexpr (!SPLIT && !(COOP && V >= 2)) {
                 if (orig_row >= N) {
                     return;
                 }
             }
             const bool active = orig_row < N;
-            const int out_row = active ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
+            const int out_row = active ? (orig_row + COLS <= N ? orig_row : N - COLS) : (N - COLS);
             int bn = (32 * int(g) + int(simd_lid)) * TN;
             const device uint8_t* rows = mat + size_t(out_row) * K;
+            const device uint8_t* up_rows = PAIRED ? up_mat + size_t(out_row) * K : nullptr;
+            const float up_dscale = DV ? up_scale * 256.0f : up_scale;
             float r[P2];
             CBV2_SP_UNROLL
             for (int i = 0; i < P2; i++) {
@@ -401,8 +408,10 @@ public enum CBv2SmallProjection {
               for (int d = 0; d < PD; d++) {
                 CBV2_SP_UNROLL
                 for (int tm = 0; tm < TM; tm++) {
+                    const device uint8_t* row = PAIRED
+                        ? ((tm & 1) ? up_rows : rows) + (tm / 2) * K : rows + tm * K;
                     wblk[d][tm] = i0 + d < n_iter
-                        ? *(const device uint*)(rows + tm * K + bn + d * blockN) : 0u;
+                        ? *(const device uint*)(row + bn + d * blockN) : 0u;
                 }
               }
               CBV2_SP_UNROLL
@@ -418,11 +427,12 @@ public enum CBv2SmallProjection {
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
                         const uint w = wq[tm];
+                        const float scale = (PAIRED && (tm & 1)) ? up_dscale : dscale;
                         if constexpr (DV_MODE == 2) {
                             const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                             const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                            const float2 f02 = float2(as_type<half2>(lo)) * scale;
+                            const float2 f13 = float2(as_type<half2>(hi)) * scale;
                             inter[tm][0] = static_cast<T>(f02.x);
                             inter[tm][1] = static_cast<T>(f13.x);
                             inter[tm][2] = static_cast<T>(f02.y);
@@ -433,7 +443,7 @@ public enum CBv2SmallProjection {
                                 const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
                                 const float decoded =
                                     (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                                inter[tm][tn] = static_cast<T>(decoded * scale);
                             }
                         }
                     }
@@ -501,9 +511,10 @@ public enum CBv2SmallProjection {
                     T inter[TM][TN];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
+                        const float scale = (PAIRED && (tm & 1)) ? up_dscale : dscale;
                         CBV2_SP_UNROLL
                         for (int tn = 0; tn < TN; tn++) {
-                            inter[tm][tn] = static_cast<T>(dec[tm][tn] * dscale);
+                            inter[tm][tn] = static_cast<T>(dec[tm][tn] * scale);
                         }
                     }
                     CBV2_SP_UNROLL
@@ -529,7 +540,8 @@ public enum CBv2SmallProjection {
                     T inter[TM];
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
-                        inter[tm] = static_cast<T>(dec[tm][tn] * dscale);
+                        const float scale = (PAIRED && (tm & 1)) ? up_dscale : dscale;
+                        inter[tm] = static_cast<T>(dec[tm][tn] * scale);
                     }
                     CBV2_SP_UNROLL
                     for (int v = 0; v < V; v++) {
@@ -551,12 +563,15 @@ public enum CBv2SmallProjection {
                 if (bn + TN <= K) {
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
-                        const uint w = *(const device uint*)(rows + tm * K + bn);
+                        const device uint8_t* row = PAIRED
+                            ? ((tm & 1) ? up_rows : rows) + (tm / 2) * K : rows + tm * K;
+                        const float scale = (PAIRED && (tm & 1)) ? up_dscale : dscale;
+                        const uint w = *(const device uint*)(row + bn);
                         if constexpr (DV_MODE == 2) {
                             const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
                             const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-                            const float2 f02 = float2(as_type<half2>(lo)) * dscale;
-                            const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                            const float2 f02 = float2(as_type<half2>(lo)) * scale;
+                            const float2 f13 = float2(as_type<half2>(hi)) * scale;
                             inter[tm][0] = static_cast<T>(f02.x);
                             inter[tm][1] = static_cast<T>(f13.x);
                             inter[tm][2] = static_cast<T>(f02.y);
@@ -576,17 +591,17 @@ public enum CBv2SmallProjection {
                                 if (((w >> 16) & 0x7Fu) == 0x7Fu) { d2 = nan_value; }
                                 if (((w >> 24) & 0x7Fu) == 0x7Fu) { d3 = nan_value; }
                             }
-                            inter[tm][0] = static_cast<T>(d0 * dscale);
-                            inter[tm][1] = static_cast<T>(d1 * dscale);
-                            inter[tm][2] = static_cast<T>(d2 * dscale);
-                            inter[tm][3] = static_cast<T>(d3 * dscale);
+                            inter[tm][0] = static_cast<T>(d0 * scale);
+                            inter[tm][1] = static_cast<T>(d1 * scale);
+                            inter[tm][2] = static_cast<T>(d2 * scale);
+                            inter[tm][3] = static_cast<T>(d3 * scale);
                         } else {
                             CBV2_SP_UNROLL
                             for (int tn = 0; tn < TN; tn++) {
                                 const uint8_t code = uint8_t((w >> (8 * tn)) & 0xFF);
                                 const float decoded =
                                     (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                                inter[tm][tn] = static_cast<T>(decoded * scale);
                             }
                         }
                     }
@@ -605,13 +620,16 @@ public enum CBv2SmallProjection {
                 } else {
                     CBV2_SP_UNROLL
                     for (int tm = 0; tm < TM; tm++) {
+                        const device uint8_t* row = PAIRED
+                            ? ((tm & 1) ? up_rows : rows) + (tm / 2) * K : rows + tm * K;
+                        const float scale = (PAIRED && (tm & 1)) ? up_scale : weight_scale;
                         CBV2_SP_UNROLL
                         for (int tn = 0; tn < TN; tn++) {
                             if (bn + tn < K) {
-                                const uint8_t code = rows[tm * K + bn + tn];
+                                const uint8_t code = row[bn + tn];
                                 const float decoded =
                                     (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
-                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                                inter[tm][tn] = static_cast<T>(decoded * scale);
                             } else {
                                 inter[tm][tn] = T(0);
                             }
@@ -646,12 +664,26 @@ public enum CBv2SmallProjection {
                     row_tgp[g * 32 + i] = r[0];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (g == 0 && holds && i < P && active) {
+                if (g == 0 && active && (PAIRED || (holds && i < P))) {
                     float result = r[0];
-                    for (int s = 1; s < BN; s++) {
-                        result += row_tgp[s * 32 + i];
+                    if (holds && i < P) {
+                        for (int s = 1; s < BN; s++) {
+                            result += row_tgp[s * 32 + i];
+                        }
                     }
-                    out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
+                    if constexpr (PAIRED) {
+                        // Consecutive tree results are the gate and up for one channel.
+                        const float sibling = simd_shuffle_xor(result, ushort(1u << SH));
+                        if (holds && i < P && (i & 1) == 0) {
+                            const bfloat16_t gate = static_cast<bfloat16_t>(result);
+                            const bfloat16_t up = static_cast<bfloat16_t>(sibling);
+                            const bfloat16_t act = (gate * verify_bf16_sigmoid(gate)) * up;
+                            out_vec[(i / TM) * NOUT + out_row + ((i % TM) / 2)] =
+                                verify_bf16_cast_fp8(act, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_value);
+                        }
+                    } else {
+                        out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
+                    }
                 }
             } else if (holds && i < P && active) {
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
@@ -1198,6 +1230,146 @@ public enum CBv2SmallProjection {
         let lead = Array(preCast.shape.dropLast())
         return zip(fp8Run(layers, flat, cast: flat, rows: rows, sharedInput: true), layers).map {
             $0.reshaped(lead + [$1.outputDimensions])
+        }
+    }
+
+    private struct FP8FeedKey: Hashable {
+        let gate: ObjectIdentifier
+        let up: ObjectIdentifier
+        let down: ObjectIdentifier
+
+        init(_ gate: ModelOptCalibratedLinear, _ up: ModelOptCalibratedLinear, _ down: ModelOptCalibratedLinear) {
+            self.gate = ObjectIdentifier(gate)
+            self.up = ObjectIdentifier(up)
+            self.down = ObjectIdentifier(down)
+        }
+    }
+
+    private final class FP8FeedPlan {
+        weak var gate: ModelOptCalibratedLinear?
+        weak var up: ModelOptCalibratedLinear?
+        weak var down: ModelOptCalibratedLinear?
+        let launches: [MLXFast.MLXFastKernel.Launch?]
+
+        init(
+            _ gate: ModelOptCalibratedLinear, _ up: ModelOptCalibratedLinear,
+            _ down: ModelOptCalibratedLinear, launches: [MLXFast.MLXFastKernel.Launch?]
+        ) {
+            self.gate = gate
+            self.up = up
+            self.down = down
+            self.launches = launches
+        }
+    }
+
+    nonisolated(unsafe) private static var fp8FeedPlans: [FP8FeedKey: FP8FeedPlan] = [:]
+
+    private static var allowsPairedFP8Feed: Bool {
+        VerifyFusedNorms.fusedElementwiseFP8Enabled && !rowsOuter && !vectorDecode
+            && rowsPerThreadOverride == nil && prefetchOverride == nil
+            && ModelOptRowExact.geometryOverride == nil
+    }
+
+    private static let fp8FeedKernel = MLXFast.metalKernel(
+        name: "cbv2_fp8_feed_pair",
+        inputNames: ["wg", "sg", "wu", "su", "xcast", "mu", "bound"],
+        outputNames: ["y"],
+        source: """
+            threadgroup float partials[RG * 8 * 32];
+            cbv2_sp_fp8<bfloat16_t, K, V, 4, true, N, N, DV, 1, VO, RG, false, true>(
+                wg, sg[0], xcast, y, int(threadgroup_position_in_grid.y),
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, partials,
+                wu, su[0], mu, bound);
+            """,
+        header: ModelOptActivationKernels.header + fp8Helper)
+
+    private static func applyFP8Feed(
+        _ launch: MLXFast.MLXFastKernel.Launch, gate: ModelOptCalibratedLinear,
+        up: ModelOptCalibratedLinear, down: ModelOptCalibratedLinear, preCast: MLXArray, rows: Int
+    ) -> MLXArray? {
+        guard let gs = gate.graphConstants?.outputScale, let us = up.graphConstants?.outputScale,
+            let dc = down.graphConstants, case .fp8(let mu, let bound) = dc.storage
+        else { return nil }
+        let result = launch([
+            gate.weight, gs, up.weight, us, preCast.reshaped(rows, gate.inputDimensions), mu, bound,
+        ])[0]
+        let width = gate.outputDimensions
+        if preCast.ndim == 3 { return result.reshaped(preCast.dim(0), preCast.dim(1), width) }
+        return result.reshaped(Array(preCast.shape.dropLast()) + [width])
+    }
+
+    public static func pairedFP8FeedPreCast(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear,
+        down: ModelOptCalibratedLinear, preCast: MLXArray
+    ) -> MLXArray? {
+        let inputs = gate.inputDimensions
+        guard allowsPairedFP8Feed, CBv2DraftRegime.strictLowVerifyEligible,
+            preCast.dtype == .bfloat16, inputs > 0, preCast.dim(-1) == inputs
+        else { return nil }
+        let rows = preCast.size / inputs
+        guard (1 ... maximumRows).contains(rows),
+            let plan = lock.withLock({ fp8FeedPlans[FP8FeedKey(gate, up, down)] }),
+            plan.gate === gate, plan.up === up, plan.down === down,
+            let launch = plan.launches[rows]
+        else { return nil }
+        return applyFP8Feed(launch, gate: gate, up: up, down: down, preCast: preCast, rows: rows)
+    }
+
+    public static func warmPairedFP8Feed(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear,
+        down: ModelOptCalibratedLinear, dtype: DType
+    ) {
+        let inputs = gate.inputDimensions
+        let outputs = gate.outputDimensions
+        let layers = [gate, up]
+        guard allowsPairedFP8Feed, dtype == .bfloat16, down.format == .fp8,
+            down.inputDimensions == outputs, outputs % 2 == 0, up.outputDimensions == outputs,
+            layers.allSatisfy({ fp8Takes($0, inputs: inputs, dtype: dtype) })
+        else { return }
+        let runs = fp8Runs(gate)
+        guard runs.count == 1, runs[0].split, runs[0].rows == 0 ..< outputs else { return }
+
+        let wasLow = CBv2DraftRegime.lowAcceptance
+        let wasStrict = CBv2DraftRegime.strictLowVerifyEligible
+        CBv2DraftRegime.lowAcceptance = true
+        CBv2DraftRegime.strictLowVerifyEligible = true
+        defer {
+            CBv2DraftRegime.lowAcceptance = wasLow
+            CBv2DraftRegime.strictLowVerifyEligible = wasStrict
+        }
+
+        let branchless = branchlessDVEnabled && allBranchlessSafe(layers)
+        var launches = [MLXFast.MLXFastKernel.Launch?](repeating: nil, count: maximumRows + 1)
+        let certified: Bool = (try? MLX.withError { errors -> Bool in
+            for rows in 1 ... maximumRows {
+                let vo = fp8RowsOuterMode == 2 || (fp8RowsOuterMode == 1 && rows >= 5)
+                let dv = branchless && vo ? 2 : (vectorDecodeEnv ? 1 : 0)
+                let rg = rows == 1 || rows >= 5 ? 1 : min(2, fp8RowGroups)
+                let tiles = (outputs + 2 * rg - 1) / (2 * rg)
+                let launch = fp8FeedKernel.prepare(
+                    template: [("K", inputs), ("V", rows), ("N", outputs), ("DV", dv), ("VO", vo), ("RG", rg)],
+                    grid: (32, 8 * rg * tiles, 1), threadGroup: (32, 8 * rg, 1),
+                    outputShapes: [[rows, outputs]], outputDTypes: [dtype])
+                let samples = (0 ..< rows * inputs).map { Float(($0 * 7 + $0 / inputs * 3) % 29 - 14) / 16 }
+                let x = MLXArray(samples, [1, rows, inputs]).asType(dtype)
+                guard let separate = fp8ProductsPreCast(layers, preCast: x),
+                    let reference = VerifyFusedNorms.fusedSiluProductCastFP8(
+                        gate: separate[0], up: separate[1], layer: down),
+                    let fused = applyFP8Feed(launch, gate: gate, up: up, down: down, preCast: x, rows: rows)
+                else { return false }
+                let mismatched = (contiguous(fused).view(dtype: .uint16)
+                    .!= contiguous(reference).view(dtype: .uint16)).asType(.int32).sum()
+                eval(mismatched)
+                try errors.check()
+                if mismatched.item(Int.self) == 0 { launches[rows] = launch }
+            }
+            return true
+        }) ?? false
+        if certified {
+            lock.withLock {
+                fp8FeedPlans = fp8FeedPlans.filter { $0.value.gate != nil }
+                fp8FeedPlans[FP8FeedKey(gate, up, down)] = FP8FeedPlan(gate, up, down, launches: launches)
+            }
         }
     }
 
