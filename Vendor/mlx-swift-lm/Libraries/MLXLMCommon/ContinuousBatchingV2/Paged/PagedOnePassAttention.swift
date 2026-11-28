@@ -77,6 +77,21 @@ public enum PagedOnePassAttention {
     /// `CBV2_ONEPASS_APPEND=0`: linear rectangular verify keeps the separate K/V
     /// scatter instead of the write-owning one-pass variant (same bytes either way).
     static let appendEnabled = environment["CBV2_ONEPASS_APPEND"] != "0"
+    /// `CBV2_ONEPASS_MULTIROW=0`: keep the one-row-per-threadgroup kernel on deep-low
+    /// verify rounds. The multi-row kernel (2 rows x 2 heads per threadgroup, tokens
+    /// both rows attend loaded once) computes the same bytes; it is launched only
+    /// under `lowAcceptance && strictLowVerifyC3`, so high-acceptance rounds keep
+    /// the original kernel.
+    static let multiRowEnabled = environment["CBV2_ONEPASS_MULTIROW"] != "0"
+    nonisolated(unsafe) private static var multiRowProbeFailed = false
+    static let defaultMultiRow = MultiRowConfig(rows: 2, heads: 2, wave: 2)
+    /// The multi-row configuration a live round launches, or nil for the original kernel.
+    static func activeMultiRow(pending: Bool) -> MultiRowConfig? {
+        guard multiRowEnabled, !multiRowProbeFailed, !pending, CBv2DraftRegime.lowAcceptance,
+            CBv2DraftRegime.strictLowVerifyC3, !useRecordKernel
+        else { return nil }
+        return defaultMultiRow
+    }
     /// `CBV2_ONEPASS_OUTGATE=0`: keep separate BF16 `output * sigmoid(gate)` launch.
     public static let outputGateEnabled = environment["CBV2_ONEPASS_OUTGATE"] != "0"
     /// True once `warm` qualified at least one write-owning variant.
@@ -240,6 +255,14 @@ public enum PagedOnePassAttention {
                         hpt: hpt, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
                         source: source, maxPart: mp, record: useRec)
                 }
+                if multiRowEnabled && !useRec && !multiRowProbeFailed {
+                    outputs += warmMultiRow(
+                        q: q, storage: storage, bindings: bindings, seqinfo: seqinfo,
+                        params: params, previous: previous, valueOffsets: MLXArray(offsets),
+                        records: MLXArray(record), dtype: dtype, kvHeads: kvHeads, gqa: gqa,
+                        pageSize: pageSize, hpt: hpt, simdgroups: nsg, partitionTokens: ptok,
+                        softcap: softcap, source: source, maxPart: mp, warmDynTree: warmDynTree)
+                }
                 if outputGateEnabled && !useRec && dtype == .bfloat16 {
                     let dummyMu = MLXArray([Float(1.0), Float(1.0)])
                     let dummyBd = MLXArray([Float(448.0)])
@@ -265,6 +288,65 @@ public enum PagedOnePassAttention {
             }
         }
         }
+    }
+
+    /// Compiles the multi-row variants (plain, dynamic tree, fused output gate with and
+    /// without the FP8 cast) at one MAXPART; a failed threadgroup probe disables them.
+    private static func warmMultiRow(
+        q: MLXArray, storage: MLXArray, bindings: Int, seqinfo: MLXArray, params: MLXArray,
+        previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
+        kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int, simdgroups: Int,
+        partitionTokens: Int, softcap: Bool, source: String, maxPart: Int, warmDynTree: Bool
+    ) -> [MLXArray] {
+        let cfg = defaultMultiRow
+        let backing = [MLXArray](repeating: storage, count: bindings)
+        let held =
+            (try? withError { () -> Bool in
+                let probed = segments(
+                    queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                    previous: previous, valueOffsets: valueOffsets, records: records,
+                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                    simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
+                    source: source, probe: true, maxPart: maxPart, forceMaxPart: true,
+                    record: false, multiRow: cfg)
+                eval(probed.fence, probed.out)
+                return true
+            }) ?? false
+        if logs {
+            FileHandle.standardError.write(
+                Data("[onepass] multirow probe bindings=\(bindings) maxpart=\(maxPart) held=\(held)\n".utf8))
+        }
+        guard held else {
+            multiRowProbeFailed = true
+            return []
+        }
+        var outputs = [MLXArray]()
+        func launch(tree: MLXArray?, gate: Bool, fp8: Bool) {
+            let dummyMu = MLXArray([Float(1.0), Float(1.0)])
+            let dummyBd = MLXArray([Float(448.0)])
+            let result = segments(
+                queries: q, backing: backing, seqinfo: seqinfo, params: params,
+                previous: previous, valueOffsets: valueOffsets, records: records, dtype: dtype,
+                kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
+                partitionTokens: partitionTokens, softcap: softcap, source: source,
+                treeMeta: tree, maxPart: maxPart, forceMaxPart: true,
+                outputGate: gate ? q : nil, fp8Cast: fp8 ? (dummyMu, dummyBd) : nil,
+                record: false, multiRow: cfg)
+            outputs += [result.fence, result.out]
+        }
+        launch(tree: nil, gate: false, fp8: false)
+        if warmDynTree && !dynTreeProbeFailedFor(record: false) {
+            launch(tree: dummyTreeMeta, gate: false, fp8: false)
+        }
+        if outputGateEnabled && dtype == .bfloat16 {
+            for fp8 in [false, true] {
+                launch(tree: nil, gate: true, fp8: fp8)
+                if warmDynTree && !dynTreeProbeFailedFor(record: false) {
+                    launch(tree: dummyTreeMeta, gate: true, fp8: fp8)
+                }
+            }
+        }
+        return outputs
     }
 
     private static func warmOutputGate(
@@ -463,6 +545,29 @@ public enum PagedOnePassAttention {
             """
     }
 
+    private static func segmentBodyMultiRow(bindings: Int, outGateMode: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        let gateArgs =
+            outGateMode == 2
+            ? ", out_gate, fp8_mu[0], fp8_mu[1], fp8_bd[0]"
+            : (outGateMode == 1 ? ", out_gate" : ", nullptr")
+        return """
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)> cache{
+                {\(pointers)}, value_offsets, records, (size_t)KVH * S * D};
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            threadgroup float red_smem[MAXPART * NSG * WAVE * (D + 2)];
+            cbv2::paged_attention_onepass_impl_mr<
+                T, D, S, GQA, HPT, MROWS, NSG, PTOK, MAXPART, WAVE, HAS_SOFTCAP,
+                cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE,
+                \(outGateMode)>(
+                q, cache, records, STRIDE, seqinfo, params, KVH, (int)q_shape[0], red_smem, out,
+                threadgroup_position_in_grid, thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tree_meta\(gateArgs));
+            """
+    }
+
     private static func name(
         _ kind: String, dtype: DType, headDim: Int, pageSize: Int, gqa: Int, hpt: Int,
         simdgroups: Int, partitionTokens: Int, softcap: Bool, maxPart: Int = maxPartitions
@@ -539,6 +644,7 @@ public enum PagedOnePassAttention {
         let append: Bool
         let outGateMode: Int
         let record: Bool
+        let mr: Int
     }
 
     private struct AppendKey: Hashable {
@@ -614,6 +720,12 @@ public enum PagedOnePassAttention {
         return lock.withLock { outGateVariants.contains(key) }
     }
 
+    struct MultiRowConfig: Equatable {
+        let rows: Int
+        let heads: Int
+        let wave: Int
+    }
+
     nonisolated(unsafe) private static var segLaunchCache: [SegLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     /// Segmented entry for a single-bucket plan. Returns the next fence and
@@ -627,9 +739,22 @@ public enum PagedOnePassAttention {
         pending: (keys: MLXArray, values: MLXArray)? = nil,
         outputGate: MLXArray? = nil,
         fp8Cast: (multipliers: MLXArray, overflowBound: MLXArray)? = nil,
-        record: Bool = useRecordKernel
+        record: Bool = useRecordKernel,
+        multiRow: MultiRowConfig? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        var multiRow = multiRow
+        if let m = multiRow {
+            let planned = resolvedMaxPart(maxPart, probe: probe, forceMaxPart: forceMaxPart)
+            if record || pending != nil || d != 128 || block <= 1 || (qh / kvHeads) % m.heads != 0
+                || planned * simdgroups * m.wave * (d + 2) * 4
+                    > PagedAttentionKernel.threadgroupMemoryLimit
+            {
+                multiRow = nil
+            }
+        }
+        let hpt = multiRow?.heads ?? hpt
+        let mrCode = multiRow.map { $0.rows * 10000 + $0.heads * 100 + $0.wave } ?? 0
         let gqa = qh / kvHeads
         let bindings = backing.count
         let mp = resolvedMaxPart(maxPart, probe: probe, forceMaxPart: forceMaxPart)
@@ -656,7 +781,7 @@ public enum PagedOnePassAttention {
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, outGateMode: outGateMode, record: record)
+                append: appending, outGateMode: outGateMode, record: record, mr: mrCode)
             if let hit = lock.withLock({ segLaunchCache[lkey] }) {
                 let outputs = hit(inputs)
                 return (outputs[0], outputs[1])
@@ -669,6 +794,7 @@ public enum PagedOnePassAttention {
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 softcap: softcap, maxPart: mp) + (appending ? "_append" : "")
             + gateSuffix + (record ? "_rec" : "")
+            + (multiRow.map { "_mr\($0.rows)h\($0.heads)w\($0.wave)" } ?? "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -687,31 +813,38 @@ public enum PagedOnePassAttention {
                     + ["seqinfo", "params", "previous", "value_offsets", "records", "tree_meta"]
                     + extraNames,
                 outputNames: ["fence", "out"],
-                source: segmentBody(
-                    bindings: bindings, appending: appending, outGateMode: outGateMode,
-                    record: record),
+                source: multiRow != nil
+                    ? segmentBodyMultiRow(bindings: bindings, outGateMode: outGateMode)
+                    : segmentBody(
+                        bindings: bindings, appending: appending, outGateMode: outGateMode,
+                        record: record),
                 header: source, ensureRowContiguous: true,
                 mutableInputs: appending ? segmentNames : [])
             kernels[kernelName] = made
             return made
         }
         let tg = 32 * simdgroups * mp
-        let template: [(String, any KernelTemplateArg)] = [
+        var template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("D", d), ("S", pageSize), ("KVH", kvHeads), ("GQA", gqa),
             ("HPT", hpt), ("NSG", simdgroups), ("PTOK", partitionTokens),
             ("MAXPART", mp), ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindings),
             ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("BLOCK", block),
             ("DYN_TREE", dynTree),
         ]
+        if let multiRow {
+            template.append(("MROWS", multiRow.rows))
+            template.append(("WAVE", multiRow.wave))
+        }
+        let gridRows = multiRow.map { (b + $0.rows - 1) / $0.rows } ?? b
         if !probe {
             let lkey = SegLaunchKey(
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, outGateMode: outGateMode, record: record)
+                append: appending, outGateMode: outGateMode, record: record, mr: mrCode)
             let launch = kernel.prepare(
                 template: template,
-                grid: (kvHeads * (gqa / hpt) * tg, b, 1),
+                grid: (kvHeads * (gqa / hpt) * tg, gridRows, 1),
                 threadGroup: (tg, 1, 1),
                 outputShapes: [[1], [b, qh, d]], outputDTypes: [.int32, dtype])
             lock.withLock { segLaunchCache[lkey] = launch }
