@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -348,13 +349,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 if fusedContextKV != nil {
                     let allKV = MLXArray.zeros(
                         [1, 10 * c.kvHeads * c.headDimensions], dtype: .bfloat16)
-                    let kv0 = epilogue.applyFusedKV(allKV, rows: 1, position: 0)
-                    warm += [kv0.keys, kv0.values]
+                    var treeModes: [MLXArray?] = [nil]
                     if CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled {
-                        let dummyMeta = MLXArray.zeros([18], type: Int32.self)
-                        let kv1 = epilogue.applyFusedKV(
-                            allKV, rows: 1, position: 0, treeMeta: dummyMeta)
-                        warm += [kv1.keys, kv1.values]
+                        treeModes.append(MLXArray.zeros([18], type: Int32.self))
+                    }
+                    for treeMeta in treeModes {
+                        let kv = epilogue.applyFusedKV(
+                            allKV, rows: 1, position: 0, treeMeta: treeMeta)
+                        warm += [kv.keys, kv.values]
+                        if epilogue.canGroupAffine {
+                            let packed = epilogue.applyPackedAffine(
+                                allKV, rows: 1, position: 0, treeMeta: treeMeta)
+                            warm += [packed.keys, packed.values]
+                        }
                     }
                 }
             }
@@ -1187,6 +1194,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         )
     }
 
+    public func stagedDraftTokens(
+        count: Int, requestState: any CBv2MTPRequestState
+    ) -> MLXArray? {
+        let s = state(requestState)
+        guard count > 0, s.refusal == nil, s.stagedInputCount == count,
+            let tokens = s.memo?.tokens, tokens.ndim == 1, tokens.dtype == .int32,
+            count <= tokens.dim(0)
+        else { return nil }
+        // The first draft submission has encoded this array. Read its layout only.
+        var contiguous = false
+        guard _mlx_array_is_row_contiguous(&contiguous, tokens.ctx) == 0, contiguous
+        else { return nil }
+        return tokens[0 ..< count].reshaped([1, count])
+    }
+
     /// Builds the round's block and memo. Returns why it could not.
     private func startRound(_ s: State, tokens: MLXArray, hidden: MLXArray) -> String? {
         let c = model.configuration
@@ -1375,7 +1397,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 case 3: src = k3; weight = w3; break;
                 default: src = k4; weight = w4; break;
             }
-            src += (size_t(row) * HEADS_ + head) * 128 + lane * 4;
+            if constexpr (PACKED_KV_) {
+                src = k0 + (size_t(row) * 10u * HEADS_ + layer * HEADS_ + head) * 128u;
+            } else {
+                src += (size_t(row) * HEADS_ + head) * 128u;
+            }
+            src += lane * 4u;
             weight += lane * 4;
             device bfloat16_t* dst = keys + size_t(group) * 128 + lane * 4;
 
@@ -2015,6 +2042,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let weights: [MLXArray]
         let coefficients: MLXArray
         let dummyTreeMeta: MLXArray
+        let canGroupAffine: Bool
 
         init?(_ model: MuseGlimmerDFlashDraftModel) {
             let c = model.configuration
@@ -2033,13 +2061,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             self.kvHeads = c.kvHeads
             self.weights = weights
             self.coefficients = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+            // On GPU family 15 or newer, these shapes use the same affine QMV
+            // for up to 8 rows. At 8 rows, 1024 outputs miss the split-K size
+            // threshold and 10240 outputs exceed its threadgroup limit.
+            self.canGroupAffine =
+                c.hiddenSize == 6656 && c.kvHeads == 8
+                && (ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"] ?? "").isEmpty
+                && AffineQuantizedVectors.family() >= 15
+                && model.layers.allSatisfy { layer in
+                    [layer.attention.kProj, layer.attention.vProj].allSatisfy { projection in
+                        guard let q = projection as? QuantizedLinear,
+                            type(of: q) == QuantizedLinear.self, q.weight.ndim == 2
+                        else { return false }
+                        return q.mode == .affine && q.globalScale == nil && q.shape == (1024, 6656)
+                            && q.scales.dtype == .bfloat16 && q.biases?.dtype == .bfloat16
+                    }
+                }
             let dm = MLXArray.zeros([18], type: Int32.self)
             eval(dm)
             self.dummyTreeMeta = dm
         }
 
         func apply(
-            _ projections: [MLXArray], rows: Int, position: Int, treeMeta: MLXArray? = nil
+            _ projections: [MLXArray], rows: Int, position: Int, treeMeta: MLXArray? = nil,
+            packedKV: Bool = false
         ) -> MLXArray {
             var inputs = projections
             inputs.reserveCapacity(13)
@@ -2048,9 +2093,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             inputs.append(coefficients)
             inputs.append(treeMeta ?? dummyTreeMeta)
             return MuseGlimmerDFlashDrafter.contextKeysKernel(
-                inputs, template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil)],
+                inputs,
+                template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil), ("PACKED_KV_", packedKV)],
                 grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
                 outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
+        }
+
+        func applyPackedAffine(
+            _ allKV: MLXArray, rows: Int, position: Int, treeMeta: MLXArray?
+        ) -> (keys: MLXArray, values: MLXArray) {
+            let keys = apply(
+                Array(repeating: allKV, count: 5), rows: rows, position: position,
+                treeMeta: treeMeta, packedKV: true)
+            // The projection writes five key blocks followed by five value blocks per row.
+            let width = kvHeads * 128
+            let values = asStrided(
+                allKV, [5, kvHeads, rows, 128],
+                strides: [width, 128, 10 * width, 1], offset: 5 * width)
+            return (keys, values)
         }
 
         func applyFusedKV(
@@ -2109,13 +2169,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
         else { return model.contextKeyValues(context, at: position) }
-        if Self.fusedProjEnabled
-            && (CBv2DraftRegime.lowAcceptance || CBv2DraftRegime.xnorDraftHeadEligible),
-            let fusedContextKV
+        let useFusedEpilogue = CBv2DraftRegime.lowAcceptance || CBv2DraftRegime.xnorDraftHeadEligible
+        if Self.fusedProjEnabled, let fusedContextKV,
+            useFusedEpilogue || (epilogue.canGroupAffine && rows <= 8)
         {
             let allKV = fusedContextKV(context)
             if allKV.dtype == .bfloat16 {
-                return epilogue.applyFusedKV(allKV, rows: rows, position: position, treeMeta: treeMeta)
+                if useFusedEpilogue {
+                    return epilogue.applyFusedKV(
+                        allKV, rows: rows, position: position, treeMeta: treeMeta)
+                }
+                return epilogue.applyPackedAffine(
+                    allKV, rows: rows, position: position, treeMeta: treeMeta)
             }
         }
         let shape = [1, rows, c.kvHeads, c.headDimensions]
