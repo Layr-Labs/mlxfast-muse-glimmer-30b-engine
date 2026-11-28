@@ -45,6 +45,7 @@ public enum CBv2VerifyNVFP4 {
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
     private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
     private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
+    public static let fusedGateUpSiluEnabled: Bool = env["CBV2_NVFP4_FUSED_GU_SILU"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
@@ -86,10 +87,10 @@ public enum CBv2VerifyNVFP4 {
             let pf = prefetchEnv ?? defaultPF
             return (tn, pf, wc, sv)
         }
-        // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
+        // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.59 GB, o 0.30 GB):
         // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
         // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
-        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        let defaultPF = (strictC3 && rows >= 5 && peeledPFEnv && wc) ? 2 : 0
         let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
@@ -626,6 +627,283 @@ public enum CBv2VerifyNVFP4 {
     private final class CacheBox: @unchecked Sendable {
         var launches: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var plans: [PlanKey: Plan] = [:]
+        var fusedGULaunches: [FusedGULaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var fusedGUPlans: [FusedGUPlanKey: FusedGUPlan] = [:]
+    }
+
+    private struct FusedGULaunchKey: Hashable {
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+        let castFP8: Bool
+    }
+
+    private struct FusedGUPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let downID: ObjectIdentifier?
+        let rows: Int
+        let inputs: Int
+    }
+
+    private struct FusedGUPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let outputs: Int
+        let castFP8: Bool
+    }
+
+    nonisolated(unsafe) private static let dummyFP8Mu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummyFP8Bound: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    static let fusedGateUpSiluHeader = """
+
+        inline bfloat16_t cbv2_vn_bf16_sigmoid(bfloat16_t x) {
+            const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            const bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t one = bfloat16_t(1.0f);
+            const bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+
+        inline bfloat16_t cbv2_vn_bf16_cast_fp8(
+            bfloat16_t yb, float m0, float m1, float bound, float nan_value
+        ) {
+            const float scaled = static_cast<float>(yb) * m0;
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+            return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+        }
+
+        """
+
+    /// True TN=1 4g+4u fused NVFP4 `gate_up + SiLU (+ optional FP8 cast)` with full
+    /// 4,992-TG grid, single `float2` accumulator, 1,792 B join, maxT=1024, and full
+    /// peeled PF=2 next-chunk weight+scale DRAM prefetch. Lanes `fm < 4` hold 4 gate
+    /// rows and lanes `fm >= 4` hold the matching 4 up rows (while keeping activation
+    /// addresses on the original `fm`); `sg == 0` pairs them via `simd_shuffle_down(16)`.
+    static let fusedGateUpSiluSource = """
+        constexpr int WK = 8;
+        constexpr int BK = 128;
+        constexpr int STEP = WK * BK;
+        constexpr int row_bytes = K / 2;
+        constexpr int row_scales = K / 16;
+        static_assert(K % BK == 0, "whole chunks only");
+        static_assert(V >= 1 && V <= 8, "1..8 rows");
+        threadgroup float partials[7 * 2 * 32];
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        const short qid = sl / 4;
+        const short fm = (qid & 4) + ((sl / 2) % 4);
+        const short fn = (qid & 2) * 2 + (sl % 2) * 2;
+        const uint scale_shift = (fn & 4u) << 1;
+        const bool is_up = (fm >= 4);
+        const int out_row = tile * 4 + (fm & 3);
+        const int row = min(out_row, N - 1);
+        // Activation address keeps original `fm` so the 8x8x8 MMA covers all 32 K lanes.
+        const device bfloat16_t* xr0 = x + size_t(min(int(fn), V - 1)) * K + 4 * fm;
+        const device bfloat16_t* xr1 = x + size_t(min(int(fn + 1), V - 1)) * K + 4 * fm;
+        const device uint* wl = (const device uint*)(
+            (const device uint8_t*)(is_up ? w1 : w0) + size_t(row) * row_bytes + 2 * fn);
+        const device uint8_t* scl = (is_up ? sc1 : sc0) + size_t(row) * row_scales;
+        float2 C = float2(0);
+        int k = int(sg) * BK;
+        if (k < K) {
+            uint qb[4];
+            MO_WO_UNROLL
+            for (short block = 0; block < 4; block++) {
+                qb[block] = wl[(k + 32 * block) / 8];
+            }
+            uint2 sb = *(const device uint2*)(scl + (k / 16));
+            for (; k + STEP < K; k += STEP) {
+                const int kn = k + STEP;
+                uint q[4];
+                ushort4 xa[4][2];
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    q[block] = qb[block];
+                    qb[block] = wl[(kn + 32 * block) / 8];
+                    xa[block][0] = *(const device ushort4*)(xr0 + b);
+                    xa[block][1] = *(const device ushort4*)(xr1 + b);
+                }
+                const half2 hs0 = cbv2_vn_e4m3x2(sb.x >> scale_shift);
+                const half2 hs1 = cbv2_vn_e4m3x2(sb.y >> scale_shift);
+                sb = *(const device uint2*)(scl + (kn / 16));
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const half s = (block < 2) ? hs0[block] : hs1[block - 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        const float2 bf = float2(
+                            float(as_type<bfloat>(xa[block][0][i])),
+                            float(as_type<bfloat>(xa[block][1][i])));
+                        mo_wo_mma(C, mo_wo_pair(q[block], i, s), bf);
+                    }
+                }
+            }
+            ushort4 xa[4][2];
+            MO_WO_UNROLL
+            for (short block = 0; block < 4; block++) {
+                const int b = k + 32 * block;
+                xa[block][0] = *(const device ushort4*)(xr0 + b);
+                xa[block][1] = *(const device ushort4*)(xr1 + b);
+            }
+            const half2 hs0 = cbv2_vn_e4m3x2(sb.x >> scale_shift);
+            const half2 hs1 = cbv2_vn_e4m3x2(sb.y >> scale_shift);
+            MO_WO_UNROLL
+            for (short block = 0; block < 4; block++) {
+                const half s = (block < 2) ? hs0[block] : hs1[block - 2];
+                MO_WO_UNROLL
+                for (short i = 0; i < 4; i++) {
+                    const float2 bf = float2(
+                        float(as_type<bfloat>(xa[block][0][i])),
+                        float(as_type<bfloat>(xa[block][1][i])));
+                    mo_wo_mma(C, mo_wo_pair(qb[block], i, s), bf);
+                }
+            }
+        }
+        if (sg > 0u) {
+            threadgroup float* p = partials + (sg - 1u) * 64u + sl;
+            p[0] = C[0];
+            p[32] = C[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            for (int s = 0; s < WK - 1; s++) {
+                const threadgroup float* p = partials + s * 64 + sl;
+                C[0] += p[0];
+                C[1] += p[32];
+            }
+            const float ts_val = is_up ? ts1[0] : ts0[0];
+            const bfloat16_t v0 = mo_wo_result<bfloat16_t>(C[0], true, ts_val);
+            const bfloat16_t v1 = mo_wo_result<bfloat16_t>(C[1], true, ts_val);
+            // Warp-uniform shuffle before restricting stores to the gate half (fm < 4).
+            const ushort u0_bits = simd_shuffle_down(as_type<ushort>(v0), ushort(16));
+            const ushort u1_bits = simd_shuffle_down(as_type<ushort>(v1), ushort(16));
+            if (!is_up && out_row < N) {
+                const float nan_v = metal::numeric_limits<float>::quiet_NaN();
+                if (fn < V) {
+                    bfloat16_t o0 =
+                        (v0 * cbv2_vn_bf16_sigmoid(v0)) * as_type<bfloat16_t>(u0_bits);
+                    if constexpr (CAST_FP8) {
+                        o0 = cbv2_vn_bf16_cast_fp8(o0, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_v);
+                    }
+                    y[size_t(fn) * N + out_row] = o0;
+                }
+                if (fn + 1 < V) {
+                    bfloat16_t o1 =
+                        (v1 * cbv2_vn_bf16_sigmoid(v1)) * as_type<bfloat16_t>(u1_bits);
+                    if constexpr (CAST_FP8) {
+                        o1 = cbv2_vn_bf16_cast_fp8(o1, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_v);
+                    }
+                    y[size_t(fn + 1) * N + out_row] = o1;
+                }
+            }
+        }
+        """
+
+    private static let fusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_fused_gu_silu_4g4u",
+        inputNames: ["w0", "sc0", "ts0", "w1", "sc1", "ts1", "x", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fusedGateUpSiluSource,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + ModelOptActivationKernels.header
+            + tileHelper + fusedGateUpSiluHeader)
+
+    /// Fused TN=1 4g+4u NVFP4 `silu(gate(x)) * up(x)` (optionally pre-cast to FP8 for an FP8
+    /// `downProj`), 0-ULP bit-exact to separate `products([gate, up], x)` + `silu(g)*u` (+ FP8 cast).
+    /// Active strictly on `strictLowVerifyC3` low-acceptance verify rounds (`rows in 5...8`).
+    public static func fusedGateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear, x: MLXArray,
+        fp8Down: ModelOptCalibratedLinear? = nil
+    ) -> (act: MLXArray, preCastFP8: Bool)? {
+        guard fusedGateUpSiluEnabled, geometryOverride == nil else { return nil }
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        guard lowVerify, CBv2DraftRegime.strictLowVerifyC3 else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0, x.dtype == .bfloat16 else { return nil }
+        let rows = x.size / inputs
+        guard (2 ... maximumRows).contains(rows) else { return nil }
+        let downID = fp8Down.map(ObjectIdentifier.init)
+        let pkey = FusedGUPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up), downID: downID,
+            rows: rows, inputs: inputs)
+        if let plan = cacheLock.withLockUnchecked({ $0.fusedGUPlans[pkey] }) {
+            var args = plan.weightArrays
+            args += [x.reshaped(rows, inputs), plan.fp8Mu, plan.fp8Bound]
+            let raw = plan.launch(args)[0]
+            let act =
+                x.ndim == 3
+                ? raw.reshaped(x.dim(0), x.dim(1), plan.outputs)
+                : raw.reshaped(Array(x.shape.dropLast()) + [plan.outputs])
+            return (act, plan.castFP8)
+        }
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            gate.outputDimensions == up.outputDimensions,
+            takes(weight: gate.weight, blockScales: gate.weightScale, tensorScale: gate.weightScale2, inputs: inputs),
+            takes(weight: up.weight, blockScales: up.weightScale, tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let castFP8: Bool
+        if let fp8Down, fp8Down.format == .fp8,
+            let constants = fp8Down.graphConstants,
+            case .fp8(let mu, let bd) = constants.storage
+        {
+            fp8Mu = mu
+            fp8Bound = bd
+            castFP8 = true
+        } else {
+            fp8Mu = dummyFP8Mu
+            fp8Bound = dummyFP8Bound
+            castFP8 = false
+        }
+        let outputs = gate.weight.dim(0)
+        let lkey = FusedGULaunchKey(rows: rows, inputs: inputs, outputs: outputs, castFP8: castFP8)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = cacheLock.withLockUnchecked({ $0.fusedGULaunches[lkey] }) {
+            launch = hit
+        } else {
+            let tiles = (outputs + 3) / 4
+            let made = fusedGateUpSiluKernel.prepare(
+                template: [
+                    ("V", rows), ("K", inputs), ("N", outputs), ("CAST_FP8", castFP8),
+                ],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [.bfloat16])
+            cacheLock.withLockUnchecked { $0.fusedGULaunches[lkey] = made }
+            launch = made
+        }
+        let weightArrays = [
+            gate.weight, gate.weightScale, gate.weightScale2.reshaped(1),
+            up.weight, up.weightScale, up.weightScale2.reshaped(1),
+        ]
+        let plan = FusedGUPlan(
+            launch: launch, weightArrays: weightArrays, fp8Mu: fp8Mu, fp8Bound: fp8Bound,
+            outputs: outputs, castFP8: castFP8)
+        cacheLock.withLockUnchecked { $0.fusedGUPlans[pkey] = plan }
+        var args = weightArrays
+        args += [x.reshaped(rows, inputs), fp8Mu, fp8Bound]
+        let raw = launch(args)[0]
+        let act =
+            x.ndim == 3
+            ? raw.reshaped(x.dim(0), x.dim(1), outputs)
+            : raw.reshaped(Array(x.shape.dropLast()) + [outputs])
+        return (act, castFP8)
     }
 
     private static let cacheLock = OSAllocatedUnfairLock(initialState: CacheBox())
