@@ -528,6 +528,70 @@ public enum PagedAttentionKernel {
         }
     }
 
+    private struct DecodePartLaunchID: Hashable {
+        let key: PagedAttentionKernelKey
+        let rows: Int
+        let queryHeads: Int
+        let maxParts: Int
+    }
+
+    private struct DecodeMergeLaunchID: Hashable {
+        let key: PagedAttentionKernelKey
+        let rows: Int
+        let queryHeads: Int
+    }
+
+    private struct BulkWriteLaunchID: Hashable {
+        let key: PagedAttentionKernelKey
+        let kvHeads: Int
+        let count: Int
+    }
+
+    private final class LaunchMemo: @unchecked Sendable {
+        private let lock = NSLock()
+        private var part: [DecodePartLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+        private var merge: [DecodeMergeLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+        private var write: [BulkWriteLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+
+        func partLaunch(
+            _ id: DecodePartLaunchID, make: () -> MLXFast.MLXFastKernel.Launch
+        ) -> MLXFast.MLXFastKernel.Launch {
+            if let hit = lock.withLock({ part[id] }) { return hit }
+            let made = make()
+            return lock.withLock {
+                if let hit = part[id] { return hit }
+                if part.count < 1024 { part[id] = made }
+                return made
+            }
+        }
+
+        func mergeLaunch(
+            _ id: DecodeMergeLaunchID, make: () -> MLXFast.MLXFastKernel.Launch
+        ) -> MLXFast.MLXFastKernel.Launch {
+            if let hit = lock.withLock({ merge[id] }) { return hit }
+            let made = make()
+            return lock.withLock {
+                if let hit = merge[id] { return hit }
+                if merge.count < 1024 { merge[id] = made }
+                return made
+            }
+        }
+
+        func writeLaunch(
+            _ id: BulkWriteLaunchID, make: () -> MLXFast.MLXFastKernel.Launch
+        ) -> MLXFast.MLXFastKernel.Launch {
+            if let hit = lock.withLock({ write[id] }) { return hit }
+            let made = make()
+            return lock.withLock {
+                if let hit = write[id] { return hit }
+                if write.count < 1024 { write[id] = made }
+                return made
+            }
+        }
+    }
+
+    private static let launchMemo = LaunchMemo()
+
     private static let cache = KernelCache()
 
     static func kernel(
@@ -752,45 +816,52 @@ public enum PagedAttentionKernel {
         // space; the merge implementation expects a device pointer. Keep even
         // a one-head/one-partition probe on the same legal interface.
         let metaShape = [max(8, b * queryHeads * maxParts * 2)]
-        let partOut = kernel(for: partKey, source: kernelSource)(
-            partInputs,
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("S", pageSize),
-                ("GQA", gqa),
-                ("HPT", hpt),
-                ("NSG", nsg),
-                ("PTOK", ptok),
-                ("HAS_SOFTCAP", softcap),
-            ],
-            grid: (kvHeads * splits * tg, b, maxParts),
-            threadGroup: (tg, 1, 1),
-            outputShapes: hasWrite
-                ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
-                : [[b, queryHeads, maxParts, headDim], metaShape],
-            outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32],
-            stream: stream
-        )
+        let partLaunch = launchMemo.partLaunch(
+            DecodePartLaunchID(key: partKey, rows: b, queryHeads: queryHeads, maxParts: maxParts)
+        ) {
+            kernel(for: partKey, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("D", headDim),
+                    ("S", pageSize),
+                    ("GQA", gqa),
+                    ("HPT", hpt),
+                    ("NSG", nsg),
+                    ("PTOK", ptok),
+                    ("HAS_SOFTCAP", softcap),
+                ],
+                grid: (kvHeads * splits * tg, b, maxParts),
+                threadGroup: (tg, 1, 1),
+                outputShapes: hasWrite
+                    ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
+                    : [[b, queryHeads, maxParts, headDim], metaShape],
+                outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32]
+            )
+        }
+        let partOut = partLaunch(partInputs, stream: stream)
 
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false,
             partitionTokens: ptok)
-        let outputs = kernel(for: mergeKey, source: kernelSource)(
-            [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("PTOK", ptok),
-                ("HAS_SINKS", sinks != nil),
-            ],
-            grid: (queryHeads * 32, b, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[b, queryHeads, headDim]],
-            outputDTypes: [dtype],
-            stream: stream
-        )
+        let mergeLaunch = launchMemo.mergeLaunch(
+            DecodeMergeLaunchID(key: mergeKey, rows: b, queryHeads: queryHeads)
+        ) {
+            kernel(for: mergeKey, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("D", headDim),
+                    ("PTOK", ptok),
+                    ("HAS_SINKS", sinks != nil),
+                ],
+                grid: (queryHeads * 32, b, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[b, queryHeads, headDim]],
+                outputDTypes: [dtype]
+            )
+        }
+        let outputs = mergeLaunch(
+            [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks], stream: stream)
         return (outputs[0], hasWrite ? partOut[2] : nil)
     }
 
@@ -830,18 +901,21 @@ public enum PagedAttentionKernel {
         let key = PagedAttentionKernelKey(
             pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
             simdgroups: 0, hasSinks: false, hasSoftcap: false, partitionTokens: 0)
-        let outputs = kernel(for: key, source: kernelSource)(
-            [keys, values, slots, prevFence, kSlab, vSlab],
-            template: [
-                ("T", dtype),
-                ("S", pageSize),
-            ],
-            grid: (headDim, kvHeads, n),
-            threadGroup: (min(headDim, 256), 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.int32],
-            stream: stream
-        )
+        let launch = launchMemo.writeLaunch(
+            BulkWriteLaunchID(key: key, kvHeads: kvHeads, count: n)
+        ) {
+            kernel(for: key, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("S", pageSize),
+                ],
+                grid: (headDim, kvHeads, n),
+                threadGroup: (min(headDim, 256), 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32]
+            )
+        }
+        let outputs = launch([keys, values, slots, prevFence, kSlab, vSlab], stream: stream)
         return outputs[0]
     }
 }
