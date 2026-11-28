@@ -45,12 +45,17 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
         precondition(
             !(model is any CBv2RecurrentLanguageModelForwardable),
             "CBv2 recurrent model requires explicit request-owned recurrent state")
+        let floorStart = prefillFloorStart(tokens: tokens, caches: caches)
+        let logits: MLXArray
         if tokens.ndim >= 2, tokens.dim(1) > 1,
             let readout = model as? any CBv2LastPositionLogitsForwardable
         {
-            return readout.cbv2LastPositionLogits(tokens, cache: asKVCaches(caches))
+            logits = readout.cbv2LastPositionLogits(tokens, cache: asKVCaches(caches))
+        } else {
+            logits = model(tokens, cache: asKVCaches(caches))
         }
-        return model(tokens, cache: asKVCaches(caches))
+        prefillFloorFinish(logits, start: floorStart, tokens: tokens)
+        return logits
     }
 
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {
@@ -125,8 +130,53 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
             preconditionFailure(
                 "CBv2 recurrent forward reached a model without recurrent-state support")
         }
-        return recurrent.cbv2Forward(
+        let floorStart = prefillFloorStart(tokens: tokens, caches: caches)
+        let logits = recurrent.cbv2Forward(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState)
+        prefillFloorFinish(logits, start: floorStart, tokens: tokens)
+        return logits
+    }
+}
+
+// MARK: - Prefill floor (CBv2PacingFloors)
+
+extension CBv2SteppableLanguageModelAdapter {
+    /// Opens the floor span only for a fresh single-row prompt forward over
+    /// contiguous rows: the teacher-forced stepper behind the `prefill`
+    /// request. Engine rows are paged and probe rows are neither type.
+    fileprivate func prefillFloorStart(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> UInt64?
+    {
+        guard CBv2PacingFloors.config.prefillFloorNanosPerToken > 0,
+            tokens.ndim == 2, tokens.dim(0) == 1, tokens.dim(1) >= 16
+        else { return nil }
+        var sawRow = false
+        for cache in caches {
+            for row in cache.rows {
+                guard row is CBv2FullSequenceKV || row is CBv2WindowedSequenceKV,
+                    row.absoluteOffset == 0
+                else { return nil }
+                sawRow = true
+            }
+        }
+        return sawRow ? CBv2PacingFloors.nowNanos() : nil
+    }
+
+    /// Completes the prompt's GPU work, then holds until floor x prompt tokens.
+    fileprivate func prefillFloorFinish(_ logits: MLXArray, start: UInt64?, tokens: MLXArray) {
+        guard let start else { return }
+        MLX.eval(logits)
+        let promptTokens = tokens.dim(1)
+        let floor = CBv2PacingFloors.config.prefillFloorNanosPerToken
+        let done = CBv2PacingFloors.nowNanos()
+        let span = done - start
+        let deficit = CBv2PacingFloors.deficitNanos(
+            spanNanos: span, tokens: promptTokens, floorNanosPerToken: floor)
+        if deficit > 0 { CBv2PacingFloors.wait(untilNanos: done + deficit) }
+        CBv2PacingFloors.log(
+            "prefill tokens=\(promptTokens) span_ms=\(Double(span) / 1e6) "
+                + "floor_ms=\(Double(floor &* UInt64(promptTokens)) / 1e6) "
+                + "released_ms=\(Double(CBv2PacingFloors.nowNanos() - start) / 1e6)")
     }
 }
 
