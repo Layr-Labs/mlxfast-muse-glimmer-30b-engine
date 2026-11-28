@@ -606,11 +606,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         private static let ospecZeroCopyEnabled: Bool =
             ProcessInfo.processInfo.environment["CBV2_OSPEC_ZEROCOPY"] != "0"
+        private static let ospecPromoteEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_OSPEC_PROMOTE"] != "0"
+
+        struct SpeculativeTailTicket {
+            let keysID: ObjectIdentifier
+            let valuesID: ObjectIdentifier
+            let anchor: Int
+            let first: Int
+            let base: Int
+            let startSlot: Int
+            let writtenRows: Int
+            let generation: UInt64
+        }
 
         private var keys: MLXArray?
         private var values: MLXArray?
         private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
         private var speculativeReadDeps: [MLXArray] = []
+        private var ringGeneration: UInt64 = 0
         private var basePosition = 0
         private(set) var firstPosition = 0
         private(set) var nextPosition = 0
@@ -747,6 +761,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         func restart(at position: Int) {
             precondition(position >= 0, "DFlash context position must not be negative")
+            ringGeneration &+= 1
             basePosition = position
             firstPosition = position
             nextPosition = position
@@ -771,12 +786,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// avoiding a full ring copy inside `speculateOutcomeBlock`.
         func writeSpeculativeTail(
             keys newKeys: MLXArray, values newValues: MLXArray
-        ) -> (keys: MLXArray, values: MLXArray)? {
+        ) -> (keys: MLXArray, values: MLXArray, ticket: SpeculativeTailTicket)? {
             let rows = newKeys.dim(2)
             guard Self.ospecZeroCopyEnabled, inPlaceRing, let keys, let values,
                 rows > 0, firstPosition == basePosition, count + rows <= window
             else { return nil }
             consumeReadBarriers()
+            ringGeneration &+= 1
             let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
             let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
             let params = MLXArray([Int32(count), Int32(rows)])
@@ -785,10 +801,39 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 window: window, headDimensions: headDimensions, rows: rows, layers: layers)
             let pair = depends(inputs: [keys, values], dependencies: [writeFence])
             let total = count + rows
+            let ticket = SpeculativeTailTicket(
+                keysID: ObjectIdentifier(keys), valuesID: ObjectIdentifier(values),
+                anchor: nextPosition, first: firstPosition, base: basePosition,
+                startSlot: count, writtenRows: rows, generation: ringGeneration)
             return (
                 pair[0][0..., 0..., 0 ..< total, 0...],
-                pair[1][0..., 0..., 0 ..< total, 0...]
+                pair[1][0..., 0..., 0 ..< total, 0...],
+                ticket
             )
+        }
+
+        /// Promotes a verified contiguous linear prefix `[0 ..< prefixCount)` that
+        /// `writeSpeculativeTail` already placed at `[count ..< count + prefixCount)`,
+        /// avoiding a duplicate `dflash_ring_write_inplace` dispatch on commit.
+        func promoteSpeculativePrefix(
+            ticket: SpeculativeTailTicket, count prefixCount: Int
+        ) -> Bool {
+            guard Self.ospecPromoteEnabled, inPlaceRing, let keys, let values,
+                ObjectIdentifier(keys) == ticket.keysID,
+                ObjectIdentifier(values) == ticket.valuesID,
+                ringGeneration == ticket.generation,
+                firstPosition == basePosition,
+                firstPosition == ticket.first,
+                basePosition == ticket.base,
+                nextPosition == ticket.anchor,
+                count == ticket.startSlot,
+                prefixCount > 0, prefixCount <= ticket.writtenRows,
+                count + prefixCount <= window
+            else { return false }
+            nextPosition += prefixCount
+            firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
+            return true
         }
 
         func recordSpeculativeRead(_ dep: MLXArray) {
@@ -857,6 +902,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             nextPosition = start + rows
             firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
         }
 
         var heldPositions: [Int] {
@@ -1023,6 +1069,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// Verify slot path `[0, ..., carrySlot]` committed for this outcome
         /// (length `accepted + 1`; nil falls back to linear `0...accepted`).
         var acceptedPath: [Int]? = nil
+        /// Ticket proving `[0 ..< depth + 1)` were already written into the
+        /// request's in-place ring at `[count ..< count + depth + 1)`, so a
+        /// confirmed linear prefix can be promoted without re-copying.
+        var tailTicket: FastInPlaceContext.SpeculativeTailTicket? = nil
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -2352,6 +2402,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ctxKeys = tail.keys
             ctxValues = tail.values
             usedZeroCopyTail = true
+            if !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.strictLowVerifyC3 {
+                speculation.tailTicket = tail.ticket
+            }
         } else {
             ctxKeys = concatenated([
                 ring[0][0..., 0..., 0 ..< existingCount, 0...],
@@ -2516,6 +2569,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.context.append(
                 keys: speculation.keys.take(idx, axis: 2),
                 values: speculation.values.take(idx, axis: 2))
+        } else if let ticket = speculation.tailTicket,
+            s.context.promoteSpeculativePrefix(ticket: ticket, count: accepted + 1)
+        {
+            // Verified linear prefix is already resident in the ring tail;
+            // `promoteSpeculativePrefix` advanced `nextPosition` in place.
         } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {

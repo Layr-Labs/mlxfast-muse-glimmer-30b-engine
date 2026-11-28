@@ -1447,69 +1447,106 @@ template <
         }
       }
     } else {
-      for (int k = simd_gid * BK; k < K; k += WK * BK) {
-        vec<T, 8> xs[2][4];
+      uint4 ws_cur[TN][2];
+      ushort ss_cur[TN][2];
+      const int k0 = simd_gid * BK;
+      if (k0 < K) {
         STEEL_PRAGMA_UNROLL
-        for (short r = 0; r < 2; r++) {
+        for (short t = 0; t < TN; t++) {
           STEEL_PRAGMA_UNROLL
-          for (short i = 0; i < 4; i++) {
-            xs[r][i] = x_rows[r]
-                ? *(const device vec<T, 8>*)(
-                      x + r * 8 * static_cast<int64_t>(K) + k + 8 * i)
-                : vec<T, 8>(0);
+          for (short r = 0; r < 2; r++) {
+            const int row = 16 * t + 8 * r;
+            ws_cur[t][r] = *(const device uint4*)(
+                wl + row * static_cast<int64_t>(row_bytes) + k0 / 2);
+            ss_cur[t][r] = *(const device ushort*)(
+                scales + row * static_cast<int64_t>(row_scales) + k0 / 16);
           }
         }
-        uint4 ws[TN][2];
-        ushort ss[TN][2];
+      }
+
+      for (int k = k0; k < K; k += WK * BK) {
+        uint4 ws_next[TN][2];
+        ushort ss_next[TN][2];
+        const int kn = k + WK * BK;
+        if (kn < K) {
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            STEEL_PRAGMA_UNROLL
+            for (short r = 0; r < 2; r++) {
+              const int row = 16 * t + 8 * r;
+              ws_next[t][r] = *(const device uint4*)(
+                  wl + row * static_cast<int64_t>(row_bytes) + kn / 2);
+              ss_next[t][r] = *(const device ushort*)(
+                  scales + row * static_cast<int64_t>(row_scales) + kn / 16);
+            }
+          }
+        }
+
         half sc0[TN][2];
         half sc1[TN][2];
         STEEL_PRAGMA_UNROLL
         for (short t = 0; t < TN; t++) {
           STEEL_PRAGMA_UNROLL
           for (short r = 0; r < 2; r++) {
-            const int row = 16 * t + 8 * r;
-            ws[t][r] = *(const device uint4*)(
-                wl + row * static_cast<int64_t>(row_bytes) + k / 2);
-            ss[t][r] = *(const device ushort*)(
-                scales + row * static_cast<int64_t>(row_scales) + k / 16);
-            sc0[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r]));
-            sc1[t][r] = dequantize_scale<half, 16>(uint8_t(ss[t][r] >> 8));
+            sc0[t][r] = dequantize_scale<half, 16>(uint8_t(ss_cur[t][r]));
+            sc1[t][r] = dequantize_scale<half, 16>(uint8_t(ss_cur[t][r] >> 8));
           }
         }
+
         STEEL_PRAGMA_UNROLL
-        for (short f = 0; f < TK; f++) {
-          typename Frag::template dtype_frag_t<T> a;
+        for (short i = 0; i < 4; i++) {
+          vec<T, 8> xr[2];
           STEEL_PRAGMA_UNROLL
           for (short r = 0; r < 2; r++) {
-            STEEL_PRAGMA_UNROLL
-            for (short j = 0; j < 4; j++) {
-              a[4 * r + j] = xs[r][f / 2][4 * (f % 2) + j];
-            }
+            xr[r] = x_rows[r]
+                ? *(const device vec<T, 8>*)(
+                      x + r * 8 * static_cast<int64_t>(K) + k + 8 * i)
+                : vec<T, 8>(0);
           }
-          typename Frag::template dtype_frag_t<Wtype> b[TN];
           STEEL_PRAGMA_UNROLL
-          for (short t = 0; t < TN; t++) {
+          for (short sub = 0; sub < 2; sub++) {
+            typename Frag::template dtype_frag_t<T> a;
             STEEL_PRAGMA_UNROLL
             for (short r = 0; r < 2; r++) {
-              const uint q = ws[t][r][f / 2] >> (16 * (f % 2));
-              const half sc = (f < 4) ? sc0[t][r] : sc1[t][r];
-              const vec<Wtype, 4> v = dequantize_fp4_x4_scaled<Wtype>(q, sc);
               STEEL_PRAGMA_UNROLL
               for (short j = 0; j < 4; j++) {
-                b[t][4 * r + j] = v[j];
+                a[4 * r + j] = xr[r][4 * sub + j];
               }
             }
+            typename Frag::template dtype_frag_t<Wtype> b[TN];
+            STEEL_PRAGMA_UNROLL
+            for (short t = 0; t < TN; t++) {
+              STEEL_PRAGMA_UNROLL
+              for (short r = 0; r < 2; r++) {
+                const uint q = ws_cur[t][r][i] >> (16 * sub);
+                const half sc = (i < 2) ? sc0[t][r] : sc1[t][r];
+                const vec<Wtype, 4> v = dequantize_fp4_x4_scaled<Wtype>(q, sc);
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < 4; j++) {
+                  b[t][4 * r + j] = v[j];
+                }
+              }
+            }
+            STEEL_PRAGMA_UNROLL
+            for (short t = 0; t < TN; t += 2) {
+              Frag::mma(
+                  Dtile.frag_at(0, t),
+                  Dtile.frag_at(0, t + 1),
+                  a,
+                  metal::bool_constant<false>{},
+                  b[t],
+                  b[t + 1],
+                  metal::bool_constant<true>{});
+            }
           }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < TN; t++) {
           STEEL_PRAGMA_UNROLL
-          for (short t = 0; t < TN; t += 2) {
-            Frag::mma(
-                Dtile.frag_at(0, t),
-                Dtile.frag_at(0, t + 1),
-                a,
-                metal::bool_constant<false>{},
-                b[t],
-                b[t + 1],
-                metal::bool_constant<true>{});
+          for (short r = 0; r < 2; r++) {
+            ws_cur[t][r] = ws_next[t][r];
+            ss_cur[t][r] = ss_next[t][r];
           }
         }
       }

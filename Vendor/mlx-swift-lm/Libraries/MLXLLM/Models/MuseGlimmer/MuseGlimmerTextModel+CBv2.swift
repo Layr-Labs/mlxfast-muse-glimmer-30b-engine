@@ -652,6 +652,71 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify && CBv2DraftRegime.strictLowVerifyC3, let rows = verifyRows(x) {
+            if !preCastFP8,
+                let nvGate = mlp.gateProj as? ModelOptWeightOnlyNVFP4Linear,
+                let nvUp = mlp.upProj as? ModelOptWeightOnlyNVFP4Linear,
+                let fused = CBv2VerifyNVFP4.fusedGateUpSilu(
+                    gate: nvGate, up: nvUp, x: x,
+                    fp8Down: mlp.downProj as? ModelOptCalibratedLinear)
+            {
+                if fused.preCastFP8, let fp8 = mlp.downProj as? ModelOptCalibratedLinear {
+                    let useSmallDown = rows < 6 || MuseGlimmerVerifyProjections.fp8DownSmallEnabled
+                    let projected: MLXArray? =
+                        useSmallDown
+                        ? CBv2SmallProjection.fp8ProductsPreCast([fp8], preCast: fused.act)?.first
+                        : CBv2VerifyScales.fp8ProductPreCast(fp8, preCast: fused.act)
+                    if let projected {
+                        if MuseGlimmerVerifyProjections.selfTest {
+                            let refGU = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+                            let refAct = compiledSiluProduct(refGU[0], refGU[1])
+                            MuseGlimmerVerifyProjections.requireEqualBits(
+                                [projected], [numerics.project(mlp.downProj, refAct)],
+                                kind: "nvfp4.fused_gu_silu_fp8", rows: rows)
+                        }
+                        return projected
+                    }
+                } else if !fused.preCastFP8 {
+                    if MuseGlimmerVerifyProjections.selfTest {
+                        let refGU = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+                        let refAct = compiledSiluProduct(refGU[0], refGU[1])
+                        MuseGlimmerVerifyProjections.requireEqualBits(
+                            [fused.act], [refAct], kind: "nvfp4.fused_gu_silu", rows: rows)
+                    }
+                    return verifyDownProjection(mlp.downProj, fused.act)
+                }
+            } else if preCastFP8,
+                let fp8Gate = mlp.gateProj as? ModelOptCalibratedLinear,
+                let fp8Up = mlp.upProj as? ModelOptCalibratedLinear,
+                let fp8Down = mlp.downProj as? ModelOptCalibratedLinear,
+                let preCastAct = CBv2SmallProjection.fp8FusedGateUpSiluCastFP8(
+                    gate: fp8Gate, up: fp8Up, preCast: x, downLayer: fp8Down)
+            {
+                let useSmallDown = rows < 6 || MuseGlimmerVerifyProjections.fp8DownSmallEnabled
+                let projected: MLXArray? =
+                    useSmallDown
+                    ? CBv2SmallProjection.fp8ProductsPreCast([fp8Down], preCast: preCastAct)?.first
+                    : CBv2VerifyScales.fp8ProductPreCast(fp8Down, preCast: preCastAct)
+                if let projected {
+                    if MuseGlimmerVerifyProjections.selfTest,
+                        let refGU = CBv2SmallProjection.fp8ProductsPreCast([fp8Gate, fp8Up], preCast: x)
+                    {
+                        if let refPreCast = VerifyFusedNorms.fusedSiluProductCastFP8(
+                            gate: refGU[0], up: refGU[1], layer: fp8Down)
+                        {
+                            MuseGlimmerVerifyProjections.requireEqualBits(
+                                [preCastAct], [refPreCast],
+                                kind: "fp8.fused_gu_silu_precast", rows: rows)
+                        }
+                        let refAct = compiledSiluProduct(refGU[0], refGU[1])
+                        MuseGlimmerVerifyProjections.requireEqualBits(
+                            [projected], [numerics.project(mlp.downProj, refAct)],
+                            kind: "fp8.fused_gu_silu", rows: rows)
+                    }
+                    return projected
+                }
+            }
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -1084,6 +1149,7 @@ extension MuseGlimmerTextModel {
         }
         CBv2SmallProjection.warmFP8BranchlessSafe(allFP8Layers)
         var seen = Set<String>()
+        var seenFusedMLP = Set<String>()
         for layer in model.layers {
             let a = layer.selfAttention
             let mlp = layer.mlp
@@ -1168,6 +1234,34 @@ extension MuseGlimmerTextModel {
                     }
                 }
                 eval(outputs)
+            }
+            if seenFusedMLP.insert(key([mlp.gateProj, mlp.upProj, mlp.downProj])).inserted,
+                let width = inputs(mlp.gateProj)
+            {
+                CBv2DraftRegime.lowAcceptance = true
+                CBv2DraftRegime.xnorDraftHeadEligible = true
+                CBv2DraftRegime.strictLowVerifyEligible = true
+                CBv2DraftRegime.strictLowVerifyC3 = true
+                var fusedOutputs = [MLXArray]()
+                for rows in 5 ... MuseGlimmerVerifyProjections.maximumRows {
+                    let x = MLXArray.zeros([1, rows, width], dtype: dtype)
+                    if let nvGate = mlp.gateProj as? ModelOptWeightOnlyNVFP4Linear,
+                        let nvUp = mlp.upProj as? ModelOptWeightOnlyNVFP4Linear,
+                        let fused = CBv2VerifyNVFP4.fusedGateUpSilu(
+                            gate: nvGate, up: nvUp, x: x,
+                            fp8Down: mlp.downProj as? ModelOptCalibratedLinear)
+                    {
+                        fusedOutputs.append(fused.act)
+                    } else if let fp8Gate = mlp.gateProj as? ModelOptCalibratedLinear,
+                        let fp8Up = mlp.upProj as? ModelOptCalibratedLinear,
+                        let fp8Down = mlp.downProj as? ModelOptCalibratedLinear,
+                        let preCastAct = CBv2SmallProjection.fp8FusedGateUpSiluCastFP8(
+                            gate: fp8Gate, up: fp8Up, preCast: x, downLayer: fp8Down)
+                    {
+                        fusedOutputs.append(preCastAct)
+                    }
+                }
+                if !fusedOutputs.isEmpty { eval(fusedOutputs) }
             }
         }
         if lmHead is ModelOptWeightOnlyNVFP4Linear, let width = inputs(lmHead) {
