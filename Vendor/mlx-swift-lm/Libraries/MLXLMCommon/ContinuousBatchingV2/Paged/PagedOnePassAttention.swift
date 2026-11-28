@@ -505,16 +505,34 @@ public enum PagedOnePassAttention {
             return made
         }
         let tg = 32 * simdgroups * maxPartitions
-        return kernel(
-            [queries, kSlab, vSlab, tables, seqinfo, params, writeFence],
+        let inputs: [MLXArray] = [queries, kSlab, vSlab, tables, seqinfo, params, writeFence]
+        let lkey = SlabLaunchKeyType(kernelName: kernelName, rows: b, queryHeads: qh, kvHeads: kvh)
+        if let hit = lock.withLock({ slabLaunchCache[lkey] }) {
+            return hit(inputs, stream: stream)[0]
+        }
+        let launch = kernel.prepare(
             template: [
                 ("T", dtype), ("D", d), ("S", pageSize), ("GQA", gqa), ("HPT", hpt),
                 ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", maxPartitions),
                 ("HAS_SOFTCAP", softcap), ("BLOCK", block),
             ],
             grid: (kvh * (gqa / hpt) * tg, b, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[b, qh, d]], outputDTypes: [dtype], stream: stream)[0]
+            outputShapes: [[b, qh, d]], outputDTypes: [dtype])
+        lock.withLock {
+            if slabLaunchCache.count < 1024 { slabLaunchCache[lkey] = launch }
+        }
+        return launch(inputs, stream: stream)[0]
     }
+
+    private struct SlabLaunchKeyType: Hashable {
+        let kernelName: String
+        let rows: Int
+        let queryHeads: Int
+        let kvHeads: Int
+    }
+
+    nonisolated(unsafe) private static var slabLaunchCache:
+        [SlabLaunchKeyType: MLXFast.MLXFastKernel.Launch] = [:]
 
     nonisolated(unsafe) private static let dummyTreeMeta: MLXArray = {
         let arr = MLXArray.zeros([18], type: Int32.self)
