@@ -1685,15 +1685,12 @@ public enum CBv2DraftRegime {
             }
         }
     }
-    /// Strict low-acceptance gate (`< 3.60 @ 6`) exclusively for verify-only speedups so
     /// Pair 1 keeps its 25-round drafter/window schedule without approaching the 5.000x ceiling.
     nonisolated(unsafe) public static var strictLowVerifyEligible = false {
         didSet {
             if !strictLowVerifyEligible { strictLowVerifyC3 = false }
         }
     }
-    /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
-    /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
     nonisolated(unsafe) public static var strictLowVerifyC3 = false
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil

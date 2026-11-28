@@ -71,9 +71,6 @@ public enum CBv2VerifyNVFP4 {
         let sv = scaleVecEnv ?? wc
         let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         if inputs >= 16384 {
-            // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
-            // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
-            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
             if strictC3 && rows >= 7 && downTN1Env && wc {
                 let defaultPF = peeledPFEnv ? 2 : 0
                 let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
@@ -86,9 +83,6 @@ public enum CBv2VerifyNVFP4 {
             let pf = prefetchEnv ?? defaultPF
             return (tn, pf, wc, sv)
         }
-        // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
-        // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
-        // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
         let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
         let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
