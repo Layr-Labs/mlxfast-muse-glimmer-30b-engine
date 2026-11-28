@@ -323,6 +323,17 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.modelCapabilities = modelCapabilities
         // Parameter buffers resident before the first step (memory only).
         CBv2ParameterResidency.prepare([model as AnyObject] + (mtpDrafter.map { [$0 as AnyObject] } ?? []))
+        // Decode-shaped allocator warm-up on zeros (no request, cache or token state): the phase
+        // starts on a drained free-buffer cache, so without it the first scored round allocates
+        // every verify intermediate fresh.
+        // The engine's `model` is the runner's adapter of the target, which is not an editable
+        // file and does not adopt the protocol; a drafter bound to the target does, and forwards.
+        if CBv2DecodeBufferPrewarm.enabled, mtpConfig.enabled, mtpConfig.maxDraftTokens > 0,
+            let prewarming = (model as? any CBv2DecodeBufferPrewarming)
+                ?? (mtpDrafter as? any CBv2DecodeBufferPrewarming)
+        {
+            prewarming.prewarmDecodeBuffers(verifyRows: mtpConfig.maxDraftTokens + 1)
+        }
         if let violation = Self.backendCapabilityViolation(
             capabilities: modelCapabilities, backend: backend)
         {
@@ -2267,4 +2278,19 @@ extension EngineV2 {
         case .float64: return "float64"
         }
     }
+}
+
+/// A target that can evaluate its verify-path kernels once on zeros at a decode shape, so the
+/// allocator's free-buffer cache holds that shape's buffers before the first scored round. The
+/// warm-up is input-independent: it reads no request, KV cache or token, and drops its outputs.
+public protocol CBv2DecodeBufferPrewarming: AnyObject {
+    func prewarmDecodeBuffers(verifyRows: Int)
+}
+
+public enum CBv2DecodeBufferPrewarm {
+    /// `MLX_MUSE_DECODE_PREWARM=0` (or `MUSE_MLX_DECODE_PREWARM=0`) disables the warm-up.
+    public static let enabled: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return (env["MLX_MUSE_DECODE_PREWARM"] ?? env["MUSE_MLX_DECODE_PREWARM"]) != "0"
+    }()
 }
