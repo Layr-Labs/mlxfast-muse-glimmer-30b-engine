@@ -913,6 +913,14 @@ public enum CBv2SmallProjection {
         }
     }
 
+    /// Branchless FP8 decode for the CBv2VerifyScales FP8 products: strict-low verify
+    /// rounds only, and only for layers the boot check proved NaN-free and scale-safe.
+    public static func shouldUseBranchlessFP8(for layers: [ModelOptCalibratedLinear]) -> Bool {
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        return lowVerify && CBv2DraftRegime.strictLowVerifyEligible && branchlessDVEnabled
+            && allBranchlessSafe(layers)
+    }
+
     private static func allBranchlessSafe(_ layers: [ModelOptCalibratedLinear]) -> Bool {
         fastLock.withLockUnchecked { box in
             for layer in layers {

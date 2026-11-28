@@ -1683,6 +1683,10 @@ public enum CBv2DraftRegime {
     /// Strict low-acceptance gate (`< 3.60 @ 6`) for target verify-only speedups so
     /// Pair 1 keeps its 25-round drafter/window schedule without approaching the 5.000x ceiling.
     nonisolated(unsafe) public static var strictLowVerifyEligible = false
+    /// Verify-only deep-low kernel variants (ArthurOstapenko 41a222d2: lm_head top-2 lazy
+    /// activation loads, wide top-2 stage 2, branchless FP8 in CBv2VerifyScales) follow the
+    /// strict-low verify gate, so Pair 1 keeps its schedule.
+    public static var deepLowVerify: Bool { !lowOnlyVerifySpeedups || strictLowVerifyEligible }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.

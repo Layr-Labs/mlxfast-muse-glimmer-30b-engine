@@ -631,6 +631,18 @@ extension MuseGlimmerTextModel {
                 return projected
             }
         }
+        // ArthurOstapenko 41a222d2: vectorized bf16 silu(gate) * up on strict-low verify
+        // rounds whose down_proj is not FP8 (bit-identical to compiledSiluProduct).
+        if CBv2DraftRegime.deepLowVerify, let rows = verifyRows(gu[0]),
+            let act = VerifyFusedNorms.fusedSiluProduct(gate: gu[0], up: gu[1])
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [act], [compiledSiluProduct(gu[0], gu[1])],
+                    kind: "bf16.silu_mul", rows: rows)
+            }
+            return verifyDownProjection(mlp.downProj, act)
+        }
         return verifyDownProjection(mlp.downProj, compiledSiluProduct(gu[0], gu[1]))
     }
 
@@ -1095,6 +1107,9 @@ extension MuseGlimmerTextModel {
                             }
                         default:
                             outputs.append(verifyDownProjection(group[0], x))
+                            if strictMode, let act = VerifyFusedNorms.fusedSiluProduct(gate: x, up: x) {
+                                outputs.append(act)
+                            }
                             if lowAcc, let fp8 = group[0] as? ModelOptCalibratedLinear,
                                 let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
                                     gate: x, up: x, layer: fp8)
@@ -1120,22 +1135,34 @@ extension MuseGlimmerTextModel {
                 })
             if CBv2VerifyScales.fusedLMHeadEnabled {
                 var fusedWarm = [MLXArray]()
-                for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-                    if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
-                        lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
-                        outputMultiplier: configuration.outputMultiplier,
-                        softcap: configuration.finalLogitSoftcapping)
-                    {
-                        fusedWarm += [res.ids, res.values, res.nonFinite]
+                // Warm both lm_head top-2 variants (strict-low lazy activation loads and
+                // wide stage 2, and the record schedule) so no JIT compile lands in a timed window.
+                for (lowAcc, strictMode) in [(false, false), (true, false), (true, true)] {
+                    CBv2DraftRegime.lowAcceptance = lowAcc
+                    CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
+                    CBv2DraftRegime.strictLowVerifyEligible = strictMode
+                    for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                        if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+                            lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
+                            outputMultiplier: configuration.outputMultiplier,
+                            softcap: configuration.finalLogitSoftcapping)
+                        {
+                            fusedWarm += [res.ids, res.values, res.nonFinite]
+                        }
                     }
                 }
                 if !fusedWarm.isEmpty { eval(fusedWarm) }
             }
-            let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
-                MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
-                outputMultiplier: configuration.outputMultiplier,
-                softcap: configuration.finalLogitSoftcapping)
-            eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            for (lowAcc, strictMode) in [(false, false), (true, true)] {
+                CBv2DraftRegime.lowAcceptance = lowAcc
+                CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
+                CBv2DraftRegime.strictLowVerifyEligible = strictMode
+                let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
+                    MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
+                    outputMultiplier: configuration.outputMultiplier,
+                    softcap: configuration.finalLogitSoftcapping)
+                eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            }
         }
     }
 }

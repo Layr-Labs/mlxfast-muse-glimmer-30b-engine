@@ -564,6 +564,9 @@ public enum VerifyFusedNorms {
     public static let fusedElementwiseFP8Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_ELEM_FP8"] != "0"
 
+    public static let verifySiluMulEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_VERIFY_SILU_MUL"] != "0"
+
     private static let elemFP8Header = """
         inline bfloat16_t verify_bf16_sigmoid(bfloat16_t x) {
           bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
@@ -603,19 +606,31 @@ public enum VerifyFusedNorms {
             vec<bfloat16_t, 4> out;
             #pragma unroll
             for (int k = 0; k < 4; ++k) {
-              bfloat16_t yb;
               if constexpr (MODE_ == 0) {
-                yb = av[k] * verify_bf16_sigmoid(bv[k]);
+                const bfloat16_t yb = av[k] * verify_bf16_sigmoid(bv[k]);
+                out[k] = verify_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
+              } else if constexpr (MODE_ == 1) {
+                const bfloat16_t g = av[k];
+                const bfloat16_t yb = (g * verify_bf16_sigmoid(g)) * bv[k];
+                out[k] = verify_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
               } else {
                 const bfloat16_t g = av[k];
-                yb = (g * verify_bf16_sigmoid(g)) * bv[k];
+                out[k] = (g * verify_bf16_sigmoid(g)) * bv[k];
               }
-              out[k] = verify_bf16_cast_fp8(yb, m0, m1, bound, nan_value);
             }
             y4[idx4] = out;
             """,
         header: ModelOptActivationKernels.header + elemFP8Header,
         ensureRowContiguous: true)
+
+    /// Vectorized BF16 `silu(gate) * up` (`vec<bfloat16_t, 4>`, bit-identical to
+    /// `compiledSiluProduct` with cached launch and zero compile-graph trace overhead).
+    public static func fusedSiluProduct(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard verifySiluMulEnabled else { return nil }
+        return runElemFP8(
+            gate, up, outShape: gate.shape, multipliers: dummyFP8Mu, overflowBound: dummyFP8Bound,
+            mode: 2)
+    }
 
     private static func runElemFP8(
         _ a: MLXArray, _ b: MLXArray, outShape: [Int],
