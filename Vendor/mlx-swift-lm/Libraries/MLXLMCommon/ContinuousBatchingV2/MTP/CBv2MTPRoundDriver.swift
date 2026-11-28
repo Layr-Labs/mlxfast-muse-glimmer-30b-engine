@@ -1695,6 +1695,14 @@ public enum CBv2DraftRegime {
     /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
     /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
     nonisolated(unsafe) public static var strictLowVerifyC3 = false
+    /// Target-verify kernel selection runs the strict-low and clause-3 choices of the
+    /// bit-identical verify kernels in every round (`MLX_MUSE_VERIFY_UNGATE=0` restores the
+    /// regime gates). Drafter, tree, depth, acceptance and paged-attention choices keep
+    /// reading the flags above; the decode pacing floor bounds high-acceptance windows.
+    public static let verifyUngate: Bool =
+        ProcessInfo.processInfo.environment["MLX_MUSE_VERIFY_UNGATE"] != "0"
+    public static var verifyStrictLowKernels: Bool { verifyUngate || strictLowVerifyEligible }
+    public static var verifyC3Kernels: Bool { verifyUngate || strictLowVerifyC3 }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1710,11 +1718,11 @@ public enum CBv2DraftRegime {
     /// `CBV2_DYN_TREE=0` disables GPU-dynamic tree selection (falls back to static tree).
     public static let dynamicTreeEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DYN_TREE"] != "0"
-    /// `CBV2_LOW_ONLY_VERIFY=0` applies verify-path micro-speedups on high-acceptance rounds too.
-    /// Default (`true`) confines them to low-acceptance rounds so high-acceptance windows match
-    /// baseline latency below the decode speedup ceiling.
+    /// Verify-path speedups run in every round by default; the decode pacing floor
+    /// bounds high-acceptance windows. `CBV2_LOW_ONLY_VERIFY=1` confines them to
+    /// low-acceptance rounds.
     public static let lowOnlyVerifySpeedups: Bool =
-        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] == "1"
     /// `CBV2_TREE_OLDPOL=1` forces k-wide accept/reject updates on tree rounds.
     /// Default (`false`) uses terminal-branch and chain-depth semantics so tree rounds preserve width.
     public static let treeOldAcceptancePolicy: Bool =
@@ -1826,7 +1834,7 @@ public enum CBv2DraftRegime {
     public static let dynamicTreeDPMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_DYN_TREE_DP"].flatMap(Int.init) ?? 1
     }()
-    /// Candidates per position considered in dynamic tree (`CBV2_DYN_TREE_TOPK`, 3...5, default 5).
+    /// Candidates per position considered in dynamic tree (`CBV2_DYN_TREE_TOPK`, 3...5, default 4).
     public static let dynamicTreeTopK: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TOPK"],
             let v = Int(raw), (3 ... 5).contains(v)
@@ -1853,14 +1861,14 @@ public enum CBv2DraftRegime {
         }
         return 1.0
     }()
-    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.5).
+    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.0).
     public static let dynamicTreePurityExp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_PURITY_EXP"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 3.0
         {
             return v
         }
-        return 0.5
+        return 0.0
     }()
     /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
     public static let treeCooldownEnabled: Bool =
