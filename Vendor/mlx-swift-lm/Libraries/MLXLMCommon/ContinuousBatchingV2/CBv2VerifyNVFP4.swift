@@ -43,6 +43,8 @@ public enum CBv2VerifyNVFP4 {
     private static let env = ProcessInfo.processInfo.environment
     private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
+    private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
+    private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
@@ -67,7 +69,13 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         if inputs >= 16384 {
+            if strictC3 && rows >= 7 && downTN1Env && wc {
+                let defaultPF = peeledPFEnv ? 2 : 0
+                let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
+                return (1, pf, wc, sv)
+            }
             // MLP down (K = 19968): WC + PF=1 + SV=1 on low-acceptance verify rows;
             // keep high-acceptance Pair 1 at PF=0 to stay safely below the decode ceiling.
             let tn = rows >= 7 ? 2 : 1
@@ -75,7 +83,8 @@ public enum CBv2VerifyNVFP4 {
             let pf = prefetchEnv ?? defaultPF
             return (tn, pf, wc, sv)
         }
-        let pf = prefetchEnv ?? 0
+        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
 
@@ -183,6 +192,142 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (WC && PF == 2) {
+                // Branchless peeled next-chunk weight+scale DRAM prefetch with 4-block
+                // upfront activation loads (zero if(more) branches inside K-loop, maxT=1024).
+                constexpr int STEP = WK * BK;
+                int k = int(sg) * BK;
+                if (k < K) {
+                    uint qb[4][TN];
+                    uint2 sb[TN];
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qb[block][t] = wl[t][b / 8]; }
+                    }
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            sb[t] = *(const device uint2*)(sl[t] + (k / 16));
+                        } else {
+                            sb[t] = uint2(
+                                uint(sl[t][k / 16]) | (uint(sl[t][k / 16 + 2]) << 16),
+                                uint(sl[t][k / 16 + 4]) | (uint(sl[t][k / 16 + 6]) << 16));
+                        }
+                    }
+                    for (; k + STEP < K; k += STEP) {
+                        const int kn = k + STEP;
+                        uint q[4][TN];
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            const int bn = kn + 32 * block;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                q[block][t] = qb[block][t];
+                                qb[block][t] = wl[t][bn / 8];
+                            }
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                                sb[t] = *(const device uint2*)(sl[t] + (kn / 16));
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                                sb[t] = uint2(
+                                    uint(sl[t][kn / 16]) | (uint(sl[t][kn / 16 + 2]) << 16),
+                                    uint(sl[t][kn / 16 + 4]) | (uint(sl[t][kn / 16 + 6]) << 16));
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Final peeled chunk (no next-chunk load).
+                    {
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(qb[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
                                 }
                             }
                         }

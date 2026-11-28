@@ -77,21 +77,29 @@ struct PagedSegmentDispatchPlan {
         func flush() {
             guard !pending.isEmpty else { return }
             let ids = segments.sorted()
-            let binding = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
+            let oneBinding = ids.count == 1
+            let binding = oneBinding ? [:] : Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
             var records: [Int32] = []
             records.reserveCapacity(pending.count * Self.recordStride)
             for item in pending {
                 let writer = item.write.map {
-                    (binding[layout.segmentIndex(page: $0)]!, layout.localPage($0))
+                    (oneBinding ? 0 : binding[layout.segmentIndex(page: $0)]!, layout.localPage($0))
                 }
                 var record: [Int32] = [
                     Int32(item.row), Int32(item.partition), Int32(item.firstPage),
                     Int32(item.pages.count), Int32(writer?.0 ?? 0), Int32(writer?.1 ?? 0),
                     Int32(maxPartitions), 0,
                 ]
-                for page in item.pages {
-                    record.append(Int32(binding[layout.segmentIndex(page: page)]!))
-                    record.append(Int32(layout.localPage(page)))
+                if oneBinding {
+                    for page in item.pages {
+                        record.append(0)
+                        record.append(Int32(layout.localPage(page)))
+                    }
+                } else {
+                    for page in item.pages {
+                        record.append(Int32(binding[layout.segmentIndex(page: page)]!))
+                        record.append(Int32(layout.localPage(page)))
+                    }
                 }
                 record.append(contentsOf: repeatElement(0, count: Self.recordStride - record.count))
                 records.append(contentsOf: record)
@@ -129,9 +137,21 @@ struct PagedSegmentDispatchPlan {
                     precondition(
                         writer == pages.last, "fused write must target the newest attended page")
                 }
-                let needed = Set(pages.map { layout.segmentIndex(page: $0) })
+                let firstSegment = layout.segmentIndex(page: pages[0])
+                var oneSegment = true
+                for page in pages.dropFirst() {
+                    if layout.segmentIndex(page: page) != firstSegment {
+                        oneSegment = false
+                        break
+                    }
+                }
+                let needed = oneSegment
+                    ? Set([firstSegment])
+                    : Set(pages.map { layout.segmentIndex(page: $0) })
                 precondition(needed.count <= Self.maximumBindings)
-                if segments.union(needed).count > Self.maximumBindings { flush() }
+                if segments.count + needed.count > Self.maximumBindings,
+                    segments.union(needed).count > Self.maximumBindings
+                { flush() }
                 segments.formUnion(needed)
                 pending.append(
                     Item(

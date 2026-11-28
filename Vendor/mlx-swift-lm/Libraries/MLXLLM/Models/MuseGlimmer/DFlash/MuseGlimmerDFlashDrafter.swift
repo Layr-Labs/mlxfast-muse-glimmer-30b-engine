@@ -518,7 +518,6 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         nvWarm += [hMid, downOut]
                     }
                     eval(nvWarm)
-                    // Warm strided-ring SDPA on deep-low NVFP4 path for both 32-aligned and unaligned ctxLen.
                     for ctxLen in [520, 528] {
                         let tmpCtx = FastInPlaceContext(
                             configuration: c, dtype: .bfloat16, inPlaceRing: true)
@@ -528,12 +527,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                             values: MLXArray.zeros(
                                 [c.hiddenLayers, c.kvHeads, ctxLen, 128], dtype: .bfloat16))
                         let vis = tmpCtx.visibleContext()
-                        let r = fastDraftBlockRows(
+                        let rUnmasked = fastDraftBlockRows(
                             embeddings: dummyEmb, at: ctxLen,
                             context: vis.map { ($0.keys, $0.values) }, mask: vis?.mask,
                             draftCount: settings.maximumDraftTokens,
                             ringContext: tmpCtx, ringTailStart: ctxLen)
-                        eval(r)
+                        let cols = MLXArray.ones([ctxLen + c.blockSize], type: Bool.self)
+                        let boolMask = broadcast(
+                            cols.reshaped([1, ctxLen + c.blockSize]),
+                            to: [c.blockSize, ctxLen + c.blockSize])
+                        let rMasked = fastDraftBlockRows(
+                            embeddings: dummyEmb, at: ctxLen,
+                            context: vis.map { ($0.keys, $0.values) }, mask: boolMask,
+                            draftCount: settings.maximumDraftTokens, devicePosition: devPos,
+                            ringContext: tmpCtx, ringTailStart: ctxLen)
+                        eval(rUnmasked, rMasked)
                     }
                 }
                 CBv2DraftRegime.lowAcceptance = prevLow
@@ -787,6 +795,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         func canWriteBlockTail(at tailStart: Int, rows: Int) -> Bool {
             inPlaceRing && keys != nil && values != nil && firstPosition == basePosition
                 && tailStart == count && tailStart > 0 && tailStart + rows <= window
+        }
+
+        func canWriteSpeculativeBlockTail(at tailStart: Int, rows: Int) -> Bool {
+            inPlaceRing && keys != nil && values != nil && firstPosition == basePosition
+                && tailStart >= count && tailStart > 0 && tailStart + rows <= window
         }
 
         func ringTailBuffers() -> (keys: MLXArray, values: MLXArray, fence: MLXArray)? {
@@ -2358,10 +2371,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let prevLow = CBv2DraftRegime.lowAcceptance
         CBv2DraftRegime.lowAcceptance = true
         defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let useSpecBlockTail =
+            usedZeroCopyTail && Self.zeroCopyBlockTailEnabled
+            && CBv2DraftRegime.strictLowVerifyC3
+            && context.canWriteSpeculativeBlockTail(at: existingCount + n, rows: block)
         let rows = fastDraftBlockRows(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
             context: (ctxKeys, ctxValues), mask: mask,
-            draftCount: settings.maximumDraftTokens, devicePosition: position)
+            draftCount: settings.maximumDraftTokens, devicePosition: position,
+            ringContext: useSpecBlockTail ? context : nil,
+            ringTailStart: useSpecBlockTail ? (existingCount + n) : 0)
         if usedZeroCopyTail {
             context.recordSpeculativeRead(rows)
         }
@@ -4696,9 +4715,10 @@ extension MuseGlimmerDFlashDrafter {
                     }
                 }
 
-                threadgroup float sh_v[NUM_SG_][2];
-                threadgroup int sh_i[NUM_SG_][2];
+                threadgroup float sh_v[2][NUM_SG_][2];
+                threadgroup int sh_i[2][NUM_SG_][2];
                 for (uint r = 0u; r < uint(R_); ++r) {
+                    const uint b = r & 1u;
                     float v0 = acc[r], v1 = -INFINITY;
                     int i0 = valid ? v : -1, i1 = -1;
                     for (ushort off = 16u; off > 0u; off >>= 1u) {
@@ -4710,14 +4730,14 @@ extension MuseGlimmerDFlashDrafter {
                         }
                     }
                     if (lane == 0u) {
-                        sh_v[sg][0] = v0; sh_i[sg][0] = i0;
-                        sh_v[sg][1] = v1; sh_i[sg][1] = i1;
+                        sh_v[b][sg][0] = v0; sh_i[b][sg][0] = i0;
+                        sh_v[b][sg][1] = v1; sh_i[b][sg][1] = i1;
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     if (sg == 0u) {
                         if (lane < uint(NUM_SG_)) {
-                            v0 = sh_v[lane][0]; i0 = sh_i[lane][0];
-                            v1 = sh_v[lane][1]; i1 = sh_i[lane][1];
+                            v0 = sh_v[b][lane][0]; i0 = sh_i[b][lane][0];
+                            v1 = sh_v[b][lane][1]; i1 = sh_i[b][lane][1];
                         } else {
                             v0 = v1 = -INFINITY; i0 = i1 = -1;
                         }
@@ -4735,7 +4755,6 @@ extension MuseGlimmerDFlashDrafter {
                             cand_ids[base + 1u] = i1;
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
                 """,
             header: header)
