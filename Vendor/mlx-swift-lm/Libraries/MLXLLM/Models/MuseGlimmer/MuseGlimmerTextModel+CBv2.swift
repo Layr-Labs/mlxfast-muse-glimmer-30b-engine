@@ -358,7 +358,9 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            if (flushLayer > 0 && index + 1 == flushLayer)
+                || (lowVerify && MuseGlimmerVerifyProjections.lowFlushLayers.contains(index + 1))
+            {
                 asyncEval(h, layerInput)
             }
         }
@@ -777,6 +779,13 @@ enum MuseGlimmerVerifyProjections {
     static let midTrunkFlushLayer: Int = {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
+    }()
+    /// Extra mid-trunk submissions on low-acceptance verify rounds
+    /// (`CBV2_LOW_FLUSH`, comma-separated layer counts; empty disables), so the
+    /// GPU starts earlier and stays ahead of graph construction.
+    static let lowFlushLayers: Set<Int> = {
+        let raw = environment["CBV2_LOW_FLUSH"] ?? "8,26,38"
+        return Set(raw.split(separator: ",").compactMap { Int($0) })
     }()
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
