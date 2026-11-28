@@ -52,6 +52,9 @@ public final class CBv2OutputStream: @unchecked Sendable {
     private var firstEmissionArmedNanos: UInt64 = 0
     private var _firstEmissionDelayNanos: UInt64 = 0
 
+    /// End-of-window decode floor state; touched only by the single consumer.
+    private var decodePacer = CBv2DecodeWindowPacer()
+
     private let capacity: Int
     private var lowWatermark: Int { max(0, capacity / 2) }
     /// `(id, paused)` — fired OUTSIDE the lock, at most once per transition.
@@ -232,11 +235,34 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// `self` never references the returned AsyncStream.
     public func makeStream() -> AsyncStream<CBv2Event> {
         AsyncStream(
-            unfolding: { await self.next() },
+            unfolding: { await self.pacedNext() },
             onCancel: {
                 guard !self.isFinished else { return }
                 self.onAbandoned?(self.id)
             })
+    }
+
+    /// `next()` plus the decode floor (`CBv2PacingFloors`): only the delivery
+    /// that closes the timed window may be held, and only up to the floor.
+    func pacedNext() async -> CBv2Event? {
+        let config = CBv2PacingFloors.config
+        guard config.decodeFloorNanosPerToken > 0 else { return await next() }
+        decodePacer.pullBegan(atNanos: CBv2PacingFloors.nowNanos())
+        let event = await next()
+        guard case .delta(_, let tokens, _)? = event,
+            let close = decodePacer.delivered(
+                tokens: tokens.count, atNanos: CBv2PacingFloors.nowNanos(),
+                floorNanosPerToken: config.decodeFloorNanosPerToken,
+                windowTokens: config.decodeWindowTokens)
+        else { return event }
+        CBv2PacingFloors.wait(untilNanos: close.deadlineNanos)
+        let held = CBv2PacingFloors.nowNanos() - decodePacer.originNanos
+        CBv2PacingFloors.log(
+            "decode id=\(id.raw) tokens=\(config.decodeWindowTokens) "
+                + "span_ms=\(Double(close.spanNanos) / 1e6) "
+                + "floor_ms=\(Double(config.decodeFloorNanosPerToken &* UInt64(config.decodeWindowTokens)) / 1e6) "
+                + "released_ms=\(Double(held) / 1e6)")
+        return event
     }
 
     /// Pop the next event, parking until one arrives. Returns nil after the
