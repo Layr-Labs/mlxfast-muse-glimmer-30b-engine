@@ -720,8 +720,10 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let fastRegimeEntry: Bool =
         ProcessInfo.processInfo.environment["CBV2_FAST_REGIME"] != "0"
     static let ceilingBurstTokens = 27
+    /// Off by default: the decode pacing floor bounds pair 1's window instead.
+    /// `CBV2_MTP_ACCEPTANCE_CEILING=1` restores the budget line.
     static let ceilingEnabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] == "1"
 
     /// Records one finalized speculative round for the acceptance ceiling.
     mutating func observeCommitted(draftedDepth: Int, committedTokens: Int) {
