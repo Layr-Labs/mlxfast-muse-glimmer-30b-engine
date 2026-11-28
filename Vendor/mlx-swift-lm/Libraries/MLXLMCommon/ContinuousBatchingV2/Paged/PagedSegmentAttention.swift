@@ -2,6 +2,23 @@ import Foundation
 import MLX
 import MLXFast
 
+private final class PagedPreparedLaunchCache<Key: Hashable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var launches: [Key: MLXFast.MLXFastKernel.Launch] = [:]
+
+    func launch(for key: Key, make: () -> MLXFast.MLXFastKernel.Launch)
+        -> MLXFast.MLXFastKernel.Launch
+    {
+        if let cached = lock.withLock({ launches[key] }) { return cached }
+        let made = make()
+        return lock.withLock {
+            if let cached = launches[key] { return cached }
+            if launches.count < 1024 { launches[key] = made }
+            return made
+        }
+    }
+}
+
 /// Decode over any number of native segments using bounded binding buckets.
 /// Only address resolution differs from the direct-slab numerical reference.
 enum PagedSegmentAttention {
@@ -23,6 +40,25 @@ enum PagedSegmentAttention {
         [:]
     nonisolated(unsafe) private static var mergeKernels:
         [PagedAttentionKernelKey: MLXFast.MLXFastKernel] = [:]
+
+    private struct PartLaunchID: Hashable {
+        let kernel: PartKernelID
+        let headsPerThreadgroup: Int
+        let workCount: Int
+        let scratchRows: Int
+        let scratchPartitions: Int
+        let dynamicTree: Bool
+    }
+
+    private struct MergeLaunchID: Hashable {
+        let kernel: PagedAttentionKernelKey
+        let rows: Int
+        let queryHeads: Int
+        let dynamicTree: Bool
+    }
+
+    private static let partLaunches = PagedPreparedLaunchCache<PartLaunchID>()
+    private static let mergeLaunches = PagedPreparedLaunchCache<MergeLaunchID>()
 
     /// `allocatesScratch` is the first bucket's variant: `partials` and `meta`
     /// are its uninitialized outputs instead of mutable inputs. The body and
@@ -222,6 +258,33 @@ enum PagedSegmentAttention {
         }
     }
 
+    fileprivate static func merge(
+        _ inputs: [MLXArray], key: PagedAttentionKernelKey, rows: Int, queryHeads: Int,
+        dynamicTree: Bool, source: String, cacheLaunch: Bool
+    ) -> MLXArray {
+        func template() -> [(String, any KernelTemplateArg)] {
+            [
+                ("T", key.dtype), ("D", key.headDim), ("PTOK", key.partitionTokens),
+                ("HAS_SINKS", key.hasSinks), ("DYN_TREE", dynamicTree),
+            ]
+        }
+        let grid = (queryHeads * 32, rows, 1)
+        let threads = (32, 1, 1)
+        if cacheLaunch {
+            let id = MergeLaunchID(
+                kernel: key, rows: rows, queryHeads: queryHeads, dynamicTree: dynamicTree)
+            let launch = mergeLaunches.launch(for: id) {
+                mergeKernel(key: key, source: source).prepare(
+                    template: template(), grid: grid, threadGroup: threads,
+                    outputShapes: [[rows, queryHeads, key.headDim]], outputDTypes: [key.dtype])
+            }
+            return launch(inputs)[0]
+        }
+        return mergeKernel(key: key, source: source)(
+            inputs, template: template(), grid: grid, threadGroup: threads,
+            outputShapes: [[rows, queryHeads, key.headDim]], outputDTypes: [key.dtype])[0]
+    }
+
     static func decode(
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
@@ -310,19 +373,29 @@ enum PagedSegmentAttention {
             PagedSegmentTransfers.write(
                 group: group, slots: slots, keys: pending.keys, values: pending.values)
         }
+        let record = PagedOnePassAttention.useRecordKernel
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
-            let heads = PagedOnePassAttention.eligible(
+            let baselineHeads = PagedOnePassAttention.eligible(
                 headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b,
-                dynTree: treeMeta != nil)
+                dynTree: treeMeta != nil, record: record)
         {
             let bucket = plan.buckets[0]
+            let gate =
+                !PagedOnePassAttention.checks && outputGate?.dtype == dtype
+                && outputGate?.shape == [b, qh, d] ? outputGate : nil
+            let heads = PagedOnePassAttention.warmedSegmentHeads(
+                baselineHeads, dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa,
+                pageSize: group.pageSize, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                partitions: plan.maxPartitions, rows: b, bindings: bucket.bindingClass,
+                dynTree: treeMeta != nil, appending: pending != nil,
+                outputGateMode: gate == nil ? 0 : (fp8Cast == nil ? 1 : 2), record: record)
             var fusedPending = pending
             if let pending,
                 !PagedOnePassAttention.supportsAppend(
                     dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
                     hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass)
+                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass, record: record)
             {
                 scatterPending(pending)
                 guard !group.writeValidation.isFaulted else { return (q, false) }
@@ -330,15 +403,14 @@ enum PagedSegmentAttention {
             }
             var fusedOutGate: MLXArray? = nil
             var fusedFP8Cast: (multipliers: MLXArray, overflowBound: MLXArray)? = nil
-            if fusedPending == nil, !PagedOnePassAttention.checks, let outputGate,
-                outputGate.dtype == dtype, outputGate.shape == [b, qh, d],
+            if fusedPending == nil, let gate,
                 PagedOnePassAttention.supportsOutputGate(
                     dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
                     hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
                     maxPart: plan.maxPartitions, bindings: bucket.bindingClass,
-                    dynTree: treeMeta != nil, fp8Cast: fp8Cast != nil)
+                    dynTree: treeMeta != nil, fp8Cast: fp8Cast != nil, record: record)
             {
-                fusedOutGate = outputGate
+                fusedOutGate = gate
                 fusedFP8Cast = fp8Cast
             }
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
@@ -354,7 +426,13 @@ enum PagedSegmentAttention {
                 pending: fusedPending.map {
                     ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
                 },
-                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast)
+                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast, record: record)
+            if heads != baselineHeads {
+                PagedOnePassAttention.logSharedLaunch(
+                    record: record, partitions: plan.maxPartitions, hpt: heads,
+                    dynTree: treeMeta != nil, appending: fusedPending != nil,
+                    gated: fusedOutGate != nil, fp8Cast: fusedFP8Cast != nil)
+            }
             if PagedOnePassAttention.checks {
                 // The reference reads the pages this dispatch wrote.
                 if fusedPending != nil { group.writeFence = result.fence }
@@ -401,6 +479,8 @@ enum PagedSegmentAttention {
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
             partitionTokens: ptok, hasWrite: newKeys != nil)
+        let cacheLaunches = true
+        let dynamicTree = treeMeta != nil
         for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
             let segments = bucket.segmentIDs.map { group.segments[$0]! }
             let bindingCount = bucket.bindingClass
@@ -409,35 +489,63 @@ enum PagedSegmentAttention {
             // never a separately declared writable output.
             backing.append(
                 contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
-            let inputs =
+            var inputs =
                 [q, k, v] + backing + [
                     seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
                     treeMeta ?? dummyTreeMeta,
                 ]
-            let template: [(String, any KernelTemplateArg)] = [
-                ("T", dtype), ("D", d), ("S", group.pageSize),
-                ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
-                ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
-                ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride),
-                ("DYN_TREE", treeMeta != nil),
-            ]
-            let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+            let allocatesScratch = partials == nil
             if let partials, let meta {
-                group.writeFence =
-                    kernel(
-                        key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
-                        inputs + [partials, meta], template: template, grid: grid,
-                        threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[
-                        0]
-            } else {
-                let outputs = kernel(
+                inputs.append(partials)
+                inputs.append(meta)
+            }
+            func configuration() -> (
+                kernel: MLXFast.MLXFastKernel, template: [(String, any KernelTemplateArg)],
+                shapes: [[Int]], types: [DType]
+            ) {
+                let kernel = Self.kernel(
                     key: partKey, bindings: bindingCount, kvHeads: kvh, source: source,
-                    allocatesScratch: true)(
-                        inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
-                        outputShapes: [[1], partialsShape, [metaCount]],
-                        outputDTypes: [.int32, .float32, .float32])
-                group.writeFence = outputs[0]
+                    allocatesScratch: allocatesScratch)
+                let template: [(String, any KernelTemplateArg)] = [
+                    ("T", dtype), ("D", d), ("S", group.pageSize),
+                    ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
+                    ("PTOK", ptok), ("HAS_WRITE", partKey.hasWrite),
+                    ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
+                    ("STRIDE", PagedSegmentDispatchPlan.recordStride), ("DYN_TREE", dynamicTree),
+                ]
+                return (
+                    kernel, template,
+                    allocatesScratch ? [[1], partialsShape, [metaCount]] : [[1]],
+                    allocatesScratch ? [.int32, .float32, .float32] : [.int32]
+                )
+            }
+            let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+            let threads = (32 * nsg, 1, 1)
+            let outputs: [MLXArray]
+            if cacheLaunches {
+                let id = PartLaunchID(
+                    kernel: PartKernelID(
+                        key: partKey, bindings: bindingCount, kvHeads: kvh,
+                        allocatesScratch: allocatesScratch),
+                    headsPerThreadgroup: hpt, workCount: bucket.workCount,
+                    scratchRows: allocatesScratch ? b : 0,
+                    scratchPartitions: allocatesScratch ? plan.maxPartitions : 0,
+                    dynamicTree: dynamicTree)
+                let launch = partLaunches.launch(for: id) {
+                    let config = configuration()
+                    return config.kernel.prepare(
+                        template: config.template, grid: grid, threadGroup: threads,
+                        outputShapes: config.shapes, outputDTypes: config.types)
+                }
+                outputs = launch(inputs)
+            } else {
+                let config = configuration()
+                outputs = config.kernel(
+                    inputs, template: config.template, grid: grid, threadGroup: threads,
+                    outputShapes: config.shapes, outputDTypes: config.types)
+            }
+            group.writeFence = outputs[0]
+            if allocatesScratch {
                 partials = outputs[1]
                 meta = outputs[2]
             }
@@ -446,14 +554,10 @@ enum PagedSegmentAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let mergeSinks = sinks ?? unusedMergeSinks(count: max(8, qh))
-        let out = mergeKernel(key: mergeKey, source: source)(
+        let out = merge(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence, treeMeta ?? dummyTreeMeta],
-            template: [
-                ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
-                ("DYN_TREE", treeMeta != nil),
-            ],
-            grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+            key: mergeKey, rows: b, queryHeads: qh, dynamicTree: dynamicTree, source: source,
+            cacheLaunch: cacheLaunches)
         return (out, false)
     }
 }
@@ -618,6 +722,18 @@ enum PagedMultiQueryAttention {
     nonisolated(unsafe) private(set) static var dispatches = 0
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    private struct PartLaunchID: Hashable {
+        let kernel: PagedAttentionKernelKey
+        let columns: Int
+        let groups: Int
+        let columnsPerGroup: Int
+        let kvHeads: Int
+        let bindings: Int
+        let workCount: Int
+    }
+
+    private static let partLaunches = PagedPreparedLaunchCache<PartLaunchID>()
 
     static func eligible(columns: Int, queryHeads: Int, headDim: Int, group: PagedKVGroup) -> Bool {
         let kvh = group.key.kvHeads
@@ -816,13 +932,9 @@ enum PagedMultiQueryAttention {
         if q.dtype != dtype { q = q.asType(dtype) }
         let partials = MLXArray.zeros([count, qh, plan.maxPartitions, d], dtype: .float32)
         let meta = MLXArray.zeros([max(8, count * qh * plan.maxPartitions * 2)], dtype: .float32)
-        let dname: String
-        switch dtype {
-        case .float16: dname = "f16"
-        case .float32: dname = "f32"
-        case .bfloat16: dname = "bf16"
-        default: dname = "dt\(dtype)"
-        }
+        let partKey = PagedAttentionKernelKey(
+            pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
+            simdgroups: nsg, hasSinks: false, hasSoftcap: softcap, partitionTokens: ptok)
         for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
             let segments = bucket.segmentIDs.map { group.segments[$0]! }
             let bindingCount = bucket.bindingClass
@@ -834,12 +946,21 @@ enum PagedMultiQueryAttention {
                     seqinfo, params, group.writeFence, metadata.valueOffsets,
                     metadata.records, PagedSegmentAttention.dummyTreeMeta, partials, meta,
                 ]
-            let name =
-                "cbv2_paged_mq_\(dname)_d\(d)_s\(group.pageSize)_g\(gqa)_n\(nsg)_c\(count)_x\(cpt)"
-                + "_t\(ptok)_kvh\(kvh)_cap\(softcap ? 1 : 0)_segments\(bindingCount)"
-            group.writeFence =
-                kernel(name: name, bindings: bindingCount, source: source)(
-                    inputs,
+            let id = PartLaunchID(
+                kernel: partKey, columns: count, groups: groups, columnsPerGroup: cpt,
+                kvHeads: kvh, bindings: bindingCount, workCount: bucket.workCount)
+            let launch = partLaunches.launch(for: id) {
+                let dname: String
+                switch dtype {
+                case .float16: dname = "f16"
+                case .float32: dname = "f32"
+                case .bfloat16: dname = "bf16"
+                default: dname = "dt\(dtype)"
+                }
+                let name =
+                    "cbv2_paged_mq_\(dname)_d\(d)_s\(group.pageSize)_g\(gqa)_n\(nsg)_c\(count)_x\(cpt)"
+                    + "_t\(ptok)_kvh\(kvh)_cap\(softcap ? 1 : 0)_segments\(bindingCount)"
+                return kernel(name: name, bindings: bindingCount, source: source).prepare(
                     template: [
                         ("T", dtype), ("D", d), ("S", group.pageSize), ("KVH", kvh),
                         ("GQA", gqa), ("NSG", nsg), ("PTOK", ptok), ("HAS_SOFTCAP", softcap),
@@ -849,23 +970,18 @@ enum PagedMultiQueryAttention {
                     ],
                     grid: (kvh * groups * 32 * gqa * cpt, bucket.workCount, 1),
                     threadGroup: (32 * gqa * cpt, 1, 1), outputShapes: [[1]],
-                    outputDTypes: [.int32])[0]
+                    outputDTypes: [.int32])
+            }
+            group.writeFence = launch(inputs)[0]
         }
         lock.withLock { dispatches += 1 }
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
-        return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
-            [
-                partials, meta, seqinfo, zeroSinks, group.writeFence,
-                PagedSegmentAttention.dummyTreeMeta,
-            ],
-            template: [
-                ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
-                ("DYN_TREE", false),
-            ],
-            grid: (qh * 32, count, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
+        return PagedSegmentAttention.merge(
+            [partials, meta, seqinfo, zeroSinks, group.writeFence, PagedSegmentAttention.dummyTreeMeta],
+            key: mergeKey, rows: count, queryHeads: qh, dynamicTree: false, source: source,
+            cacheLaunch: true)
     }
 }
