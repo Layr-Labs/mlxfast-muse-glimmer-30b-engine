@@ -591,7 +591,6 @@ public enum VerifyFusedNorms {
         header: ModelOptActivationKernels.header + elemFP8Header,
         ensureRowContiguous: true)
 
-    /// Direct cached `vec<bfloat16_t, 4>` `silu(gate) * up` (0-ULP to `compiledSiluProduct`).
     public static func fusedSiluProduct(gate: MLXArray, up: MLXArray) -> MLXArray? {
         guard fusedSiluProdEnabled,
             gate.dtype == .bfloat16, up.dtype == .bfloat16,

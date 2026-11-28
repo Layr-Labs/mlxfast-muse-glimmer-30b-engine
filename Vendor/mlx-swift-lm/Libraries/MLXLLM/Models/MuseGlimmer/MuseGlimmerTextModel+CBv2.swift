@@ -94,8 +94,6 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 
 /// A multi-row teacher-forced forward is read at its last position only. Every
 /// row runs each layer's attention and writes its K/V; the last layer's
-/// gate and output projections, feed-forward half, final norm and readout run
-/// on the last row. Exact windows give a row the bytes it gets alone.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
     /// arithmetic (one GEMM per projection over all rows), the arithmetic the

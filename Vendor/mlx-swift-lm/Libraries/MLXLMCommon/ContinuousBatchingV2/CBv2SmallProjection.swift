@@ -1066,10 +1066,8 @@ public enum CBv2SmallProjection {
     /// `CBV2_FP8_OPROJ_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT (o_proj) strict-low verify rows.
     public static let coopOProjEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_OPROJ_COOP"] != "0"
-    /// `CBV2_DENSE_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT dense BF16 (q/gate) strict-low verify rows.
     public static let coopDenseEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DENSE_COOP"] != "0"
-    /// `CBV2_FP8_TM4=0` disables single-body TM=4 RG=1 pure-SPLIT FP8 verify kernels on strict-C3 low-acceptance rows >= 5.
     public static let fp8TM4Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_TM4"] != "0"
 
