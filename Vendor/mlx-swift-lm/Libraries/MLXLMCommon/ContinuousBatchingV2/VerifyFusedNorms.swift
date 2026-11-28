@@ -32,6 +32,22 @@ public protocol CBv2FusedVerifyReadoutForwarding: CBv2FusedVerifyForwarding {
         -> (
             topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
         )?
+    /// With firstOnly, the rank axis may contain only the best target.
+    func fusedVerifyForwardScoredWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], firstOnly: Bool
+    ) -> (
+        topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
+    )?
+}
+
+public extension CBv2FusedVerifyReadoutForwarding {
+    func fusedVerifyForwardScoredWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], firstOnly: Bool
+    ) -> (
+        topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
+    )? {
+        fusedVerifyForwardScoredWithHidden(tokens: tokens, caches: caches)
+    }
 }
 
 public enum VerifyFusedNorms {
@@ -53,6 +69,7 @@ public enum VerifyFusedNorms {
     }
 
     static let header = """
+        template <bool PerSIMDGroup = false>
         METAL_FUNC float verify_tg_sum(
             float total, uint lid, uint lane, uint sg, uint nsg,
             threadgroup float* shared_vals, threadgroup float* bcast) {
@@ -62,14 +79,21 @@ public enum VerifyFusedNorms {
               shared_vals[sg] = total;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            float v = (lid < nsg) ? shared_vals[lid] : 0.0f;
+            // In the vector path, every SIMD group reads the same ordered partials.
+            // The two reductions have separate scratch arrays.
+            const uint index = PerSIMDGroup ? lane : lid;
+            float v = (index < nsg) ? shared_vals[index] : 0.0f;
             total = simd_sum(v);
           }
-          if (lid == 0) {
-            bcast[0] = total;
+          if constexpr (PerSIMDGroup) {
+            return total;
+          } else {
+            if (lid == 0) {
+              bcast[0] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            return bcast[0];
           }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          return bcast[0];
         }
 
         // Mirrors per_thread_row_reduce + threadgroup_reduce (Sum, float) for one row.
@@ -156,7 +180,7 @@ public enum VerifyFusedNorms {
               total1 = sqv + total1;
             }
           }
-          total1 = verify_tg_sum(total1, lid, lane, sg, nsg, shared_a, bcast_a);
+          total1 = verify_tg_sum<true>(total1, lid, lane, sg, nsg, shared_a, bcast_a);
           const float r1 = metal::precise::rsqrt(total1 * inv + eps1);
 
           float total2 = 0.0f;
@@ -194,7 +218,7 @@ public enum VerifyFusedNorms {
             }
             hr4[idx4] = hv;
           }
-          total2 = verify_tg_sum(total2, lid, lane, sg, nsg, shared_b, bcast_b);
+          total2 = verify_tg_sum<true>(total2, lid, lane, sg, nsg, shared_b, bcast_b);
           const float r2 = metal::precise::rsqrt(total2 * inv + eps2);
 
           if constexpr (CAST_FP8_) {
@@ -591,7 +615,6 @@ public enum VerifyFusedNorms {
         header: ModelOptActivationKernels.header + elemFP8Header,
         ensureRowContiguous: true)
 
-    /// Direct cached `vec<bfloat16_t, 4>` `silu(gate) * up` (0-ULP to `compiledSiluProduct`).
     public static func fusedSiluProduct(gate: MLXArray, up: MLXArray) -> MLXArray? {
         guard fusedSiluProdEnabled,
             gate.dtype == .bfloat16, up.dtype == .bfloat16,

@@ -518,9 +518,6 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         nvWarm += [hMid, downOut]
                     }
                     eval(nvWarm)
-                    // Warm strided-ring SDPA on deep-low NVFP4 path for both 32-aligned and unaligned ctxLen,
-                    // covering BOTH unmasked and Boolean-masked contiguous-Q (`boolmask_qnt`) used by live
-                    // `speculateOutcomeBlock` so no SDPA Metal PSO compiles during timed decode.
                     for ctxLen in [520, 528] {
                         let tmpCtx = FastInPlaceContext(
                             configuration: c, dtype: .bfloat16, inPlaceRing: true)
@@ -4992,3 +4989,4 @@ extension MuseGlimmerDFlashDrafter {
         }
     }
 }
+private let gauntletRedraw_3b78bf8f_20261128T032428Z: Int = 0

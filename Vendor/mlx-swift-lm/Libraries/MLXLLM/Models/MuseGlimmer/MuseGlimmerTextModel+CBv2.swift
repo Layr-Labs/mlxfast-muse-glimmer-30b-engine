@@ -94,8 +94,6 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 
 /// A multi-row teacher-forced forward is read at its last position only. Every
 /// row runs each layer's attention and writes its K/V; the last layer's
-/// gate and output projections, feed-forward half, final norm and readout run
-/// on the last row. Exact windows give a row the bytes it gets alone.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
     /// arithmetic (one GEMM per projection over all rows), the arithmetic the
@@ -373,7 +371,9 @@ extension MuseGlimmerTextModel {
         return (verifyOutputLogits(trunk.normed), trunk.hidden)
     }
 
-    func fusedVerifyForwardScoredWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
+    func fusedVerifyForwardScoredWithMTPHidden(
+        _ tokens: MLXArray, cache: [KVCache], firstOnly: Bool
+    )
         -> (
             topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, hidden: MLXArray
         )?
@@ -383,10 +383,10 @@ extension MuseGlimmerTextModel {
             verifyRows(trunk.normed) != nil
         else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
-            lmHead, trunk.normed,
-            outputMultiplier: configuration.outputMultiplier,
-            softcap: configuration.finalLogitSoftcapping)
+        if lowVerify, let fused = CBv2VerifyScales.nvfp4Readout(
+            lmHead, trunk.normed, outputMultiplier: configuration.outputMultiplier,
+            softcap: configuration.finalLogitSoftcapping,
+            firstOnly: firstOnly && !MuseGlimmerVerifyProjections.selfTest)
         {
             if MuseGlimmerVerifyProjections.selfTest,
                 let product = CBv2VerifyScales.product(lmHead, trunk.normed),
@@ -733,9 +733,17 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
     ) -> (
         topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
     )? {
+        fusedVerifyForwardScoredWithHidden(tokens: tokens, caches: caches, firstOnly: false)
+    }
+
+    public func fusedVerifyForwardScoredWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], firstOnly: Bool
+    ) -> (
+        topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
+    )? {
         let kv = caches.compactMap { $0 as? KVCache }
         guard kv.count == caches.count,
-            let result = target.fusedVerifyForwardScoredWithMTPHidden(tokens, cache: kv)
+            let result = target.fusedVerifyForwardScoredWithMTPHidden(tokens, cache: kv, firstOnly: firstOnly)
         else { return nil }
         return (result.topTwoIDs, result.topTwoValues, result.nonFinite, result.hidden)
     }

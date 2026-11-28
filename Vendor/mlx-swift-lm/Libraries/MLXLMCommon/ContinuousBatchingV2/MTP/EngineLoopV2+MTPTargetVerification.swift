@@ -392,7 +392,9 @@ extension EngineLoopV2 {
                 {
                     scoredOutput = try checkedModelForward(phase: .mtpVerification) {
                         fusedReadout.fusedVerifyForwardScoredWithHidden(
-                            tokens: tokens, caches: caches)
+                            tokens: tokens, caches: caches,
+                            firstOnly: mtp.config.fixedDraftTokens != nil
+                                && CBv2DraftRegime.activeDynamicTreeMeta != nil)
                     }
                 }
                 if scoredOutput == nil {
