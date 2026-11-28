@@ -44,12 +44,16 @@ public enum CBv2VerifyNVFP4 {
     private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
     private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
+    /// Kill switch for the strict-C3 MLP TN=4 schedule (CBV2_NVFP4_MLP_TN4=0 disables).
+    nonisolated(unsafe) public static var mlpTN4Enabled: Bool = env["CBV2_NVFP4_MLP_TN4"] != "0"
     private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
+    /// Bench-only schedule variant selector (0 = shipped default).
+    nonisolated(unsafe) public static var benchVariant: Int = 0
 
     /// Per-shape fragment and prefetch schedule.
     public static func geometry(rows: Int, inputs: Int) -> Geometry {
@@ -60,7 +64,7 @@ public enum CBv2VerifyNVFP4 {
     }
 
     private static func schedule(
-        rows: Int, inputs: Int, lowVerify: Bool
+        rows: Int, inputs: Int, lowVerify: Bool, segments: Int = 1
     ) -> (fragments: Int, prefetch: Int, wholeChunk: Bool, scaleVec: Bool) {
         if let o = geometryOverride {
             let wc = wholeChunkEnv ?? lowVerify
@@ -70,6 +74,13 @@ public enum CBv2VerifyNVFP4 {
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
         let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        // Strict-C3 MLP (gate+up pair at K<16384, down at K>=16384): 32 outputs per
+        // threadgroup (TN=4, PF=0). Same per-output accumulation order and rounding; measured
+        // 4-6% faster than TN=1 (gate_up) and TN=1 PF=2 / TN=2 PF=1 (down) on M4.
+        if strictC3 && wc && mlpTN4Enabled && prefetchEnv == nil
+            && ((inputs >= 16384 && segments == 1) || (inputs < 16384 && segments == 2)) {
+            return (4, 0, wc, sv)
+        }
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
@@ -774,7 +785,7 @@ public enum CBv2VerifyNVFP4 {
         let rows = x.size / inputs
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         if !lowVerify { return Record.products(nv, x) }
-        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify, segments: nv.count)
         let pkey = PlanKey(
             id0: ObjectIdentifier(nv[0]), idLast: ObjectIdentifier(nv[nv.count - 1]),
             count: nv.count, inputs: inputs, rows: rows, dtype: x.dtype,

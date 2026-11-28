@@ -354,7 +354,8 @@ enum PagedSegmentAttention {
                 pending: fusedPending.map {
                     ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
                 },
-                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast)
+                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast,
+                multiRow: PagedOnePassAttention.activeMultiRow(pending: fusedPending != nil))
             if PagedOnePassAttention.checks {
                 // The reference reads the pages this dispatch wrote.
                 if fusedPending != nil { group.writeFence = result.fence }
