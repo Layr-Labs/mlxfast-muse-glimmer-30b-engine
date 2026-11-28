@@ -38,9 +38,21 @@ public enum PagedOnePassAttention {
         if let raw = environment["MUSE_PAGED_ONEPASS_HPT"], let value = Int(raw), value >= 1 {
             return value
         }
-        // Two heads share each K/V row load: at 8 rows the one-head form is
-        // throughput-bound (measured 43 vs 31 us per layer), at 1 row equal.
+        // Two heads share each K/V row load on the record path.
         return 2
+    }()
+    /// Four-head segmented verify attention on low-acceptance rounds (`mp <= 3`,
+    /// 24.96 KB <= 32 KB threadgroup memory), halving KV DRAM reads across all 52 layers
+    /// once verified by the load-time threadgroup probe. Falls back to `requestedHeads`
+    /// automatically for `mp >= 4` or if the probe fails.
+    private static let requestedHeadsLow: Int = {
+        if let raw = environment["MUSE_PAGED_ONEPASS_HPT_LOW"], let value = Int(raw), value >= 1 {
+            return value
+        }
+        if let raw = environment["MUSE_PAGED_ONEPASS_HPT"], let value = Int(raw), value >= 1 {
+            return value
+        }
+        return 4
     }()
     /// `MUSE_PAGED_ONEPASS_CHECK=1` or `CBV2_ONEPASS_CHECK=1`: every one-pass dispatch also runs the
     /// two-pass kernels and compares raw bits (slow; a self-test, not a mode).
@@ -88,6 +100,9 @@ public enum PagedOnePassAttention {
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var appendVariants: Set<AppendKey> = []
     nonisolated(unsafe) private static var outGateVariants: Set<OutGateKey> = []
+    nonisolated(unsafe) private static var hptLowApproved: Set<HPTLowKey> = []
+    nonisolated(unsafe) private static var slabLaunchCache:
+        [SlabLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
     nonisolated(unsafe) private static var checked = 0
     nonisolated(unsafe) private static var differing = 0
     nonisolated(unsafe) private static var appendedChecks = 0
@@ -262,6 +277,109 @@ public enum PagedOnePassAttention {
                         }
                     }
                 }
+                if !useRec,
+                    let highHpt = headsPerThreadgroup(
+                        headDim: headDim, gqa: gqa, simdgroups: nsg,
+                        maxPart: mp, record: false),
+                    highHpt > hpt
+                {
+                    let highHeld =
+                        (try? withError { () -> Bool in
+                            let probed = segments(
+                                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                                seqinfo: seqinfo, params: params, previous: previous,
+                                valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: highHpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, probe: true, maxPart: mp, forceMaxPart: true,
+                                record: false)
+                            eval(probed.fence, probed.out)
+                            return true
+                        }) ?? false
+                    var highDynHeld = !warmDynTree || dynTreeProbeFailedFor(record: false)
+                    if highHeld && warmDynTree && !dynTreeProbeFailedFor(record: false) {
+                        highDynHeld =
+                            (try? withError { () -> Bool in
+                                let probed = segments(
+                                    queries: q,
+                                    backing: [MLXArray](repeating: storage, count: bindings),
+                                    seqinfo: seqinfo, params: params, previous: previous,
+                                    valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                    dtype: dtype, kvHeads: kvHeads, pageSize: pageSize,
+                                    hpt: highHpt, simdgroups: nsg, partitionTokens: ptok,
+                                    softcap: softcap, source: source, probe: true,
+                                    treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true,
+                                    record: false)
+                                eval(probed.fence, probed.out)
+                                return true
+                            }) ?? false
+                    }
+                    if highHeld && highDynHeld {
+                        let resHigh = segments(
+                            queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                            seqinfo: seqinfo, params: params, previous: previous,
+                            valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
+                            kvHeads: kvHeads, pageSize: pageSize, hpt: highHpt, simdgroups: nsg,
+                            partitionTokens: ptok, softcap: softcap, source: source, maxPart: mp,
+                            forceMaxPart: true, record: false)
+                        outputs += [resHigh.fence, resHigh.out]
+                        if warmDynTree && !dynTreeProbeFailedFor(record: false) {
+                            let dynHigh = segments(
+                                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                                seqinfo: seqinfo, params: params, previous: resHigh.fence,
+                                valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: highHpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, treeMeta: dummyTreeMeta, maxPart: mp,
+                                forceMaxPart: true, record: false)
+                            outputs += [dynHigh.fence, dynHigh.out]
+                        }
+                        if appendEnabled {
+                            outputs += warmAppend(
+                                q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
+                                params: params, previous: previous, valueOffsets: MLXArray(offsets),
+                                records: MLXArray(record), pending: pending, dtype: dtype,
+                                headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
+                                hpt: highHpt, simdgroups: nsg, partitionTokens: ptok,
+                                softcap: softcap, source: source, maxPart: mp, record: false)
+                        }
+                        var highGateOK = true
+                        if outputGateEnabled && dtype == .bfloat16 {
+                            let dummyMu = MLXArray([Float(1.0), Float(1.0)])
+                            let dummyBd = MLXArray([Float(448.0)])
+                            for fp8Pair: (MLXArray, MLXArray)? in [nil, (dummyMu, dummyBd)] {
+                                let wLin = warmOutputGate(
+                                    q: q, storage: storage, bindings: bindings, seqinfo: seqinfo,
+                                    params: params, previous: previous,
+                                    valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                    dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa,
+                                    pageSize: pageSize, hpt: highHpt, simdgroups: nsg,
+                                    partitionTokens: ptok, softcap: softcap, source: source,
+                                    maxPart: mp, treeMeta: nil, fp8Cast: fp8Pair)
+                                outputs += wLin
+                                if wLin.isEmpty { highGateOK = false }
+                                if warmDynTree && !dynTreeProbeFailedFor(record: false) {
+                                    let wDyn = warmOutputGate(
+                                        q: q, storage: storage, bindings: bindings,
+                                        seqinfo: seqinfo, params: params, previous: previous,
+                                        valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                        dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa,
+                                        pageSize: pageSize, hpt: highHpt, simdgroups: nsg,
+                                        partitionTokens: ptok, softcap: softcap, source: source,
+                                        maxPart: mp, treeMeta: dummyTreeMeta, fp8Cast: fp8Pair)
+                                    outputs += wDyn
+                                    if wDyn.isEmpty { highGateOK = false }
+                                }
+                            }
+                        }
+                        if highGateOK {
+                            let hkey = HPTLowKey(
+                                headDim: headDim, gqa: gqa, simdgroups: nsg,
+                                maxPart: mp, bindings: bindings, hpt: highHpt)
+                            lock.withLock { _ = hptLowApproved.insert(hkey) }
+                        }
+                    }
+                }
             }
         }
         }
@@ -354,18 +472,21 @@ public enum PagedOnePassAttention {
     }
 
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
-    /// requested count whose threadgroup memory fits Metal's limit.
+    /// requested count whose threadgroup memory fits Metal's limit for `maxPart`.
     static func headsPerThreadgroup(
-        headDim: Int, gqa: Int, simdgroups: Int, record: Bool = useRecordKernel
+        headDim: Int, gqa: Int, simdgroups: Int, maxPart: Int? = nil,
+        record: Bool = useRecordKernel
     ) -> Int? {
-        var hpt = min(gqa, requestedHeads)
+        let effectivePart = maxPart ?? maxPartitions
+        let targetHeads = (record || maxPart == nil) ? requestedHeads : requestedHeadsLow
+        var hpt = min(gqa, targetHeads)
         while hpt >= 1 {
             // The record kernel also holds q_smem and part_smem.
             let floats =
                 record
-                ? hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                    + maxPartitions * hpt * (headDim + 2)
-                : maxPartitions * simdgroups * hpt * (headDim + 2)
+                ? hpt * headDim + effectivePart * simdgroups * hpt * (headDim + 2)
+                    + effectivePart * hpt * (headDim + 2)
+                : effectivePart * simdgroups * hpt * (headDim + 2)
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -376,12 +497,27 @@ public enum PagedOnePassAttention {
 
     static func eligible(
         headDim: Int, gqa: Int, simdgroups: Int, partitions: Int, rows: Int,
-        dynTree: Bool = false, record: Bool = useRecordKernel
+        dynTree: Bool = false, record: Bool = useRecordKernel, bindings: Int? = nil
     ) -> Int? {
         guard !probeFailed(record: record), !(dynTree && dynTreeProbeFailedFor(record: record)),
             partitions >= 1, partitions <= maxPartitions,
             rows <= 64, 32 * simdgroups * maxPartitions <= 1024
         else { return nil }
+        if !record, let bindings,
+            let highHpt = headsPerThreadgroup(
+                headDim: headDim, gqa: gqa, simdgroups: simdgroups,
+                maxPart: resolvedMaxPart(partitions, probe: false, forceMaxPart: false),
+                record: false),
+            highHpt > requestedHeads
+        {
+            let mp = resolvedMaxPart(partitions, probe: false, forceMaxPart: false)
+            let hkey = HPTLowKey(
+                headDim: headDim, gqa: gqa, simdgroups: simdgroups,
+                maxPart: mp, bindings: bindings, hpt: highHpt)
+            if lock.withLock({ hptLowApproved.contains(hkey) }) {
+                return highHpt
+            }
+        }
         return headsPerThreadgroup(
             headDim: headDim, gqa: gqa, simdgroups: simdgroups, record: record)
     }
@@ -490,30 +626,66 @@ public enum PagedOnePassAttention {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let kvh = kSlab.dim(1)
         let gqa = qh / kvh
-        let kernelName = name(
-            "slab", dtype: dtype, headDim: d, pageSize: pageSize, gqa: gqa, hpt: hpt,
-            simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap)
-            + (record ? "_rec" : "")
-        let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
-            if let existing = kernels[kernelName] { return existing }
-            let made = MLXFast.metalKernel(
-                name: kernelName,
-                inputNames: ["q", "kcache", "vcache", "tables", "seqinfo", "params", "wfence"],
-                outputNames: ["out"], source: record ? slabBodyRecord : slabBody, header: source,
-                ensureRowContiguous: true)
-            kernels[kernelName] = made
-            return made
+        let lkey = SlabLaunchKey(
+            dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvh, pageSize: pageSize,
+            hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
+            maxPart: maxPartitions, softcap: softcap, record: record)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = lock.withLock({ slabLaunchCache[lkey] }) {
+            launch = hit
+        } else {
+            let kernelName = name(
+                "slab", dtype: dtype, headDim: d, pageSize: pageSize, gqa: gqa, hpt: hpt,
+                simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap)
+                + (record ? "_rec" : "")
+            let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
+                if let existing = kernels[kernelName] { return existing }
+                let made = MLXFast.metalKernel(
+                    name: kernelName,
+                    inputNames: ["q", "kcache", "vcache", "tables", "seqinfo", "params", "wfence"],
+                    outputNames: ["out"], source: record ? slabBodyRecord : slabBody, header: source,
+                    ensureRowContiguous: true)
+                kernels[kernelName] = made
+                return made
+            }
+            let tg = 32 * simdgroups * maxPartitions
+            let made = kernel.prepare(
+                template: [
+                    ("T", dtype), ("D", d), ("S", pageSize), ("GQA", gqa), ("HPT", hpt),
+                    ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", maxPartitions),
+                    ("HAS_SOFTCAP", softcap), ("BLOCK", block),
+                ],
+                grid: (kvh * (gqa / hpt) * tg, b, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [[b, qh, d]], outputDTypes: [dtype])
+            lock.withLock { slabLaunchCache[lkey] = made }
+            launch = made
         }
-        let tg = 32 * simdgroups * maxPartitions
-        return kernel(
-            [queries, kSlab, vSlab, tables, seqinfo, params, writeFence],
-            template: [
-                ("T", dtype), ("D", d), ("S", pageSize), ("GQA", gqa), ("HPT", hpt),
-                ("NSG", simdgroups), ("PTOK", partitionTokens), ("MAXPART", maxPartitions),
-                ("HAS_SOFTCAP", softcap), ("BLOCK", block),
-            ],
-            grid: (kvh * (gqa / hpt) * tg, b, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[b, qh, d]], outputDTypes: [dtype], stream: stream)[0]
+        return launch(
+            [queries, kSlab, vSlab, tables, seqinfo, params, writeFence], stream: stream)[0]
+    }
+
+    private struct SlabLaunchKey: Hashable {
+        let dtype: DType
+        let b: Int
+        let qh: Int
+        let d: Int
+        let kvHeads: Int
+        let pageSize: Int
+        let hpt: Int
+        let simdgroups: Int
+        let partitionTokens: Int
+        let maxPart: Int
+        let softcap: Bool
+        let record: Bool
+    }
+
+    private struct HPTLowKey: Hashable {
+        let headDim: Int
+        let gqa: Int
+        let simdgroups: Int
+        let maxPart: Int
+        let bindings: Int
+        let hpt: Int
     }
 
     nonisolated(unsafe) private static let dummyTreeMeta: MLXArray = {
