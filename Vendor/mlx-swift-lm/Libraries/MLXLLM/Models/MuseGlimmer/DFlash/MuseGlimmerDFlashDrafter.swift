@@ -789,6 +789,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 && tailStart == count && tailStart > 0 && tailStart + rows <= window
         }
 
+        func canWriteSpeculativeBlockTail(at tailStart: Int, rows: Int) -> Bool {
+            inPlaceRing && keys != nil && values != nil && firstPosition == basePosition
+                && tailStart >= count && tailStart > 0 && tailStart + rows <= window
+        }
+
         func ringTailBuffers() -> (keys: MLXArray, values: MLXArray, fence: MLXArray)? {
             guard let keys, let values else { return nil }
             consumeReadBarriers()
@@ -2358,10 +2363,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let prevLow = CBv2DraftRegime.lowAcceptance
         CBv2DraftRegime.lowAcceptance = true
         defer { CBv2DraftRegime.lowAcceptance = prevLow }
+        let useSpecBlockTail =
+            usedZeroCopyTail && Self.zeroCopyBlockTailEnabled
+            && CBv2DraftRegime.strictLowVerifyC3
+            && context.canWriteSpeculativeBlockTail(at: existingCount + n, rows: block)
         let rows = fastDraftBlockRows(
             embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding), at: next,
             context: (ctxKeys, ctxValues), mask: mask,
-            draftCount: settings.maximumDraftTokens, devicePosition: position)
+            draftCount: settings.maximumDraftTokens, devicePosition: position,
+            ringContext: useSpecBlockTail ? context : nil,
+            ringTailStart: useSpecBlockTail ? (existingCount + n) : 0)
         if usedZeroCopyTail {
             context.recordSpeculativeRead(rows)
         }

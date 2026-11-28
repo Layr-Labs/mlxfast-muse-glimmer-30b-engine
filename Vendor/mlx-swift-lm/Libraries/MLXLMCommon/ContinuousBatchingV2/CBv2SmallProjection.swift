@@ -793,6 +793,9 @@ public enum CBv2SmallProjection {
     /// `CBV2_FP8_OPROJ_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT (o_proj) strict-low verify rows.
     public static let coopOProjEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_OPROJ_COOP"] != "0"
+    /// `CBV2_DENSE_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT dense BF16 (q/gate) strict-low verify rows.
+    public static let coopDenseEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DENSE_COOP"] != "0"
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -1010,6 +1013,7 @@ public enum CBv2SmallProjection {
         let dtype: DType
         let rowsOuter: Bool
         let rowGroups: Int
+        let coop: Bool
         let lowVerify: Bool
     }
 
@@ -1433,7 +1437,7 @@ public enum CBv2SmallProjection {
 
     static let denseHelper = """
 
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int PF, bool VO, int RG>
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int PF, bool VO, int RG, bool COOP = false>
         inline void cbv2_sp_dense(
             const device T* mat, const device T* in_vec, device T* out_vec,
             int tile, uint simd_gid, uint simd_lid, threadgroup float* tgp) {
@@ -1444,13 +1448,16 @@ public enum CBv2SmallProjection {
             constexpr int leftover = K - blockN * n_iter;
             constexpr int P = V * TM;
             static_assert(P <= 32, "at most 32 values per lane");
+            static_assert(!COOP || V <= 8, "coop s_av requires V <= 8");
             constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
             constexpr uint LOW = (1u << SH) - 1u;
             const uint rg = SPLIT ? (simd_gid / 8u) : 0u;
             const uint g = SPLIT ? (simd_gid % 8u) : 0u;
             const int orig_row = SPLIT ? (tile * RG + int(rg)) * TM : (tile * 8 + int(simd_gid)) * TM;
-            if (!SPLIT && orig_row >= N) { return; }
+            if constexpr (!SPLIT && !(COOP && V >= 2)) {
+                if (orig_row >= N) { return; }
+            }
             const bool active = orig_row < N;
             const int out_row = active ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
             int bn = (32 * int(g) + int(simd_lid)) * TN;
@@ -1459,6 +1466,43 @@ public enum CBv2SmallProjection {
             CBV2_SP_UNROLL
             for (int i = 0; i < P2; i++) { r[i] = 0; }
             constexpr int PD = PF <= 1 ? 1 : (PF >= n_iter ? (n_iter > 0 ? n_iter : 1) : PF);
+            if constexpr (COOP && !SPLIT && V >= 2 && n_iter > 0) {
+                // Double-buffered 4 KB cooperative s_av across all 8 simdgroups
+                // (8x fewer device activation loads, 1 barrier/iter, maxT = 1024).
+                threadgroup ushort4* s_av = (threadgroup ushort4*)tgp;
+                constexpr int BUF_STRIDE = V * 32;
+                if (int(simd_gid) < V) {
+                    s_av[simd_gid * 32u + simd_lid] =
+                        *(const device ushort4*)(in_vec + simd_gid * K + bn);
+                }
+                for (int it = 0; it < n_iter; it++) {
+                    const int cur = it & 1;
+                    const int nxt = cur ^ 1;
+                    ushort4 wq[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wq[tm] = *(const device ushort4*)(rows + tm * K + bn);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (it + 1 < n_iter && int(simd_gid) < V) {
+                        s_av[nxt * BUF_STRIDE + simd_gid * 32u + simd_lid] =
+                            *(const device ushort4*)(in_vec + simd_gid * K + bn + blockN);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = s_av[cur * BUF_STRIDE + v * 32 + simd_lid];
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += as_type<T>(wq[tm][tn]) * a;
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+            } else {
             for (int i0 = 0; i0 < n_iter; i0 += PD) {
               ushort4 wblk[PD][TM];
               CBV2_SP_UNROLL
@@ -1511,6 +1555,7 @@ public enum CBv2SmallProjection {
                 }
                 bn += blockN;
               }
+            }
             }
             if constexpr (leftover > 0) {
               if (bn + TN <= K) {
@@ -1570,7 +1615,7 @@ public enum CBv2SmallProjection {
                 for (int s = 1; s < BN; s++) { result += row_tgp[s * 32 + i]; }
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
               }
-            } else if (holds && i < P) {
+            } else if (holds && i < P && active) {
               out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
             }
         }
@@ -1589,6 +1634,7 @@ public enum CBv2SmallProjection {
     struct DenseShape: Hashable {
         var rowsOuter: Bool
         var rowGroups: Int
+        var coop: Bool = false
         var segments: [DenseSegment]
         /// The record's kernel source (high-acceptance verify rounds).
         var record: Bool = false
@@ -1641,8 +1687,12 @@ public enum CBv2SmallProjection {
             return made
         }
         let rg = shape.rowGroups
+        let tgpDecl =
+            shape.coop
+            ? "alignas(8) threadgroup float sp_tgp[(\(rg) * 8 * 32) > (2 * V * 64) ? (\(rg) * 8 * 32) : (2 * V * 64)];"
+            : "threadgroup float sp_tgp[\(rg) * 8 * 32];"
         var body = """
-            threadgroup float sp_tgp[\(rg) * 8 * 32];
+            \(tgpDecl)
             const int tg = int(threadgroup_position_in_grid.y);
             const uint sg = simdgroup_index_in_threadgroup;
             const uint sl = thread_index_in_simdgroup;
@@ -1651,9 +1701,10 @@ public enum CBv2SmallProjection {
         var offset = 0
         for (i, s) in shape.segments.enumerated() {
             let end = offset + s.tiles(rowGroups: rg)
+            let segCoop = shape.coop && !s.split
             body += """
                 \(i == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_dense<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.rows), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
+                    cbv2_sp_dense<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.rows), \(s.prefetch), \(shape.rowsOuter), \(rg), \(segCoop)>(
                         m\(i), xc, y\(i), tg - \(offset), sg, sl, sp_tgp);
                 }
 
@@ -1680,6 +1731,8 @@ public enum CBv2SmallProjection {
             return nil
         }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1689,7 +1742,7 @@ public enum CBv2SmallProjection {
             let planKey = DenseGroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: x.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, lowVerify: lowVerify)
+                rowsOuter: useRowsOuter, rowGroups: targetRG, coop: allowCoop, lowVerify: lowVerify)
             if let plan = fastLock.withLockUnchecked({ $0.dense[planKey] }) {
                 var args = plan.weightArrays
                 args.append(x.reshaped(rows, inputs))
@@ -1719,8 +1772,10 @@ public enum CBv2SmallProjection {
             weightArrays.append(layer.weight)
         }
         let rg = segments.allSatisfy(\.split) ? targetRG : 1
+        let coopActive = allowCoop && segments.contains(where: { !$0.split })
         let shape = DenseShape(
-            rowsOuter: useRowsOuter, rowGroups: rg, segments: segments, record: !lowVerify)
+            rowsOuter: useRowsOuter, rowGroups: rg, coop: coopActive, segments: segments,
+            record: !lowVerify)
         let launchKey = DenseLaunchKey(shape: shape, dtype: x.dtype, inputs: inputs, rows: rows)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = lock.withLock({ denseLaunchCache[launchKey] }) {
@@ -1740,7 +1795,7 @@ public enum CBv2SmallProjection {
             let planKey = DenseGroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: x.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, lowVerify: lowVerify)
+                rowsOuter: useRowsOuter, rowGroups: targetRG, coop: allowCoop, lowVerify: lowVerify)
             let plan = DenseGroupPlan(
                 launch: launch, weightArrays: weightArrays, outputDims: outputDims)
             fastLock.withLockUnchecked { $0.dense[planKey] = plan }

@@ -172,8 +172,12 @@ public enum VerifyFusedNorms {
               hv[j] = hb;
               const float fv2 = static_cast<float>(hb);
               f[i * 4 + j] = fv2;
-              const float sqv = fv2 * fv2;
-              total2 = sqv + total2;
+              if constexpr (PLAIN_W2_) {
+                total2 = metal::fma(fv2, fv2, total2);
+              } else {
+                const float sqv = fv2 * fv2;
+                total2 = sqv + total2;
+              }
             }
             hr4[idx4] = hv;
           }
@@ -189,13 +193,19 @@ public enum VerifyFusedNorms {
               hv[j] = hb;
               const float fv2 = static_cast<float>(hb);
               f[blocks * 4 + j] = fv2;
-              const float sqv = fv2 * fv2;
-              total2 = sqv + total2;
+              if constexpr (PLAIN_W2_) {
+                total2 = metal::fma(fv2, fv2, total2);
+              } else {
+                const float sqv = fv2 * fv2;
+                total2 = sqv + total2;
+              }
             }
             hr4[idx4] = hv;
           }
           total2 = verify_tg_sum(total2, lid, lane, sg, nsg, shared_b, bcast_b);
-          const float r2 = metal::precise::rsqrt(total2 * inv + eps2);
+          const float r2 = PLAIN_W2_
+              ? metal::precise::rsqrt(total2 / float(D_) + eps2)
+              : metal::precise::rsqrt(total2 * inv + eps2);
 
           if constexpr (CAST_FP8_) {
             const float m0 = fp8_mu[0];
@@ -241,8 +251,12 @@ public enum VerifyFusedNorms {
               vec<bfloat16_t, 4> yv;
               #pragma unroll
               for (int j = 0; j < 4; j++) {
-                yv[j] = static_cast<bfloat16_t>(
-                    (f[i * 4 + j] * r2) * (1.0f + static_cast<float>(wv[j])));
+                if constexpr (PLAIN_W2_) {
+                  yv[j] = wv[j] * static_cast<bfloat16_t>(f[i * 4 + j] * r2);
+                } else {
+                  yv[j] = static_cast<bfloat16_t>(
+                      (f[i * 4 + j] * r2) * (1.0f + static_cast<float>(wv[j])));
+                }
               }
               yr4[idx4] = yv;
             }
@@ -252,8 +266,12 @@ public enum VerifyFusedNorms {
               vec<bfloat16_t, 4> yv;
               #pragma unroll
               for (int j = 0; j < 4; j++) {
-                yv[j] = static_cast<bfloat16_t>(
-                    (f[blocks * 4 + j] * r2) * (1.0f + static_cast<float>(wv[j])));
+                if constexpr (PLAIN_W2_) {
+                  yv[j] = wv[j] * static_cast<bfloat16_t>(f[blocks * 4 + j] * r2);
+                } else {
+                  yv[j] = static_cast<bfloat16_t>(
+                      (f[blocks * 4 + j] * r2) * (1.0f + static_cast<float>(wv[j])));
+                }
               }
               yr4[idx4] = yv;
             }
@@ -298,8 +316,9 @@ public enum VerifyFusedNorms {
         }
         float total2 = verify_row_sum<BLOCKS_, NR>(
             sq2, blocks, extra, lid, lane, sg, nsg, shared_b, bcast_b);
-        float var2 = total2 * inv;
-        float r2 = metal::precise::rsqrt(var2 + eps2);
+        float r2 = PLAIN_W2_
+            ? metal::precise::rsqrt(total2 / float(D_) + eps2)
+            : metal::precise::rsqrt(total2 * inv + eps2);
         if constexpr (CAST_FP8_) {
           const float m0 = fp8_mu[0];
           const float m1 = fp8_mu[1];
@@ -322,9 +341,13 @@ public enum VerifyFusedNorms {
           for (int k = 0; k < MAXV; k++) {
             if (live[k]) {
               int e = idx[k];
-              float o = f2[k] * r2;
-              o = o * (1.0f + static_cast<float>(w2[e]));
-              yr[e] = static_cast<bfloat16_t>(o);
+              if constexpr (PLAIN_W2_) {
+                yr[e] = w2[e] * static_cast<bfloat16_t>(f2[k] * r2);
+              } else {
+                float o = f2[k] * r2;
+                o = o * (1.0f + static_cast<float>(w2[e]));
+                yr[e] = static_cast<bfloat16_t>(o);
+              }
             }
           }
         }
@@ -454,6 +477,7 @@ public enum VerifyFusedNorms {
         let blocks: Int
         let castFP8: Bool
         let fastVec: Bool
+        let plainW2: Bool
     }
 
     private struct SingleNormLaunchKey: Hashable {
@@ -473,6 +497,7 @@ public enum VerifyFusedNorms {
         var launches: [NormLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var singleLaunches: [SingleNormLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var elemLaunches: [ElemFP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var siluProdLaunches: [ShapeKey: MLXFast.MLXFastKernel.Launch] = [:]
     }
 
     private static let cacheLock = OSAllocatedUnfairLock(initialState: NormCacheBox())
@@ -489,14 +514,17 @@ public enum VerifyFusedNorms {
 
     private static func cachedLaunch(
         shape: [Int], dtype: DType, width: Int, rows: Int, tg: Int, blocks: Int, castFP8: Bool,
-        fastVec: Bool
+        fastVec: Bool, plainW2: Bool = false
     ) -> MLXFast.MLXFastKernel.Launch {
         let key = NormLaunchKey(
             shape: ShapeKey(shape), dtype: dtype, width: width, blocks: blocks, castFP8: castFP8,
-            fastVec: fastVec)
+            fastVec: fastVec, plainW2: plainW2)
         if let hit = cacheLock.withLockUnchecked({ $0.launches[key] }) { return hit }
         let made = kernel.prepare(
-            template: [("D_", width), ("BLOCKS_", blocks), ("CAST_FP8_", castFP8), ("VEC_", fastVec)],
+            template: [
+                ("D_", width), ("BLOCKS_", blocks), ("CAST_FP8_", castFP8), ("VEC_", fastVec),
+                ("PLAIN_W2_", plainW2),
+            ],
             grid: (tg, rows, 1), threadGroup: (tg, 1, 1),
             outputShapes: [shape, shape], outputDTypes: [dtype, dtype])
         cacheLock.withLockUnchecked { $0.launches[key] = made }
@@ -541,11 +569,12 @@ public enum VerifyFusedNorms {
         return launch([x, w, params, multipliers, overflowBound])[0]
     }
 
-    /// `(residual + centeredRMSNorm(x, w1, eps1), centeredRMSNorm(that, w2, eps2))`.
-    /// `residual` and `x` are `[..., width]` BF16 with fewer than 32 rows.
+    /// `(residual + centeredRMSNorm(x, w1, eps1), rmsNorm(that, w2, eps2))`.
+    /// When `plainW2` is `true`, the second norm is plain `MLXFast.rmsNorm` (`w2 * bf16(f * r2)`)
+    /// matching `model.norm`; otherwise `centeredRMSNorm` (`1 + w2`).
     public static func fusedAddNormNorm(
         residual: MLXArray, x: MLXArray, w1: MLXArray, eps1: Float, w2: MLXArray, eps2: Float,
-        fastVec: Bool = true
+        fastVec: Bool = true, plainW2: Bool = false
     ) -> (h: MLXArray, y: MLXArray) {
         let width = x.dim(-1)
         let rows = x.size / width
@@ -554,7 +583,7 @@ public enum VerifyFusedNorms {
         let params = cachedParams(width: width, eps1: eps1, eps2: eps2)
         let launch = cachedLaunch(
             shape: x.shape, dtype: x.dtype, width: width, rows: rows, tg: tg, blocks: blocks,
-            castFP8: false, fastVec: fastVec)
+            castFP8: false, fastVec: fastVec, plainW2: plainW2)
         let out = launch([residual, x, w1, w2, params, dummyFP8Mu, dummyFP8Bound])
         return (out[0], out[1])
     }
@@ -563,6 +592,56 @@ public enum VerifyFusedNorms {
 
     public static let fusedElementwiseFP8Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_ELEM_FP8"] != "0"
+    public static let fusedSiluProdEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FUSED_SILU_PROD"] != "0"
+
+    private static let siluProdKernel = MLXFast.metalKernel(
+        name: "verify_fused_silu_prod",
+        inputNames: ["a", "b"],
+        outputNames: ["y"],
+        source: """
+            const uint idx4 = thread_position_in_grid.x;
+            const uint n4 = uint(N4_);
+            if (idx4 >= n4) { return; }
+            const device vec<bfloat16_t, 4>* a4 = (const device vec<bfloat16_t, 4>*)a;
+            const device vec<bfloat16_t, 4>* b4 = (const device vec<bfloat16_t, 4>*)b;
+            device vec<bfloat16_t, 4>* y4 = (device vec<bfloat16_t, 4>*)y;
+            const vec<bfloat16_t, 4> av = a4[idx4];
+            const vec<bfloat16_t, 4> bv = b4[idx4];
+            vec<bfloat16_t, 4> out;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const bfloat16_t g = av[k];
+              out[k] = (g * verify_bf16_sigmoid(g)) * bv[k];
+            }
+            y4[idx4] = out;
+            """,
+        header: elemFP8Header,
+        ensureRowContiguous: true)
+
+    /// Direct cached `vec<bfloat16_t, 4>` `silu(gate) * up` (0-ULP to `compiledSiluProduct`).
+    public static func fusedSiluProduct(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard fusedSiluProdEnabled,
+            gate.dtype == .bfloat16, up.dtype == .bfloat16,
+            gate.size == up.size, gate.size > 0, gate.size % 4 == 0
+        else { return nil }
+        let n4 = gate.size / 4
+        let key = ShapeKey(gate.shape)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = cacheLock.withLockUnchecked({ $0.siluProdLaunches[key] }) {
+            launch = hit
+        } else {
+            let tg = min(256, max(32, ((n4 + 31) / 32) * 32))
+            let gridX = ((n4 + tg - 1) / tg) * tg
+            let made = siluProdKernel.prepare(
+                template: [("N4_", n4)],
+                grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [gate.shape], outputDTypes: [.bfloat16])
+            cacheLock.withLockUnchecked { $0.siluProdLaunches[key] = made }
+            launch = made
+        }
+        return launch([gate, up])[0]
+    }
 
     private static let elemFP8Header = """
         inline bfloat16_t verify_bf16_sigmoid(bfloat16_t x) {

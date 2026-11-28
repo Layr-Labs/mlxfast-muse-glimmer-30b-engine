@@ -999,18 +999,40 @@ inline void paged_attention_onepass_impl(
             const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
             const size_t ooff = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
             device T* orow = out + ooff;
+            if constexpr (EPT == 4) {
+                vec<T, 4> o4;
+                if constexpr (OUT_GATE_MODE >= 1 && metal::is_same_v<T, bfloat16_t>) {
+                    const vec<bfloat16_t, 4> g4 =
+                        *reinterpret_cast<const device vec<bfloat16_t, 4>*>(out_gate + ooff + lane * 4);
 #pragma unroll
-            for (int e = 0; e < EPT; e++) {
-                T oval = T(gacc[e] * inv);
-                if constexpr (OUT_GATE_MODE >= 1) {
-                    if constexpr (metal::is_same_v<T, bfloat16_t>) {
-                        oval = oval * cbv2_bf16_sigmoid(out_gate[ooff + lane * EPT + e]);
+                    for (int e = 0; e < 4; e++) {
+                        bfloat16_t oval = bfloat16_t(gacc[e] * inv) * cbv2_bf16_sigmoid(g4[e]);
                         if constexpr (OUT_GATE_MODE == 2) {
                             oval = cbv2_bf16_cast_fp8(oval, fp8_m0, fp8_m1, fp8_bound);
                         }
+                        o4[e] = oval;
+                    }
+                } else {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        o4[e] = T(gacc[e] * inv);
                     }
                 }
-                orow[lane * EPT + e] = oval;
+                *reinterpret_cast<device vec<T, 4>*>(orow + lane * 4) = o4;
+            } else {
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    T oval = T(gacc[e] * inv);
+                    if constexpr (OUT_GATE_MODE >= 1) {
+                        if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                            oval = oval * cbv2_bf16_sigmoid(out_gate[ooff + lane * EPT + e]);
+                            if constexpr (OUT_GATE_MODE == 2) {
+                                oval = cbv2_bf16_cast_fp8(oval, fp8_m0, fp8_m1, fp8_bound);
+                            }
+                        }
+                    }
+                    orow[lane * EPT + e] = oval;
+                }
             }
         }
     }
