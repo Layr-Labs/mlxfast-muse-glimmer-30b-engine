@@ -269,7 +269,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             CBv2DraftRegime.dynamicTreePurityExp,
         ])
         eval(dtParams)
-        self.dynTreeParams = dtParams
+        self.dynTreeParamsBase = dtParams
+        // Clause-3 strict-low rounds (pairs with sustained low acceptance) score the
+        // tree with their own temperature; slot 2 is the only difference.
+        if CBv2DraftRegime.dynamicTreeTempC3 != CBv2DraftRegime.dynamicTreeTemp {
+            var c3 = dtParams.asArray(Float.self)
+            c3[2] = CBv2DraftRegime.dynamicTreeTempC3
+            let c3Params = MLXArray(c3)
+            eval(c3Params)
+            self.dynTreeParamsC3 = c3Params
+        } else {
+            self.dynTreeParamsC3 = dtParams
+        }
         contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
@@ -1350,7 +1361,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     }
 
     private let contextKeyEpilogue: ContextKeyEpilogue?
-    private let dynTreeParams: MLXArray
+    private let dynTreeParamsBase: MLXArray
+    private let dynTreeParamsC3: MLXArray
+    private var dynTreeParams: MLXArray {
+        CBv2DraftRegime.strictLowVerifyC3 ? dynTreeParamsC3 : dynTreeParamsBase
+    }
 
     private static let contextKeysKernel = MLXFast.metalKernel(
         name: "dflash_context_keys",

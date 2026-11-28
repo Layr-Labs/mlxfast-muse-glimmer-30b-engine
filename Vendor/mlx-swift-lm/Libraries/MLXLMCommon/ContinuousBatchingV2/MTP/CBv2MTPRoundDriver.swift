@@ -1800,6 +1800,16 @@ public enum CBv2DraftRegime {
         }
         return 0.15
     }()
+    /// Tree temperature used only on clause-3 strict-low rounds (`strictLowVerifyC3`,
+    /// `CBV2_DYN_TREE_TEMP_C3`, default 0.19). Every other round keeps `dynamicTreeTemp`.
+    public static let dynamicTreeTempC3: Float = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TEMP_C3"],
+            let v = Float(raw), v.isFinite, v > 0.05, v <= 10.0
+        {
+            return v
+        }
+        return 0.19
+    }()
     /// Chain EV multiplier (`CBV2_DYN_TREE_BONUS`, default 1.0; `0.0` forces best EV leaf(s)).
     public static let dynamicTreeChainBonus: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BONUS"],
