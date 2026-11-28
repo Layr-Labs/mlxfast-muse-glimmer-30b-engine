@@ -857,6 +857,7 @@ extension EngineLoopV2 {
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        var draftTokenBlock: MLXArray?
         var assistantEvalTargets: [MLXArray] = []
         // Low-acceptance rounds draft with the drafter's cheaper form.
         CBv2DraftRegime.lowAcceptance =
@@ -967,6 +968,11 @@ extension EngineLoopV2 {
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
             }
+            if batch == 1, k > 1, mtp.config.verificationMode == .rectangularExact,
+                let requestState = rowMetadata[0].assistantState
+            {
+                draftTokenBlock = stateful.stagedDraftTokens(count: k, requestState: requestState)
+            }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
             var draftInput = seedColumn
@@ -990,7 +996,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = draftTokenBlock ?? stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -1006,7 +1012,8 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, draftTokenBlock: draftTokenBlock, rows: verifyRows,
+            driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
