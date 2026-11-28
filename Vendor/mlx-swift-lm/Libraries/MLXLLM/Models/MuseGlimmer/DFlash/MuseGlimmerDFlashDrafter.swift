@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -187,6 +188,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private let fusedBlockQKV: [QuantizedLinear]
     private let fusedLastKV: QuantizedLinear?
     private let nvfp4Drafter: NVFP4DrafterState?
+    /// Layer 0 mask products before RoPE, computed with the full block shape.
+    private let fusedMaskQKV: MLXArray?
+    private let nvfp4MaskQKV: MLXArray?
     /// The target's NVFP4 `lm_head` when it has one. Draft rows take MLX's
     /// own few-row NVFP4 product of it (the NAX `qmv` route on an M5) rather
     /// than the target's row-exact verify kernel: the same E2M1 x E4M3
@@ -241,6 +245,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         fusedContextKV = fused.contextKV
         fusedBlockQKV = fused.blockQKV
         fusedLastKV = fused.lastKV
+        let maskAnchor = maskEmbedding.reshaped([1, 1, c.hiddenSize])
+        let maskBlock = broadcast(maskAnchor, to: [1, c.blockSize, c.hiddenSize])
+        if let qkv = fused.blockQKV.first {
+            fusedMaskQKV = qkv(model.layers[0].inputNorm(maskBlock))
+        } else {
+            fusedMaskQKV = nil
+        }
+        if let nv = nvfp4Drafter {
+            nvfp4MaskQKV = nv.blockQKV[0](
+                MLXFast.rmsNorm(
+                    maskBlock, weight: nv.inputNormWeightScaled[0],
+                    eps: model.layers[0].inputNorm.eps))
+        } else {
+            nvfp4MaskQKV = nil
+        }
         compressedDraftHead =
             (Device.defaultDevice().deviceType == .gpu && model.activationDType == .bfloat16)
             ? draftHead.flatMap { CompressedDraftHead(head: $0) }
@@ -268,11 +287,27 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             CBv2DraftRegime.dynamicTreeLeafDecay,
             CBv2DraftRegime.dynamicTreePurityExp,
         ])
-        eval(dtParams)
+        var c3Values = dtParams.asArray(Float.self)
+        c3Values[13] = Float(Self.dynamicTreeTopKC3)
+        let dtParamsC3 = MLXArray(c3Values)
+        eval(dtParams, dtParamsC3)
         self.dynTreeParams = dtParams
+        self.dynTreeParamsC3 = dtParamsC3
         contextKeyEpilogue = ContextKeyEpilogue(model)
         try MLX.withError { errors in
             var warm = [maskEmbedding]
+            if let maskQKV = fusedMaskQKV, let qkv = fusedBlockQKV.first {
+                warm += [maskQKV, qkv(model.layers[0].inputNorm(maskAnchor))]
+            }
+            if let maskQKV = nvfp4MaskQKV, let nv = nvfp4Drafter {
+                warm += [
+                    maskQKV,
+                    nv.blockQKV[0](
+                        MLXFast.rmsNorm(
+                            maskAnchor, weight: nv.inputNormWeightScaled[0],
+                            eps: model.layers[0].inputNorm.eps)),
+                ]
+            }
             if let textTarget = target as? MuseGlimmerTextModel,
                 model.activationDType == .bfloat16
             {
@@ -348,13 +383,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 if fusedContextKV != nil {
                     let allKV = MLXArray.zeros(
                         [1, 10 * c.kvHeads * c.headDimensions], dtype: .bfloat16)
-                    let kv0 = epilogue.applyFusedKV(allKV, rows: 1, position: 0)
-                    warm += [kv0.keys, kv0.values]
+                    var treeModes: [MLXArray?] = [nil]
                     if CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled {
-                        let dummyMeta = MLXArray.zeros([18], type: Int32.self)
-                        let kv1 = epilogue.applyFusedKV(
-                            allKV, rows: 1, position: 0, treeMeta: dummyMeta)
-                        warm += [kv1.keys, kv1.values]
+                        treeModes.append(MLXArray.zeros([18], type: Int32.self))
+                    }
+                    for treeMeta in treeModes {
+                        let kv = epilogue.applyFusedKV(
+                            allKV, rows: 1, position: 0, treeMeta: treeMeta)
+                        warm += [kv.keys, kv.values]
+                        if epilogue.canGroupAffine {
+                            let packed = epilogue.applyPackedAffine(
+                                allKV, rows: 1, position: 0, treeMeta: treeMeta)
+                            warm += [packed.keys, packed.values]
+                        }
                     }
                 }
             }
@@ -606,11 +647,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         private static let ospecZeroCopyEnabled: Bool =
             ProcessInfo.processInfo.environment["CBV2_OSPEC_ZEROCOPY"] != "0"
+        private static let ospecPromoteEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_OSPEC_PROMOTE"] != "0"
+
+        struct SpeculativeTailTicket {
+            let keysID: ObjectIdentifier
+            let valuesID: ObjectIdentifier
+            let anchor: Int
+            let first: Int
+            let base: Int
+            let startSlot: Int
+            let writtenRows: Int
+            let generation: UInt64
+        }
 
         private var keys: MLXArray?
         private var values: MLXArray?
         private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
         private var speculativeReadDeps: [MLXArray] = []
+        private var ringGeneration: UInt64 = 0
         private var basePosition = 0
         private(set) var firstPosition = 0
         private(set) var nextPosition = 0
@@ -739,14 +794,48 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         var count: Int { nextPosition - firstPosition }
 
+        /// `CBV2_DFLASH_FENCE_MEMO`: `0` builds a fresh `depends` pair per read
+        /// (the parent's behaviour), `all` memoizes in every round, anything
+        /// else (the default) memoizes in low-acceptance rounds only.
+        private static let fenceMemoMode: Int = {
+            switch ProcessInfo.processInfo.environment["CBV2_DFLASH_FENCE_MEMO"] {
+            case "0": return 0
+            case "all": return 2
+            default: return 1
+            }
+        }()
+
+        /// The fenced ring pair `arrays` last built and the write fence it was
+        /// built for. A fresh `depends` pair is an unscheduled graph node, so
+        /// an `eval` of it encodes a new completion signal at the END of the
+        /// device queue: the round's finalize fence then waits for every
+        /// submission queued since (the post-verify context projection, and a
+        /// speculative block when one was drafted), not only for the ring
+        /// writes of its own step. Handing back the pair the step's own draft
+        /// submission already scheduled keeps the fence on exactly those
+        /// writes. Same arrays, same graph; only the wait changes.
+        ///
+        /// The pair is kept only when it is built inside a low-acceptance
+        /// round (the regime flag is set while that round's graph is built),
+        /// so prompt observations and high-acceptance rounds keep the
+        /// parent's fence timing unchanged.
+        private var fencedPair: (fence: MLXArray, pair: [MLXArray])?
+
         var arrays: [MLXArray] {
             guard let keys, let values else { return [] }
-            return inPlaceRing
-                ? depends(inputs: [keys, values], dependencies: [writeFence]) : [keys, values]
+            guard inPlaceRing else { return [keys, values] }
+            if let held = fencedPair, held.fence === writeFence { return held.pair }
+            let pair = depends(inputs: [keys, values], dependencies: [writeFence])
+            let keeps =
+                Self.fenceMemoMode == 2
+                || (Self.fenceMemoMode == 1 && CBv2DraftRegime.lowAcceptance)
+            fencedPair = keeps ? (writeFence, pair) : nil
+            return pair
         }
 
         func restart(at position: Int) {
             precondition(position >= 0, "DFlash context position must not be negative")
+            ringGeneration &+= 1
             basePosition = position
             firstPosition = position
             nextPosition = position
@@ -755,6 +844,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         func release() {
             keys = nil
             values = nil
+            fencedPair = nil
             writeFence = MLXArray.zeros([1], dtype: .int32)
             speculativeReadDeps.removeAll(keepingCapacity: false)
             restart(at: 0)
@@ -764,6 +854,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             guard !speculativeReadDeps.isEmpty else { return }
             writeFence = depends(inputs: [writeFence], dependencies: speculativeReadDeps)[0]
             speculativeReadDeps.removeAll(keepingCapacity: true)
+            rekeyFencedPair()
+        }
+
+        /// A write to the ring's unused tail (the rows a post-verify
+        /// speculation stages there, a block's own K/V, the read barriers
+        /// between them) replaces the write fence but changes no committed
+        /// row. The pair the round's own draft submission scheduled is still
+        /// the fence of the committed ring, so it stays the pair `arrays`
+        /// hands out: the round's finalize fence then does not move behind a
+        /// block drafted after the verify. `append`, the only committed
+        /// write, drops the pair before it touches the fence.
+        private func rekeyFencedPair() {
+            if let held = fencedPair { fencedPair = (writeFence, held.pair) }
         }
 
         /// Writes unconfirmed verify rows directly into the contiguous unused tail
@@ -771,24 +874,55 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// avoiding a full ring copy inside `speculateOutcomeBlock`.
         func writeSpeculativeTail(
             keys newKeys: MLXArray, values newValues: MLXArray
-        ) -> (keys: MLXArray, values: MLXArray)? {
+        ) -> (keys: MLXArray, values: MLXArray, ticket: SpeculativeTailTicket)? {
             let rows = newKeys.dim(2)
             guard Self.ospecZeroCopyEnabled, inPlaceRing, let keys, let values,
                 rows > 0, firstPosition == basePosition, count + rows <= window
             else { return nil }
             consumeReadBarriers()
+            ringGeneration &+= 1
             let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
             let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
             let params = MLXArray([Int32(count), Int32(rows)])
             writeFence = Self.ringWrite(
                 [nk, nv, keys, values, params, writeFence], dtype: dtype, kvHeads: kvHeads,
                 window: window, headDimensions: headDimensions, rows: rows, layers: layers)
+            rekeyFencedPair()
             let pair = depends(inputs: [keys, values], dependencies: [writeFence])
             let total = count + rows
+            let ticket = SpeculativeTailTicket(
+                keysID: ObjectIdentifier(keys), valuesID: ObjectIdentifier(values),
+                anchor: nextPosition, first: firstPosition, base: basePosition,
+                startSlot: count, writtenRows: rows, generation: ringGeneration)
             return (
                 pair[0][0..., 0..., 0 ..< total, 0...],
-                pair[1][0..., 0..., 0 ..< total, 0...]
+                pair[1][0..., 0..., 0 ..< total, 0...],
+                ticket
             )
+        }
+
+        /// Promotes a verified contiguous linear prefix `[0 ..< prefixCount)` that
+        /// `writeSpeculativeTail` already placed at `[count ..< count + prefixCount)`,
+        /// avoiding a duplicate `dflash_ring_write_inplace` dispatch on commit.
+        func promoteSpeculativePrefix(
+            ticket: SpeculativeTailTicket, count prefixCount: Int
+        ) -> Bool {
+            guard Self.ospecPromoteEnabled, inPlaceRing, let keys, let values,
+                ObjectIdentifier(keys) == ticket.keysID,
+                ObjectIdentifier(values) == ticket.valuesID,
+                ringGeneration == ticket.generation,
+                firstPosition == basePosition,
+                firstPosition == ticket.first,
+                basePosition == ticket.base,
+                nextPosition == ticket.anchor,
+                count == ticket.startSlot,
+                prefixCount > 0, prefixCount <= ticket.writtenRows,
+                count + prefixCount <= window
+            else { return false }
+            nextPosition += prefixCount
+            firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
+            return true
         }
 
         func recordSpeculativeRead(_ dep: MLXArray) {
@@ -813,6 +947,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         func commitBlockTail(fence: MLXArray, readDep: MLXArray) {
             writeFence = fence
+            rekeyFencedPair()
             speculativeReadDeps.append(readDep)
         }
 
@@ -828,6 +963,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 keys = MLXArray.zeros(shape, dtype: dtype)
                 values = MLXArray.zeros(shape, dtype: dtype)
             }
+            // Every append is a new ring state: the wrapped path below rewrites
+            // `keys`/`values` lazily without touching `writeFence`.
+            fencedPair = nil
             consumeReadBarriers()
             let start = nextPosition + skipping
             if skipping > 0 {
@@ -857,6 +995,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             nextPosition = start + rows
             firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
         }
 
         var heldPositions: [Int] {
@@ -1023,6 +1162,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// Verify slot path `[0, ..., carrySlot]` committed for this outcome
         /// (length `accepted + 1`; nil falls back to linear `0...accepted`).
         var acceptedPath: [Int]? = nil
+        /// Ticket proving `[0 ..< depth + 1)` were already written into the
+        /// request's in-place ring at `[count ..< count + depth + 1)`, so a
+        /// confirmed linear prefix can be promoted without re-copying.
+        var tailTicket: FastInPlaceContext.SpeculativeTailTicket? = nil
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -1187,6 +1330,21 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         )
     }
 
+    public func stagedDraftTokens(
+        count: Int, requestState: any CBv2MTPRequestState
+    ) -> MLXArray? {
+        let s = state(requestState)
+        guard count > 0, s.refusal == nil, s.stagedInputCount == count,
+            let tokens = s.memo?.tokens, tokens.ndim == 1, tokens.dtype == .int32,
+            count <= tokens.dim(0)
+        else { return nil }
+        // The first draft submission has encoded this array. Read its layout only.
+        var contiguous = false
+        guard _mlx_array_is_row_contiguous(&contiguous, tokens.ctx) == 0, contiguous
+        else { return nil }
+        return tokens[0 ..< count].reshaped([1, count])
+    }
+
     /// Builds the round's block and memo. Returns why it could not.
     private func startRound(_ s: State, tokens: MLXArray, hidden: MLXArray) -> String? {
         let c = model.configuration
@@ -1223,18 +1381,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask,
             draftCount: activeDraftCount,
             ringContext: useBlockRingTail ? s.context : nil,
-            ringTailStart: useBlockRingTail ? s.context.count : 0)
+            ringTailStart: useBlockRingTail ? s.context.count : 0,
+            submitsLayers: CBv2DraftRegime.lowAcceptance)
         let dynK = CBv2DraftRegime.activeDynamicTreeK
         if s.selection == nil, CBv2DraftRegime.lowAcceptance, CBv2DraftRegime.xnorDraftHeadEligible,
             rows.ndim == 2, rows.dim(0) == activeDraftCount,
             rows.dim(0) <= 7,
             let comp = compressedDraftHead,
-            let p = comp.dynamicTreePartials(rows, params: dynTreeParams)
+            let p = comp.dynamicTreePartials(rows, params: activeDynTreeParams)
         {
             if dynK >= 2, dynK <= rows.dim(0) {
                 let dyn = Self.fastDynamicTreeStage2(
                     p.val, p.idx, p.sum, k: dynK, vocab: target.dflashVocabularySize,
-                    params: dynTreeParams)
+                    params: activeDynTreeParams)
                 CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
                 s.memo = (dyn.tokens, rows)
                 return nil
@@ -1351,6 +1510,20 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private let contextKeyEpilogue: ContextKeyEpilogue?
     private let dynTreeParams: MLXArray
+    /// The same parameters with the clause-3 top-K (`CBV2_DYN_TREE_TOPK_C3`, default 4).
+    private let dynTreeParamsC3: MLXArray
+    static let dynamicTreeTopKC3: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TOPK_C3"],
+            let v = Int(raw), (3 ... 5).contains(v)
+        {
+            return v
+        }
+        return 4
+    }()
+    /// Clause-3 strict-low rounds use `dynTreeParamsC3`; every other round the record's.
+    private var activeDynTreeParams: MLXArray {
+        CBv2DraftRegime.strictLowVerifyC3 ? dynTreeParamsC3 : dynTreeParams
+    }
 
     private static let contextKeysKernel = MLXFast.metalKernel(
         name: "dflash_context_keys",
@@ -1375,7 +1548,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 case 3: src = k3; weight = w3; break;
                 default: src = k4; weight = w4; break;
             }
-            src += (size_t(row) * HEADS_ + head) * 128 + lane * 4;
+            if constexpr (PACKED_KV_) {
+                src = k0 + (size_t(row) * 10u * HEADS_ + layer * HEADS_ + head) * 128u;
+            } else {
+                src += (size_t(row) * HEADS_ + head) * 128u;
+            }
+            src += lane * 4u;
             weight += lane * 4;
             device bfloat16_t* dst = keys + size_t(group) * 128 + lane * 4;
 
@@ -2015,6 +2193,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let weights: [MLXArray]
         let coefficients: MLXArray
         let dummyTreeMeta: MLXArray
+        let canGroupAffine: Bool
 
         init?(_ model: MuseGlimmerDFlashDraftModel) {
             let c = model.configuration
@@ -2033,13 +2212,30 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             self.kvHeads = c.kvHeads
             self.weights = weights
             self.coefficients = MLXArray([c.rmsNormEps, log2(c.ropeTheta)])
+            // On GPU family 15 or newer, these shapes use the same affine QMV
+            // for up to 8 rows. At 8 rows, 1024 outputs miss the split-K size
+            // threshold and 10240 outputs exceed its threadgroup limit.
+            self.canGroupAffine =
+                c.hiddenSize == 6656 && c.kvHeads == 8
+                && (ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"] ?? "").isEmpty
+                && AffineQuantizedVectors.family() >= 15
+                && model.layers.allSatisfy { layer in
+                    [layer.attention.kProj, layer.attention.vProj].allSatisfy { projection in
+                        guard let q = projection as? QuantizedLinear,
+                            type(of: q) == QuantizedLinear.self, q.weight.ndim == 2
+                        else { return false }
+                        return q.mode == .affine && q.globalScale == nil && q.shape == (1024, 6656)
+                            && q.scales.dtype == .bfloat16 && q.biases?.dtype == .bfloat16
+                    }
+                }
             let dm = MLXArray.zeros([18], type: Int32.self)
             eval(dm)
             self.dummyTreeMeta = dm
         }
 
         func apply(
-            _ projections: [MLXArray], rows: Int, position: Int, treeMeta: MLXArray? = nil
+            _ projections: [MLXArray], rows: Int, position: Int, treeMeta: MLXArray? = nil,
+            packedKV: Bool = false
         ) -> MLXArray {
             var inputs = projections
             inputs.reserveCapacity(13)
@@ -2048,9 +2244,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             inputs.append(coefficients)
             inputs.append(treeMeta ?? dummyTreeMeta)
             return MuseGlimmerDFlashDrafter.contextKeysKernel(
-                inputs, template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil)],
+                inputs,
+                template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil), ("PACKED_KV_", packedKV)],
                 grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
                 outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
+        }
+
+        func applyPackedAffine(
+            _ allKV: MLXArray, rows: Int, position: Int, treeMeta: MLXArray?
+        ) -> (keys: MLXArray, values: MLXArray) {
+            let keys = apply(
+                Array(repeating: allKV, count: 5), rows: rows, position: position,
+                treeMeta: treeMeta, packedKV: true)
+            // The projection writes five key blocks followed by five value blocks per row.
+            let width = kvHeads * 128
+            let values = asStrided(
+                allKV, [5, kvHeads, rows, 128],
+                strides: [width, 128, 10 * width, 1], offset: 5 * width)
+            return (keys, values)
         }
 
         func applyFusedKV(
@@ -2109,13 +2320,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let epilogue = contextKeyEpilogue, context.dtype == .bfloat16, rows > 0,
             position >= 0, position <= Int(Int32.max) - rows
         else { return model.contextKeyValues(context, at: position) }
-        if Self.fusedProjEnabled
-            && (CBv2DraftRegime.lowAcceptance || CBv2DraftRegime.xnorDraftHeadEligible),
-            let fusedContextKV
+        let useFusedEpilogue = CBv2DraftRegime.lowAcceptance || CBv2DraftRegime.xnorDraftHeadEligible
+        if Self.fusedProjEnabled, let fusedContextKV,
+            useFusedEpilogue || (epilogue.canGroupAffine && rows <= 8)
         {
             let allKV = fusedContextKV(context)
             if allKV.dtype == .bfloat16 {
-                return epilogue.applyFusedKV(allKV, rows: rows, position: position, treeMeta: treeMeta)
+                if useFusedEpilogue {
+                    return epilogue.applyFusedKV(
+                        allKV, rows: rows, position: position, treeMeta: treeMeta)
+                }
+                return epilogue.applyPackedAffine(
+                    allKV, rows: rows, position: position, treeMeta: treeMeta)
             }
         }
         let shape = [1, rows, c.kvHeads, c.headDimensions]
@@ -2352,6 +2568,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ctxKeys = tail.keys
             ctxValues = tail.values
             usedZeroCopyTail = true
+            if !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.strictLowVerifyC3 {
+                speculation.tailTicket = tail.ticket
+            }
         } else {
             ctxKeys = concatenated([
                 ring[0][0..., 0..., 0 ..< existingCount, 0...],
@@ -2390,7 +2609,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         if CBv2DraftRegime.xnorDraftHeadEligible,
             CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
             let comp = compressedDraftHead,
-            let p = comp.dynamicTreePartials(rows, params: dynTreeParams)
+            let p = comp.dynamicTreePartials(rows, params: activeDynTreeParams)
         {
             speculation.dynPartials = (val: p.val, idx: p.idx, sum: p.sum, hidden: rows)
             speculation.memo = nil
@@ -2407,7 +2626,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         if CBv2DraftRegime.verifyTreeMode != 0, CBv2DraftRegime.dynamicTreeEnabled,
             logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256
         {
-            let p = Self.fastDynamicTreeStage1(logits, params: dynTreeParams)
+            let p = Self.fastDynamicTreeStage1(logits, params: activeDynTreeParams)
             speculation.dynPartials = (val: p.val, idx: p.idx, sum: p.sum, hidden: rows)
             speculation.memo = nil
             speculation.confidence = nil
@@ -2516,6 +2735,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.context.append(
                 keys: speculation.keys.take(idx, axis: 2),
                 values: speculation.values.take(idx, axis: 2))
+        } else if let ticket = speculation.tailTicket,
+            s.context.promoteSpeculativePrefix(ticket: ticket, count: accepted + 1)
+        {
+            // Verified linear prefix is already resident in the ring tail;
+            // `promoteSpeculativePrefix` advanced `nextPosition` in place.
         } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {
@@ -2530,7 +2754,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             if dynK >= 2, dynK <= rows, rows <= 7 {
                 let dyn = Self.fastDynamicTreeStage2(
                     dp.val, dp.idx, dp.sum, k: dynK, vocab: target.dflashVocabularySize,
-                    params: dynTreeParams)
+                    params: activeDynTreeParams)
                 CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
                 s.memo = (dyn.tokens, dp.hidden)
                 return .drafted
@@ -2844,6 +3068,26 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private static let drafterLayer4NAX: Bool =
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_L4_NAX"] == "1"
 
+    /// Layer counts after which a block that `startRound` builds on the round's
+    /// critical path is submitted while the host builds the layers that follow
+    /// (`CBV2_DFLASH_BLOCK_FLUSH`, comma-separated layer counts; empty disables).
+    ///
+    /// A speculative round runs under the decode command-buffer limits, so the
+    /// whole block is one command buffer that is committed only when the last
+    /// of its kernels has been built and encoded: between a round's acceptance
+    /// readback and that commit the device has nothing of the new round to
+    /// run. Submitting the finished first layer hands the device its work as
+    /// soon as that layer is encoded, the way the verify trunk submits its own
+    /// early layers (`CBV2_LOW_FLUSH`). Same arrays, same kernels, same order:
+    /// only the command-buffer partitioning changes.
+    private static let blockFlushLayers: Set<Int> = {
+        let raw = ProcessInfo.processInfo.environment["CBV2_DFLASH_BLOCK_FLUSH"] ?? "1,3"
+        return Set(
+            raw.split(separator: ",").compactMap {
+                Int($0.trimmingCharacters(in: .whitespaces))
+            }.filter { $0 > 0 })
+    }()
+
     /// One block forward returning only the `draftCount` active draft rows
     /// (`1 ..< 1 + draftCount`). Layers `0 ..< last` run on all `blockSize`
     /// rows (with `compiledSiluProduct` in the MLP). The final layer projects
@@ -2855,7 +3099,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         embeddings: MLXArray, at position: Int,
         context: (keys: MLXArray, values: MLXArray)?, mask: MLXArray?,
         draftCount: Int, devicePosition: MLXArray? = nil,
-        ringContext: FastInPlaceContext? = nil, ringTailStart: Int = 0
+        ringContext: FastInPlaceContext? = nil, ringTailStart: Int = 0,
+        submitsLayers: Bool = false
     ) -> MLXArray {
         func rope(_ x: MLXArray, _ shift: Int) -> MLXArray {
             if let devicePosition {
@@ -2890,20 +3135,29 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let ringBuffers = (useFusedAttn && context != nil) ? ringContext?.ringTailBuffers() : nil
         var tailFence = ringBuffers?.fence
         var nextX: MLXArray? = nil
+        let firstMaskQKV = useNVFP4 ? nvfp4MaskQKV : fusedMaskQKV
         for (index, layer) in model.layers.enumerated() {
             let attention = layer.attention
+            let reusesMask = useFusedAttn && index == 0 && firstMaskQKV != nil
+            let normInput = reusesMask ? hidden[0..., 0 ..< 1, 0...] : hidden
             let x: MLXArray
             if let nx = nextX {
                 x = nx
             } else if useNVFP4, let nv {
                 x = MLXFast.rmsNorm(
-                    hidden, weight: nv.inputNormWeightScaled[index], eps: layer.inputNorm.eps)
+                    normInput, weight: nv.inputNormWeightScaled[index], eps: layer.inputNorm.eps)
             } else {
-                x = layer.inputNorm(hidden)
+                x = layer.inputNorm(normInput)
             }
             nextX = nil
             if useFusedAttn, index < lastIndex, let epilogue = contextKeyEpilogue, let posScalar {
-                let qkv = useNVFP4 ? nv!.blockQKV[index](x) : fusedBlockQKV[index](x)
+                let projected = useNVFP4 ? nv!.blockQKV[index](x) : fusedBlockQKV[index](x)
+                let qkv: MLXArray
+                if index == 0, let firstMaskQKV {
+                    qkv = concatenated([projected, firstMaskQKV[0..., 1..., 0...]], axis: 1)
+                } else {
+                    qkv = projected
+                }
                 let queries: MLXArray
                 var keys: MLXArray
                 var values: MLXArray
@@ -2992,6 +3246,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         let mx = layer.postAttentionNorm(hidden)
                         hidden = hidden + draftMLP(index, layer.mlp, mx)
                     }
+                }
+                if submitsLayers, Self.blockFlushLayers.contains(index + 1) {
+                    asyncEval([hidden] + (nextX.map { [$0] } ?? []))
                 }
                 continue
             }
@@ -3127,6 +3384,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             hidden =
                 hidden
                 + draftMLP(index, layer.mlp, mx)
+            if submitsLayers, index < lastIndex, Self.blockFlushLayers.contains(index + 1) {
+                asyncEval([hidden])
+            }
         }
         let result = model.norm(hidden).reshaped([block, c.hiddenSize])[1 ..< (1 + draftCount), 0...]
         if let ringContext, let fence = tailFence {
@@ -3667,7 +3927,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private static let fastDynTreeStage2Kernel = MLXFast.metalKernel(
         name: "dflash_fast_dyntree_s2",
-        inputNames: ["p_val", "p_idx", "p_sum", "tparams"],
+        inputNames: ["p_val", "p_idx", "p_sum", "tparams", "hist_in"],
         outputNames: ["tokens", "tree_meta"],
         source: """
             constexpr uint CHUNKS = 64;
@@ -3804,9 +4064,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               int num_nodes = 1;
 
               if (dp_mode != 0) {
+                const int h_len = min(7, max(0, hist_in[0]));
+                const float h_p0 = float(hist_in[1]) * 1e-6f;
+                const float h_pc = float(hist_in[2]) * 1e-6f;
+                int h_tok[7];
+                for (int r = 0; r < 7; ++r) { h_tok[r] = hist_in[3 + r]; }
+                int h_agree = 0;
+                while (h_agree < R_ && h_agree < h_len && h_tok[h_agree] == row_ids[h_agree][0]) {
+                  h_agree += 1;
+                }
+                float h_chain_ev[7];
+                for (int r = 0; r < 7; ++r) { h_chain_ev[r] = 0.0f; }
+                if (h_agree > 0) {
+                  h_chain_ev[0] = h_p0;
+                  for (int r = 1; r < h_agree; ++r) {
+                    h_chain_ev[r] = h_chain_ev[r - 1] * h_pc;
+                  }
+                }
                 const int max_L = min(K_, R_);
-                const int min_L = min(max_L, (chain_bonus > 0.0f)
-                    ? 1 : max(2, K_ - max(0, max_leaves)));
+                const int min_L = min(max_L, max((chain_bonus > 0.0f) ? 1 : 2, K_ - max(0, max_leaves)));
                 float best_total = -1.0f;
                 int best_L = max_L;
                 int best_bcnt = 0;
@@ -3818,7 +4094,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 for (int L = max_L; L >= min_L; --L) {
                   float total = 0.0f;
                   for (int r = 0; r < L; ++r) {
-                    total += surv[r] * row_probs[r][0] * chain_bonus;
+                    const float c_ev = (r < h_agree)
+                        ? max(surv[r] * row_probs[r][0], h_chain_ev[r])
+                        : (surv[r] * row_probs[r][0]);
+                    total += c_ev * chain_bonus;
                   }
                   const int budget = min(K_ - L, max(0, max_leaves));
                   const int leaf_limit = min(L, max_leaf_depth);
@@ -3826,6 +4105,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   for (int r = 0; r < 7; ++r) {
                     for (int c = 0; c < 5; ++c) { used[r][c] = false; }
                   }
+                  const int h_div = h_agree;
+                  bool h_placed = false;
+                  int h_node_idx = -1;
+                  int h_next_pos = h_div;
                   int cur_bcnt = 0;
                   int cur_par[6];
                   int cur_dep[6];
@@ -3833,6 +4116,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   float cur_ev[6];
                   int cur_bs[6];
                   bool cur_cont[6];
+                  int cur_hidx[6];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
                     int bkind = -1, ba = -1, bb = -1;
@@ -3852,7 +4136,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     }
                     if (max_branch_len > 1 && cont_decay > 0.0f) {
                       for (int j = 0; j < cur_bcnt; ++j) {
-                        if (cur_bs[j] >= 1 && cur_bs[j] < max_branch_len
+                        if (cur_hidx[j] < 0 && cur_bs[j] >= 1 && cur_bs[j] < max_branch_len
                             && !cur_cont[j] && cur_dep[j] < R_) {
                           const int d = cur_dep[j];
                           if (row_ids[d][0] < ivocab) {
@@ -3867,6 +4151,56 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         }
                       }
                     }
+                    if (h_len > 0 && !h_placed && h_div < h_len && h_div <= L
+                        && h_tok[h_div] >= 0 && h_tok[h_div] < ivocab) {
+                      int dup_j = -1;
+                      for (int j = 0; j < cur_bcnt; ++j) {
+                        if (cur_par[j] == h_div && cur_tok[j] == h_tok[h_div]) {
+                          dup_j = j;
+                          break;
+                        }
+                      }
+                      if (dup_j >= 0) {
+                        h_placed = true;
+                        h_node_idx = dup_j;
+                        cur_hidx[dup_j] = h_div;
+                        h_next_pos = h_div + 1;
+                      } else {
+                        const float h_base = (h_div == 0)
+                            ? h_p0 : (surv[min(h_div, R_ - 1)] * h_pc);
+                        float h_ev = h_base;
+                        int match_c = -1;
+                        if (h_div < R_) {
+                          const float base_w = surv[h_div] * leaf_mult[h_div];
+                          for (int c = 1; c < top_k_use; ++c) {
+                            if (row_ids[h_div][c] == h_tok[h_div]) {
+                              match_c = c;
+                              h_ev = max(h_ev, base_w * row_probs[h_div][c]);
+                              break;
+                            }
+                          }
+                        }
+                        if (h_ev > bev) {
+                          bev = h_ev;
+                          bkind = 3;
+                          ba = h_div;
+                          bb = match_c;
+                        }
+                      }
+                    }
+                    if (h_len > 0 && h_placed && h_node_idx >= 0 && h_next_pos < h_len
+                        && !cur_cont[h_node_idx] && cur_dep[h_node_idx] < K_) {
+                      const int ht = h_tok[h_next_pos];
+                      if (ht >= 0 && ht < ivocab) {
+                        const float ev = cur_ev[h_node_idx] * h_pc;
+                        if (ev > bev) {
+                          bev = ev;
+                          bkind = 4;
+                          ba = h_node_idx;
+                          bb = h_next_pos;
+                        }
+                      }
+                    }
                     if (bkind == 1 && bev > 0.0f) {
                       used[ba][bb] = true;
                       total += bev;
@@ -3876,6 +4210,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = 1;
                       cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = -1;
                       cur_bcnt += 1;
                     } else if (bkind == 2 && bev > 0.0f) {
                       cur_cont[ba] = true;
@@ -3886,6 +4221,34 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = cur_bs[ba] + 1;
                       cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = -1;
+                      cur_bcnt += 1;
+                    } else if (bkind == 3 && bev > 0.0f) {
+                      if (bb >= 1 && ba < 7) { used[ba][bb] = true; }
+                      total += bev;
+                      cur_par[cur_bcnt] = ba;
+                      cur_dep[cur_bcnt] = ba + 1;
+                      cur_tok[cur_bcnt] = h_tok[ba];
+                      cur_ev[cur_bcnt] = bev;
+                      cur_bs[cur_bcnt] = 1;
+                      cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = ba;
+                      h_placed = true;
+                      h_node_idx = cur_bcnt;
+                      h_next_pos = ba + 1;
+                      cur_bcnt += 1;
+                    } else if (bkind == 4 && bev > 0.0f) {
+                      cur_cont[ba] = true;
+                      total += bev;
+                      cur_par[cur_bcnt] = L + 1 + ba;
+                      cur_dep[cur_bcnt] = cur_dep[ba] + 1;
+                      cur_tok[cur_bcnt] = h_tok[bb];
+                      cur_ev[cur_bcnt] = bev;
+                      cur_bs[cur_bcnt] = cur_bs[ba] + 1;
+                      cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = bb;
+                      h_node_idx = cur_bcnt;
+                      h_next_pos = bb + 1;
                       cur_bcnt += 1;
                     } else {
                       break;
@@ -4211,9 +4574,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return (partials[0], partials[1], partials[2])
     }
 
+    nonisolated(unsafe) private static let emptyHistoryHint: MLXArray = {
+        let a = MLXArray.zeros([10], type: Int32.self)
+        eval(a)
+        return a
+    }()
+
     private static func fastDynamicTreeStage2(
         _ pVal: MLXArray, _ pIdx: MLXArray, _ pSum: MLXArray,
-        k: Int, vocab: Int, params: MLXArray
+        k: Int, vocab: Int, params: MLXArray, historyHint: MLXArray? = nil
     ) -> (tokens: MLXArray, treeMeta: MLXArray) {
         let rows = pVal.dim(0)
         let chunks = 64
@@ -4230,7 +4599,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             dynTreeLock.withLock { dynTreeS2Cache[key] = made }
             launch = made
         }
-        let out = launch([pVal, pIdx, pSum, params])
+        let hint = historyHint ?? CBv2DraftRegime.activeHistoryHint ?? emptyHistoryHint
+        let out = launch([pVal, pIdx, pSum, params, hint])
         return (out[0], out[1])
     }
 
@@ -4274,7 +4644,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         if logits.ndim == 2, logits.dtype == .bfloat16, logits.dim(1) >= 256 {
             let dynK = CBv2DraftRegime.activeDynamicTreeK
             if dynK >= 2, dynK <= logits.dim(0), logits.dim(0) <= 7 {
-                let dyn = Self.fastDynamicTree(logits, k: dynK, params: dynTreeParams)
+                let dyn = Self.fastDynamicTree(logits, k: dynK, params: activeDynTreeParams)
                 CBv2DraftRegime.activeDynamicTreeMeta = dyn.treeMeta
                 return dyn.tokens
             }
@@ -4497,7 +4867,27 @@ extension MuseGlimmerDFlashDrafter: CBv2ResidentParametersProviding {
         if let comp = compressedDraftHead {
             arrays += comp.residentArrays
         }
-        return arrays + [maskEmbedding]
+        return arrays + [maskEmbedding] + [fusedMaskQKV, nvfp4MaskQKV].compactMap { $0 }
+    }
+}
+
+// MARK: - Decode buffer warm-up
+
+/// The engine asks its `model` for the decode-shape allocator warm-up, but
+/// that object is the runner's adapter of the target, not the target. The
+/// drafter is bound to the target itself, so the engine also asks the drafter,
+/// which forwards. Input-independent: zeros in, outputs dropped.
+///
+/// Two row counts are warmed. A dynamic-tree round verifies `k + 1` rows and
+/// the tree window before the deep-low regime is `k = 6 or 7`, so a request
+/// can meet a `verifyRows - 1` round before any `verifyRows` round has left
+/// its buffers behind; the wide MLP and head intermediates of the two shapes
+/// fall in different allocator size classes.
+extension MuseGlimmerDFlashDrafter: CBv2DecodeBufferPrewarming {
+    public func prewarmDecodeBuffers(verifyRows: Int) {
+        guard let text = target as? MuseGlimmerTextModel else { return }
+        if verifyRows > 2 { text.prewarmVerifyBuffers(rows: verifyRows - 1) }
+        text.prewarmVerifyBuffers(rows: verifyRows)
     }
 }
 
