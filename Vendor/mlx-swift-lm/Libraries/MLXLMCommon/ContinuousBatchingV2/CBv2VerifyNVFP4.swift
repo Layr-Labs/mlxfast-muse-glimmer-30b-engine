@@ -69,7 +69,7 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
