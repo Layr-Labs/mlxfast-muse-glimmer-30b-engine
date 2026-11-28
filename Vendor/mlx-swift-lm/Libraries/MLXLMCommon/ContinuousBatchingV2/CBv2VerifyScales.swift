@@ -358,14 +358,11 @@ public enum CBv2VerifyScales {
 
             for (int k = int(simd_gid) * BK; k < K; k += WK * BK) {
                 uint qa[4][TN];
-                ushort4 xa[4][2];
                 MO_WO_UNROLL
                 for (short block = 0; block < 4; block++) {
                     const int b = k + 32 * block;
                     MO_WO_UNROLL
                     for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
-                    xa[block][0] = *(const device ushort4*)(xr0 + b);
-                    xa[block][1] = *(const device ushort4*)(xr1 + b);
                 }
                 half2 hs[TN][2];
                 MO_WO_UNROLL
@@ -376,18 +373,22 @@ public enum CBv2VerifyScales {
                 }
                 MO_WO_UNROLL
                 for (short block = 0; block < 4; block++) {
-                    half s[TN];
+                    const int b = k + 32 * block;
+                    const ushort4 x0 = *(const device ushort4*)(xr0 + b);
+                    const ushort4 x1 = *(const device ushort4*)(xr1 + b);
+                    float fs[TN];
                     MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                    for (short t = 0; t < TN; t++) {
+                        fs[t] = float(hs[t][block / 2][block % 2]) * 16384.0f;
+                    }
                     MO_WO_UNROLL
                     for (short i = 0; i < 4; i++) {
                         const float2 bf = float2(
-                            float(as_type<bfloat>(xa[block][0][i])),
-                            float(as_type<bfloat>(xa[block][1][i])));
+                            as_type<float>(uint(x0[i]) << 16),
+                            as_type<float>(uint(x1[i]) << 16));
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
-                            const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
-                            mo_wo_mma(C[t], a, bf);
+                            mo_wo_mma(C[t], cb_sc_pair_f(qa[block][t], i, fs[t]), bf);
                         }
                     }
                 }
@@ -571,19 +572,27 @@ public enum CBv2VerifyScales {
     public static let fusedLMHeadEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] != "0"
 
-    public static let fusedLMHeadChunks: Int = {
+    private static let fusedLMHeadChunksOverride: Int? = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_CHUNKS"],
             let v = Int(raw), [64, 128, 256, 512, 1024, 2048, 4096].contains(v)
         {
             return v
         }
-        return 2048
+        return nil
     }()
 
-    public static let fusedLMHeadTN: Int = {
-        let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_TN"].flatMap(Int.init) ?? 1
-        return (raw == 1 || raw == 2) ? raw : 1
+    public static let fusedLMHeadChunks: Int = fusedLMHeadChunksOverride ?? 2048
+
+    private static let fusedLMHeadTNOverride: Int? = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_TN"],
+            let v = Int(raw), (v == 1 || v == 2)
+        {
+            return v
+        }
+        return nil
     }()
+
+    public static let fusedLMHeadTN: Int = fusedLMHeadTNOverride ?? 2
 
     /// Zero-logit-materialization NVFP4 `lm_head` + readout + exact top-2 + non-finite
     /// for 1 to 8 rows (`[B, L, H]`), bit-exact to `product(lmHead, x)` followed by
@@ -598,11 +607,14 @@ public enum CBv2VerifyScales {
         let width = x.dim(1)
         let inputs = x.dim(2)
         let rows = batch * width
-        let tn = fusedLMHeadTN
         let outputs = l.outputDimensions
-        let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
         let minChunksFor16BitOffset = max(1, (outputs + 65_533) / 65_534)
-        let chunks = min(totalTiles, max(fusedLMHeadChunks, minChunksFor16BitOffset))
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let tn = fusedLMHeadTNOverride ?? (strictC3 ? 2 : 1)
+        let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
+        let preferredChunks = fusedLMHeadChunksOverride ?? (strictC3 ? 2048 : 4096)
+        let chunks = min(totalTiles, max(preferredChunks, minChunksFor16BitOffset))
         let pkey = NVFP4TopTwoPlanKey(
             id: ObjectIdentifier(l), rows: rows, inputs: inputs, dtype: x.dtype,
             chunks: chunks, tn: tn)
