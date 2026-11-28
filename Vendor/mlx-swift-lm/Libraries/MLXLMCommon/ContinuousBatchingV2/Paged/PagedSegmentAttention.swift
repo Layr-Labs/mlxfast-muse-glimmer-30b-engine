@@ -619,6 +619,23 @@ enum PagedMultiQueryAttention {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
+    private struct MQPartLaunchID: Hashable {
+        let kernelName: String
+        let workCount: Int
+    }
+
+    private struct MQMergeLaunchID: Hashable {
+        let key: PagedAttentionKernelKey
+        let columns: Int
+        let queryHeads: Int
+    }
+
+    nonisolated(unsafe) private static var partLaunches:
+        [MQPartLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var mergeLaunches:
+        [MQMergeLaunchID: MLXFast.MLXFastKernel.Launch] = [:]
+    private static let launchLimit = 1024
+
     static func eligible(columns: Int, queryHeads: Int, headDim: Int, group: PagedKVGroup) -> Bool {
         let kvh = group.key.kvHeads
         guard group.segmentLayout != nil, !group.key.isAsymmetric, kvh > 0,
@@ -837,9 +854,11 @@ enum PagedMultiQueryAttention {
             let name =
                 "cbv2_paged_mq_\(dname)_d\(d)_s\(group.pageSize)_g\(gqa)_n\(nsg)_c\(count)_x\(cpt)"
                 + "_t\(ptok)_kvh\(kvh)_cap\(softcap ? 1 : 0)_segments\(bindingCount)"
-            group.writeFence =
-                kernel(name: name, bindings: bindingCount, source: source)(
-                    inputs,
+            let partID = MQPartLaunchID(kernelName: name, workCount: bucket.workCount)
+            if let launch = lock.withLock({ partLaunches[partID] }) {
+                group.writeFence = launch(inputs)[0]
+            } else {
+                let made = kernel(name: name, bindings: bindingCount, source: source).prepare(
                     template: [
                         ("T", dtype), ("D", d), ("S", group.pageSize), ("KVH", kvh),
                         ("GQA", gqa), ("NSG", nsg), ("PTOK", ptok), ("HAS_SOFTCAP", softcap),
@@ -849,23 +868,40 @@ enum PagedMultiQueryAttention {
                     ],
                     grid: (kvh * groups * 32 * gqa * cpt, bucket.workCount, 1),
                     threadGroup: (32 * gqa * cpt, 1, 1), outputShapes: [[1]],
-                    outputDTypes: [.int32])[0]
+                    outputDTypes: [.int32])
+                let launch = lock.withLock {
+                    if let hit = partLaunches[partID] { return hit }
+                    if partLaunches.count < launchLimit { partLaunches[partID] = made }
+                    return made
+                }
+                group.writeFence = launch(inputs)[0]
+            }
         }
         lock.withLock { dispatches += 1 }
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
         let zeroSinks = sinks ?? PagedSegmentAttention.unusedMergeSinks(count: max(8, qh))
-        return PagedSegmentAttention.mergeKernel(key: mergeKey, source: source)(
-            [
-                partials, meta, seqinfo, zeroSinks, group.writeFence,
-                PagedSegmentAttention.dummyTreeMeta,
-            ],
+        let mergeInputs = [
+            partials, meta, seqinfo, zeroSinks, group.writeFence,
+            PagedSegmentAttention.dummyTreeMeta,
+        ]
+        let mergeID = MQMergeLaunchID(key: mergeKey, columns: count, queryHeads: qh)
+        if let launch = lock.withLock({ mergeLaunches[mergeID] }) {
+            return launch(mergeInputs)[0]
+        }
+        let madeMerge = PagedSegmentAttention.mergeKernel(key: mergeKey, source: source).prepare(
             template: [
                 ("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil),
                 ("DYN_TREE", false),
             ],
             grid: (qh * 32, count, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[count, qh, d]], outputDTypes: [dtype])[0]
+            outputShapes: [[count, qh, d]], outputDTypes: [dtype])
+        let mergeLaunch = lock.withLock {
+            if let hit = mergeLaunches[mergeID] { return hit }
+            if mergeLaunches.count < launchLimit { mergeLaunches[mergeID] = madeMerge }
+            return madeMerge
+        }
+        return mergeLaunch(mergeInputs)[0]
     }
 }
