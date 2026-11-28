@@ -358,7 +358,10 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            if (flushLayer > 0 && index + 1 == flushLayer)
+                || (lowVerify && CBv2DraftRegime.strictLowVerifyC3
+                    && MuseGlimmerVerifyProjections.lowFlushLayers.contains(index + 1))
+            {
                 asyncEval(h, layerInput)
             }
         }
@@ -652,6 +655,18 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, !preCastFP8, mlp.downProj is ModelOptWeightOnlyNVFP4Linear,
+            verifyRows(x) != nil,
+            let act = CBv2VerifyNVFP4.swigluProduct([mlp.gateProj, mlp.upProj], x)
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let ref = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [act], [compiledSiluProduct(ref[0], ref[1])],
+                    kind: "nvfp4.gate_up.swiglu", rows: MuseGlimmerNumerics.rows(x))
+            }
+            return verifyDownProjection(mlp.downProj, act)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -777,6 +792,13 @@ enum MuseGlimmerVerifyProjections {
     static let midTrunkFlushLayer: Int = {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
+    }()
+    /// Extra mid-trunk submissions on low-acceptance verify rounds
+    /// (`CBV2_LOW_FLUSH`, comma-separated layer counts; empty disables), so the
+    /// GPU starts earlier and stays ahead of graph construction.
+    static let lowFlushLayers: Set<Int> = {
+        let raw = environment["CBV2_LOW_FLUSH"] ?? "8,26,38"
+        return Set(raw.split(separator: ",").compactMap { Int($0) })
     }()
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
@@ -1145,6 +1167,9 @@ extension MuseGlimmerTextModel {
                             }
                         case "gate_up":
                             outputs += verifyFeedInputProjections(group, x)
+                            if lowAcc, let act = CBv2VerifyNVFP4.swigluProduct(group, x) {
+                                outputs.append(act)
+                            }
                             if lowAcc, let fp8 = group as? [ModelOptCalibratedLinear],
                                 let pre = CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
                             {

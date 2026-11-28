@@ -103,13 +103,28 @@ public enum CBv2VerifyNVFP4 {
             return as_type<half2>(u) * half2(256.0h);
         }
 
+        // silu(g) * u with the operation order and bf16 rounding of MLX's
+        // compiled `silu(gate) * up` (`x * sigmoid(x)`, then `* up`): every
+        // intermediate is a bfloat, `Sigmoid` is MLX's own formula.
+        inline bfloat cbv2_vn_swiglu(bfloat g, bfloat u) {
+            const bfloat ay = metal::abs(g);
+            auto y = 1 / (1 + metal::precise::exp(ay));
+            const bfloat sg = (g < 0) ? y : 1 - y;
+            const bfloat t = g * sg;
+            return t * u;
+        }
+
         // One tile of 8 * TN outputs of one projection: the stock matrix
         // kernel's arithmetic (see CBv2VerifyNVFP4).
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV>
+        // FUSE 1: keep the rounded (and tensor-scaled) result in `stage`;
+        // FUSE 2: combine it as `gate` with this projection's result as `up`
+        // and store silu(gate) * up.
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV,
+            int FUSE = 0>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
-            threadgroup float* partials) {
+            threadgroup float* partials, threadgroup T* stage = nullptr) {
             constexpr int WK = 8;
             constexpr int BK = 128;
             constexpr short TM = (V + 7) / 8;
@@ -534,6 +549,19 @@ public enum CBv2VerifyNVFP4 {
                         }
                     }
                 }
+                if constexpr (FUSE == 1) {
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                stage[((t * TM + mt) * 2 + j) * 32 + simd_lid] =
+                                    mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                            }
+                        }
+                    }
+                } else
                 MO_WO_UNROLL
                 for (short mt = 0; mt < TM; mt++) {
                     MO_WO_UNROLL
@@ -544,7 +572,13 @@ public enum CBv2VerifyNVFP4 {
                             for (short t = 0; t < TN; t++) {
                                 const int out = y_col + fm + 8 * t;
                                 if (out < N) {
-                                    yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    const T r = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    if constexpr (FUSE == 2) {
+                                        yr[out] = cbv2_vn_swiglu(
+                                            stage[((t * TM + mt) * 2 + j) * 32 + simd_lid], r);
+                                    } else {
+                                        yr[out] = r;
+                                    }
                                 }
                             }
                         }
@@ -590,6 +624,104 @@ public enum CBv2VerifyNVFP4 {
     nonisolated(unsafe) private static let kernels: [Int: MLXFast.MLXFastKernel] = [
         1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
+
+    /// Gate and up of one MLP for the same output columns in one launch:
+    /// each threadgroup computes its gate tile (stock arithmetic, rounded to
+    /// bf16, kept in threadgroup memory), then the up tile, and stores only
+    /// `silu(gate) * up` in the bf16 order of `compiledSiluProduct`.
+    nonisolated(unsafe) private static let swigluKernel: MLXFast.MLXFastKernel = {
+        let body = """
+            constexpr int TILE_ELEMS = TN * ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            threadgroup T stage[TILE_ELEMS * 32];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+            cbv2_vn_tile<T, V, K, N0, TN, PF, SCALED, WC, SV, 1>(
+                w0, sc0, x, ts0[0], y0, tg, sg, sl, partials, stage);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            cbv2_vn_tile<T, V, K, N0, TN, PF, SCALED, WC, SV, 2>(
+                w1, sc1, x, ts1[0], y0, tg, sg, sl, partials, stage);
+            """
+        return MLXFast.metalKernel(
+            name: "cbv2_verify_nvfp4_swiglu",
+            inputNames: ["w0", "sc0", "ts0", "w1", "sc1", "ts1", "x"],
+            outputNames: ["y0"], source: body,
+            header: ModelOptWeightOnlyNVFP4RowExact.header + tileHelper)
+    }()
+
+    /// The Metal source of the fused activation, for exhaustive tests.
+    public static let swigluHeader = ModelOptWeightOnlyNVFP4RowExact.header + tileHelper
+
+    /// `CBV2_FUSED_SWIGLU=0` disables `swigluProduct` (default on).
+    public static let fusedSwigluEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FUSED_SWIGLU"] != "0"
+
+    private struct SwigluKey: Hashable {
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let fragments: Int
+        let prefetch: Int
+        let wholeChunk: Bool
+        let scaleVec: Bool
+        let outputs: Int
+    }
+
+    nonisolated(unsafe) private static var swigluCache:
+        [SwigluKey: MLXFast.MLXFastKernel.Launch] = [:]
+    private static let swigluLock = NSLock()
+
+    /// `compiledSiluProduct(gate, up)` of `products([gate, up], x)`, bit for
+    /// bit, in one launch; nil when `products` would not take this shape, on
+    /// high-acceptance (record schedule) verify rounds, or when the switch is off.
+    public static func swigluProduct(_ layers: [any UnaryLayer], _ x: MLXArray) -> MLXArray? {
+        guard fusedSwigluEnabled, layers.count == 2, geometryOverride == nil,
+            let nv = layers as? [ModelOptWeightOnlyNVFP4Linear]
+        else { return nil }
+        // Strict deep-low rounds only: pair-1 style requests keep the record path.
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (CBv2DraftRegime.lowAcceptance && CBv2DraftRegime.strictLowVerifyC3)
+        guard lowVerify else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype) else { return nil }
+        let outputs = nv[0].weight.dim(0)
+        for layer in nv {
+            guard layer.inputDimensions == inputs, layer.weight.dim(0) == outputs,
+                takes(weight: layer.weight, blockScales: layer.weightScale,
+                    tensorScale: layer.weightScale2, inputs: inputs)
+            else { return nil }
+        }
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let key = SwigluKey(
+            dtype: x.dtype, rows: rows, inputs: inputs, fragments: s.fragments,
+            prefetch: s.prefetch, wholeChunk: s.wholeChunk, scaleVec: s.scaleVec,
+            outputs: outputs)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = swigluLock.withLock({ swigluCache[key] }) {
+            launch = hit
+        } else {
+            let tile = 8 * s.fragments
+            let template: [(String, any KernelTemplateArg)] = [
+                ("T", x.dtype), ("V", rows), ("K", inputs), ("TN", s.fragments),
+                ("PF", s.prefetch), ("SCALED", true), ("WC", s.wholeChunk),
+                ("SV", s.scaleVec), ("N0", outputs),
+            ]
+            launch = swigluKernel.prepare(
+                template: template, grid: (32, 8 * ((outputs + tile - 1) / tile), 1),
+                threadGroup: (32, 8, 1), outputShapes: [[rows, outputs]],
+                outputDTypes: [x.dtype])
+            swigluLock.withLock { swigluCache[key] = launch }
+        }
+        let r = launch([
+            nv[0].weight, nv[0].weightScale, nv[0].weightScale2.reshaped(1),
+            nv[1].weight, nv[1].weightScale, nv[1].weightScale2.reshaped(1),
+            x.reshaped(rows, inputs),
+        ])[0]
+        return r.reshaped(Array(x.shape.dropLast()) + [outputs])
+    }
 
     private struct LaunchKey: Hashable {
         let segments: Int
