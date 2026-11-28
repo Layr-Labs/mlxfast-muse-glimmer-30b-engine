@@ -1752,14 +1752,14 @@ public enum CBv2DraftRegime {
         }
         return dynamicTreeMaxLeavesAt5
     }()
-    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 2; 1 = leaves only).
+    /// Maximum branch length after forking (`CBV2_DYN_TREE_BRANCH_LEN`, default 1; 1 = leaves only).
     public static let dynamicTreeMaxBranchLen: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_BRANCH_LEN"],
             let v = Int(raw), (1 ... 4).contains(v)
         {
             return v
         }
-        return 2
+        return 1
     }()
     /// Conditional probability multiplier for depth-2+ branch continuations (`CBV2_DYN_TREE_CONT_DECAY`, default 0.70).
     public static let dynamicTreeContDecay: Float = {
