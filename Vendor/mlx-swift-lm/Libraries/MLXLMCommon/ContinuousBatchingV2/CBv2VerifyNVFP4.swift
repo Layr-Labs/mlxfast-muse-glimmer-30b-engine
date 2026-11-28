@@ -73,8 +73,9 @@ public enum CBv2VerifyNVFP4 {
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
-            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
-            if strictC3 && rows >= 7 && downTN1Env && wc {
+            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X)
+            // across all multi-row dynamic-tree widths (rows >= 4).
+            if strictC3 && rows >= 4 && downTN1Env && wc {
                 let defaultPF = peeledPFEnv ? 2 : 0
                 let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
                 return (1, pf, wc, sv)
@@ -88,8 +89,8 @@ public enum CBv2VerifyNVFP4 {
         }
         // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
         // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
-        // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
-        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        // next-chunk weight+scale DRAM prefetch (PF=2) across all multi-row tree widths (rows >= 4).
+        let defaultPF = (strictC3 && rows >= 4 && peeledPFEnv && wc) ? 2 : 0
         let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
@@ -101,6 +102,29 @@ public enum CBv2VerifyNVFP4 {
             const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
                 | ((x & 0x00800080u) << 8);
             return as_type<half2>(u) * half2(256.0h);
+        }
+
+        // Exact 0-ULP IEEE-754 fold of 256.0h * 16384.0h = 2^22 into float32:
+        // bit-identical to mo_wo_pair(q, i, mo_wo_e4m3(b)) across all 4,096 pairs.
+        inline float2 cbv2_vn_e4m3x2_f22(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return float2(as_type<half2>(u)) * 4194304.0f;
+        }
+
+        inline float2 cbv2_vn_pair_f22(uint q, int i, float fs) {
+            uint p;
+            if (i == 0) {
+                p = ((q & 0x00070007u) << 9) | ((q & 0x00080008u) << 12);
+            } else if (i == 1) {
+                p = ((q & 0x00700070u) << 5) | ((q & 0x00800080u) << 8);
+            } else if (i == 2) {
+                p = ((q & 0x07000700u) << 1) | ((q & 0x08000800u) << 4);
+            } else {
+                p = ((q & 0x70007000u) >> 3) | (q & 0x80008000u);
+            }
+            return float2(as_type<half2>(p)) * fs;
         }
 
         // One tile of 8 * TN outputs of one projection: the stock matrix
@@ -248,16 +272,16 @@ public enum CBv2VerifyNVFP4 {
                                 }
                             }
                         }
-                        half2 hs[TN][2];
+                        float2 hs[TN][2];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
                             if constexpr (SV) {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                                hs[t][0] = cbv2_vn_e4m3x2_f22(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2_f22(sb[t].y >> scale_shift);
                                 sb[t] = *(const device uint2*)(sl[t] + (kn / 16));
                             } else {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                                hs[t][0] = cbv2_vn_e4m3x2_f22(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2_f22(sb[t].y);
                                 sb[t] = uint2(
                                     uint(sl[t][kn / 16]) | (uint(sl[t][kn / 16 + 2]) << 16),
                                     uint(sl[t][kn / 16 + 4]) | (uint(sl[t][kn / 16 + 6]) << 16));
@@ -265,7 +289,7 @@ public enum CBv2VerifyNVFP4 {
                         }
                         MO_WO_UNROLL
                         for (short block = 0; block < 4; block++) {
-                            half s[TN];
+                            float s[TN];
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
                             MO_WO_UNROLL
@@ -279,7 +303,7 @@ public enum CBv2VerifyNVFP4 {
                                 }
                                 MO_WO_UNROLL
                                 for (short t = 0; t < TN; t++) {
-                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
+                                    const float2 a = cbv2_vn_pair_f22(q[block][t], i, s[t]);
                                     MO_WO_UNROLL
                                     for (short mt = 0; mt < TM; mt++) {
                                         mo_wo_mma(C[t][mt], a, bf[mt]);
@@ -302,20 +326,20 @@ public enum CBv2VerifyNVFP4 {
                                 }
                             }
                         }
-                        half2 hs[TN][2];
+                        float2 hs[TN][2];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
                             if constexpr (SV) {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                                hs[t][0] = cbv2_vn_e4m3x2_f22(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2_f22(sb[t].y >> scale_shift);
                             } else {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                                hs[t][0] = cbv2_vn_e4m3x2_f22(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2_f22(sb[t].y);
                             }
                         }
                         MO_WO_UNROLL
                         for (short block = 0; block < 4; block++) {
-                            half s[TN];
+                            float s[TN];
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
                             MO_WO_UNROLL
@@ -329,7 +353,7 @@ public enum CBv2VerifyNVFP4 {
                                 }
                                 MO_WO_UNROLL
                                 for (short t = 0; t < TN; t++) {
-                                    const float2 a = mo_wo_pair(qb[block][t], i, s[t]);
+                                    const float2 a = cbv2_vn_pair_f22(qb[block][t], i, s[t]);
                                     MO_WO_UNROLL
                                     for (short mt = 0; mt < TM; mt++) {
                                         mo_wo_mma(C[t][mt], a, bf[mt]);

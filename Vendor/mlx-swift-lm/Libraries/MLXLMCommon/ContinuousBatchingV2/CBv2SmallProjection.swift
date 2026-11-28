@@ -869,6 +869,215 @@ public enum CBv2SmallProjection {
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
             }
         }
+
+        // Zero-barrier, zero-TGEM BN=1 TM=4 4-SG/TG DV_MODE=2 FP8 kernel (peeled 1-ahead PF)
+        // for 42L o_proj (0..<6617) plus exact BN=8-in-4SG split tail (6617..<6656), 0-ULP exact.
+        template <typename T, int K, int V>
+        inline void cbv2_sp_fp8_bn1_tm4_4sg(
+            const device uint8_t* mat, float weight_scale, const device T* in_vec,
+            device T* out_vec, int N, int NOUT, int tile, uint simd_gid, uint simd_lid) {
+            constexpr int TM = 4;
+            constexpr int TN = 4;
+            constexpr int blockN = 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            static_assert(P <= 32, "at most 32 values per lane");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr uint LOW = (1u << SH) - 1u;
+            const float dscale = weight_scale * 256.0f;
+            const int orig_row = (tile * 4 + int(simd_gid)) * TM;
+            if (orig_row >= N) { return; }
+            const int out_row = orig_row + TM <= N ? orig_row : N - TM;
+            int bn = int(simd_lid) * TN;
+            const device uint8_t* rows = mat + size_t(out_row) * K;
+            float r[P2];
+            CBV2_SP_UNROLL
+            for (int i = 0; i < P2; i++) { r[i] = 0; }
+            if constexpr (n_iter > 0) {
+                uint wq[TM];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) { wq[tm] = *(const device uint*)(rows + tm * K + bn); }
+                for (int it = 0; it < n_iter - 1; it++) {
+                    uint wn[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) { wn[tm] = *(const device uint*)(rows + tm * K + bn + blockN); }
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = wq[tm];
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) { r[v * TM + tm] += inter[tm][tn] * a; }
+                        }
+                    }
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) { wq[tm] = wn[tm]; }
+                    bn += blockN;
+                }
+                T inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const uint w = wq[tm];
+                    const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                    const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                    const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                    const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                    inter[tm][0] = static_cast<T>(f02.x);
+                    inter[tm][1] = static_cast<T>(f13.x);
+                    inter[tm][2] = static_cast<T>(f02.y);
+                    inter[tm][3] = static_cast<T>(f13.y);
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) { r[v * TM + tm] += inter[tm][tn] * a; }
+                    }
+                }
+                bn += blockN;
+            }
+            if constexpr (leftover > 0) {
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                T inter[TM][TN];
+                for (int tm = 0; tm < TM; tm++) {
+                    for (int tn = 0; tn < TN; tn++) {
+                        if (bn + tn < K) {
+                            const uint8_t code = rows[tm * K + bn + tn];
+                            const float decoded = (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                            inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                        } else {
+                            inter[tm][tn] = T(0);
+                        }
+                    }
+                }
+                for (int v = 0; v < V; v++) {
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                        for (int tm = 0; tm < TM; tm++) { r[v * TM + tm] += inter[tm][tn] * a; }
+                    }
+                }
+            }
+            const ushort lid = ushort(simd_lid);
+            cbv2_sp_tree_step<P2, 16>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int i = int(simd_lid >> SH);
+            if (holds && i < P) {
+                out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
+            }
+        }
+
+        template <typename T, int K, int V, int TM>
+        inline void cbv2_sp_fp8_split_in_4sg(
+            const device uint8_t* mat, float weight_scale, const device T* in_vec,
+            device T* out_vec, int N, int NOUT, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* tgp) {
+            constexpr int BN = 8;
+            constexpr int TN = 4;
+            constexpr int blockN = BN * 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr uint LOW = (1u << SH) - 1u;
+            const float dscale = weight_scale * 256.0f;
+            const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+            const int orig_row = tile * TM;
+            const bool active = orig_row < N;
+            const int out_row = active ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
+            const device uint8_t* rows = mat + size_t(out_row) * K;
+            const ushort lid = ushort(simd_lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int idx = int(simd_lid >> SH);
+            for (int half_p = 0; half_p < 2; half_p++) {
+                const uint g = simd_gid + uint(half_p) * 4u;
+                int bn = (32 * int(g) + int(simd_lid)) * TN;
+                float r[P2];
+                CBV2_SP_UNROLL
+                for (int i = 0; i < P2; i++) { r[i] = 0; }
+                for (int it = 0; it < n_iter; it++) {
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = *(const device uint*)(rows + tm * K + bn);
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) { r[v * TM + tm] += inter[tm][tn] * a; }
+                        }
+                    }
+                    bn += blockN;
+                }
+                if constexpr (leftover > 0) {
+                    T inter[TM][TN];
+                    for (int tm = 0; tm < TM; tm++) {
+                        for (int tn = 0; tn < TN; tn++) {
+                            if (bn + tn < K) {
+                                const uint8_t code = rows[tm * K + bn + tn];
+                                const float decoded = (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                            } else {
+                                inter[tm][tn] = T(0);
+                            }
+                        }
+                    }
+                    for (int v = 0; v < V; v++) {
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                            for (int tm = 0; tm < TM; tm++) { r[v * TM + tm] += inter[tm][tn] * a; }
+                        }
+                    }
+                }
+                cbv2_sp_tree_step<P2, 16>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+                cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+                if (holds) { tgp[g * 32 + idx] = r[0]; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0 && holds && idx < P && active) {
+                float result = tgp[idx];
+                for (int s = 1; s < BN; s++) { result += tgp[s * 32 + idx]; }
+                out_vec[(idx / TM) * NOUT + out_row + (idx % TM)] = static_cast<T>(result);
+            }
+        }
         """
 
     /// One segment of a dispatch: `rows` output rows of weight `weight`
@@ -886,8 +1095,8 @@ public enum CBv2SmallProjection {
         var tm: Int
         var prefetch: Int
 
-        func tiles(rowGroups: Int) -> Int {
-            split ? (rows + rowGroups * tm - 1) / (rowGroups * tm) : (rows + 8 * tm - 1) / (8 * tm)
+        func tiles(rowGroups: Int, sgPerTG: Int = 8) -> Int {
+            split ? (rows + rowGroups * tm - 1) / (rowGroups * tm) : (rows + sgPerTG * tm - 1) / (sgPerTG * tm)
         }
     }
 
@@ -897,6 +1106,7 @@ public enum CBv2SmallProjection {
         var rowGroups: Int
         var coopOProj: Bool
         var tm4Split: Bool = false
+        var bn1TM4: Bool = false
         var weights: Int
         var outputs: Int
         var segments: [FP8Segment]
@@ -942,6 +1152,51 @@ public enum CBv2SmallProjection {
             let kernel = MLXFast.metalKernel(
                 name: name, inputNames: inputNames, outputNames: outputNames, source: body,
                 header: ModelOptActivationKernels.header + fp8HelperRec)
+            fp8Kernels[shape] = kernel
+            return kernel
+        }
+        if shape.bn1TM4 {
+            var body = """
+                threadgroup float sp_tgp[8 * 32];
+                const int tg = int(threadgroup_position_in_grid.y);
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint sl = thread_index_in_simdgroup;
+
+                """
+            var offset = 0
+            for (index, s) in shape.segments.enumerated() {
+                let end = offset + s.tiles(rowGroups: 1, sgPerTG: 4)
+                let cond =
+                    index == 0
+                    ? "if (tg < \(end))"
+                    : (index + 1 == shape.segments.count ? "else" : "else if (tg < \(end))")
+                if !s.split {
+                    body += """
+                        \(cond) {
+                            cbv2_sp_fp8_bn1_tm4_4sg<T, K, V>(
+                                m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
+                                xc + size_t(\(s.input)) * V * K,
+                                y\(s.output) + \(s.column0), \(s.rows), \(s.outputWidth), tg - \(offset), sg, sl);
+                        }
+
+                        """
+                } else {
+                    body += """
+                        \(cond) {
+                            cbv2_sp_fp8_split_in_4sg<T, K, V, \(s.tm)>(
+                                m\(s.weight) + size_t(\(s.row0)) * K, ws\(s.weight)[0],
+                                xc + size_t(\(s.input)) * V * K,
+                                y\(s.output) + \(s.column0), \(s.rows), \(s.outputWidth), tg - \(offset), sg, sl, sp_tgp);
+                        }
+
+                        """
+                }
+                offset = end
+            }
+            let name = "cbv2_small_fp8_" + stableName(body)
+            let kernel = MLXFast.metalKernel(
+                name: name, inputNames: inputNames, outputNames: outputNames, source: body,
+                header: ModelOptActivationKernels.header + fp8Helper)
             fp8Kernels[shape] = kernel
             return kernel
         }
@@ -1069,9 +1324,12 @@ public enum CBv2SmallProjection {
     /// `CBV2_DENSE_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT dense BF16 (q/gate) strict-low verify rows.
     public static let coopDenseEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DENSE_COOP"] != "0"
-    /// `CBV2_FP8_TM4=0` disables single-body TM=4 RG=1 pure-SPLIT FP8 verify kernels on strict-C3 low-acceptance rows >= 5.
+    /// `CBV2_FP8_TM4=0` disables single-body TM=4 RG=1 pure-SPLIT FP8 verify kernels on strict-C3 low-acceptance rows >= 4.
     public static let fp8TM4Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_TM4"] != "0"
+    /// `CBV2_FP8_OPROJ_TM4=0` disables zero-barrier 4-SG/TG BN=1 TM=4 FP8 o_proj kernels on strict-C3 low-acceptance rows >= 4.
+    public static let fp8OProjTM4Enabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_OPROJ_TM4"] != "0"
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -1271,6 +1529,7 @@ public enum CBv2SmallProjection {
         let dvMode: Int
         let coopOProj: Bool
         let tm4Split: Bool
+        let bn1TM4: Bool
         let lowVerify: Bool
         let sharedInput: Bool
     }
@@ -1323,7 +1582,12 @@ public enum CBv2SmallProjection {
             useBranchlessDV ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let allowCoopOProj = strictLow && coopOProjEnabled && rows >= 2
         let allowTM4Split =
-            strictC3 && fp8TM4Enabled && rows >= 5 && rows <= 8 && dvMode == 2 && useRowsOuter
+            strictC3 && fp8TM4Enabled && rows >= 4 && rows <= 8 && dvMode == 2
+            && (useRowsOuter || rows == 4)
+            && rowsPerThreadOverride == nil && prefetchOverride == nil
+        let allowBN1TM4 =
+            strictC3 && fp8OProjTM4Enabled && rows >= 4 && rows <= 8 && dvMode == 2
+            && (useRowsOuter || rows == 4)
             && rowsPerThreadOverride == nil && prefetchOverride == nil
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         let canUseFastPlan =
@@ -1334,8 +1598,8 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, dvMode: dvMode,
-                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, lowVerify: lowVerify,
-                sharedInput: sharedInput)
+                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, bn1TM4: allowBN1TM4,
+                lowVerify: lowVerify, sharedInput: sharedInput)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 var args = plan.weightArrays
                 args.append(cast)
@@ -1362,16 +1626,23 @@ public enum CBv2SmallProjection {
             }
             let tm4Active =
                 allowTM4Split && segments.allSatisfy { $0.split && $0.rows % 4 == 0 }
+            let bn1TM4Active =
+                !tm4Active && allowBN1TM4 && segments.contains(where: { !$0.split })
+                && segments.allSatisfy { $0.split || $0.rows >= 4 }
             if tm4Active {
                 for idx in segments.indices { segments[idx].tm = 4 }
+            } else if bn1TM4Active {
+                for idx in segments.indices where !segments[idx].split { segments[idx].tm = 4 }
             }
-            let rg = tm4Active ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
-            let coopActive = !tm4Active && allowCoopOProj && segments.contains(where: { !$0.split })
-            let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive) ? 0 : dvMode
+            let rg = (tm4Active || bn1TM4Active) ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
+            let sgPerTG = bn1TM4Active ? 4 : 8
+            let coopActive =
+                !tm4Active && !bn1TM4Active && allowCoopOProj && segments.contains(where: { !$0.split })
+            let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive && !tm4Active && !bn1TM4Active) ? 0 : dvMode
             let shape = FP8Shape(
                 dvMode: effectiveDVMode, rowsOuter: useRowsOuter, rowGroups: rg,
-                coopOProj: coopActive, tm4Split: tm4Active, weights: layers.count,
-                outputs: layers.count, segments: segments)
+                coopOProj: coopActive, tm4Split: tm4Active, bn1TM4: bn1TM4Active,
+                weights: layers.count, outputs: layers.count, segments: segments)
             let outputDims = layers.map(\.outputDimensions)
             let launchKey = FP8LaunchKey(
                 shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
@@ -1379,10 +1650,10 @@ public enum CBv2SmallProjection {
             if let hit = lock.withLock({ fp8LaunchCache[launchKey] }) {
                 launch = hit
             } else {
-                let tiles = segments.reduce(0) { $0 + $1.tiles(rowGroups: rg) }
+                let tiles = segments.reduce(0) { $0 + $1.tiles(rowGroups: rg, sgPerTG: sgPerTG) }
                 let made = fp8Kernel(shape).prepare(
                     template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
-                    grid: (32, 8 * rg * tiles, 1), threadGroup: (32, 8 * rg, 1),
+                    grid: (32, sgPerTG * rg * tiles, 1), threadGroup: (32, sgPerTG * rg, 1),
                     outputShapes: outputDims.map { [rows, $0] },
                     outputDTypes: Array(repeating: flat.dtype, count: outputDims.count))
                 lock.withLock { fp8LaunchCache[launchKey] = made }
@@ -1416,16 +1687,23 @@ public enum CBv2SmallProjection {
         arrays.append(cast)
         let tm4Active =
             allowTM4Split && segments.allSatisfy { $0.split && $0.rows % 4 == 0 }
+        let bn1TM4Active =
+            !tm4Active && allowBN1TM4 && segments.contains(where: { !$0.split })
+            && segments.allSatisfy { $0.split || $0.rows >= 4 }
         if tm4Active {
             for idx in segments.indices { segments[idx].tm = 4 }
+        } else if bn1TM4Active {
+            for idx in segments.indices where !segments[idx].split { segments[idx].tm = 4 }
         }
-        let rg = tm4Active ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
-        let coopActive = !tm4Active && allowCoopOProj && segments.contains(where: { !$0.split })
-        let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive) ? 0 : dvMode
+        let rg = (tm4Active || bn1TM4Active) ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
+        let sgPerTG = bn1TM4Active ? 4 : 8
+        let coopActive =
+            !tm4Active && !bn1TM4Active && allowCoopOProj && segments.contains(where: { !$0.split })
+        let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive && !tm4Active && !bn1TM4Active) ? 0 : dvMode
         let shape = FP8Shape(
             dvMode: effectiveDVMode, rowsOuter: useRowsOuter, rowGroups: rg,
-            coopOProj: coopActive, tm4Split: tm4Active, weights: layers.count,
-            outputs: layers.count, segments: segments, record: !lowVerify)
+            coopOProj: coopActive, tm4Split: tm4Active, bn1TM4: bn1TM4Active,
+            weights: layers.count, outputs: layers.count, segments: segments, record: !lowVerify)
         let outputDims = layers.map(\.outputDimensions)
         let launchKey = FP8LaunchKey(
             shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
@@ -1433,10 +1711,10 @@ public enum CBv2SmallProjection {
         if let hit = lock.withLock({ fp8LaunchCache[launchKey] }) {
             launch = hit
         } else {
-            let tiles = segments.reduce(0) { $0 + $1.tiles(rowGroups: rg) }
+            let tiles = segments.reduce(0) { $0 + $1.tiles(rowGroups: rg, sgPerTG: sgPerTG) }
             let made = fp8Kernel(shape).prepare(
                 template: [("T", flat.dtype), ("K", inputs), ("V", rows)],
-                grid: (32, 8 * rg * tiles, 1), threadGroup: (32, 8 * rg, 1),
+                grid: (32, sgPerTG * rg * tiles, 1), threadGroup: (32, sgPerTG * rg, 1),
                 outputShapes: outputDims.map { [rows, $0] },
                 outputDTypes: Array(repeating: flat.dtype, count: outputDims.count))
             lock.withLock { fp8LaunchCache[launchKey] = made }
@@ -1468,7 +1746,12 @@ public enum CBv2SmallProjection {
             useBranchlessDV ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let allowCoopOProj = strictLow && coopOProjEnabled && rows >= 2
         let allowTM4Split =
-            strictC3 && fp8TM4Enabled && rows >= 5 && rows <= 8 && dvMode == 2 && useRowsOuter
+            strictC3 && fp8TM4Enabled && rows >= 4 && rows <= 8 && dvMode == 2
+            && (useRowsOuter || rows == 4)
+            && rowsPerThreadOverride == nil && prefetchOverride == nil
+        let allowBN1TM4 =
+            strictC3 && fp8OProjTM4Enabled && rows >= 4 && rows <= 8 && dvMode == 2
+            && (useRowsOuter || rows == 4)
             && rowsPerThreadOverride == nil && prefetchOverride == nil
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         if rowsPerThreadOverride == nil && prefetchOverride == nil
@@ -1478,8 +1761,8 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, dvMode: dvMode,
-                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, lowVerify: lowVerify,
-                sharedInput: true)
+                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, bn1TM4: allowBN1TM4,
+                lowVerify: lowVerify, sharedInput: true)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 let flat = preCast.reshaped(rows, inputs)
                 var args = plan.weightArrays

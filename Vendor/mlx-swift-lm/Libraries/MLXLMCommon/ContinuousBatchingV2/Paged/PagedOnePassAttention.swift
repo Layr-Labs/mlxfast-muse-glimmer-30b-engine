@@ -79,6 +79,11 @@ public enum PagedOnePassAttention {
     static let appendEnabled = environment["CBV2_ONEPASS_APPEND"] != "0"
     /// `CBV2_ONEPASS_OUTGATE=0`: keep separate BF16 `output * sigmoid(gate)` launch.
     public static let outputGateEnabled = environment["CBV2_ONEPASS_OUTGATE"] != "0"
+    /// `CBV2_ONEPASS_HPT4=0`: disable strict-C3 unphased HPT=4 (fits <= 32 KB for mp <= 3, 2 barriers).
+    public static let hpt4Enabled = environment["CBV2_ONEPASS_HPT4"] != "0"
+    nonisolated(unsafe) private static var hpt4ProbeFailed = false
+    nonisolated(unsafe) private static var hpt4DynTreeProbeFailed = false
+    nonisolated(unsafe) private static var hpt4MaxPartLimit = 4
     /// True once `warm` qualified at least one write-owning variant.
     static var appendWarmed: Bool { appendEnabled && lock.withLock { !appendVariants.isEmpty } }
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
@@ -154,15 +159,22 @@ public enum PagedOnePassAttention {
         outputs += PagedSegmentAttention.warmTwoPass(
             dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim,
             pageSize: pageSize, softcap: softcap, source: source)
-        variants: for useRec in [true, false] {
+        variants: for (useRec, useHPT4) in [(true, false), (false, false), (false, true)] {
+        if useHPT4 && (!hpt4Enabled || gqa % 4 != 0) { continue }
         guard
-            let hpt = eligible(
-                headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1,
-                record: useRec)
+            let hpt = useHPT4
+                ? 4
+                : eligible(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1,
+                    record: useRec)
         else { continue }
+        if useHPT4 && nsg * hpt * (headDim + 2) * 4 > PagedAttentionKernel.threadgroupMemoryLimit {
+            continue
+        }
         for bindings in PagedSegmentDispatchPlan.bindingClasses {
             let offsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
             // Probe first: one threadgroup on zero inputs, output discarded.
+            let probeMP = useHPT4 ? 1 : maxPartitions
             let held =
                 (try? withError { () -> Bool in
                     let probed = segments(
@@ -171,18 +183,21 @@ public enum PagedOnePassAttention {
                         valueOffsets: MLXArray(offsets), records: MLXArray(record),
                         dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
                         simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                        source: source, probe: true, record: useRec)
+                        source: source, probe: true, maxPart: probeMP, forceMaxPart: useHPT4,
+                        record: useRec)
                     eval(probed.fence, probed.out)
                     return true
                 }) ?? false
             if logs {
                 FileHandle.standardError.write(
                     Data(
-                    "[onepass] threadgroup probe record=\(useRec) bindings=\(bindings) held=\(held)\n"
+                    "[onepass] threadgroup probe record=\(useRec) hpt4=\(useHPT4) bindings=\(bindings) held=\(held)\n"
                         .utf8))
             }
             guard held else {
-                if useRec {
+                if useHPT4 {
+                    hpt4ProbeFailed = true
+                } else if useRec {
                     threadgroupProbeFailedRecord = true
                 } else {
                     threadgroupProbeFailedLow = true
@@ -190,7 +205,8 @@ public enum PagedOnePassAttention {
                 continue variants
             }
             let warmDynTree = CBv2DraftRegime.verifyTreeMode != 0 && CBv2DraftRegime.dynamicTreeEnabled
-            if warmDynTree && !dynTreeProbeFailedFor(record: useRec) {
+            let dynFailed = useHPT4 ? hpt4DynTreeProbeFailed : dynTreeProbeFailedFor(record: useRec)
+            if warmDynTree && !dynFailed {
                 let dynHeld =
                     (try? withError { () -> Bool in
                         let probed = segments(
@@ -199,12 +215,15 @@ public enum PagedOnePassAttention {
                             valueOffsets: MLXArray(offsets), records: MLXArray(record),
                             dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
                             simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                            source: source, probe: true, treeMeta: dummyTreeMeta, record: useRec)
+                            source: source, probe: true, treeMeta: dummyTreeMeta,
+                            maxPart: probeMP, forceMaxPart: useHPT4, record: useRec)
                         eval(probed.fence, probed.out)
                         return true
                     }) ?? false
                 if !dynHeld {
-                    if useRec {
+                    if useHPT4 {
+                        hpt4DynTreeProbeFailed = true
+                    } else if useRec {
                         dynTreeProbeFailedRecord = true
                     } else {
                         dynTreeProbeFailedLow = true
@@ -213,6 +232,30 @@ public enum PagedOnePassAttention {
             }
             let partRange = dynamicMaxPartitions ? (1 ... maxPartitions) : (maxPartitions ... maxPartitions)
             for mp in partRange {
+                if useHPT4
+                    && mp * nsg * hpt * (headDim + 2) * 4 > PagedAttentionKernel.threadgroupMemoryLimit
+                {
+                    continue
+                }
+                if useHPT4 && mp > 1 {
+                    let mpHeld =
+                        (try? withError { () -> Bool in
+                            let probed = segments(
+                                queries: q, backing: [MLXArray](repeating: storage, count: bindings),
+                                seqinfo: seqinfo, params: params, previous: previous,
+                                valueOffsets: MLXArray(offsets), records: MLXArray(record),
+                                dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
+                                simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                                source: source, probe: true, maxPart: mp, forceMaxPart: true,
+                                record: false)
+                            eval(probed.fence, probed.out)
+                            return true
+                        }) ?? false
+                    if !mpHeld {
+                        hpt4MaxPartLimit = min(hpt4MaxPartLimit, mp - 1)
+                        continue
+                    }
+                }
                 let result = segments(
                     queries: q, backing: [MLXArray](repeating: storage, count: bindings),
                     seqinfo: seqinfo, params: params, previous: previous,
@@ -221,7 +264,8 @@ public enum PagedOnePassAttention {
                     partitionTokens: ptok, softcap: softcap, source: source, maxPart: mp,
                     forceMaxPart: true, record: useRec)
                 outputs += [result.fence, result.out]
-                if warmDynTree && !dynTreeProbeFailedFor(record: useRec) {
+                let curDynFailed = useHPT4 ? hpt4DynTreeProbeFailed : dynTreeProbeFailedFor(record: useRec)
+                if warmDynTree && !curDynFailed {
                     let dynResult = segments(
                         queries: q, backing: [MLXArray](repeating: storage, count: bindings),
                         seqinfo: seqinfo, params: params, previous: result.fence,
@@ -231,7 +275,7 @@ public enum PagedOnePassAttention {
                         treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec)
                     outputs += [dynResult.fence, dynResult.out]
                 }
-                if appendEnabled {
+                if appendEnabled && !useHPT4 {
                     outputs += warmAppend(
                         q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
                         params: params, previous: previous, valueOffsets: MLXArray(offsets),
@@ -251,7 +295,7 @@ public enum PagedOnePassAttention {
                             gqa: gqa, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                             partitionTokens: ptok, softcap: softcap, source: source, maxPart: mp,
                             treeMeta: nil, fp8Cast: fp8Pair)
-                        if warmDynTree && !dynTreeProbeFailedFor(record: false) {
+                        if warmDynTree && !curDynFailed {
                             outputs += warmOutputGate(
                                 q: q, storage: storage, bindings: bindings, seqinfo: seqinfo,
                                 params: params, previous: previous, valueOffsets: MLXArray(offsets),
@@ -356,16 +400,18 @@ public enum PagedOnePassAttention {
     /// Heads per threadgroup: the largest divisor of `gqa` at or under the
     /// requested count whose threadgroup memory fits Metal's limit.
     static func headsPerThreadgroup(
-        headDim: Int, gqa: Int, simdgroups: Int, record: Bool = useRecordKernel
+        headDim: Int, gqa: Int, simdgroups: Int, maxPart: Int = maxPartitions,
+        allowHPT4: Bool = false, record: Bool = useRecordKernel
     ) -> Int? {
-        var hpt = min(gqa, requestedHeads)
+        let cap = (allowHPT4 && !record) ? max(requestedHeads, 4) : requestedHeads
+        var hpt = min(gqa, cap)
         while hpt >= 1 {
             // The record kernel also holds q_smem and part_smem.
             let floats =
                 record
-                ? hpt * headDim + maxPartitions * simdgroups * hpt * (headDim + 2)
-                    + maxPartitions * hpt * (headDim + 2)
-                : maxPartitions * simdgroups * hpt * (headDim + 2)
+                ? hpt * headDim + maxPart * simdgroups * hpt * (headDim + 2)
+                    + maxPart * hpt * (headDim + 2)
+                : maxPart * simdgroups * hpt * (headDim + 2)
             if gqa % hpt == 0, floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
                 return hpt
             }
@@ -382,6 +428,15 @@ public enum PagedOnePassAttention {
             partitions >= 1, partitions <= maxPartitions,
             rows <= 64, 32 * simdgroups * maxPartitions <= 1024
         else { return nil }
+        let mp = resolvedMaxPart(partitions, probe: false, forceMaxPart: false)
+        let allowHPT4 =
+            !record && hpt4Enabled && !hpt4ProbeFailed && !(dynTree && hpt4DynTreeProbeFailed)
+            && mp <= hpt4MaxPartLimit && CBv2DraftRegime.strictLowVerifyC3 && gqa % 4 == 0
+        if allowHPT4 {
+            return headsPerThreadgroup(
+                headDim: headDim, gqa: gqa, simdgroups: simdgroups, maxPart: mp,
+                allowHPT4: true, record: false)
+        }
         return headsPerThreadgroup(
             headDim: headDim, gqa: gqa, simdgroups: simdgroups, record: record)
     }

@@ -358,7 +358,10 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            if (flushLayer > 0 && index + 1 == flushLayer)
+                || (lowVerify && CBv2DraftRegime.strictLowVerifyC3
+                    && MuseGlimmerVerifyProjections.lowFlushLayers.contains(index + 1))
+            {
                 asyncEval(h, layerInput)
             }
         }
@@ -778,6 +781,12 @@ enum MuseGlimmerVerifyProjections {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
     }()
+    static let lowFlushLayers: Set<Int> = {
+        if let raw = environment["CBV2_LOW_FLUSH"] {
+            return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+        }
+        return [8, 26, 38]
+    }()
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
     static let nvfp4AllEnabled: Bool =
@@ -1177,13 +1186,19 @@ extension MuseGlimmerTextModel {
                 })
             if CBv2VerifyScales.fusedLMHeadEnabled {
                 var fusedWarm = [MLXArray]()
-                for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-                    if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
-                        lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
-                        outputMultiplier: configuration.outputMultiplier,
-                        softcap: configuration.finalLogitSoftcapping)
-                    {
-                        fusedWarm += [res.ids, res.values, res.nonFinite]
+                for c3Mode in [false, true] {
+                    CBv2DraftRegime.lowAcceptance = true
+                    CBv2DraftRegime.xnorDraftHeadEligible = true
+                    CBv2DraftRegime.strictLowVerifyEligible = c3Mode
+                    CBv2DraftRegime.strictLowVerifyC3 = c3Mode
+                    for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                        if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+                            lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
+                            outputMultiplier: configuration.outputMultiplier,
+                            softcap: configuration.finalLogitSoftcapping)
+                        {
+                            fusedWarm += [res.ids, res.values, res.nonFinite]
+                        }
                     }
                 }
                 if !fusedWarm.isEmpty { eval(fusedWarm) }
