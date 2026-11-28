@@ -57,7 +57,8 @@ extension EngineLoopV2 {
         var constraintLogits: MLXArray?
         var scores: MLXArray
         var accept: MLXArray?
-        let nonFinite: MLXArray
+        // Nil when the target readout has already encoded non-finite rows.
+        let nonFinite: MLXArray?
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
@@ -336,11 +337,7 @@ extension EngineLoopV2 {
             // attention owner; its reads must finish construction before sealing.
             let nativePagedWork = CBv2NativePagedMTPWork.current
             let windowWork = try nativePagedWork?.prepareWindow()
-            var scoredOutput:
-                (
-                    topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray,
-                    lastHidden: MLXArray
-                )?
+            var scoredOutput: (readout: CBv2TopTwoReadout, lastHidden: MLXArray)?
             var output: (logits: MLXArray, lastHidden: MLXArray)?
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
@@ -391,8 +388,14 @@ extension EngineLoopV2 {
                     let fusedReadout = mtp.model as? any CBv2FusedVerifyReadoutForwarding
                 {
                     scoredOutput = try checkedModelForward(phase: .mtpVerification) {
-                        fusedReadout.fusedVerifyForwardScoredWithHidden(
+                        if let targetReadout = fusedReadout as? any CBv2FusedVerifyTargetForwarding {
+                            return targetReadout.fusedVerifyForwardReadoutWithHidden(
+                                tokens: tokens, caches: caches, includeTargetIDs: true)
+                        }
+                        guard let raw = fusedReadout.fusedVerifyForwardScoredWithHidden(
                             tokens: tokens, caches: caches)
+                        else { return nil }
+                        return ((raw.topTwoIDs, raw.topTwoValues, raw.nonFinite, nil), raw.lastHidden)
                     }
                 }
                 if scoredOutput == nil {
@@ -407,11 +410,17 @@ extension EngineLoopV2 {
                 try nativePagedWork.closeWindow(windowWork)
             }
             if let scored = scoredOutput {
-                nonFinite = scored.nonFinite
-                if mtp.config.fixedDraftTokens == nil {
-                    policyTopTwo = (scored.topTwoIDs, scored.topTwoValues)
+                let readout = scored.readout
+                if let targetIDs = readout.targetIDs {
+                    scores = targetIDs
+                    nonFinite = nil
+                } else {
+                    scores = readout.ids[0..., 0..., 0]
+                    nonFinite = readout.nonFinite
                 }
-                scores = scored.topTwoIDs[0..., 0..., 0]
+                if mtp.config.fixedDraftTokens == nil {
+                    policyTopTwo = (readout.ids, readout.values)
+                }
                 hidden = scored.lastHidden
             } else {
                 let output = output!
@@ -466,7 +475,9 @@ extension EngineLoopV2 {
             mtp.recordControllerFallback("typical_acceptance_unsupported")
         }
 
-        scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
+        if let nonFinite {
+            scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
+        }
         return (
             scores, accept, hidden, constraintLogits, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent

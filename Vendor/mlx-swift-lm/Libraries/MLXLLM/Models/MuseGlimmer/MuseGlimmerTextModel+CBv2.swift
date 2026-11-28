@@ -373,11 +373,9 @@ extension MuseGlimmerTextModel {
         return (verifyOutputLogits(trunk.normed), trunk.hidden)
     }
 
-    func fusedVerifyForwardScoredWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
-        -> (
-            topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, hidden: MLXArray
-        )?
-    {
+    func fusedVerifyForwardScoredWithMTPHidden(
+        _ tokens: MLXArray, cache: [KVCache], includeTargetIDs: Bool
+    ) -> (readout: CBv2TopTwoReadout, lastHidden: MLXArray)? {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
             verifyRows(trunk.normed) != nil
@@ -386,7 +384,7 @@ extension MuseGlimmerTextModel {
         if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
             lmHead, trunk.normed,
             outputMultiplier: configuration.outputMultiplier,
-            softcap: configuration.finalLogitSoftcapping)
+            softcap: configuration.finalLogitSoftcapping, includeTargetIDs: includeTargetIDs)
         {
             if MuseGlimmerVerifyProjections.selfTest,
                 let product = CBv2VerifyScales.product(lmHead, trunk.normed),
@@ -402,7 +400,7 @@ extension MuseGlimmerTextModel {
                     kind: "nvfp4.lm_head.fused_top2",
                     rows: MuseGlimmerNumerics.rows(trunk.normed))
             }
-            return (fused.ids, fused.values, fused.nonFinite, trunk.hidden)
+            return (fused, trunk.hidden)
         }
         let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear
         guard let product = (MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled ? nvHead.flatMap({ CBv2VerifyNVFP4.product($0, trunk.normed) }) : nil)
@@ -413,8 +411,8 @@ extension MuseGlimmerTextModel {
         let scored = cbv2FusedReadoutTopTwoAndNonFinite(
             product,
             outputMultiplier: configuration.outputMultiplier,
-            softcap: configuration.finalLogitSoftcapping)
-        return (scored.ids, scored.values, scored.nonFinite, trunk.hidden)
+            softcap: configuration.finalLogitSoftcapping, includeTargetIDs: includeTargetIDs)
+        return (scored, trunk.hidden)
     }
     /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
@@ -727,17 +725,26 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
     }
 }
 
-extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
+extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyTargetForwarding {
     public func fusedVerifyForwardScoredWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> (
         topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
     )? {
-        let kv = caches.compactMap { $0 as? KVCache }
-        guard kv.count == caches.count,
-            let result = target.fusedVerifyForwardScoredWithMTPHidden(tokens, cache: kv)
+        guard let result = fusedVerifyForwardReadoutWithHidden(
+            tokens: tokens, caches: caches, includeTargetIDs: false)
         else { return nil }
-        return (result.topTwoIDs, result.topTwoValues, result.nonFinite, result.hidden)
+        let readout = result.readout
+        return (readout.ids, readout.values, readout.nonFinite, result.lastHidden)
+    }
+
+    package func fusedVerifyForwardReadoutWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], includeTargetIDs: Bool
+    ) -> (readout: CBv2TopTwoReadout, lastHidden: MLXArray)? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count else { return nil }
+        return target.fusedVerifyForwardScoredWithMTPHidden(
+            tokens, cache: kv, includeTargetIDs: includeTargetIDs)
     }
 }
 
@@ -1181,7 +1188,7 @@ extension MuseGlimmerTextModel {
                     if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
                         lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
                         outputMultiplier: configuration.outputMultiplier,
-                        softcap: configuration.finalLogitSoftcapping)
+                        softcap: configuration.finalLogitSoftcapping, includeTargetIDs: true)
                     {
                         fusedWarm += [res.ids, res.values, res.nonFinite]
                     }
@@ -1191,7 +1198,7 @@ extension MuseGlimmerTextModel {
             let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
                 MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
                 outputMultiplier: configuration.outputMultiplier,
-                softcap: configuration.finalLogitSoftcapping)
+                softcap: configuration.finalLogitSoftcapping, includeTargetIDs: true)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
         }
     }
