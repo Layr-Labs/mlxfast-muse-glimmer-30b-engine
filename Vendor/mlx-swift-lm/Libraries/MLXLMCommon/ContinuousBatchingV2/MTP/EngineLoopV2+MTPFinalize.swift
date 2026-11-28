@@ -910,10 +910,16 @@ extension EngineLoopV2 {
     /// round; the shared commit work is always submitted. 0 disables the
     /// gate.
     static var mtpSpeculativeBlockMinimumFullAcceptance: Double { 0.5 }
-    /// `CBV2_MTP_OUTCOME_SPEC=1`: enable device-outcome post-verify drafting
-    /// on low-acceptance rounds (off by default to avoid masked-SDPA contention).
+    /// Device-outcome post-verify drafting on deep-low-acceptance rounds: the next
+    /// block is drafted behind the verify for whichever accept count the
+    /// verify decides, so the device goes from the verify straight into the
+    /// next round while the host reads the packet and finalizes.
+    /// `CBV2_MTP_OUTCOME_SPEC=0` turns it off. It needs the drafter's ring
+    /// fence to stay on the round's own writes (`FastInPlaceContext.arrays`):
+    /// with a fence that follows the speculative writes the host waits for
+    /// the whole block before it reads the packet, and the round is longer.
     static let mtpOutcomeSpeculation =
-        ProcessInfo.processInfo.environment["CBV2_MTP_OUTCOME_SPEC"] == "1"
+        ProcessInfo.processInfo.environment["CBV2_MTP_OUTCOME_SPEC"] != "0"
 
     /// Submit the drafter's next-round work behind a verify.
     /// One-row rounds only (a batched round's drafter pass has other
@@ -938,10 +944,19 @@ extension EngineLoopV2 {
             mtp.predictedFullAcceptance(for: id, depth: k).map {
                 $0 >= Self.mtpSpeculativeBlockMinimumFullAcceptance
             } ?? true
+        // A round that starts with one token of the request's budget left ends
+        // the request, and with two it usually does: a block drafted behind
+        // such a verify would be device work queued behind the last tokens.
+        let budgetLeft =
+            scheduler.record(for: id).map { $0.request.maxTokens - $0.generatedTokenCount } ?? 0
+        // Deep-low rounds only: the regime whose drafter forms the outcome block
+        // was built for, and one a high-acceptance request does not enter, so
+        // its rounds keep the proposals and the timing they have without it.
+        let deepLow = mtp.inDeepLowAcceptanceRegime(id)
         let draftTokens: MLXArray? =
-            Self.mtpOutcomeSpeculation && mtp.inLowAcceptanceRegime(id)
+            Self.mtpOutcomeSpeculation && budgetLeft > 2 && deepLow
             ? verify.acceptancePacket[0 ..< k].reshaped([1, k]) : nil
-        CBv2DraftRegime.xnorDraftHeadEligible = mtp.inDeepLowAcceptanceRegime(id)
+        CBv2DraftRegime.xnorDraftHeadEligible = deepLow
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
         let roots = speculator.speculateNextRound(
             targetTokens: targets, targetHidden: verify.lastHidden, depth: k,

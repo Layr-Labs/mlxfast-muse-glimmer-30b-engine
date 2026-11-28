@@ -402,11 +402,11 @@ private let cbv2FusedReadoutTopTwoStage1 = MLXFast.metalKernel(
     header: cbv2PackedReadoutHeader
 )
 
-private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
-    name: "cbv2_fused_readout_top2_s2",
-    inputNames: ["partial_ids", "partial_values", "partial_nf"],
-    outputNames: ["top_ids", "top_values", "non_finite"],
-    source: """
+private func cbv2MakeReadoutTopTwoStage2(includeTargetIDs: Bool) -> MLXFast.MLXFastKernel {
+    let writeTarget = includeTargetIDs
+        ? "\n        target_ids[row] = nf != 0u ? \(CBv2NonFiniteLogits.invalidTarget) : int(local.first_id);"
+        : ""
+    let source = """
         constexpr uint CHUNKS = uint(C_);
         const uint lid = thread_position_in_threadgroup.x;
         const uint row = threadgroup_position_in_grid.y;
@@ -440,11 +440,47 @@ private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
             top_ids[output_base + 1] = int(local.second_id);
             top_values[output_base] = local.first_value;
             top_values[output_base + 1] = local.second_value;
-            non_finite[row] = nf != 0u ? 1 : 0;
+            non_finite[row] = nf != 0u ? 1 : 0;\(writeTarget)
         }
-    """,
-    header: cbv2FusedReadoutTopTwoHeader
+    """
+    let outputNames = ["top_ids", "top_values", "non_finite"]
+    return MLXFast.metalKernel(
+        name: includeTargetIDs ? "cbv2_fused_readout_top2_s2_targets" : "cbv2_fused_readout_top2_s2",
+        inputNames: ["partial_ids", "partial_values", "partial_nf"],
+        outputNames: includeTargetIDs ? outputNames + ["target_ids"] : outputNames,
+        source: source, header: cbv2FusedReadoutTopTwoHeader)
+}
+
+private let cbv2FusedReadoutTopTwoStage2 = cbv2MakeReadoutTopTwoStage2(includeTargetIDs: false)
+private let cbv2FusedReadoutTargetIDsStage2 = cbv2MakeReadoutTopTwoStage2(includeTargetIDs: true)
+
+package typealias CBv2TopTwoReadout = (
+    ids: MLXArray, values: MLXArray, nonFinite: MLXArray, targetIDs: MLXArray?
 )
+
+private func cbv2PrepareReadoutStage2(rows: Int, chunks: Int, includeTargetIDs: Bool)
+    -> MLXFast.MLXFastKernel.Launch
+{
+    let kernel = includeTargetIDs ? cbv2FusedReadoutTargetIDsStage2 : cbv2FusedReadoutTopTwoStage2
+    var shapes = [[rows, 2], [rows, 2], [rows]]
+    var dtypes: [DType] = [.int32, .float32, .int32]
+    if includeTargetIDs {
+        shapes.append([rows])
+        dtypes.append(.int32)
+    }
+    return kernel.prepare(
+        template: [("C_", chunks)], grid: (64, rows, 1), threadGroup: (64, 1, 1),
+        outputShapes: shapes, outputDTypes: dtypes)
+}
+
+private func cbv2ReadoutOutputs(_ outputs: [MLXArray], batch: Int, width: Int) -> CBv2TopTwoReadout {
+    (
+        outputs[0].reshaped([batch, width, 2]),
+        outputs[1].reshaped([batch, width, 2]),
+        outputs[2].reshaped([batch, width]),
+        outputs.count == 4 ? outputs[3].reshaped([batch, width]) : nil
+    )
+}
 
 private let cbv2ReadoutParamsLock = NSLock()
 nonisolated(unsafe) private var cbv2ReadoutParamsCache: [UInt64: MLXArray] = [:]
@@ -464,6 +500,7 @@ private struct CBv2ReadoutLaunchKey: Hashable {
     let rows: Int
     let vocab: Int
     let chunks: Int
+    let includeTargetIDs: Bool
 }
 
 private let cbv2ReadoutLaunchLock = NSLock()
@@ -473,6 +510,7 @@ nonisolated(unsafe) private var cbv2ReadoutLaunchCache:
 private struct CBv2ReadoutStage2Key: Hashable {
     let rows: Int
     let chunks: Int
+    let includeTargetIDs: Bool
 }
 
 nonisolated(unsafe) private var cbv2ReadoutStage2Cache:
@@ -480,34 +518,34 @@ nonisolated(unsafe) private var cbv2ReadoutStage2Cache:
 
 internal func cbv2FusedReadoutTopTwoMergePartials(
     partialIDs: MLXArray, partialValues: MLXArray, partialNF: MLXArray,
-    batch: Int, width: Int, chunks: Int
-) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
+    batch: Int, width: Int, chunks: Int, includeTargetIDs: Bool
+) -> CBv2TopTwoReadout {
     let rows = batch * width
-    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks)
+    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks, includeTargetIDs: includeTargetIDs)
     let s2: MLXFast.MLXFastKernel.Launch
     if let hit = cbv2ReadoutLaunchLock.withLock({ cbv2ReadoutStage2Cache[key] }) {
         s2 = hit
     } else {
-        let made = cbv2FusedReadoutTopTwoStage2.prepare(
-            template: [("C_", chunks)],
-            grid: (64, rows, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[rows, 2], [rows, 2], [rows]],
-            outputDTypes: [.int32, .float32, .int32])
+        let made = cbv2PrepareReadoutStage2(
+            rows: rows, chunks: chunks, includeTargetIDs: includeTargetIDs)
         cbv2ReadoutLaunchLock.withLock { cbv2ReadoutStage2Cache[key] = made }
         s2 = made
     }
     let outputs = s2([partialIDs, partialValues, partialNF])
-    return (
-        outputs[0].reshaped([batch, width, 2]),
-        outputs[1].reshaped([batch, width, 2]),
-        outputs[2].reshaped([batch, width])
-    )
+    return cbv2ReadoutOutputs(outputs, batch: batch, width: width)
 }
 
 public func cbv2FusedReadoutTopTwoAndNonFinite(
     _ rawProduct: MLXArray, outputMultiplier: Float, softcap: Float
 ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
+    let readout = cbv2FusedReadoutTopTwoAndNonFinite(
+        rawProduct, outputMultiplier: outputMultiplier, softcap: softcap, includeTargetIDs: false)
+    return (readout.ids, readout.values, readout.nonFinite)
+}
+
+package func cbv2FusedReadoutTopTwoAndNonFinite(
+    _ rawProduct: MLXArray, outputMultiplier: Float, softcap: Float, includeTargetIDs: Bool
+) -> CBv2TopTwoReadout {
     precondition(rawProduct.ndim == 3 && rawProduct.dtype == .bfloat16)
     let batch = rawProduct.dim(0)
     let width = rawProduct.dim(1)
@@ -517,7 +555,8 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
     let chunks = max(64, (vocab - 1) / 65_536 + 1)
     let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
     let flat = rawProduct.reshaped([rows, vocab])
-    let key = CBv2ReadoutLaunchKey(rows: rows, vocab: vocab, chunks: chunks)
+    let key = CBv2ReadoutLaunchKey(
+        rows: rows, vocab: vocab, chunks: chunks, includeTargetIDs: includeTargetIDs)
     let launches: (s1: MLXFast.MLXFastKernel.Launch, s2: MLXFast.MLXFastKernel.Launch)
     if let hit = cbv2ReadoutLaunchLock.withLock({ cbv2ReadoutLaunchCache[key] }) {
         launches = hit
@@ -528,20 +567,11 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
             threadGroup: (256, 1, 1),
             outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],
             outputDTypes: [.int32, .float32, .int32])
-        let s2 = cbv2FusedReadoutTopTwoStage2.prepare(
-            template: [("C_", chunks)],
-            grid: (64, rows, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[rows, 2], [rows, 2], [rows]],
-            outputDTypes: [.int32, .float32, .int32])
+        let s2 = cbv2PrepareReadoutStage2(
+            rows: rows, chunks: chunks, includeTargetIDs: includeTargetIDs)
         launches = (s1, s2)
         cbv2ReadoutLaunchLock.withLock { cbv2ReadoutLaunchCache[key] = launches }
     }
     let partials = launches.s1([flat, params])
-    let outputs = launches.s2(partials)
-    return (
-        outputs[0].reshaped([batch, width, 2]),
-        outputs[1].reshaped([batch, width, 2]),
-        outputs[2].reshaped([batch, width])
-    )
+    return cbv2ReadoutOutputs(launches.s2(partials), batch: batch, width: width)
 }
