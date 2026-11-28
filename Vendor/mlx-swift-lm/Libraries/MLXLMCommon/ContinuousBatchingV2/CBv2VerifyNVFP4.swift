@@ -43,8 +43,8 @@ public enum CBv2VerifyNVFP4 {
     private static let env = ProcessInfo.processInfo.environment
     private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
-    private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
-    private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
+    private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] == "1"
+    private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] == "1"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
