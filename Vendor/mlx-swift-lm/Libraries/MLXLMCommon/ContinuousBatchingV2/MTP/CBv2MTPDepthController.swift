@@ -641,6 +641,9 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     static let strictLowVerifyCommittedHundredths: Int = {
         ProcessInfo.processInfo.environment["CBV2_STRICT_LOW_VERIFY_COMMITTED"].flatMap(Int.init) ?? 360
     }()
+    static let strictLowVerifyC3CommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_STRICT_LOW_C3_COMMITTED"].flatMap(Int.init) ?? 360
+    }()
 
     /// Stricter low-acceptance gate for deep-low drafter & XNOR Stage-1:
     /// 1) Early cold-start EWMA (`observedRegimeRounds >= 3 && fraction < 0.55`), OR
@@ -676,15 +679,24 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                     < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
     }
 
-    /// Clause-3-only strict low-acceptance gate (`inLowAcceptanceRegime && rounds >= 6
-    /// && avg < 3.60`) for Wave 17+ target-verify speedups: guarantees zero early-dip
-    /// leakage onto high-acceptance Pair 1 (keeping Pair 1 locked at ~4.966x) while
-    /// giving sustained low-acceptance Pair 2 & Pair 3 full coverage.
+    static let c3EarlyEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_C3_EARLY"] != "0"
+
+    /// Strict low-acceptance gate for Wave 18+ target-verify speedups:
+    /// Clause 2 (`ceilingRounds >= 3 && avg < 3.05 && roundAcceptanceFraction < 0.55`) +
+    /// Clause 3 (`ceilingRounds >= 6 && avg < 3.60`), both under `inLowAcceptanceRegime`.
+    /// Guarantees zero leakage onto high-acceptance Pair 1 while recovering early low-acc rounds
+    /// on Pair 2 & Pair 3.
     var isStrictLowVerifyC3Regime: Bool {
         inLowAcceptanceRegime
-            && ceilingRounds >= Self.deepLowCommittedMinRounds
-            && ceilingCommittedTokens * 100
-                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
+            && ((Self.c3EarlyEnabled
+                && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold
+                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
+                && ceilingCommittedTokens * 100
+                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
+                || (ceilingRounds >= Self.deepLowCommittedMinRounds
+                    && ceilingCommittedTokens * 100
+                        < Self.strictLowVerifyC3CommittedHundredths * ceilingRounds))
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
