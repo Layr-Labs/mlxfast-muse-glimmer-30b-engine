@@ -1695,6 +1695,23 @@ public enum CBv2DraftRegime {
     /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
     /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
     nonisolated(unsafe) public static var strictLowVerifyC3 = false
+    /// `MLX_MUSE_VERIFY_UNGATE=0` (or `MUSE_MLX_VERIFY_UNGATE=0`) restores the regime gates on the
+    /// target-verify kernel choices. Default on: every verify round takes the strict-C3 choice of
+    /// the bit-identical kernels in `CBv2VerifyNVFP4`, `CBv2SmallProjection` and the fused verify
+    /// trunk. Pair 1 stays under the decode ceiling only through the decode pacing floor. Drafter,
+    /// tree, depth, acceptance and paged-attention choices keep reading the flags above.
+    public static let verifyUngate: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return (env["MLX_MUSE_VERIFY_UNGATE"] ?? env["MUSE_MLX_VERIFY_UNGATE"]) != "0"
+    }()
+    /// Target-verify kernel selection only: the low-acceptance (`lowVerify`) tier.
+    public static var verifyLowKernels: Bool {
+        verifyUngate || !lowOnlyVerifySpeedups || lowAcceptance
+    }
+    /// Target-verify kernel selection only: the strict-low (`strictLowVerifyEligible`) tier.
+    public static var verifyStrictLowKernels: Bool { verifyUngate || strictLowVerifyEligible }
+    /// Target-verify kernel selection only: the clause-3 (`strictLowVerifyC3`) tier.
+    public static var verifyC3Kernels: Bool { verifyUngate || strictLowVerifyC3 }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1853,14 +1870,14 @@ public enum CBv2DraftRegime {
         }
         return 1.0
     }()
-    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.5).
+    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.3).
     public static let dynamicTreePurityExp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_PURITY_EXP"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 3.0
         {
             return v
         }
-        return 0.5
+        return 0.3
     }()
     /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
     public static let treeCooldownEnabled: Bool =

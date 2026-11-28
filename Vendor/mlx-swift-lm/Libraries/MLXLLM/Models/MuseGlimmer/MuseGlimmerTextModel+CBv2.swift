@@ -268,7 +268,7 @@ extension MuseGlimmerTextModel {
         var shared: (positions: [Int], offsets: MLXArray)?
         let width = h.dim(-1)
         let dtype = h.dtype
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         let allowPreCastFP8 =
             lowVerify && routesVerifyProjections && !MuseGlimmerVerifyProjections.selfTest
             && (1 ... MuseGlimmerVerifyProjections.maximumRows).contains(rows)
@@ -291,6 +291,7 @@ extension MuseGlimmerTextModel {
             layerInput = layers[0].inputLayerNorm(h)
         }
         let flushLayer = MuseGlimmerVerifyProjections.midTrunkFlushLayer
+        let earlyFlushLayer = MuseGlimmerVerifyProjections.earlyFlushLayer
         for (index, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
             if layer.selfAttention.rope != nil,
@@ -358,7 +359,9 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            if (flushLayer > 0 && index + 1 == flushLayer)
+                || (earlyFlushLayer > 0 && index + 1 == earlyFlushLayer)
+            {
                 asyncEval(h, layerInput)
             }
         }
@@ -382,7 +385,7 @@ extension MuseGlimmerTextModel {
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
             verifyRows(trunk.normed) != nil
         else { return nil }
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
             lmHead, trunk.normed,
             outputMultiplier: configuration.outputMultiplier,
@@ -651,7 +654,7 @@ extension MuseGlimmerTextModel {
     func groupedVerifyFeed(
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -673,7 +676,7 @@ extension MuseGlimmerTextModel {
                 return projected
             }
         }
-        if lowVerify && CBv2DraftRegime.strictLowVerifyC3, verifyRows(gu[0]) != nil,
+        if lowVerify && CBv2DraftRegime.verifyC3Kernels, verifyRows(gu[0]) != nil,
             let act = VerifyFusedNorms.fusedSiluProduct(gate: gu[0], up: gu[1])
         {
             if MuseGlimmerVerifyProjections.selfTest {
@@ -778,6 +781,11 @@ enum MuseGlimmerVerifyProjections {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
     }()
+    /// `MLX_MUSE_VERIFY_LADDER=0` (or `MUSE_MLX_VERIFY_LADDER=0`) drops the early submission
+    /// after layer 1; by default the verify trunk submits after layers 1 and `midTrunkFlushLayer`.
+    /// Partitioning only (same values); pair 1 relies on the decode pacing floor.
+    static let earlyFlushLayer: Int =
+        (environment["MLX_MUSE_VERIFY_LADDER"] ?? environment["MUSE_MLX_VERIFY_LADDER"]) != "0" ? 1 : 0
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
     static let nvfp4AllEnabled: Bool =
@@ -869,7 +877,7 @@ extension MuseGlimmerTextModel {
             } else if layers.allSatisfy({ $0 is ModelOptWeightOnlyNVFP4Linear }) {
                 let allowNVFP4All =
                     MuseGlimmerVerifyProjections.nvfp4AllEnabled
-                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+                    && CBv2DraftRegime.verifyLowKernels
                 if allowNVFP4All,
                     MuseGlimmerVerifyProjections.nvfp4GroupedQKVGMode != 2,
                     let grouped = CBv2VerifyNVFP4.products(layers, x)
@@ -884,7 +892,7 @@ extension MuseGlimmerTextModel {
                     routed = CBv2VerifyScales.products(layers, x)
                 }
                 kind = "nvfp4.qkvg"
-            } else if (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance),
+            } else if CBv2DraftRegime.verifyLowKernels,
                 MuseGlimmerVerifyProjections.denseGroupedEnabled,
                 let linear = layers as? [Linear],
                 let grouped = CBv2SmallProjection.denseProducts(linear, x)
@@ -912,7 +920,7 @@ extension MuseGlimmerTextModel {
             } else if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
                 let allowNVFP4All =
                     MuseGlimmerVerifyProjections.nvfp4AllEnabled
-                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+                    && CBv2DraftRegime.verifyLowKernels
                 routed =
                     allowNVFP4All
                     ? (CBv2VerifyNVFP4.product(nv, x) ?? CBv2VerifyScales.product(layer, x))
@@ -965,14 +973,14 @@ extension MuseGlimmerTextModel {
             if let nv = layer as? ModelOptWeightOnlyNVFP4Linear {
                 let allowNVFP4All =
                     MuseGlimmerVerifyProjections.nvfp4AllEnabled
-                    && (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+                    && CBv2DraftRegime.verifyLowKernels
                 routed =
                     (allowNVFP4All || rows >= 7)
                     ? (CBv2VerifyNVFP4.product(nv, x) ?? CBv2VerifyScales.product(layer, x))
                     : CBv2VerifyScales.product(layer, x)
                 kind = "nvfp4.down"
             } else if let fp8 = layer as? ModelOptCalibratedLinear {
-                let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+                let lowVerify = CBv2DraftRegime.verifyLowKernels
                 let useSmallDown = rows < 6 || (lowVerify && MuseGlimmerVerifyProjections.fp8DownSmallEnabled)
                 routed =
                     useSmallDown
