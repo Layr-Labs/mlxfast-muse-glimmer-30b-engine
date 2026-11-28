@@ -45,6 +45,7 @@ public enum CBv2VerifyNVFP4 {
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
+    private static let tn2TwoBlkEnabled: Bool = env["CBV2_NVFP4_TN2_2BLK"] != "0"
 
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
@@ -58,12 +59,21 @@ public enum CBv2VerifyNVFP4 {
     }
 
     private static func schedule(
-        rows: Int, inputs: Int, lowVerify: Bool
-    ) -> (fragments: Int, prefetch: Int, wholeChunk: Bool, scaleVec: Bool) {
+        rows: Int, inputs: Int, lowVerify: Bool,
+        segments: Int = 1, aligned16Equal: Bool = false, scaled: Bool = true
+    ) -> (fragments: Int, prefetch: Int, wholeChunk: Bool, scaleVec: Bool, twoBlk: Bool) {
         if let o = geometryOverride {
             let wc = wholeChunkEnv ?? lowVerify
             let sv = scaleVecEnv ?? wc
-            return (o.fragments, o.prefetch, wc, sv)
+            return (o.fragments, o.prefetch, wc, sv, false)
+        }
+        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
+        if tn2TwoBlkEnabled && strictLow && scaled && rows == 8
+            && (segments == 1 || segments == 2 || segments == 4) && aligned16Equal
+            && prefetchEnv == nil && downPrefetchEnv == nil
+            && wholeChunkEnv == nil && scaleVecEnv == nil
+        {
+            return (2, 0, true, true, true)
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
@@ -73,10 +83,10 @@ public enum CBv2VerifyNVFP4 {
             let tn = rows >= 7 ? 2 : 1
             let defaultPF = (lowVerify && wc) ? (downPrefetchEnv ?? (rows >= 8 ? 1 : 0)) : 0
             let pf = prefetchEnv ?? defaultPF
-            return (tn, pf, wc, sv)
+            return (tn, pf, wc, sv, false)
         }
         let pf = prefetchEnv ?? 0
-        return (1, pf, wc, sv)
+        return (1, pf, wc, sv, false)
     }
 
     static let tileHelper = """
@@ -440,6 +450,195 @@ public enum CBv2VerifyNVFP4 {
         1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
 
+    /// Low-register `TN = 2`, 2-block-chunked tile for strict-low `V = 8` verify rounds
+    /// with `N_i % 16 == 0` (`1`, `2`, or `4` segments — covers 100% of trunk NVFP4:
+    /// `mlp.gate_up`, `mlp.down`, `attn.qkvg`, `attn.o`). Single base pointers
+    /// (`wl0`, `sl0`, `xr0`) with compile-time constant strides plus post-loop output
+    /// pointer/scale selection inside `sg == 0` keep occupancy at `maxT = 1024` on
+    /// native 16-bit while halving activation loads, conversions, and barriers (`0-ULP`).
+    static let tn2TwoBlkHelper = """
+
+        inline half2 cbv2_vn_e4m3x2_2b(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        template <typename T, int K>
+        inline void cbv2_vn_accum_tn2_2blk_v8(
+            const device uint32_t* w, const device uint8_t* scales, const device T* x,
+            int row0, short fm, short fn, uint sg, uint simd_lid,
+            threadgroup float* partials, thread float2& C0, thread float2& C1) {
+            constexpr int WK = 8;
+            constexpr int BK = 128;
+            constexpr int row_bytes = K / 2;
+            constexpr int row_scales = K / 16;
+            constexpr size_t row_stride_w = size_t(8) * size_t(K / 8);
+            constexpr size_t row_stride_s = size_t(8) * size_t(K / 16);
+            static_assert(K % BK == 0, "whole chunks only");
+            const uint scale_shift = (fn & 4u) << 1;
+            const device T* xr0 = x + size_t(fn) * K + 4 * fm;
+            const device uint* wl0 = (const device uint*)(
+                (const device uint8_t*)w + size_t(row0) * row_bytes + 2 * fn);
+            const device uint8_t* sl0 = scales + size_t(row0) * row_scales;
+            C0 = float2(0);
+            C1 = float2(0);
+
+            for (int k = int(sg) * BK; k < K; k += WK * BK) {
+                MO_WO_UNROLL
+                for (short half_k = 0; half_k < 2; half_k++) {
+                    const int kh = k + 64 * half_k;
+                    const uint q0a = wl0[kh / 8];
+                    const uint q1a = wl0[row_stride_w + kh / 8];
+                    const uint q0b = wl0[(kh + 32) / 8];
+                    const uint q1b = wl0[row_stride_w + (kh + 32) / 8];
+                    const uint sv0 = *(const device uint*)(sl0 + (kh / 16));
+                    const uint sv1 = *(const device uint*)(sl0 + row_stride_s + (kh / 16));
+                    const half2 h0 = cbv2_vn_e4m3x2_2b(sv0 >> scale_shift);
+                    const half2 h1 = cbv2_vn_e4m3x2_2b(sv1 >> scale_shift);
+                    {
+                        const ushort4 xv0 = *(const device ushort4*)(xr0 + kh);
+                        const ushort4 xv1 = *(const device ushort4*)(xr0 + K + kh);
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xv0[i])),
+                                float(as_type<bfloat>(xv1[i])));
+                            mo_wo_mma(C0, mo_wo_pair(q0a, i, h0.x), bf);
+                            mo_wo_mma(C1, mo_wo_pair(q1a, i, h1.x), bf);
+                        }
+                    }
+                    {
+                        const ushort4 xv0 = *(const device ushort4*)(xr0 + kh + 32);
+                        const ushort4 xv1 = *(const device ushort4*)(xr0 + K + kh + 32);
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xv0[i])),
+                                float(as_type<bfloat>(xv1[i])));
+                            mo_wo_mma(C0, mo_wo_pair(q0b, i, h0.y), bf);
+                            mo_wo_mma(C1, mo_wo_pair(q1b, i, h1.y), bf);
+                        }
+                    }
+                }
+            }
+
+            if (sg > 0) {
+                threadgroup float* p = partials + (sg - 1) * 128 + simd_lid;
+                p[0] = C0[0];
+                p[32] = C0[1];
+                p[64] = C1[0];
+                p[96] = C1[1];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                for (int s = 0; s < WK - 1; s++) {
+                    const threadgroup float* p = partials + s * 128 + simd_lid;
+                    C0[0] += p[0];
+                    C0[1] += p[32];
+                    C1[0] += p[64];
+                    C1[1] += p[96];
+                }
+            }
+        }
+        """
+
+    private static func tn2TwoBlkKernel(segments: Int) -> MLXFast.MLXFastKernel {
+        var inputs = [String]()
+        var outputs = [String]()
+        for i in 0 ..< segments {
+            inputs += ["w\(i)", "sc\(i)", "ts\(i)"]
+            outputs.append("y\(i)")
+        }
+        inputs.append("x")
+        let selectIn: String
+        let selectOut: String
+        if segments == 1 {
+            selectIn = """
+                static_assert(N0 % 16 == 0, "16-row aligned outputs only");
+                const device uint32_t* w = w0;
+                const device uint8_t* sc = sc0;
+                const int lt = tg;
+                """
+            selectOut = """
+                const float ts_v = ts0[0];
+                device T* y = y0;
+                const int nseg = N0;
+                """
+        } else if segments == 2 {
+            selectIn = """
+                static_assert(N0 % 16 == 0 && N1 % 16 == 0, "16-row aligned outputs only");
+                constexpr int t0 = N0 / 16;
+                const bool s0 = tg < t0;
+                const device uint32_t* w = s0 ? w0 : w1;
+                const device uint8_t* sc = s0 ? sc0 : sc1;
+                const int lt = s0 ? tg : (tg - t0);
+                """
+            selectOut = """
+                const float ts_v = s0 ? ts0[0] : ts1[0];
+                device T* y = s0 ? y0 : y1;
+                const int nseg = s0 ? N0 : N1;
+                """
+        } else {
+            selectIn = """
+                static_assert(
+                    N0 % 16 == 0 && N1 % 16 == 0 && N2 % 16 == 0 && N3 % 16 == 0,
+                    "16-row aligned outputs only");
+                constexpr int t0 = N0 / 16;
+                constexpr int t1 = N1 / 16;
+                constexpr int t2 = N2 / 16;
+                const device uint32_t* w;
+                const device uint8_t* sc;
+                int lt;
+                if (tg < t0) { w = w0; sc = sc0; lt = tg; }
+                else if (tg < t0 + t1) { w = w1; sc = sc1; lt = tg - t0; }
+                else if (tg < t0 + t1 + t2) { w = w2; sc = sc2; lt = tg - t0 - t1; }
+                else { w = w3; sc = sc3; lt = tg - t0 - t1 - t2; }
+                """
+            selectOut = """
+                float ts_v;
+                device T* y;
+                int nseg;
+                if (tg < t0) { ts_v = ts0[0]; y = y0; nseg = N0; }
+                else if (tg < t0 + t1) { ts_v = ts1[0]; y = y1; nseg = N1; }
+                else if (tg < t0 + t1 + t2) { ts_v = ts2[0]; y = y2; nseg = N2; }
+                else { ts_v = ts3[0]; y = y3; nseg = N3; }
+                """
+        }
+        let body = """
+            threadgroup float partials[7 * 4 * 32];
+            const int tg = int(threadgroup_position_in_grid.y);
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint sl = thread_index_in_simdgroup;
+            const short qid = sl / 4;
+            const short fm = (qid & 4) + ((sl / 2) % 4);
+            const short fn = (qid & 2) * 2 + (sl % 2) * 2;
+            \(selectIn)
+            const int row0 = lt * 16 + fm;
+            float2 C0, C1;
+            cbv2_vn_accum_tn2_2blk_v8<T, K>(w, sc, x, row0, fm, fn, sg, sl, partials, C0, C1);
+            if (sg == 0) {
+                \(selectOut)
+                y[size_t(fn) * nseg + row0] = mo_wo_result<T>(C0[0], true, ts_v);
+                y[size_t(fn + 1) * nseg + row0] = mo_wo_result<T>(C0[1], true, ts_v);
+                y[size_t(fn) * nseg + row0 + 8] = mo_wo_result<T>(C1[0], true, ts_v);
+                y[size_t(fn + 1) * nseg + row0 + 8] = mo_wo_result<T>(C1[1], true, ts_v);
+            }
+            """
+        return MLXFast.metalKernel(
+            name: "cbv2_verify_nvfp4_tn2_2blk_\(segments)",
+            inputNames: inputs,
+            outputNames: outputs,
+            source: body,
+            header: ModelOptWeightOnlyNVFP4RowExact.header + tn2TwoBlkHelper)
+    }
+
+    nonisolated(unsafe) private static let tn2TwoBlkKernels: [Int: MLXFast.MLXFastKernel] = [
+        1: tn2TwoBlkKernel(segments: 1), 2: tn2TwoBlkKernel(segments: 2),
+        4: tn2TwoBlkKernel(segments: 4),
+    ]
+
     private struct LaunchKey: Hashable {
         let segments: Int
         let dtype: DType
@@ -450,6 +649,7 @@ public enum CBv2VerifyNVFP4 {
         let scaled: Bool
         let wholeChunk: Bool
         let scaleVec: Bool
+        let twoBlk: Bool
         let outputs: [Int]
     }
 
@@ -464,6 +664,7 @@ public enum CBv2VerifyNVFP4 {
         let prefetch: Int
         let wholeChunk: Bool
         let scaleVec: Bool
+        let twoBlk: Bool
     }
 
     private struct Plan {
@@ -481,30 +682,46 @@ public enum CBv2VerifyNVFP4 {
 
     private static func preparedLaunch(
         segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
-        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int]
+        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, twoBlk: Bool, outputs: [Int]
     ) -> MLXFast.MLXFastKernel.Launch {
         let key = LaunchKey(
             segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
             prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk, scaleVec: scaleVec,
-            outputs: outputs)
+            twoBlk: twoBlk, outputs: outputs)
         if let hit = cacheLock.withLockUnchecked({ $0.launches[key] }) { return hit }
         let tile = 8 * fragments
-        var template: [(String, any KernelTemplateArg)] = [
-            ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
-            ("SCALED", scaled), ("WC", wholeChunk), ("SV", scaleVec),
-        ]
         var shapes = [[Int]]()
         shapes.reserveCapacity(outputs.count)
         var tiles = 0
-        for (i, n) in outputs.enumerated() {
-            template.append(("N\(i)", n))
+        for n in outputs {
             shapes.append([rows, n])
             tiles += (n + tile - 1) / tile
         }
-        let made = kernels[segments]!.prepare(
-            template: template,
-            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-            outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
+        let made: MLXFast.MLXFastKernel.Launch
+        if twoBlk, let k2b = tn2TwoBlkKernels[segments] {
+            var template: [(String, any KernelTemplateArg)] = [
+                ("T", dtype), ("K", inputs),
+            ]
+            for (i, n) in outputs.enumerated() {
+                template.append(("N\(i)", n))
+            }
+            made = k2b.prepare(
+                template: template,
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
+        } else {
+            var template: [(String, any KernelTemplateArg)] = [
+                ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
+                ("SCALED", scaled), ("WC", wholeChunk), ("SV", scaleVec),
+            ]
+            for (i, n) in outputs.enumerated() {
+                template.append(("N\(i)", n))
+            }
+            made = kernels[segments]!.prepare(
+                template: template,
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
+        }
         cacheLock.withLockUnchecked { $0.launches[key] = made }
         return made
     }
@@ -547,11 +764,14 @@ public enum CBv2VerifyNVFP4 {
             return Record.product(
                 x, weight: weight, blockScales: blockScales, tensorScale: tensorScale)
         }
-        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let s = schedule(
+            rows: rows, inputs: inputs, lowVerify: lowVerify,
+            segments: 1, aligned16Equal: outputs >= 16 && outputs % 16 == 0,
+            scaled: tensorScale != nil)
         let launch = preparedLaunch(
             segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: s.fragments,
             prefetch: s.prefetch, scaled: tensorScale != nil,
-            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: [outputs])
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, twoBlk: s.twoBlk, outputs: [outputs])
         let result = launch([
             weight, blockScales, tensorScale?.reshaped(1) ?? unit, x.reshaped(rows, inputs),
         ])[0]
@@ -569,12 +789,15 @@ public enum CBv2VerifyNVFP4 {
         let rows = x.size / inputs
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         if !lowVerify { return Record.product(layer, x) }
-        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let outputs = layer.outputDimensions
+        let s = schedule(
+            rows: rows, inputs: inputs, lowVerify: lowVerify,
+            segments: 1, aligned16Equal: outputs >= 16 && outputs % 16 == 0, scaled: true)
         let id = ObjectIdentifier(layer)
         let pkey = PlanKey(
             id0: id, idLast: id, count: 1, inputs: inputs, rows: rows, dtype: x.dtype,
             fragments: s.fragments, prefetch: s.prefetch,
-            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, twoBlk: s.twoBlk)
         if lowVerify && geometryOverride == nil, let plan = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
             var args = plan.weightArrays
             args.append(x.reshaped(rows, inputs))
@@ -590,11 +813,10 @@ public enum CBv2VerifyNVFP4 {
                 weight: layer.weight, blockScales: layer.weightScale,
                 tensorScale: layer.weightScale2, inputs: inputs)
         else { return nil }
-        let outputs = layer.weight.dim(0)
         let launch = preparedLaunch(
             segments: 1, dtype: x.dtype, rows: rows, inputs: inputs, fragments: s.fragments,
             prefetch: s.prefetch, scaled: true,
-            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: [outputs])
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, twoBlk: s.twoBlk, outputs: [outputs])
         let weightArrays = [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
         if lowVerify && geometryOverride == nil {
             let plan = Plan(launch: launch, weightArrays: weightArrays, outputDims: [outputs])
@@ -623,12 +845,28 @@ public enum CBv2VerifyNVFP4 {
         let rows = x.size / inputs
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         if !lowVerify { return Record.products(nv, x) }
-        let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
+        let aligned16Equal: Bool
+        if nv.count == 2 {
+            aligned16Equal =
+                nv[0].outputDimensions >= 16 && nv[0].outputDimensions % 16 == 0
+                && nv[1].outputDimensions >= 16 && nv[1].outputDimensions % 16 == 0
+        } else if nv.count == 4 {
+            aligned16Equal =
+                nv[0].outputDimensions >= 16 && nv[0].outputDimensions % 16 == 0
+                && nv[1].outputDimensions >= 16 && nv[1].outputDimensions % 16 == 0
+                && nv[2].outputDimensions >= 16 && nv[2].outputDimensions % 16 == 0
+                && nv[3].outputDimensions >= 16 && nv[3].outputDimensions % 16 == 0
+        } else {
+            aligned16Equal = false
+        }
+        let s = schedule(
+            rows: rows, inputs: inputs, lowVerify: lowVerify,
+            segments: nv.count, aligned16Equal: aligned16Equal, scaled: true)
         let pkey = PlanKey(
             id0: ObjectIdentifier(nv[0]), idLast: ObjectIdentifier(nv[nv.count - 1]),
             count: nv.count, inputs: inputs, rows: rows, dtype: x.dtype,
             fragments: s.fragments, prefetch: s.prefetch,
-            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec)
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, twoBlk: s.twoBlk)
         if lowVerify && geometryOverride == nil, let plan = cacheLock.withLockUnchecked({ $0.plans[pkey] }) {
             var args = plan.weightArrays
             args.append(x.reshaped(rows, inputs))
@@ -659,7 +897,7 @@ public enum CBv2VerifyNVFP4 {
         let launch = preparedLaunch(
             segments: nv.count, dtype: x.dtype, rows: rows, inputs: inputs,
             fragments: s.fragments, prefetch: s.prefetch, scaled: true,
-            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, outputs: outputDims)
+            wholeChunk: s.wholeChunk, scaleVec: s.scaleVec, twoBlk: s.twoBlk, outputs: outputDims)
         if lowVerify && geometryOverride == nil {
             let plan = Plan(launch: launch, weightArrays: weightArrays, outputDims: outputDims)
             cacheLock.withLockUnchecked { $0.plans[pkey] = plan }

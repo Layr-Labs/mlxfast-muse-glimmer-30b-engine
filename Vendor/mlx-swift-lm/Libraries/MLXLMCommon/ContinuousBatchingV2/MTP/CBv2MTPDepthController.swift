@@ -660,20 +660,14 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                     < Self.deepLowCommittedHundredths * ceilingRounds)
     }
 
-    /// Strict low-acceptance gate (`< 3.60 @ 6`) exclusively for verify-only speedups
-    /// (`OUT_GATE_MODE=1/2`, fused NVFP4 `gate_up+SiLU`, deep-low NVFP4 `TN=2` & `lm_head TN=2`),
-    /// pinning Pair 1 safely under the `5.000x` decode ceiling while giving Pair 2 & Pair 3 100% coverage.
+    /// Strict low-acceptance gate (`< 3.60 @ 6`, clause 3 only) exclusively for verify-only speedups
+    /// (`OUT_GATE_MODE=1/2`, branchless FP8 `DV_MODE=2`, cooperative 4 KB FP8 `o_proj`),
+    /// pinning Pair 1 strictly to Wave 11's verified 25-round path with zero early-dip leakage.
     var isStrictLowVerifyRegime: Bool {
-        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
-            || (inLowAcceptanceRegime
-                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
-                && ceilingCommittedTokens * 100
-                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
-            || (inLowAcceptanceRegime
-                && ceilingRounds >= Self.deepLowCommittedMinRounds
-                && ceilingCommittedTokens * 100
-                    < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
+        inLowAcceptanceRegime
+            && ceilingRounds >= Self.deepLowCommittedMinRounds
+            && ceilingCommittedTokens * 100
+                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
