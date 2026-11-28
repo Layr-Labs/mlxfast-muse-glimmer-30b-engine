@@ -310,19 +310,29 @@ enum PagedSegmentAttention {
             PagedSegmentTransfers.write(
                 group: group, slots: slots, keys: pending.keys, values: pending.values)
         }
+        let record = PagedOnePassAttention.useRecordKernel
         if newKeys == nil, sinks == nil, dispatchCache != nil, PagedOnePassAttention.enabled,
             plan.buckets.count == 1,
-            let heads = PagedOnePassAttention.eligible(
+            let baselineHeads = PagedOnePassAttention.eligible(
                 headDim: d, gqa: gqa, simdgroups: nsg, partitions: plan.maxPartitions, rows: b,
-                dynTree: treeMeta != nil)
+                dynTree: treeMeta != nil, record: record)
         {
             let bucket = plan.buckets[0]
+            let gate =
+                !PagedOnePassAttention.checks && outputGate?.dtype == dtype
+                && outputGate?.shape == [b, qh, d] ? outputGate : nil
+            let heads = PagedOnePassAttention.warmedSegmentHeads(
+                baselineHeads, dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa,
+                pageSize: group.pageSize, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
+                partitions: plan.maxPartitions, rows: b, bindings: bucket.bindingClass,
+                dynTree: treeMeta != nil, appending: pending != nil,
+                outputGateMode: gate == nil ? 0 : (fp8Cast == nil ? 1 : 2), record: record)
             var fusedPending = pending
             if let pending,
                 !PagedOnePassAttention.supportsAppend(
                     dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
                     hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass)
+                    maxPart: plan.maxPartitions, bindings: bucket.bindingClass, record: record)
             {
                 scatterPending(pending)
                 guard !group.writeValidation.isFaulted else { return (q, false) }
@@ -330,15 +340,14 @@ enum PagedSegmentAttention {
             }
             var fusedOutGate: MLXArray? = nil
             var fusedFP8Cast: (multipliers: MLXArray, overflowBound: MLXArray)? = nil
-            if fusedPending == nil, !PagedOnePassAttention.checks, let outputGate,
-                outputGate.dtype == dtype, outputGate.shape == [b, qh, d],
+            if fusedPending == nil, let gate,
                 PagedOnePassAttention.supportsOutputGate(
                     dtype: dtype, headDim: d, kvHeads: kvh, gqa: gqa, pageSize: group.pageSize,
                     hpt: heads, simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
                     maxPart: plan.maxPartitions, bindings: bucket.bindingClass,
-                    dynTree: treeMeta != nil, fp8Cast: fp8Cast != nil)
+                    dynTree: treeMeta != nil, fp8Cast: fp8Cast != nil, record: record)
             {
-                fusedOutGate = outputGate
+                fusedOutGate = gate
                 fusedFP8Cast = fp8Cast
             }
             var backing = bucket.segmentIDs.map { group.segments[$0]!.storage }
@@ -354,7 +363,13 @@ enum PagedSegmentAttention {
                 pending: fusedPending.map {
                     ($0.keys.transposed(1, 0, 2), $0.values.transposed(1, 0, 2))
                 },
-                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast)
+                outputGate: fusedOutGate, fp8Cast: fusedFP8Cast, record: record)
+            if heads != baselineHeads {
+                PagedOnePassAttention.logSharedLaunch(
+                    record: record, partitions: plan.maxPartitions, hpt: heads,
+                    dynTree: treeMeta != nil, appending: fusedPending != nil,
+                    gated: fusedOutGate != nil, fp8Cast: fusedFP8Cast != nil)
+            }
             if PagedOnePassAttention.checks {
                 // The reference reads the pages this dispatch wrote.
                 if fusedPending != nil { group.writeFence = result.fence }
