@@ -5380,6 +5380,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         var committedPlainRows: [CBv2RequestID] = []
         let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
         var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
+        let deferSeedPublish =
+            step.mtpRound != nil
+            && ProcessInfo.processInfo.environment["CBV2_SEED_PUBLISH_AFTER_MTP"] != "0"
+        var deferredSeedEmissions: [() -> Void] = []
 
         func finishPlainRow(_ id: CBv2RequestID, reason: CBv2FinishReason) {
             if mtpSeedIDs.contains(id) {
@@ -5473,14 +5477,27 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stream?.reserveEmission(
                     firstEmissionArmedNanos: firstToken ? readbackDoneNanos : 0)
                 let trackedLoop = nativeShutdownState == nil ? nil : self
-                enqueueDetokenization(owner: detokenizer) {
-                    let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-                    let publish: () -> Void = {
-                        stream?.emit(
-                            .delta(text: text, tokens: [token], logprobs: logprobs),
-                            consumingReservation: true)
+                let dispatchEmission: () -> Void = {
+                    self.enqueueDetokenization(owner: detokenizer) {
+                        let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+                        let publish: () -> Void = {
+                            stream?.emit(
+                                .delta(text: text, tokens: [token], logprobs: logprobs),
+                                consumingReservation: true)
+                        }
+                        if let trackedLoop {
+                            _ = trackedLoop.nativeCommit(publish)
+                        } else {
+                            publish()
+                        }
                     }
-                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
+                }
+                if firstToken && deferSeedPublish && !isStopToken
+                    && rec.generatedTokenCount < rec.request.maxTokens
+                {
+                    deferredSeedEmissions.append(dispatchEmission)
+                } else {
+                    dispatchEmission()
                 }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -5550,6 +5567,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 guard tracking.beginCommit() else { return }
                 nativeCommitHeld = true
             }
+        }
+        if !deferredSeedEmissions.isEmpty {
+            for emit in deferredSeedEmissions { emit() }
         }
         mtp?.recordCommittedDecodeBaseline(
             measurement: step.mtpMeasurement, completedAtNanos: readbackDoneNanos,

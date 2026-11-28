@@ -69,7 +69,8 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
@@ -661,6 +662,353 @@ public enum CBv2VerifyNVFP4 {
     }
 
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
+
+    // MARK: Fused NVFP4 MLP Gate + Up + SiLU * Up (WC+SV Peeled Prefetch, 0-ULP Verified)
+
+    private static let fusedGateUpSiluEnvEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_FUSED_NVFP4_SILU"] != "0"
+
+    nonisolated(unsafe) private(set) static var fusedGateUpSiluVerified = false
+
+    private struct FusedGateUpLaunchKey: Hashable {
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+    }
+
+    private struct FusedGateUpPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+    }
+
+    private struct FusedGateUpPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let outputs: Int
+    }
+
+    private final class FusedGateUpCacheBox: @unchecked Sendable {
+        var launches: [FusedGateUpLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var plans: [FusedGateUpPlanKey: FusedGateUpPlan] = [:]
+    }
+
+    private static let fusedGateUpLock = OSAllocatedUnfairLock(initialState: FusedGateUpCacheBox())
+
+    private static let fusedGateUpScaleHelper = """
+
+        inline half2 cbv2_vn_gu_e4m3x2(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return as_type<half2>(u) * half2(256.0h);
+        }
+
+        inline bfloat16_t cbv2_vn_bf16_sigmoid(bfloat16_t x) {
+            const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            const bfloat16_t ey = static_cast<bfloat16_t>(
+                metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t one = bfloat16_t(1.0f);
+            const bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+        """
+
+    private static let fusedGateUpSiluSource = """
+        constexpr int WK = 8;
+        constexpr int BK = 128;
+        constexpr int ROWS = 8;
+        constexpr int STEP = WK * BK;
+        constexpr int row_bytes = K / 2;
+        constexpr int row_scales = K / 16;
+        static_assert(V >= 1 && V <= 8, "1 to 8 rows only");
+        static_assert(K % BK == 0, "whole chunks only");
+
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const short qid = simd_lid / 4;
+        const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+        const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+        const uint scale_shift = (fn & 4u) << 1;
+        const int y_col = tile * ROWS;
+
+        const device T* xr0 = x + size_t(min(int(fn), V - 1)) * K + 4 * fm;
+        const device T* xr1 = x + size_t(min(int(fn) + 1, V - 1)) * K + 4 * fm;
+        const int row = min(y_col + fm, N - 1);
+        const device uint* wgl = (const device uint*)(
+            (const device uint8_t*)wg + size_t(row) * row_bytes + 2 * fn);
+        const device uint8_t* sgl = scg + size_t(row) * row_scales;
+        const device uint* wul = (const device uint*)(
+            (const device uint8_t*)wu + size_t(row) * row_bytes + 2 * fn);
+        const device uint8_t* sul = scu + size_t(row) * row_scales;
+
+        float2 Cg = float2(0);
+        float2 Cu = float2(0);
+        int k = int(simd_gid) * BK;
+        if (k < K) {
+            uint qgb[4];
+            uint qub[4];
+            MO_WO_UNROLL
+            for (short block = 0; block < 4; block++) {
+                const int b = k + 32 * block;
+                qgb[block] = wgl[b / 8];
+                qub[block] = wul[b / 8];
+            }
+            uint2 sgb = *(const device uint2*)(sgl + (k / 16));
+            uint2 sub = *(const device uint2*)(sul + (k / 16));
+            for (; k + STEP < K; k += STEP) {
+                const int kn = k + STEP;
+                uint qg[4];
+                uint qu[4];
+                ushort4 xa0[4];
+                ushort4 xa1[4];
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    const int bn = kn + 32 * block;
+                    qg[block] = qgb[block];
+                    qu[block] = qub[block];
+                    qgb[block] = wgl[bn / 8];
+                    qub[block] = wul[bn / 8];
+                    xa0[block] = *(const device ushort4*)(xr0 + b);
+                    xa1[block] = *(const device ushort4*)(xr1 + b);
+                }
+                const half2 hsg0 = cbv2_vn_gu_e4m3x2(sgb.x >> scale_shift);
+                const half2 hsg1 = cbv2_vn_gu_e4m3x2(sgb.y >> scale_shift);
+                const half2 hsu0 = cbv2_vn_gu_e4m3x2(sub.x >> scale_shift);
+                const half2 hsu1 = cbv2_vn_gu_e4m3x2(sub.y >> scale_shift);
+                sgb = *(const device uint2*)(sgl + (kn / 16));
+                sub = *(const device uint2*)(sul + (kn / 16));
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const half sg_b = (block < 2) ? hsg0[block] : hsg1[block - 2];
+                    const half su_b = (block < 2) ? hsu0[block] : hsu1[block - 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        const float2 bf = float2(
+                            float(as_type<bfloat>(xa0[block][i])),
+                            float(as_type<bfloat>(xa1[block][i])));
+                        mo_wo_mma(Cg, mo_wo_pair(qg[block], i, sg_b), bf);
+                        mo_wo_mma(Cu, mo_wo_pair(qu[block], i, su_b), bf);
+                    }
+                }
+            }
+            {
+                ushort4 xa0[4];
+                ushort4 xa1[4];
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const int b = k + 32 * block;
+                    xa0[block] = *(const device ushort4*)(xr0 + b);
+                    xa1[block] = *(const device ushort4*)(xr1 + b);
+                }
+                const half2 hsg0 = cbv2_vn_gu_e4m3x2(sgb.x >> scale_shift);
+                const half2 hsg1 = cbv2_vn_gu_e4m3x2(sgb.y >> scale_shift);
+                const half2 hsu0 = cbv2_vn_gu_e4m3x2(sub.x >> scale_shift);
+                const half2 hsu1 = cbv2_vn_gu_e4m3x2(sub.y >> scale_shift);
+                MO_WO_UNROLL
+                for (short block = 0; block < 4; block++) {
+                    const half sg_b = (block < 2) ? hsg0[block] : hsg1[block - 2];
+                    const half su_b = (block < 2) ? hsu0[block] : hsu1[block - 2];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        const float2 bf = float2(
+                            float(as_type<bfloat>(xa0[block][i])),
+                            float(as_type<bfloat>(xa1[block][i])));
+                        mo_wo_mma(Cg, mo_wo_pair(qgb[block], i, sg_b), bf);
+                        mo_wo_mma(Cu, mo_wo_pair(qub[block], i, su_b), bf);
+                    }
+                }
+            }
+        }
+
+        threadgroup float partials[7 * 4 * 32];
+        if (simd_gid > 0) {
+            threadgroup float* p = partials + (simd_gid - 1) * 4 * 32 + simd_lid;
+            p[0 * 32] = Cg.x;
+            p[1 * 32] = Cg.y;
+            p[2 * 32] = Cu.x;
+            p[3 * 32] = Cu.y;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 0) {
+            for (int s = 0; s < WK - 1; s++) {
+                const threadgroup float* p = partials + s * 4 * 32 + simd_lid;
+                Cg.x += p[0 * 32];
+                Cg.y += p[1 * 32];
+                Cu.x += p[2 * 32];
+                Cu.y += p[3 * 32];
+            }
+            const int out = y_col + fm;
+            if (out < N) {
+                const float ts_g = tsg[0];
+                const float ts_u = tsu[0];
+                MO_WO_UNROLL
+                for (short j = 0; j < 2; j++) {
+                    if (int(fn) + j < V) {
+                        const T gv = mo_wo_result<T>(Cg[j], true, ts_g);
+                        const T uv = mo_wo_result<T>(Cu[j], true, ts_u);
+                        const T silu = gv * cbv2_vn_bf16_sigmoid(gv);
+                        y[size_t(int(fn) + j) * N + out] = silu * uv;
+                    }
+                }
+            }
+        }
+        """
+
+    private static let fusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_gate_up_silu",
+        inputNames: ["wg", "scg", "tsg", "wu", "scu", "tsu", "x"],
+        outputNames: ["y"],
+        source: fusedGateUpSiluSource,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + fusedGateUpScaleHelper)
+
+    private static func preparedFusedGateUpLaunch(
+        dtype: DType, rows: Int, inputs: Int, outputs: Int
+    ) -> MLXFast.MLXFastKernel.Launch {
+        let key = FusedGateUpLaunchKey(dtype: dtype, rows: rows, inputs: inputs, outputs: outputs)
+        if let hit = fusedGateUpLock.withLockUnchecked({ $0.launches[key] }) { return hit }
+        let tiles = (outputs + 7) / 8
+        let made = fusedGateUpSiluKernel.prepare(
+            template: [("T", dtype), ("V", rows), ("K", inputs), ("N", outputs)],
+            grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[rows, outputs]], outputDTypes: [dtype])
+        fusedGateUpLock.withLockUnchecked { $0.launches[key] = made }
+        return made
+    }
+
+    private static func fusedGateUpSiluUnchecked(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray
+    ) -> MLXArray? {
+        let inputs = x.dim(-1)
+        guard inputs > 0, geometryOverride == nil else { return nil }
+        let rows = x.size / inputs
+        let pkey = FusedGateUpPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+            dtype: x.dtype, rows: rows, inputs: inputs)
+        if let plan = fusedGateUpLock.withLockUnchecked({ $0.plans[pkey] }) {
+            var args = plan.weightArrays
+            args.append(x.reshaped(rows, inputs))
+            let result = plan.launch(args)[0]
+            if x.ndim == 3 {
+                return result.reshaped(x.dim(0), x.dim(1), plan.outputs)
+            }
+            return result.reshaped(Array(x.shape.dropLast()) + [plan.outputs])
+        }
+        let outputs = gate.weight.dim(0)
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            up.weight.dim(0) == outputs,
+            takes(
+                weight: gate.weight, blockScales: gate.weightScale,
+                tensorScale: gate.weightScale2, inputs: inputs),
+            takes(
+                weight: up.weight, blockScales: up.weightScale,
+                tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+        let launch = preparedFusedGateUpLaunch(
+            dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs)
+        let weightArrays: [MLXArray] = [
+            gate.weight, gate.weightScale, gate.weightScale2.reshaped(1),
+            up.weight, up.weightScale, up.weightScale2.reshaped(1),
+        ]
+        let plan = FusedGateUpPlan(launch: launch, weightArrays: weightArrays, outputs: outputs)
+        fusedGateUpLock.withLockUnchecked { $0.plans[pkey] = plan }
+        var args = weightArrays
+        args.append(x.reshaped(rows, inputs))
+        let result = launch(args)[0]
+        if x.ndim == 3 {
+            return result.reshaped(x.dim(0), x.dim(1), outputs)
+        }
+        return result.reshaped(Array(x.shape.dropLast()) + [outputs])
+    }
+
+    /// Computes `compiledSiluProduct(gate(x), up(x))` in one NVFP4 launch using
+    /// whole-chunk `uint2` scale loads and peeled next-chunk weight+scale prefetch,
+    /// reading `x` once and skipping both intermediate `[rows, N]` writes.
+    /// Active only after load-time 0-ULP verification passes; otherwise nil.
+    public static func fusedGateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear, _ x: MLXArray
+    ) -> MLXArray? {
+        guard fusedGateUpSiluEnvEnabled, fusedGateUpSiluVerified else { return nil }
+        return fusedGateUpSiluUnchecked(gate: gate, up: up, x)
+    }
+
+    /// Load-time 0-ULP bit-exact verification and warmup for `fusedGateUpSilu`.
+    /// Compares against `compiledSiluProduct(products([gate, up], x))` on non-zero
+    /// BF16 inputs across `rows = 2` and `rows = 8` in both verify regimes; activates
+    /// only on 0 differing bits.
+    public static func verifyAndWarmFusedGateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear,
+        dtype: DType, rows: ClosedRange<Int> = 2 ... maximumRows
+    ) {
+        guard fusedGateUpSiluEnvEnabled, dtype == .bfloat16,
+            Device.defaultDevice().deviceType == .gpu
+        else { return }
+        let inputs = gate.inputDimensions
+        let outputs = gate.weight.dim(0)
+        guard up.inputDimensions == inputs, up.weight.dim(0) == outputs,
+            supports(rows: 2, inputs: inputs, dtype: dtype)
+        else { return }
+        let prevLow = CBv2DraftRegime.lowAcceptance
+        let prevStrict = CBv2DraftRegime.strictLowVerifyEligible
+        let prevC3 = CBv2DraftRegime.strictLowVerifyC3
+        defer {
+            CBv2DraftRegime.lowAcceptance = prevLow
+            CBv2DraftRegime.strictLowVerifyEligible = prevStrict
+            CBv2DraftRegime.strictLowVerifyC3 = prevC3
+        }
+        let ok = (try? MLX.withError { errors -> Bool in
+            for testRows in [2, min(8, rows.upperBound)] {
+                let n = testRows * inputs
+                let vals: [Float] = (0 ..< n).map { idx in
+                    switch idx % 11 {
+                    case 0: return 0.0
+                    case 1: return -0.000244140625
+                    case 2: return 0.000244140625
+                    case 3: return -12.5
+                    case 4: return 12.5
+                    case 5: return -4.25
+                    case 6: return 4.25
+                    default: return Float(((idx * 13 + 5) % 61) - 30) * 0.125
+                    }
+                }
+                let x = MLXArray(vals, [1, testRows, inputs]).asType(dtype)
+                guard let got = fusedGateUpSiluUnchecked(gate: gate, up: up, x) else {
+                    return false
+                }
+                for isLow in [false, true] {
+                    CBv2DraftRegime.lowAcceptance = isLow
+                    CBv2DraftRegime.strictLowVerifyEligible = isLow
+                    CBv2DraftRegime.strictLowVerifyC3 = isLow
+                    guard let pair = products([gate, up], x) else { return false }
+                    let ref = compiledSiluProduct(pair[0], pair[1])
+                    let diff = (
+                        contiguous(got).view(dtype: .uint16)
+                            .!= contiguous(ref).view(dtype: .uint16)
+                    ).asType(.int32).sum()
+                    eval(diff)
+                    try errors.check()
+                    guard diff.item(Int.self) == 0 else { return false }
+                }
+            }
+            return true
+        }) ?? false
+        guard ok else { return }
+        var warmOuts = [MLXArray]()
+        for r in rows where supports(rows: r, inputs: inputs, dtype: dtype) {
+            let z = MLXArray.zeros([1, r, inputs], dtype: dtype)
+            if let y = fusedGateUpSiluUnchecked(gate: gate, up: up, z) {
+                warmOuts.append(y)
+            }
+        }
+        if !warmOuts.isEmpty { eval(warmOuts) }
+        fusedGateUpLock.withLockUnchecked { _ in fusedGateUpSiluVerified = true }
+    }
 
     /// Whether `product` takes `rows` rows of `inputs` activations of `dtype`.
     /// The tile reads activations as bfloat16 bits, so only bfloat16 is taken.

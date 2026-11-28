@@ -1710,11 +1710,12 @@ public enum CBv2DraftRegime {
     /// `CBV2_DYN_TREE=0` disables GPU-dynamic tree selection (falls back to static tree).
     public static let dynamicTreeEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DYN_TREE"] != "0"
-    /// `CBV2_LOW_ONLY_VERIFY=0` applies verify-path micro-speedups on high-acceptance rounds too.
-    /// Default (`true`) confines them to low-acceptance rounds so high-acceptance windows match
-    /// baseline latency below the decode speedup ceiling.
+    /// `CBV2_LOW_ONLY_VERIFY=1` confines verify-path micro-speedups to low-acceptance rounds only.
+    /// Default (`false`) runs every 0-ULP exact verify kernel from round 1 onward (including
+    /// early rounds of low-acceptance requests), while high-throughput requests are bounded by
+    /// the conservative decode pacing floor in `EngineLoopV2+MTPFinalize`.
     public static let lowOnlyVerifySpeedups: Bool =
-        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] == "1"
     /// `CBV2_TREE_OLDPOL=1` forces k-wide accept/reject updates on tree rounds.
     /// Default (`false`) uses terminal-branch and chain-depth semantics so tree rounds preserve width.
     public static let treeOldAcceptancePolicy: Bool =

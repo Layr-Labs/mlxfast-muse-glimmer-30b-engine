@@ -358,7 +358,15 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            let fullVerify =
+                !CBv2DraftRegime.lowOnlyVerifySpeedups
+                || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
+            if fullVerify && MuseGlimmerVerifyProjections.midTrunkLadderEnabled {
+                let nextLayerIndex = index + 1
+                if nextLayerIndex == 12 || nextLayerIndex == 24 || nextLayerIndex == 36 {
+                    asyncEval(h, layerInput)
+                }
+            } else if flushLayer > 0 && index + 1 == flushLayer {
                 asyncEval(h, layerInput)
             }
         }
@@ -652,6 +660,23 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let fullVerify =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
+        if fullVerify, !preCastFP8, let rows = verifyRows(x),
+            let gate = mlp.gateProj as? ModelOptWeightOnlyNVFP4Linear,
+            let up = mlp.upProj as? ModelOptWeightOnlyNVFP4Linear,
+            !(mlp.downProj is ModelOptCalibratedLinear),
+            let fused = CBv2VerifyNVFP4.fusedGateUpSilu(gate: gate, up: up, x)
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let refPair = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+                let refAct = compiledSiluProduct(refPair[0], refPair[1])
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [fused], [refAct], kind: "nvfp4.gate_up_silu", rows: rows)
+            }
+            return verifyDownProjection(mlp.downProj, fused)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -673,7 +698,7 @@ extension MuseGlimmerTextModel {
                 return projected
             }
         }
-        if lowVerify && CBv2DraftRegime.strictLowVerifyC3, verifyRows(gu[0]) != nil,
+        if fullVerify, verifyRows(gu[0]) != nil,
             let act = VerifyFusedNorms.fusedSiluProduct(gate: gu[0], up: gu[1])
         {
             if MuseGlimmerVerifyProjections.selfTest {
@@ -778,6 +803,8 @@ enum MuseGlimmerVerifyProjections {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
     }()
+    static let midTrunkLadderEnabled: Bool =
+        environment["CBV2_MID_TRUNK_LADDER"] != "0"
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
     static let nvfp4AllEnabled: Bool =
@@ -1012,6 +1039,27 @@ extension MuseGlimmerTextModel {
             dst[idx] = o;
             """)
 
+    private struct ReadoutLaunchKey: Hashable {
+        let shape: [Int]
+        let n4: Int
+    }
+
+    private static let readoutLaunchLock = NSLock()
+    nonisolated(unsafe) private static var readoutLaunchCache:
+        [ReadoutLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var readoutParamsCache: [UInt64: MLXArray] = [:]
+
+    private static func cachedReadoutParams(outputMultiplier: Float, softcap: Float) -> MLXArray {
+        let key = (UInt64(outputMultiplier.bitPattern) << 32) | UInt64(softcap.bitPattern)
+        return readoutLaunchLock.withLock {
+            if let existing = readoutParamsCache[key] { return existing }
+            let arr = MLXArray([outputMultiplier, softcap])
+            eval(arr)
+            readoutParamsCache[key] = arr
+            return arr
+        }
+    }
+
     /// `outputLogits` for verify rows: an NVFP4 `lm_head` through
     /// `CBv2VerifyScales` (8-row tiles), then the same multiplier and softcap
     /// fused into one vectorized pass. Other calls run `outputLogits` itself.
@@ -1023,14 +1071,24 @@ extension MuseGlimmerTextModel {
         let cap = configuration.finalLogitSoftcapping
         if cap > 0, product.dtype == .bfloat16, product.size % 4 == 0 {
             let n4 = product.size / 4
-            let tg = 256
-            let gridX = ((n4 + tg - 1) / tg) * tg
-            let params = MLXArray([configuration.outputMultiplier, cap])
-            return Self.readoutKernel(
-                [product, params],
-                template: [("N4_", n4)],
-                grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
-                outputShapes: [product.shape], outputDTypes: [product.dtype])[0]
+            let shape = product.shape
+            let key = ReadoutLaunchKey(shape: shape, n4: n4)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = Self.readoutLaunchLock.withLock({ Self.readoutLaunchCache[key] }) {
+                launch = hit
+            } else {
+                let tg = 256
+                let gridX = ((n4 + tg - 1) / tg) * tg
+                let made = Self.readoutKernel.prepare(
+                    template: [("N4_", n4)],
+                    grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+                    outputShapes: [shape], outputDTypes: [product.dtype])
+                Self.readoutLaunchLock.withLock { Self.readoutLaunchCache[key] = made }
+                launch = made
+            }
+            let params = Self.cachedReadoutParams(
+                outputMultiplier: configuration.outputMultiplier, softcap: cap)
+            return launch([product, params])[0]
         }
         var logits = product * configuration.outputMultiplier
         if cap > 0 { logits = tanh(logits / cap) * cap }
@@ -1084,9 +1142,20 @@ extension MuseGlimmerTextModel {
         }
         CBv2SmallProjection.warmFP8BranchlessSafe(allFP8Layers)
         var seen = Set<String>()
+        var warmedFusedNVFP4Silu = false
         for layer in model.layers {
             let a = layer.selfAttention
             let mlp = layer.mlp
+            if !warmedFusedNVFP4Silu,
+                let gate = mlp.gateProj as? ModelOptWeightOnlyNVFP4Linear,
+                let up = mlp.upProj as? ModelOptWeightOnlyNVFP4Linear,
+                !(mlp.downProj is ModelOptCalibratedLinear)
+            {
+                CBv2VerifyNVFP4.verifyAndWarmFusedGateUpSilu(
+                    gate: gate, up: up, dtype: dtype,
+                    rows: 2 ... MuseGlimmerVerifyProjections.maximumRows)
+                warmedFusedNVFP4Silu = true
+            }
             // Pre-populate shared FP8 activation cast parameter cache at boot so no host sync
             // (`asArray(Float.self)`) runs during the first timed verify step.
             if let fp8Attn = [a.queryProj, a.keyProj, a.valueProj, a.gateProj]
@@ -1193,6 +1262,27 @@ extension MuseGlimmerTextModel {
                 outputMultiplier: configuration.outputMultiplier,
                 softcap: configuration.finalLogitSoftcapping)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+        }
+        // Boot-time allocator warm-up: simultaneously materialize verify-window-sized
+        // scratch buffers across every hot intermediate size class so MLX's Metal buffer
+        // cache holds pre-faulted buffers before Round 1 runs (`CBV2_ALLOCATOR_WARMUP=0` off).
+        if ProcessInfo.processInfo.environment["CBV2_ALLOCATOR_WARMUP"] != "0" {
+            let r = MuseGlimmerVerifyProjections.maximumRows
+            let h = configuration.hiddenSize
+            let inter = configuration.intermediateSize
+            let qDim = configuration.attentionHeads * configuration.headDimensions
+            let kvDim = configuration.kvHeads * configuration.headDimensions
+            let scratch: [MLXArray] = [
+                MLXArray.zeros([1, r, h], dtype: dtype),
+                MLXArray.zeros([1, r, h], dtype: dtype),
+                MLXArray.zeros([1, r, inter], dtype: dtype),
+                MLXArray.zeros([1, r, inter], dtype: dtype),
+                MLXArray.zeros([1, r, qDim], dtype: dtype),
+                MLXArray.zeros([1, r, qDim], dtype: dtype),
+                MLXArray.zeros([1, r, kvDim], dtype: dtype),
+                MLXArray.zeros([1, r, configuration.vocabularySize], dtype: dtype),
+            ]
+            eval(scratch)
         }
     }
 }

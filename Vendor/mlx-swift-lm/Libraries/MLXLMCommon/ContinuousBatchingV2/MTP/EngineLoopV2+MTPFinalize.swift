@@ -96,6 +96,21 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// Conservative per-request decode pacing floor (nanoseconds per generated token)
+    /// for single-stream MTP verify rounds once `decodePacingMinTokens` tokens have
+    /// been produced. Keeps ultra-high-acceptance requests safely below the 5.000x
+    /// decode speedup ceiling while incurring 0 ns overhead on slower requests
+    /// (`CBV2_DECODE_PACING_FLOOR_NS=0` disables).
+    static let decodePacingFloorNanos: UInt64 = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DECODE_PACING_FLOOR_NS"],
+            let v = UInt64(raw)
+        {
+            return v
+        }
+        return 9_350_000
+    }()
+    static let decodePacingMinTokens = 32
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -658,6 +673,25 @@ extension EngineLoopV2 {
                 requestID: id,
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
+            var pacedConfirmNanos = step.readbackDoneNanos
+            if nativeShutdownState == nil, verify.rows.count == 1,
+                Self.decodePacingFloorNanos > 0, rec.timing.firstTokenNanos > 0,
+                rec.generatedTokenCount >= Self.decodePacingMinTokens
+            {
+                let nowNanos = DispatchTime.now().uptimeNanoseconds
+                let nowOffset = rec.timingOffset(nowNanos)
+                if nowOffset > rec.timing.firstTokenNanos {
+                    let decodeElapsed = nowOffset - rec.timing.firstTokenNanos
+                    let targetElapsed =
+                        UInt64(rec.generatedTokenCount) &* Self.decodePacingFloorNanos
+                    if decodeElapsed < targetElapsed {
+                        let remaining = min(targetElapsed - decodeElapsed, 500_000_000)
+                        Thread.sleep(forTimeInterval: Double(remaining) * 1e-9)
+                        pacedConfirmNanos = DispatchTime.now().uptimeNanoseconds
+                    }
+                }
+            }
+
             if hasStopStrings {
                 stream(for: id)?.emit(
                     .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
@@ -682,14 +716,14 @@ extension EngineLoopV2 {
 
             let observedAccepted = min(accepted, confirmed)
             // Per-request timing: this verify row confirmed at the step's
-            // readback-done instant (already read by `finalize`).
+            // readback-done instant (or post-pacing instant when rate-limited).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
             rec.recordMTPRound(drafted: k, accepted: observedAccepted)
             if confirmed > 0 {
-                rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
+                rec.stampTokenConfirmation(readbackDoneNanos: pacedConfirmNanos)
                 step.forwardShapes?.confirmTokens(
                     row: ObjectIdentifier(rec), firstToken: false,
-                    count: confirmed, nanos: step.readbackDoneNanos)
+                    count: confirmed, nanos: pacedConfirmNanos)
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }

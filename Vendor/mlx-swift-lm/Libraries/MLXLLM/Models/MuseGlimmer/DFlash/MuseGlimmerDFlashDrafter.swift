@@ -867,6 +867,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
         }
 
+        private var cachedMaskKey: (anchor: Int, first: Int, base: Int, count: Int)? = nil
+        private var cachedMask: MLXArray? = nil
+
         func visibleContext() -> (keys: MLXArray, values: MLXArray, mask: MLXArray?)? {
             guard count > 0, let keys, let values else { return nil }
             let pair =
@@ -875,10 +878,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             let rows = 0 ..< count
             let visibleKeys = pair[0][0..., 0..., rows, 0...]
             let visibleValues = pair[1][0..., 0..., rows, 0...]
-            let mask = MuseGlimmerDFlashContextState.visibility(
-                anchor: nextPosition, blockSize: blockSize, window: window,
-                contextPositions: heldPositions
-            ).map { MLXArray($0, [blockSize, count + blockSize]) }
+            let maskKey = (anchor: nextPosition, first: firstPosition, base: basePosition, count: count)
+            let mask: MLXArray?
+            if let k = cachedMaskKey, k == maskKey {
+                mask = cachedMask
+            } else {
+                let built = MuseGlimmerDFlashContextState.visibility(
+                    anchor: nextPosition, blockSize: blockSize, window: window,
+                    contextPositions: heldPositions
+                ).map { MLXArray($0, [blockSize, count + blockSize]) }
+                cachedMaskKey = maskKey
+                cachedMask = built
+                mask = built
+            }
             return (visibleKeys, visibleValues, mask)
         }
     }
@@ -2047,10 +2059,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             inputs.append(MLXArray([Int32(rows), Int32(position)]))
             inputs.append(coefficients)
             inputs.append(treeMeta ?? dummyTreeMeta)
-            return MuseGlimmerDFlashDrafter.contextKeysKernel(
-                inputs, template: [("HEADS_", kvHeads), ("DYN_TREE_", treeMeta != nil)],
-                grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
-                outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])[0]
+            let dyn = treeMeta != nil
+            let key = ContextKeyLaunchKey(kvHeads: kvHeads, rows: rows, dynTree: dyn)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = MuseGlimmerDFlashDrafter.readoutLaunchLock.withLock({
+                MuseGlimmerDFlashDrafter.contextKeyLaunches[key]
+            }) {
+                launch = hit
+            } else {
+                let made = MuseGlimmerDFlashDrafter.contextKeysKernel.prepare(
+                    template: [("HEADS_", kvHeads), ("DYN_TREE_", dyn)],
+                    grid: (32, 5 * kvHeads * rows, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[5, kvHeads, rows, 128]], outputDTypes: [.bfloat16])
+                MuseGlimmerDFlashDrafter.readoutLaunchLock.withLock {
+                    MuseGlimmerDFlashDrafter.contextKeyLaunches[key] = made
+                }
+                launch = made
+            }
+            return launch(inputs)[0]
         }
 
         func applyFusedKV(
@@ -3276,25 +3302,64 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             """)
 
+    private struct ContextKeyLaunchKey: Hashable {
+        let kvHeads: Int
+        let rows: Int
+        let dynTree: Bool
+    }
+
+    private struct ReadoutLaunchKey: Hashable {
+        let kind: Int
+        let rows: Int
+        let vocab: Int
+    }
+
+    private static let readoutLaunchLock = NSLock()
+    nonisolated(unsafe) private static var contextKeyLaunches:
+        [ContextKeyLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var readoutLaunches:
+        [ReadoutLaunchKey: (s1: MLXFast.MLXFastKernel.Launch, s2: MLXFast.MLXFastKernel.Launch)] = [:]
+    nonisolated(unsafe) private static var readoutParamsCache: [UInt64: MLXArray] = [:]
+
+    private static func cachedReadoutParams(outputMultiplier: Float, softcap: Float) -> MLXArray {
+        let key = (UInt64(outputMultiplier.bitPattern) << 32) | UInt64(softcap.bitPattern)
+        return readoutLaunchLock.withLock {
+            if let existing = readoutParamsCache[key] { return existing }
+            let arr = MLXArray([outputMultiplier, softcap])
+            eval(arr)
+            readoutParamsCache[key] = arr
+            return arr
+        }
+    }
+
     private static func fusedArgMaxAndConfidence(
         _ logits: MLXArray, outputMultiplier: Float, softcap: Float
     ) -> (tokens: MLXArray, confidence: MLXArray) {
         let rows = logits.dim(0)
         let vocab = logits.dim(1)
         let chunks = 64
-        let params = MLXArray([outputMultiplier, softcap])
-        let partials = argMaxConfStage1(
-            [logits, params],
-            template: [("V_", vocab)],
-            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks], [rows, chunks]],
-            outputDTypes: [.float32, .int32, .float32, .float32])
-        let out = argMaxConfStage2(
-            partials,
-            template: [("V_", vocab)],
-            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
-            outputShapes: [[rows], [rows]],
-            outputDTypes: [.int32, .float32])
+        let params = cachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
+        let key = ReadoutLaunchKey(kind: 0, rows: rows, vocab: vocab)
+        let pair: (s1: MLXFast.MLXFastKernel.Launch, s2: MLXFast.MLXFastKernel.Launch)
+        if let hit = readoutLaunchLock.withLock({ readoutLaunches[key] }) {
+            pair = hit
+        } else {
+            let s1 = argMaxConfStage1.prepare(
+                template: [("V_", vocab)],
+                grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, chunks], [rows, chunks], [rows, chunks], [rows, chunks]],
+                outputDTypes: [.float32, .int32, .float32, .float32])
+            let s2 = argMaxConfStage2.prepare(
+                template: [("V_", vocab)],
+                grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+                outputShapes: [[rows], [rows]],
+                outputDTypes: [.int32, .float32])
+            let made = (s1, s2)
+            readoutLaunchLock.withLock { readoutLaunches[key] = made }
+            pair = made
+        }
+        let partials = pair.s1([logits, params])
+        let out = pair.s2(partials)
         return (out[0], out[1])
     }
 
@@ -3417,18 +3482,26 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let rows = logits.dim(0)
         let vocab = logits.dim(1)
         let chunks = 64
-        let partials = fastArgMaxStage1(
-            [logits],
-            template: [("V_", vocab)],
-            grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[rows, chunks], [rows, chunks]],
-            outputDTypes: [.float32, .int32])
-        return fastArgMaxStage2(
-            partials,
-            template: [("V_", vocab)],
-            grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
-            outputShapes: [[rows]],
-            outputDTypes: [.int32])[0]
+        let key = ReadoutLaunchKey(kind: 1, rows: rows, vocab: vocab)
+        let pair: (s1: MLXFast.MLXFastKernel.Launch, s2: MLXFast.MLXFastKernel.Launch)
+        if let hit = readoutLaunchLock.withLock({ readoutLaunches[key] }) {
+            pair = hit
+        } else {
+            let s1 = fastArgMaxStage1.prepare(
+                template: [("V_", vocab)],
+                grid: (256 * chunks, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, chunks], [rows, chunks]],
+                outputDTypes: [.float32, .int32])
+            let s2 = fastArgMaxStage2.prepare(
+                template: [("V_", vocab)],
+                grid: (chunks, rows, 1), threadGroup: (chunks, 1, 1),
+                outputShapes: [[rows]],
+                outputDTypes: [.int32])
+            let made = (s1, s2)
+            readoutLaunchLock.withLock { readoutLaunches[key] = made }
+            pair = made
+        }
+        return pair.s2(pair.s1([logits]))[0]
     }
 
     private static let fastDynTreeHeader = """

@@ -367,42 +367,59 @@ public enum CBv2GroupedProjection {
         2: fp8Kernel(segments: 2), 4: fp8Kernel(segments: 4),
     ]
 
-    /// `ModelOptActivationKernels.fp8Kernel` for each segment's own multipliers
-    /// and bound, one launch; segment `i` writes `out[i * COUNT ..< (i + 1) * COUNT]`.
+    /// Single-read, division-free multi-segment FP8 activation cast: each thread
+    /// loads `x[i]` once and writes all `segments` calibrated outputs with exact
+    /// bit parity to `ModelOptActivationKernels.fp8Kernel`.
     private static func castKernel(segments: Int) -> MLXFast.MLXFastKernel {
         var inputs = ["x"]
         for i in 0 ..< segments { inputs += ["mu\(i)", "bd\(i)"] }
-        // Per-segment scalars are chosen by value: the small arrays live in the
-        // `constant` address space, so pointers to them cannot share a ternary.
-        func select(_ name: String, _ element: Int) -> String {
-            var expr = "\(name)\(segments - 1)[\(element)]"
-            for i in (0 ..< segments - 1).reversed() {
-                expr = "(seg == \(i) ? \(name)\(i)[\(element)] : \(expr))"
-            }
-            return expr
-        }
-        let source = """
+        var body = """
             const uint i = thread_position_in_grid.x;
-            const uint seg = i / COUNT;
-            const uint idx = i - seg * COUNT;
-            const float m0 = \(select("mu", 0));
-            const float m1 = \(select("mu", 1));
-            const float bound = \(select("bd", 0));
-            const float scaled = static_cast<float>(x[idx]) * m0;
-            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float xv = static_cast<float>(x[i]);
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
-            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
-            out[i] = static_cast<T>(invalid ? nan_value : decoded * m1);
             """
+        for s in 0 ..< segments {
+            let dst = s == 0 ? "i" : "i + \(s)u * uint(COUNT)"
+            body += """
+
+                {
+                    const float scaled = xv * mu\(s)[0];
+                    const uint8_t bits = modelopt_e4m3_bits(scaled);
+                    const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                    const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bd\(s)[0];
+                    out[\(dst)] = static_cast<T>(invalid ? nan_value : decoded * mu\(s)[1]);
+                }
+                """
+        }
         return MLXFast.metalKernel(
-            name: "cbv2_grouped_fp8_activation_\(segments)", inputNames: inputs,
-            outputNames: ["out"], source: source, header: ModelOptActivationKernels.header)
+            name: "cbv2_grouped_fp8_activation_fused_\(segments)", inputNames: inputs,
+            outputNames: ["out"], source: body, header: ModelOptActivationKernels.header)
     }
 
     nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
         2: castKernel(segments: 2), 4: castKernel(segments: 4),
     ]
+
+    private struct GroupLaunchKey: Hashable {
+        let kind: Int
+        let segments: Int
+        let dtype: DType
+        let rows: Int
+        let inputs: Int
+        let outputs: [Int]
+    }
+
+    private struct CastLaunchKey: Hashable {
+        let segments: Int
+        let dtype: DType
+        let count: Int
+    }
+
+    private static let launchLock = NSLock()
+    nonisolated(unsafe) private static var groupLaunches:
+        [GroupLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var castLaunches:
+        [CastLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
 
     // MARK: Entry
 
@@ -489,51 +506,98 @@ public enum CBv2GroupedProjection {
         switch plan {
         case .nvfp4(let group):
             var arrays = [MLXArray]()
-            var template: [(String, any KernelTemplateArg)] = [
-                ("T", x.dtype), ("V", rows), ("K", inputs),
-            ]
-            var shapes = [[Int]]()
-            var tiles = 0
-            for (i, layer) in group.enumerated() {
+            arrays.reserveCapacity(count * 3 + 1)
+            var outputDims = [Int]()
+            outputDims.reserveCapacity(count)
+            for layer in group {
                 arrays += [layer.weight, layer.weightScale, layer.weightScale2.reshaped(1)]
-                template.append(("N\(i)", layer.outputDimensions))
-                shapes.append([rows, layer.outputDimensions])
-                tiles += (layer.outputDimensions + 31) / 32
+                outputDims.append(layer.outputDimensions)
             }
             arrays.append(flat)
-            let results = nvfp4Kernels[count]!(
-                arrays, template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
-                outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: count))
+            let key = GroupLaunchKey(
+                kind: 0, segments: count, dtype: x.dtype, rows: rows, inputs: inputs,
+                outputs: outputDims)
+            let launch: MLXFast.MLXFastKernel.Launch
+            if let hit = launchLock.withLock({ groupLaunches[key] }) {
+                launch = hit
+            } else {
+                var template: [(String, any KernelTemplateArg)] = [
+                    ("T", x.dtype), ("V", rows), ("K", inputs),
+                ]
+                var shapes = [[Int]]()
+                shapes.reserveCapacity(count)
+                var tiles = 0
+                for (i, n) in outputDims.enumerated() {
+                    template.append(("N\(i)", n))
+                    shapes.append([rows, n])
+                    tiles += (n + 31) / 32
+                }
+                let made = nvfp4Kernels[count]!.prepare(
+                    template: template, grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                    outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: count))
+                launchLock.withLock { groupLaunches[key] = made }
+                launch = made
+            }
+            let results = launch(arrays)
             return zip(results, group).map {
                 $0.reshaped(lead + [$1.outputDimensions])
             }
         case .fp8(let group):
             var castInputs: [MLXArray] = [flat]
+            castInputs.reserveCapacity(1 + count * 2)
             var arrays = [MLXArray]()
-            var template: [(String, any KernelTemplateArg)] = [
-                ("T", x.dtype), ("V", rows), ("K", inputs),
-            ]
-            var shapes = [[Int]]()
-            var groups = 0
-            for (i, layer) in group.enumerated() {
+            arrays.reserveCapacity(count * 2 + 1)
+            var outputDims = [Int]()
+            outputDims.reserveCapacity(count)
+            for layer in group {
                 guard let constants = layer.graphConstants,
                     case .fp8(let multipliers, let bound) = constants.storage
                 else { return nil }
                 castInputs += [multipliers, bound]
                 arrays += [layer.weight, constants.outputScale]
-                template.append(("N\(i)", layer.outputDimensions))
-                shapes.append([rows, layer.outputDimensions])
-                groups += (layer.outputDimensions + 1) / 2
+                outputDims.append(layer.outputDimensions)
             }
-            let total = count * rows * inputs
-            let cast = castKernels[count]!(
-                castInputs, template: [("T", x.dtype), ("COUNT", rows * inputs)],
-                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
-                outputShapes: [[total]], outputDTypes: [x.dtype])[0]
+            let elemCount = rows * inputs
+            let total = count * elemCount
+            let castKey = CastLaunchKey(segments: count, dtype: x.dtype, count: elemCount)
+            let castLaunch: MLXFast.MLXFastKernel.Launch
+            if let hit = launchLock.withLock({ castLaunches[castKey] }) {
+                castLaunch = hit
+            } else {
+                let made = castKernels[count]!.prepare(
+                    template: [("T", x.dtype), ("COUNT", elemCount)],
+                    grid: (elemCount, 1, 1), threadGroup: (min(256, elemCount), 1, 1),
+                    outputShapes: [[total]], outputDTypes: [x.dtype])
+                launchLock.withLock { castLaunches[castKey] = made }
+                castLaunch = made
+            }
+            let cast = castLaunch(castInputs)[0]
             arrays.append(cast)
-            let results = fp8Kernels[count]!(
-                arrays, template: template, grid: (groups * 32, 8, 1), threadGroup: (32, 8, 1),
-                outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: count))
+            let key = GroupLaunchKey(
+                kind: 1, segments: count, dtype: x.dtype, rows: rows, inputs: inputs,
+                outputs: outputDims)
+            let fp8Launch: MLXFast.MLXFastKernel.Launch
+            if let hit = launchLock.withLock({ groupLaunches[key] }) {
+                fp8Launch = hit
+            } else {
+                var template: [(String, any KernelTemplateArg)] = [
+                    ("T", x.dtype), ("V", rows), ("K", inputs),
+                ]
+                var shapes = [[Int]]()
+                shapes.reserveCapacity(count)
+                var groups = 0
+                for (i, n) in outputDims.enumerated() {
+                    template.append(("N\(i)", n))
+                    shapes.append([rows, n])
+                    groups += (n + 1) / 2
+                }
+                let made = fp8Kernels[count]!.prepare(
+                    template: template, grid: (groups * 32, 8, 1), threadGroup: (32, 8, 1),
+                    outputShapes: shapes, outputDTypes: Array(repeating: x.dtype, count: count))
+                launchLock.withLock { groupLaunches[key] = made }
+                fp8Launch = made
+            }
+            let results = fp8Launch(arrays)
             return zip(results, group).map {
                 $0.reshaped(lead + [$1.outputDimensions])
             }

@@ -1311,8 +1311,12 @@ public enum CBv2SmallProjection {
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyEligible)
+        let strictC3 =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1456,8 +1460,12 @@ public enum CBv2SmallProjection {
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyEligible)
+        let strictC3 =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1518,35 +1526,33 @@ public enum CBv2SmallProjection {
             """,
         header: ModelOptActivationKernels.header)
 
-    /// The activation cast of `ModelOptActivationKernels.fp8` for each layer's
-    /// own multipliers and bound, one launch (`CBv2GroupedProjection`'s cast).
+    /// Single-read, division-free multi-segment FP8 activation cast: each thread
+    /// loads `x[i]` once and writes all `segments` calibrated outputs with exact
+    /// bit parity to `ModelOptActivationKernels.fp8`.
     private static func castKernel(segments: Int) -> MLXFast.MLXFastKernel {
         var inputs = ["x"]
         for i in 0 ..< segments { inputs += ["mu\(i)", "bd\(i)"] }
-        func select(_ name: String, _ element: Int) -> String {
-            var expr = "\(name)\(segments - 1)[\(element)]"
-            for i in (0 ..< segments - 1).reversed() {
-                expr = "(seg == \(i) ? \(name)\(i)[\(element)] : \(expr))"
-            }
-            return expr
-        }
-        let source = """
+        var body = """
             const uint i = thread_position_in_grid.x;
-            const uint seg = i / COUNT;
-            const uint idx = i - seg * COUNT;
-            const float m0 = \(select("mu", 0));
-            const float m1 = \(select("mu", 1));
-            const float bound = \(select("bd", 0));
-            const float scaled = static_cast<float>(x[idx]) * m0;
-            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float xv = static_cast<float>(x[i]);
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
-            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
-            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
-            out[i] = static_cast<T>(invalid ? nan_value : decoded * m1);
             """
+        for s in 0 ..< segments {
+            let dst = s == 0 ? "i" : "i + \(s)u * uint(COUNT)"
+            body += """
+
+                {
+                    const float scaled = xv * mu\(s)[0];
+                    const uint8_t bits = modelopt_e4m3_bits(scaled);
+                    const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                    const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bd\(s)[0];
+                    out[\(dst)] = static_cast<T>(invalid ? nan_value : decoded * mu\(s)[1]);
+                }
+                """
+        }
         return MLXFast.metalKernel(
-            name: "cbv2_small_fp8_activation_\(segments)", inputNames: inputs,
-            outputNames: ["out"], source: source, header: ModelOptActivationKernels.header)
+            name: "cbv2_small_fp8_activation_fused_\(segments)", inputNames: inputs,
+            outputNames: ["out"], source: body, header: ModelOptActivationKernels.header)
     }
 
     nonisolated(unsafe) private static let castKernels: [Int: MLXFast.MLXFastKernel] = [
@@ -1577,7 +1583,7 @@ public enum CBv2SmallProjection {
                 : [("T", flat.dtype), ("COUNT", count)]
             let made = kernel.prepare(
                 template: template,
-                grid: (total, 1, 1), threadGroup: (min(256, total), 1, 1),
+                grid: (count, 1, 1), threadGroup: (min(256, count), 1, 1),
                 outputShapes: [[total]], outputDTypes: [flat.dtype])
             lock.withLock { castLaunchCache[key] = made }
             launch = made
@@ -2028,7 +2034,9 @@ public enum CBv2SmallProjection {
             return nil
         }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 =
+            !CBv2DraftRegime.lowOnlyVerifySpeedups
+            || (lowVerify && CBv2DraftRegime.strictLowVerifyC3)
         let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2

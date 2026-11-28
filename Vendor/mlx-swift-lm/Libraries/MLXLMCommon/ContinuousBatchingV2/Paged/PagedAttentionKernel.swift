@@ -530,6 +530,38 @@ public enum PagedAttentionKernel {
 
     private static let cache = KernelCache()
 
+    private struct DecodePartLaunchKey: Hashable {
+        let key: PagedAttentionKernelKey
+        let kvHeads: Int
+        let hpt: Int
+        let b: Int
+        let queryHeads: Int
+        let maxParts: Int
+    }
+
+    private struct DecodeMergeLaunchKey: Hashable {
+        let key: PagedAttentionKernelKey
+        let b: Int
+        let queryHeads: Int
+        let headDim: Int
+    }
+
+    private struct BulkWriteLaunchKey: Hashable {
+        let dtype: DType
+        let pageSize: Int
+        let headDim: Int
+        let kvHeads: Int
+        let n: Int
+    }
+
+    private static let launchLock = NSLock()
+    nonisolated(unsafe) private static var decodePartLaunches:
+        [DecodePartLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var decodeMergeLaunches:
+        [DecodeMergeLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+    nonisolated(unsafe) private static var bulkWriteLaunches:
+        [BulkWriteLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+
     static func kernel(
         for key: PagedAttentionKernelKey,
         source: String
@@ -752,45 +784,60 @@ public enum PagedAttentionKernel {
         // space; the merge implementation expects a device pointer. Keep even
         // a one-head/one-partition probe on the same legal interface.
         let metaShape = [max(8, b * queryHeads * maxParts * 2)]
-        let partOut = kernel(for: partKey, source: kernelSource)(
-            partInputs,
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("S", pageSize),
-                ("GQA", gqa),
-                ("HPT", hpt),
-                ("NSG", nsg),
-                ("PTOK", ptok),
-                ("HAS_SOFTCAP", softcap),
-            ],
-            grid: (kvHeads * splits * tg, b, maxParts),
-            threadGroup: (tg, 1, 1),
-            outputShapes: hasWrite
-                ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
-                : [[b, queryHeads, maxParts, headDim], metaShape],
-            outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32],
-            stream: stream
-        )
+        let partLaunchKey = DecodePartLaunchKey(
+            key: partKey, kvHeads: kvHeads, hpt: hpt, b: b, queryHeads: queryHeads,
+            maxParts: maxParts)
+        let partLaunch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ decodePartLaunches[partLaunchKey] }) {
+            partLaunch = hit
+        } else {
+            let made = kernel(for: partKey, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("D", headDim),
+                    ("S", pageSize),
+                    ("GQA", gqa),
+                    ("HPT", hpt),
+                    ("NSG", nsg),
+                    ("PTOK", ptok),
+                    ("HAS_SOFTCAP", softcap),
+                ],
+                grid: (kvHeads * splits * tg, b, maxParts),
+                threadGroup: (tg, 1, 1),
+                outputShapes: hasWrite
+                    ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
+                    : [[b, queryHeads, maxParts, headDim], metaShape],
+                outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32])
+            launchLock.withLock { decodePartLaunches[partLaunchKey] = made }
+            partLaunch = made
+        }
+        let partOut = partLaunch(partInputs, stream: stream)
 
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false,
             partitionTokens: ptok)
-        let outputs = kernel(for: mergeKey, source: kernelSource)(
-            [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("PTOK", ptok),
-                ("HAS_SINKS", sinks != nil),
-            ],
-            grid: (queryHeads * 32, b, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[b, queryHeads, headDim]],
-            outputDTypes: [dtype],
-            stream: stream
-        )
+        let mergeLaunchKey = DecodeMergeLaunchKey(
+            key: mergeKey, b: b, queryHeads: queryHeads, headDim: headDim)
+        let mergeLaunch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ decodeMergeLaunches[mergeLaunchKey] }) {
+            mergeLaunch = hit
+        } else {
+            let made = kernel(for: mergeKey, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("D", headDim),
+                    ("PTOK", ptok),
+                    ("HAS_SINKS", sinks != nil),
+                ],
+                grid: (queryHeads * 32, b, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[b, queryHeads, headDim]],
+                outputDTypes: [dtype])
+            launchLock.withLock { decodeMergeLaunches[mergeLaunchKey] = made }
+            mergeLaunch = made
+        }
+        let outputs = mergeLaunch([partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks], stream: stream)
         return (outputs[0], hasWrite ? partOut[2] : nil)
     }
 
@@ -827,21 +874,29 @@ public enum PagedAttentionKernel {
 
         // The write kernel has no PTOK template parameter; 0 keeps its
         // variant identity independent of the decode partition sizing.
-        let key = PagedAttentionKernelKey(
-            pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
-            simdgroups: 0, hasSinks: false, hasSoftcap: false, partitionTokens: 0)
-        let outputs = kernel(for: key, source: kernelSource)(
-            [keys, values, slots, prevFence, kSlab, vSlab],
-            template: [
-                ("T", dtype),
-                ("S", pageSize),
-            ],
-            grid: (headDim, kvHeads, n),
-            threadGroup: (min(headDim, 256), 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.int32],
-            stream: stream
-        )
+        let writeLaunchKey = BulkWriteLaunchKey(
+            dtype: dtype, pageSize: pageSize, headDim: headDim, kvHeads: kvHeads, n: n)
+        let writeLaunch: MLXFast.MLXFastKernel.Launch
+        if let hit = launchLock.withLock({ bulkWriteLaunches[writeLaunchKey] }) {
+            writeLaunch = hit
+        } else {
+            let key = PagedAttentionKernelKey(
+                pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
+                simdgroups: 0, hasSinks: false, hasSoftcap: false, partitionTokens: 0)
+            let made = kernel(for: key, source: kernelSource).prepare(
+                template: [
+                    ("T", dtype),
+                    ("S", pageSize),
+                ],
+                grid: (headDim, kvHeads, n),
+                threadGroup: (min(headDim, 256), 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32])
+            launchLock.withLock { bulkWriteLaunches[writeLaunchKey] = made }
+            writeLaunch = made
+        }
+        let outputs = writeLaunch(
+            [keys, values, slots, prevFence, kSlab, vSlab], stream: stream)
         return outputs[0]
     }
 }
