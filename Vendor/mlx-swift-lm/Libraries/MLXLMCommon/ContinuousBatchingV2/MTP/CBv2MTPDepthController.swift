@@ -664,16 +664,15 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// (`OUT_GATE_MODE=1/2`, fused NVFP4 `gate_up+SiLU`, deep-low NVFP4 `TN=2` & `lm_head TN=2`),
     /// pinning Pair 1 safely under the `5.000x` decode ceiling while giving Pair 2 & Pair 3 100% coverage.
     var isStrictLowVerifyRegime: Bool {
-        (observedRegimeRounds >= Self.deepLowAcceptanceMinRounds
-            && roundAcceptanceFraction < Self.deepLowAcceptanceThreshold)
-            || (inLowAcceptanceRegime
-                && ceilingRounds >= Self.deepLowEarlyCommittedMinRounds
-                && ceilingCommittedTokens * 100
-                    < Self.deepLowEarlyCommittedHundredths * ceilingRounds)
-            || (inLowAcceptanceRegime
-                && ceilingRounds >= Self.deepLowCommittedMinRounds
-                && ceilingCommittedTokens * 100
-                    < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
+        // Committed-per-round lock only: a request must average under 3.60 committed
+        // tokens per round over at least `deepLowCommittedMinRounds` ceiling rounds.
+        // The EWMA and early branches are left to the drafter's deep-low gate, so the
+        // high-acceptance request's transient early dips never reach the verify-only
+        // speedups.
+        inLowAcceptanceRegime
+            && ceilingRounds >= Self.deepLowCommittedMinRounds
+            && ceilingCommittedTokens * 100
+                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
