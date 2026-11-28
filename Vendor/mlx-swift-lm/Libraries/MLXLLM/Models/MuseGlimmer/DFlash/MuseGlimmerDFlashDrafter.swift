@@ -3782,6 +3782,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               int num_nodes = 1;
 
               if (dp_mode != 0) {
+                bool ranked_children = max_branch_len == 2 && cont_decay > 0.0f && cont_decay <= 1.0f;
+                for (int r = 0; r < R_ && ranked_children; ++r) {
+                  for (int c = 0; c < top_k_use; ++c) {
+                    const float p = row_probs[r][c];
+                    if (!metal::isfinite(p) || p < 0.0f || p > 1.0f) { ranked_children = false; }
+                  }
+                }
                 const int max_L = min(K_, R_);
                 const int min_L = min(max_L, (chain_bonus > 0.0f)
                     ? 1 : max(2, K_ - max(0, max_leaves)));
@@ -3810,10 +3817,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   int cur_tok[6];
                   float cur_ev[6];
                   int cur_bs[6];
-                  bool cur_cont[6];
+                  uint cur_children[6];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
-                    int bkind = -1, ba = -1, bb = -1;
+                    int bkind = -1, ba = -1, bb = -1, bc = 0;
                     for (int r = 0; r < leaf_limit; ++r) {
                       const float base_w = surv[r] * leaf_mult[r];
                       for (int c = 1; c < top_k_use; ++c) {
@@ -3831,15 +3838,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     if (max_branch_len > 1 && cont_decay > 0.0f) {
                       for (int j = 0; j < cur_bcnt; ++j) {
                         if (cur_bs[j] >= 1 && cur_bs[j] < max_branch_len
-                            && !cur_cont[j] && cur_dep[j] < R_) {
+                            && (ranked_children || cur_children[j] == 0u) && cur_dep[j] < R_) {
                           const int d = cur_dep[j];
-                          if (row_ids[d][0] < ivocab) {
-                            const float ev = cur_ev[j] * row_probs[d][0] * cont_decay;
-                            if (ev > bev) {
-                              bev = ev;
-                              bkind = 2;
-                              ba = j;
-                              bb = d;
+                          const int ranks = ranked_children ? top_k_use : 1;
+                          for (int c = 0; c < ranks; ++c) {
+                            if ((cur_children[j] & (1u << c)) == 0u && row_ids[d][c] < ivocab) {
+                              const float ev = cur_ev[j] * row_probs[d][c] * cont_decay;
+                              if (ev > bev) {
+                                bev = ev;
+                                bkind = 2;
+                                ba = j;
+                                bb = d;
+                                bc = c;
+                              }
                             }
                           }
                         }
@@ -3853,17 +3864,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                       cur_tok[cur_bcnt] = row_ids[ba][bb];
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = 1;
-                      cur_cont[cur_bcnt] = false;
+                      cur_children[cur_bcnt] = 0u;
                       cur_bcnt += 1;
                     } else if (bkind == 2 && bev > 0.0f) {
-                      cur_cont[ba] = true;
+                      cur_children[ba] |= 1u << bc;
                       total += bev;
                       cur_par[cur_bcnt] = L + 1 + ba;
                       cur_dep[cur_bcnt] = bb + 1;
-                      cur_tok[cur_bcnt] = row_ids[bb][0];
+                      cur_tok[cur_bcnt] = row_ids[bb][bc];
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = cur_bs[ba] + 1;
-                      cur_cont[cur_bcnt] = false;
+                      cur_children[cur_bcnt] = 0u;
                       cur_bcnt += 1;
                     } else {
                       break;
