@@ -676,6 +676,17 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                     < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
     }
 
+    /// Clause-3-only strict low-acceptance gate (`inLowAcceptanceRegime && rounds >= 6
+    /// && avg < 3.60`) for Wave 17+ target-verify speedups: guarantees zero early-dip
+    /// leakage onto high-acceptance Pair 1 (keeping Pair 1 locked at ~4.966x) while
+    /// giving sustained low-acceptance Pair 2 & Pair 3 full coverage.
+    var isStrictLowVerifyC3Regime: Bool {
+        inLowAcceptanceRegime
+            && ceilingRounds >= Self.deepLowCommittedMinRounds
+            && ceilingCommittedTokens * 100
+                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
+    }
+
     /// Acceptance ceiling: a per-request rate limiter on committed tokens
     /// per speculative round. The request's own running totals (rounds that
     /// drafted, tokens those rounds committed) bound the next round's draft

@@ -473,6 +473,7 @@ public enum VerifyFusedNorms {
         var launches: [NormLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var singleLaunches: [SingleNormLaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var elemLaunches: [ElemFP8LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var siluProdLaunches: [ShapeKey: MLXFast.MLXFastKernel.Launch] = [:]
     }
 
     private static let cacheLock = OSAllocatedUnfairLock(initialState: NormCacheBox())
@@ -563,6 +564,56 @@ public enum VerifyFusedNorms {
 
     public static let fusedElementwiseFP8Enabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_ELEM_FP8"] != "0"
+    public static let fusedSiluProdEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FUSED_SILU_PROD"] != "0"
+
+    private static let siluProdKernel = MLXFast.metalKernel(
+        name: "verify_fused_silu_prod",
+        inputNames: ["a", "b"],
+        outputNames: ["y"],
+        source: """
+            const uint idx4 = thread_position_in_grid.x;
+            const uint n4 = uint(N4_);
+            if (idx4 >= n4) { return; }
+            const device vec<bfloat16_t, 4>* a4 = (const device vec<bfloat16_t, 4>*)a;
+            const device vec<bfloat16_t, 4>* b4 = (const device vec<bfloat16_t, 4>*)b;
+            device vec<bfloat16_t, 4>* y4 = (device vec<bfloat16_t, 4>*)y;
+            const vec<bfloat16_t, 4> av = a4[idx4];
+            const vec<bfloat16_t, 4> bv = b4[idx4];
+            vec<bfloat16_t, 4> out;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const bfloat16_t g = av[k];
+              out[k] = (g * verify_bf16_sigmoid(g)) * bv[k];
+            }
+            y4[idx4] = out;
+            """,
+        header: ModelOptActivationKernels.header + elemFP8Header,
+        ensureRowContiguous: true)
+
+    /// Direct cached `vec<bfloat16_t, 4>` `silu(gate) * up` (0-ULP to `compiledSiluProduct`).
+    public static func fusedSiluProduct(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard fusedSiluProdEnabled,
+            gate.dtype == .bfloat16, up.dtype == .bfloat16,
+            gate.size == up.size, gate.size > 0, gate.size % 4 == 0
+        else { return nil }
+        let n4 = gate.size / 4
+        let key = ShapeKey(gate.shape)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = cacheLock.withLockUnchecked({ $0.siluProdLaunches[key] }) {
+            launch = hit
+        } else {
+            let tg = min(256, max(32, ((n4 + 31) / 32) * 32))
+            let gridX = ((n4 + tg - 1) / tg) * tg
+            let made = siluProdKernel.prepare(
+                template: [("N4_", n4)],
+                grid: (gridX, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [gate.shape], outputDTypes: [.bfloat16])
+            cacheLock.withLockUnchecked { $0.siluProdLaunches[key] = made }
+            launch = made
+        }
+        return launch([gate, up])[0]
+    }
 
     private static let elemFP8Header = """
         inline bfloat16_t verify_bf16_sigmoid(bfloat16_t x) {
