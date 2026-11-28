@@ -1318,6 +1318,361 @@ inline void paged_attention_onepass_impl_rec(
     }
 }
 
+inline int valid_row_own(const device int32_t* seqinfo, int b, int nrows, int ptok) {
+    return b < nrows ? (seqinfo[b * 8 + 1] + ptok - 1) / ptok : 0;
+}
+
+template <int EPT>
+inline void mr_step(
+    thread const float* qv, thread float& m, thread float& l, thread float* acc,
+    thread const float* kf, thread const float* vf, const bool has_softcap,
+    const float softcap
+) {
+    float partial = 0.0f;
+#pragma unroll
+    for (int e = 0; e < EPT; e++) {
+        partial += qv[e] * kf[e];
+    }
+    float qk = simd_sum(partial);
+    if (has_softcap) {
+        qk = softcap * precise::tanh(qk / softcap);
+    }
+    qk *= M_LOG2E_F;
+
+    const float m_new = max(m, qk);
+    const float corr = exp2(m - m_new);
+    const float p = exp2(qk - m_new);
+    l = l * corr + p;
+#pragma unroll
+    for (int e = 0; e < EPT; e++) {
+        acc[e] = acc[e] * corr + p * vf[e];
+    }
+    m = m_new;
+}
+
+template <
+    typename T, int D, int S, int GQA, int HPT, int R, int NSG, int PTOK, int MAXPART,
+    int WAVE, bool HAS_SOFTCAP, typename Cache, int BLOCK = 4, bool DYN_TREE = false,
+    int OUT_GATE_MODE = 0>
+inline void paged_attention_onepass_impl_mr(
+    const device T* q,
+    thread const Cache& cache0,
+    const device int32_t* records,
+    const int rec_stride,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int nrows,
+    threadgroup float* red_smem,
+    device T* out,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane,
+    const device int32_t* tree_meta = nullptr,
+    const device T* out_gate = nullptr,
+    const float fp8_m0 = 0.0f,
+    const float fp8_m1 = 0.0f,
+    const float fp8_bound = 0.0f
+) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    static_assert((R * HPT) % WAVE == 0, "WAVE must divide R * HPT");
+    static_assert(D == 128 && BLOCK > 1, "multi-row kernel serves D=128 with blocked loads");
+    constexpr int SPLITS = GQA / HPT;
+    constexpr int EPT = D / 32;
+    constexpr int RSTRIDE = D + 2;
+    constexpr int RH = R * HPT;
+
+    const int kv_head = tgpig.x / SPLITS;
+    const int hgroup = tgpig.x % SPLITS;
+    const int part = (int)sgitg / NSG;
+    const int state = (int)sgitg % NSG;
+    const int row0 = (int)tgpig.y * R;
+
+    int starts[R];
+    int lens[R];
+    int bases[R];
+    uint ancs[R];
+    int parts_r[R];
+    bool valid[R];
+    const device int32_t* recs[R];
+    int rec_first = 0;
+    for (int r = 0; r < row0; r++) {
+        rec_first += (seqinfo[r * 8 + 1] + PTOK - 1) / PTOK;
+    }
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        const int b = row0 + j;
+        {
+            const int own = valid_row_own(seqinfo, b, nrows, PTOK);
+            recs[j] = records + (rec_first + min(part, max(own, 1) - 1)) * rec_stride;
+            rec_first += own;
+        }
+        valid[j] = b < nrows;
+        const device int32_t* info = seqinfo + (valid[j] ? b : row0) * 8;
+        int attend_start = info[0];
+        int attend_len = valid[j] ? info[1] : 0;
+        int tree_base = 0;
+        uint tree_anc = 0u;
+        if constexpr (DYN_TREE) {
+            if (valid[j]) {
+                tree_base = info[6];
+                const int depth = tree_meta[9 + b];
+                const int q_pos = tree_base + depth;
+                const int win = info[7];
+                if (win > 0) {
+                    attend_start = max(attend_start, q_pos - win + 1);
+                }
+                attend_len = q_pos - attend_start + 1;
+                tree_anc = uint(tree_meta[1 + b]);
+            }
+        }
+        starts[j] = attend_start;
+        lens[j] = attend_len;
+        bases[j] = tree_base;
+        ancs[j] = tree_anc;
+        parts_r[j] = (attend_len + PTOK - 1) / PTOK;
+    }
+    const int lo = part * PTOK;
+    int his[R];
+    int chi = INT_MAX;
+    bool uniform = true;
+    int share_limit = INT_MAX;
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        his[j] = min(lens[j], lo + PTOK);
+        if (valid[j]) {
+            chi = min(chi, his[j]);
+            uniform = uniform && starts[j] == starts[0] && bases[j] == bases[0];
+        }
+    }
+    if constexpr (DYN_TREE) {
+        share_limit = bases[0] - starts[0];
+    }
+    const int shared_end = uniform ? max(lo, min(chi, share_limit)) : lo;
+
+    const float softcap = params[0];
+    const float scale = params[1];
+    const int q_head0 = kv_head * GQA + hgroup * HPT;
+    const int64_t qr = (int64_t)(kvh * GQA) * D;
+
+    float qv[RH][EPT];
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+#pragma unroll
+        for (int g = 0; g < HPT; g++) {
+            const device T* qrow =
+                q + (int64_t)(valid[j] ? row0 + j : row0) * qr + (int64_t)(q_head0 + g) * D
+                + lane * EPT;
+            const vec<T, 4> q4 = *reinterpret_cast<const device vec<T, 4>*>(qrow);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                qv[j * HPT + g][e] = float(q4[e]) * scale;
+            }
+        }
+    }
+    float m[RH];
+    float l[RH];
+    float acc[RH][EPT];
+#pragma unroll
+    for (int h = 0; h < RH; h++) {
+        m[h] = -FLT_MAX;
+        l[h] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            acc[h][e] = 0.0f;
+        }
+    }
+
+    float kf[EPT];
+    float vf[EPT];
+    const int first = lo + state;
+    if (first < shared_end) {
+        const int count = (shared_end - first + NSG - 1) / NSG;
+        int cur_lpage = -1;
+        const device T* cur_key = nullptr;
+        const device T* cur_value = nullptr;
+        Cache cache = cache0;
+        cache.record = recs[0];
+        for (int j0 = 0; j0 < count; j0 += BLOCK) {
+            vec<T, 4> kr[BLOCK];
+            vec<T, 4> vr[BLOCK];
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+                    const uint upos = uint(starts[0] + first + (j0 + u) * NSG);
+                    const int lpage = int(upos / uint(S));
+                    const uint slot = upos % uint(S);
+                    if (lpage != cur_lpage) {
+                        const auto page = cache.read_page(nullptr, lpage, 0);
+                        cur_key = page.key;
+                        cur_value = page.value;
+                        cur_lpage = lpage;
+                    }
+                    const size_t base = ((size_t)kv_head * S + (size_t)slot) * D + lane * EPT;
+                    kr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_key + base);
+                    vr[u] = *reinterpret_cast<const device vec<T, 4>*>(cur_value + base);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < BLOCK; u++) {
+                if (j0 + u < count) {
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        kf[e] = float(kr[u][e]);
+                        vf[e] = float(vr[u][e]);
+                    }
+#pragma unroll
+                    for (int h = 0; h < RH; h++) {
+                        mr_step<EPT>(qv[h], m[h], l[h], acc[h], kf, vf, HAS_SOFTCAP, softcap);
+                    }
+                }
+            }
+        }
+    }
+    int tail_first = first;
+    if (first < shared_end) {
+        tail_first = first + ((shared_end - first + NSG - 1) / NSG) * NSG;
+    }
+    int max_hi = lo;
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        if (valid[j]) max_hi = max(max_hi, his[j]);
+    }
+    for (int i = tail_first; i < max_hi; i += NSG) {
+#pragma unroll
+        for (int j = 0; j < R; j++) {
+            if (valid[j] && i < his[j]) {
+                const int raw_pos = starts[j] + i;
+                const uint upos = uint(DYN_TREE
+                    ? ((ancs[j] != 0u && raw_pos >= bases[j])
+                        ? (bases[j] + int((ancs[j] >> ((raw_pos - bases[j]) * 4)) & 0xFu))
+                        : raw_pos)
+                    : raw_pos);
+                const int lpage = int(upos / uint(S));
+                const uint slot = upos % uint(S);
+                Cache cache = cache0;
+                cache.record = recs[j];
+                const auto page = cache.read_page(nullptr, lpage, 0);
+                const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+                page.template load<EPT>(base, lane, kf, vf);
+#pragma unroll
+                for (int g = 0; g < HPT; g++) {
+                    mr_step<EPT>(
+                        qv[j * HPT + g], m[j * HPT + g], l[j * HPT + g], acc[j * HPT + g], kf, vf,
+                        HAS_SOFTCAP, softcap);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int w = 0; w < RH / WAVE; w++) {
+        threadgroup float* mine = red_smem + (size_t)(sgitg * WAVE) * RSTRIDE;
+#pragma unroll
+        for (int g = 0; g < WAVE; g++) {
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                mine[g * RSTRIDE + lane * EPT + e] = acc[w * WAVE + g][e];
+            }
+            if (lane == 0) {
+                mine[g * RSTRIDE + D] = m[w * WAVE + g];
+                mine[g * RSTRIDE + D + 1] = l[w * WAVE + g];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float* red = red_smem + (size_t)(part * NSG * WAVE) * RSTRIDE;
+        for (int g = state; g < WAVE; g += NSG) {
+            const int rj = (w * WAVE + g) / HPT;
+            if (part < parts_r[rj] && valid[rj]) {
+                float pm = -FLT_MAX;
+                for (int s = 0; s < NSG; s++) {
+                    pm = max(pm, red[(size_t)(s * WAVE + g) * RSTRIDE + D]);
+                }
+                float w_s[NSG];
+                float pl = 0.0f;
+                for (int s = 0; s < NSG; s++) {
+                    const float ms = red[(size_t)(s * WAVE + g) * RSTRIDE + D];
+                    const float ls = red[(size_t)(s * WAVE + g) * RSTRIDE + D + 1];
+                    w_s[s] = exp2(ms - pm);
+                    pl += ls * w_s[s];
+                }
+                float p_out[EPT];
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    const int col = int(lane) + e * 32;
+                    float v = 0.0f;
+                    for (int s = 0; s < NSG; s++) {
+                        v += red[(size_t)(s * WAVE + g) * RSTRIDE + col] * w_s[s];
+                    }
+                    p_out[e] = v;
+                }
+                threadgroup float* prow = red + (size_t)g * RSTRIDE;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    prow[int(lane) + e * 32] = p_out[e];
+                }
+                if (lane == 0) {
+                    prow[D] = pm;
+                    prow[D + 1] = pl;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0) {
+            for (int g = state; g < WAVE; g += NSG) {
+                const int rh = w * WAVE + g;
+                const int rj = rh / HPT;
+                if (valid[rj]) {
+                    const int parts = parts_r[rj];
+                    float gm = -FLT_MAX;
+                    for (int p = 0; p < parts; p++) {
+                        gm = max(gm, red_smem[(size_t)(p * NSG * WAVE + g) * RSTRIDE + D]);
+                    }
+                    float gl = 0.0f;
+                    float gacc[EPT];
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        gacc[e] = 0.0f;
+                    }
+                    for (int p = 0; p < parts; p++) {
+                        const threadgroup float* pp =
+                            red_smem + (size_t)(p * NSG * WAVE + g) * RSTRIDE;
+                        const float ms = pp[D];
+                        const float ls = pp[D + 1];
+                        const float wt = exp2(ms - gm);
+                        gl += ls * wt;
+#pragma unroll
+                        for (int e = 0; e < EPT; e++) {
+                            gacc[e] += pp[lane * EPT + e] * wt;
+                        }
+                    }
+                    const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+                    const size_t ooff = ((size_t)(row0 + rj) * (size_t)(kvh * GQA)
+                                         + (size_t)(q_head0 + (rh % HPT))) * D;
+                    device T* orow = out + ooff;
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        T oval = T(gacc[e] * inv);
+                        if constexpr (OUT_GATE_MODE >= 1) {
+                            if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                                oval = oval * cbv2_bf16_sigmoid(out_gate[ooff + lane * EPT + e]);
+                                if constexpr (OUT_GATE_MODE == 2) {
+                                    oval = cbv2_bf16_cast_fp8(oval, fp8_m0, fp8_m1, fp8_bound);
+                                }
+                            }
+                        }
+                        orow[lane * EPT + e] = oval;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Bulk in-place KV write (prefill chunks, prefix adoption): scatter an
 // [KVH, N, D] tile into the slabs at host-computed physical slots
 // (page * S + slot per token). Emits a chained fence value so gathers of

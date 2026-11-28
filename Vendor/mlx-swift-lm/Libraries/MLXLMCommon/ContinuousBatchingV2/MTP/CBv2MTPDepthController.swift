@@ -721,7 +721,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         ProcessInfo.processInfo.environment["CBV2_FAST_REGIME"] != "0"
     static let ceilingBurstTokens = 27
     static let ceilingEnabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_MTP_ACCEPTANCE_CEILING"] == "1"
 
     /// Records one finalized speculative round for the acceptance ceiling.
     mutating func observeCommitted(draftedDepth: Int, committedTokens: Int) {
