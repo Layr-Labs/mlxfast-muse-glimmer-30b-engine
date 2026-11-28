@@ -610,6 +610,18 @@ extension MuseGlimmerTextModel {
         _ mlp: MuseGlimmerTextMLP, _ x: MLXArray, preCastFP8: Bool = false
     ) -> MLXArray {
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        if lowVerify, !preCastFP8, let rows = verifyRows(x),
+            mlp.downProj is ModelOptWeightOnlyNVFP4Linear,
+            let activated = CBv2VerifyNVFP4.fusedGateUpSilu(mlp.gateProj, mlp.upProj, x)
+        {
+            if MuseGlimmerVerifyProjections.selfTest {
+                let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x)
+                let reference = compiledSiluProduct(gu[0], gu[1])
+                MuseGlimmerVerifyProjections.requireEqualBits(
+                    [activated], [reference], kind: "nvfp4.gate_up_silu", rows: rows)
+            }
+            return verifyDownProjection(mlp.downProj, activated)
+        }
         let gu = verifyFeedInputProjections([mlp.gateProj, mlp.upProj], x, preCastFP8: preCastFP8)
         if lowVerify, let rows = verifyRows(gu[0]),
             let fp8 = mlp.downProj as? ModelOptCalibratedLinear,
@@ -1088,6 +1100,11 @@ extension MuseGlimmerTextModel {
                             }
                         case "gate_up":
                             outputs += verifyFeedInputProjections(group, x)
+                            if lowAcc, !strictMode,
+                                let activated = CBv2VerifyNVFP4.fusedGateUpSilu(group[0], group[1], x)
+                            {
+                                outputs.append(activated)
+                            }
                             if lowAcc, let fp8 = group as? [ModelOptCalibratedLinear],
                                 let pre = CBv2SmallProjection.fp8ProductsPreCast(fp8, preCast: x)
                             {

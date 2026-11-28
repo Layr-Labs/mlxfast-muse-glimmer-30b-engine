@@ -88,20 +88,34 @@ public enum CBv2VerifyNVFP4 {
             return as_type<half2>(u) * half2(256.0h);
         }
 
-        // One tile of 8 * TN outputs of one projection: the stock matrix
-        // kernel's arithmetic (see CBv2VerifyNVFP4).
-        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV>
+        // The same BF16 rounding steps as MLX's Sigmoid and two Multiply ops.
+        template <typename T>
+        inline T cbv2_vn_silu_product(T gate, T up) {
+            const T magnitude = static_cast<T>(metal::abs(static_cast<float>(gate)));
+            const T exponential =
+                static_cast<T>(metal::precise::exp(static_cast<float>(magnitude)));
+            const auto lower = 1 / (1 + exponential);
+            const T sigmoid = gate < 0 ? lower : 1 - lower;
+            const T silu = gate * sigmoid;
+            return silu * up;
+        }
+
+        // Fused gate/up uses both fragments for the same output columns.
+        template <typename T, int V, int K, int N, int TN, int PF, bool SCALED, bool WC, bool SV,
+                  bool FUSED_SILU = false>
         inline void cbv2_vn_tile(
             const device uint32_t* w, const device uint8_t* scales, const device T* x,
             float tensor_scale0, device T* y, int tile, uint simd_gid, uint simd_lid,
-            threadgroup float* partials) {
+            threadgroup float* partials, const device uint32_t* up_weights = nullptr,
+            const device uint8_t* up_scales = nullptr, float up_tensor_scale = 0.0f) {
             constexpr int WK = 8;
             constexpr int BK = 128;
             constexpr short TM = (V + 7) / 8;
-            constexpr int ROWS = 8 * TN;
+            constexpr int ROWS = FUSED_SILU ? 8 : 8 * TN;
             constexpr int row_bytes = K / 2;
             constexpr int row_scales = K / 16;
             static_assert(K % BK == 0, "whole chunks only");
+            static_assert(!FUSED_SILU || (TN == 2 && SCALED), "fused gate/up needs two scaled fragments");
             const uint sg = simd_gid;
             const short qid = simd_lid / 4;
             const short fm = (qid & 4) + ((simd_lid / 2) % 4);
@@ -126,10 +140,12 @@ public enum CBv2VerifyNVFP4 {
             const device uint8_t* sl[TN];
             MO_WO_UNROLL
             for (short t = 0; t < TN; t++) {
-                const int row = min(y_col + fm + 8 * t, N - 1);
+                const int row = min(y_col + fm + (FUSED_SILU ? 0 : 8 * t), N - 1);
+                const device uint32_t* weights = FUSED_SILU && t == 1 ? up_weights : w;
+                const device uint8_t* block_scales = FUSED_SILU && t == 1 ? up_scales : scales;
                 wl[t] = (const device uint*)(
-                    (const device uint8_t*)w + size_t(row) * row_bytes + 2 * fn);
-                sl[t] = scales + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
+                    (const device uint8_t*)weights + size_t(row) * row_bytes + 2 * fn);
+                sl[t] = block_scales + size_t(row) * row_scales + (SV ? 0 : (fn / 4));
             }
 
             if constexpr (WC && PF == 0) {
@@ -389,11 +405,20 @@ public enum CBv2VerifyNVFP4 {
                     for (short j = 0; j < 2; j++) {
                         if (8 * mt + fn + j < V) {
                             device T* yr = y + size_t(8 * mt + fn + j) * N;
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                const int out = y_col + fm + 8 * t;
+                            if constexpr (FUSED_SILU) {
+                                const int out = y_col + fm;
                                 if (out < N) {
-                                    yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    const T gate = mo_wo_result<T>(C[0][mt][j], true, tensor_scale0);
+                                    const T up = mo_wo_result<T>(C[1][mt][j], true, up_tensor_scale);
+                                    yr[out] = cbv2_vn_silu_product(gate, up);
+                                }
+                            } else {
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const int out = y_col + fm + 8 * t;
+                                    if (out < N) {
+                                        yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    }
                                 }
                             }
                         }
@@ -440,8 +465,23 @@ public enum CBv2VerifyNVFP4 {
         1: kernel(segments: 1), 2: kernel(segments: 2), 4: kernel(segments: 4),
     ]
 
+    private static let fusedGateUpKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_gate_up_silu",
+        inputNames: ["w", "sc", "ts", "wu", "scu", "tsu", "x"],
+        outputNames: ["y"],
+        source: """
+            constexpr int TILE_ELEMS = TN * ((V + 7) / 8) * 2;
+            threadgroup float partials[7 * TILE_ELEMS * 32];
+            cbv2_vn_tile<T, V, K, N0, TN, PF, SCALED, WC, SV, true>(
+                w, sc, x, ts[0], y, int(threadgroup_position_in_grid.y),
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup,
+                partials, wu, scu, tsu[0]);
+            """,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + tileHelper)
+
     private struct LaunchKey: Hashable {
         let segments: Int
+        let fusedSilu: Bool
         let dtype: DType
         let rows: Int
         let inputs: Int
@@ -481,14 +521,15 @@ public enum CBv2VerifyNVFP4 {
 
     private static func preparedLaunch(
         segments: Int, dtype: DType, rows: Int, inputs: Int, fragments: Int, prefetch: Int,
-        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int]
+        scaled: Bool, wholeChunk: Bool, scaleVec: Bool, outputs: [Int],
+        fusedSilu: Bool = false
     ) -> MLXFast.MLXFastKernel.Launch {
         let key = LaunchKey(
-            segments: segments, dtype: dtype, rows: rows, inputs: inputs, fragments: fragments,
-            prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk, scaleVec: scaleVec,
-            outputs: outputs)
+            segments: segments, fusedSilu: fusedSilu, dtype: dtype, rows: rows, inputs: inputs,
+            fragments: fragments, prefetch: prefetch, scaled: scaled, wholeChunk: wholeChunk,
+            scaleVec: scaleVec, outputs: outputs)
         if let hit = cacheLock.withLockUnchecked({ $0.launches[key] }) { return hit }
-        let tile = 8 * fragments
+        let tile = fusedSilu ? 8 : 8 * fragments
         var template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("V", rows), ("K", inputs), ("TN", fragments), ("PF", prefetch),
             ("SCALED", scaled), ("WC", wholeChunk), ("SV", scaleVec),
@@ -501,7 +542,8 @@ public enum CBv2VerifyNVFP4 {
             shapes.append([rows, n])
             tiles += (n + tile - 1) / tile
         }
-        let made = kernels[segments]!.prepare(
+        let kernel = fusedSilu ? fusedGateUpKernel : kernels[segments]!
+        let made = kernel.prepare(
             template: template,
             grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
             outputShapes: shapes, outputDTypes: Array(repeating: dtype, count: outputs.count))
@@ -673,6 +715,41 @@ public enum CBv2VerifyNVFP4 {
         }
         let lead = Array(x.shape.dropLast())
         return zip(results, outputDims).map { $0.reshaped(lead + [$1]) }
+    }
+
+    /// Stores only the SiLU product of a pair of NVFP4 projections.
+    public static func fusedGateUpSilu(
+        _ gate: any UnaryLayer, _ up: any UnaryLayer, _ x: MLXArray
+    ) -> MLXArray? {
+        guard geometryOverride == nil,
+            let gate = gate as? ModelOptWeightOnlyNVFP4Linear,
+            let up = up as? ModelOptWeightOnlyNVFP4Linear
+        else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0 else { return nil }
+        let rows = x.size / inputs
+        let outputs = gate.outputDimensions
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            up.outputDimensions == outputs,
+            takes(
+                weight: gate.weight, blockScales: gate.weightScale,
+                tensorScale: gate.weightScale2, inputs: inputs),
+            takes(
+                weight: up.weight, blockScales: up.weightScale,
+                tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+        let s = schedule(rows: rows, inputs: inputs, lowVerify: true)
+        let launch = preparedLaunch(
+            segments: 2, dtype: x.dtype, rows: rows, inputs: inputs, fragments: 2,
+            prefetch: s.prefetch, scaled: true, wholeChunk: s.wholeChunk,
+            scaleVec: s.scaleVec, outputs: [outputs], fusedSilu: true)
+        let result = launch([
+            gate.weight, gate.weightScale, gate.weightScale2,
+            up.weight, up.weightScale, up.weightScale2,
+            x.reshaped(rows, inputs),
+        ])[0]
+        return result.reshaped(Array(x.shape.dropLast()) + [outputs])
     }
 
     /// Compiles the kernels for rows 1 to 8 of these MLP layers (gate and up
