@@ -23,6 +23,8 @@ import os
 ///   `uint2` scale load (`SV`);
 /// - `PF 1`: rolling register buffer prefetching the next chunk's weight words
 ///   and packed scales for long 19,968-input rows;
+/// - `PF 2`: branchless peeled next-chunk prefetch; `PF 3`: the same with lean
+///   addressing (hoisted, pointer-bumped streams; identical loads and MMAs);
 /// - activations are kept as their raw bf16 bits until each MMA converts them.
 /// Rows past V repeat row V - 1, as in the stock kernel; their columns are
 /// never stored. Groups of sibling projections (MLP gate and up; attention
@@ -45,6 +47,9 @@ public enum CBv2VerifyNVFP4 {
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
     private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
     private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
+    /// Peeled prefetch defaults to PF 3 (PF 2 with lean addressing, bit-identical);
+    /// `CBV2_NVFP4_LEAN=0` restores PF 2. Explicit PF pins stay literal.
+    private static let leanEnv: Bool = env["CBV2_NVFP4_LEAN"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
@@ -75,7 +80,7 @@ public enum CBv2VerifyNVFP4 {
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
             // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
             if strictC3 && rows >= 7 && downTN1Env && wc {
-                let defaultPF = peeledPFEnv ? 2 : 0
+                let defaultPF = peeledPFEnv ? (leanEnv ? 3 : 2) : 0
                 let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
                 return (1, pf, wc, sv)
             }
@@ -89,7 +94,7 @@ public enum CBv2VerifyNVFP4 {
         // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
         // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
         // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
-        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? (leanEnv ? 3 : 2) : 0
         let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
@@ -299,6 +304,166 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short j = 0; j < 2; j++) {
                                     xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(qb[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (WC && PF == 3) {
+                // PF 2 with lean addressing: the same loads (addresses, types, order) and
+                // the same MMAs in the same order. Each stream's base moves to this
+                // simdgroup's first chunk once, then is bumped by its constant per-step
+                // stride (x 1024 elements, weights 128 words, scales 64 bytes); blocks
+                // and the next chunk are compile-time offsets. No per-iteration divides,
+                // multiplies or signed index arithmetic.
+                constexpr uint STEP = WK * BK;
+                constexpr uint W_STEP = STEP / 8;
+                constexpr uint S_STEP = STEP / 16;
+                const uint k0 = sg * uint(BK);
+                if (k0 < uint(K)) {
+                    const device uint* wp[TN];
+                    const device uint8_t* sp[TN];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        wp[t] = wl[t] + (k0 / 8u);
+                        sp[t] = sl[t] + (k0 / 16u);
+                    }
+                    const device T* xp[TM][2];
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) { xp[mt][j] = xr[mt][j] + k0; }
+                    }
+                    uint qb[4][TN];
+                    uint2 sb[TN];
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qb[block][t] = wp[t][4 * block]; }
+                    }
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            sb[t] = *(const device uint2*)(sp[t]);
+                        } else {
+                            sb[t] = uint2(
+                                uint(sp[t][0]) | (uint(sp[t][2]) << 16),
+                                uint(sp[t][4]) | (uint(sp[t][6]) << 16));
+                        }
+                    }
+                    for (uint k = k0; k + STEP < uint(K); k += STEP) {
+                        uint q[4][TN];
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                q[block][t] = qb[block][t];
+                                qb[block][t] = wp[t][W_STEP + 4 * block];
+                            }
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xp[mt][j] + 32 * block);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                                sb[t] = *(const device uint2*)(sp[t] + S_STEP);
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                                sb[t] = uint2(
+                                    uint(sp[t][S_STEP]) | (uint(sp[t][S_STEP + 2]) << 16),
+                                    uint(sp[t][S_STEP + 4]) | (uint(sp[t][S_STEP + 6]) << 16));
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
+                                }
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            wp[t] += W_STEP;
+                            sp[t] += S_STEP;
+                        }
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) { xp[mt][j] += STEP; }
+                        }
+                    }
+                    // Final peeled chunk (no next-chunk load).
+                    {
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xp[mt][j] + 32 * block);
                                 }
                             }
                         }
