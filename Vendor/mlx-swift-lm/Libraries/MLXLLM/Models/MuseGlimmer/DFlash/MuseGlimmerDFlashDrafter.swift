@@ -518,9 +518,6 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         nvWarm += [hMid, downOut]
                     }
                     eval(nvWarm)
-                    // Warm strided-ring SDPA on deep-low NVFP4 path for both 32-aligned and unaligned ctxLen,
-                    // covering BOTH unmasked and Boolean-masked contiguous-Q (`boolmask_qnt`) used by live
-                    // `speculateOutcomeBlock` so no SDPA Metal PSO compiles during timed decode.
                     for ctxLen in [520, 528] {
                         let tmpCtx = FastInPlaceContext(
                             configuration: c, dtype: .bfloat16, inPlaceRing: true)
@@ -2721,6 +2718,140 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         model.update(modules: updates)
     }
 
+    private static let devNVFP4ScaleFitEnabled =
+        (ProcessInfo.processInfo.environment["CBV2_DRAFTER_DEV_NVFP4_SCALE_FIT"] ?? "1") == "1"
+
+    private static let nvfp4ScaleFitKernel = MLXFast.metalKernel(
+        name: "dflash_nvfp4_scale_fit",
+        inputNames: ["dense", "stockWords", "stockScales"],
+        outputNames: ["words", "scales"],
+        source: """
+            const uint index = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = index / 16u;
+            const uint word = index / 8u;
+            const uint shift = (index & 7u) * 4u;
+            const uint baseline = stockScales[group];
+            const uint original = (stockWords[word] >> shift) & 15u;
+            const uint bits = as_type<ushort>(dense[index]);
+            const uint absBits = bits & 0x7fffu;
+            const float x = float(dense[index]);
+            const float magnitude = metal::abs(x);
+
+            const uint firstAbsBits = simd_shuffle(absBits, ushort(lane & 16u));
+            const bool varied = dflash_scale_fit_or16(uint(absBits != firstAbsBits)) != 0u;
+            // 2688 is the largest finite E4M3 scale times the largest E2M1 value.
+            if (baseline == 0u || baseline > 126u || !varied
+                || dflash_scale_fit_or16(uint(absBits >= 0x7f80u || magnitude > 2688.0f))) {
+                if ((index & 7u) == 0u) { words[word] = stockWords[word]; }
+                if ((index & 15u) == 0u) { scales[group] = uchar(baseline); }
+                return;
+            }
+
+            const float oldMagnitude = dflash_scale_fit_e4m3(baseline)
+                * dflash_scale_fit_e2m1[original & 7u];
+            const float oldDelta = x - ((original & 8u) ? -oldMagnitude : oldMagnitude);
+            const float oldError = dflash_scale_fit_sum16(oldDelta * oldDelta);
+            const uint sign = (bits >> 12) & 8u;
+            uint bestCode = original;
+            uint bestScale = baseline;
+            float bestError = oldError;
+            const int offsets[4] = {-1, 1, -2, 2};
+            #pragma unroll
+            for (uint j = 0; j < 4; ++j) {
+                const int neighbor = int(baseline) + offsets[j];
+                if (neighbor < 1 || neighbor > 126) { continue; }
+                const uint candidate = uint(neighbor);
+                const float s = dflash_scale_fit_e4m3(candidate);
+                // Midpoints choose the even magnitude code, as in fp4_e2m1.
+                uint code = 7u;
+                if (magnitude <= 0.25f * s) { code = 0u; }
+                else if (magnitude < 0.75f * s) { code = 1u; }
+                else if (magnitude <= 1.25f * s) { code = 2u; }
+                else if (magnitude < 1.75f * s) { code = 3u; }
+                else if (magnitude <= 2.5f * s) { code = 4u; }
+                else if (magnitude < 3.5f * s) { code = 5u; }
+                else if (magnitude <= 5.0f * s) { code = 6u; }
+                const float delta = magnitude - s * dflash_scale_fit_e2m1[code];
+                const float error = dflash_scale_fit_sum16(delta * delta);
+                if (error < bestError) {
+                    bestError = error;
+                    bestCode = code | sign;
+                    bestScale = candidate;
+                }
+            }
+
+            // Keep the stock bytes on ties and within the FP32 reduction error bound.
+            if (bestError >= oldError * (1.0f - 0x1p-18f)) {
+                bestCode = original;
+                bestScale = baseline;
+            }
+            uint packed = bestCode << shift;
+            packed |= simd_shuffle_xor(packed, 1);
+            packed |= simd_shuffle_xor(packed, 2);
+            packed |= simd_shuffle_xor(packed, 4);
+            if ((index & 7u) == 0u) { words[word] = packed; }
+            if ((index & 15u) == 0u) { scales[group] = uchar(bestScale); }
+            """,
+        header: """
+            constant float dflash_scale_fit_e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+            inline float dflash_scale_fit_e4m3(uint code) {
+                const uint exponent = code >> 3;
+                const uint mantissa = code & 7u;
+                return exponent == 0u ? float(mantissa) * 0x1p-9f
+                    : as_type<float>(((exponent + 120u) << 23) | (mantissa << 20));
+            }
+
+            inline float dflash_scale_fit_sum16(float value) {
+                value += simd_shuffle_xor(value, 8);
+                value += simd_shuffle_xor(value, 4);
+                value += simd_shuffle_xor(value, 2);
+                return value + simd_shuffle_xor(value, 1);
+            }
+
+            inline uint dflash_scale_fit_or16(uint value) {
+                value |= simd_shuffle_xor(value, 8);
+                value |= simd_shuffle_xor(value, 4);
+                value |= simd_shuffle_xor(value, 2);
+                return value | simd_shuffle_xor(value, 1);
+            }
+            """,
+        ensureRowContiguous: true)
+
+    private static func fitNVFP4Scales(_ w: MLXArray, scale: Float) -> QuantizedLinear? {
+        guard w.dtype == .bfloat16,
+            w.shape == [39936, 6656] || w.shape == [6656, 19968]
+        else { return nil }
+        let rows = w.dim(0)
+        let columns = w.dim(1)
+        let tileRows = 4_194_304 / columns
+        var words: [MLXArray] = []
+        var scales: [MLXArray] = []
+
+        for start in stride(from: 0, to: rows, by: tileRows) {
+            let end = min(start + tileRows, rows)
+            let tile = w[start ..< end]
+            let scaled = (scale == 1.0) ? tile : (tile.asType(.float32) * scale).asType(.bfloat16)
+            let stock = MLX.quantized(scaled, groupSize: 16, bits: 4, mode: .nvfp4)
+            let fit = nvfp4ScaleFitKernel.prepare(
+                template: [], grid: (scaled.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[end - start, columns / 8], [end - start, columns / 16]],
+                outputDTypes: [.uint32, .uint8])
+            let fitted = fit([scaled, stock.wq, stock.scales])
+            eval(fitted)
+            words.append(fitted[0])
+            scales.append(fitted[1])
+        }
+
+        let result = QuantizedLinear(
+            weight: concatenated(words, axis: 0), scales: concatenated(scales, axis: 0),
+            biases: nil, groupSize: 16, bits: 4, mode: .nvfp4)
+        eval(result.weight, result.scales)
+        result.freeze()
+        return result
+    }
+
     private static func buildNVFP4Drafter(_ model: MuseGlimmerDFlashDraftModel)
         -> NVFP4DrafterState?
     {
@@ -2753,7 +2884,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             return 1.0
         }
 
-        func quantNVFP4(_ w: MLXArray, scale: Float) -> QuantizedLinear {
+        func quantNVFP4(
+            _ w: MLXArray, scale: Float, fitLayer: Int? = nil, projection: String = ""
+        ) -> QuantizedLinear {
+            if devNVFP4ScaleFitEnabled, let fitLayer, fitLayer < 4,
+                let fitted = fitNVFP4Scales(w, scale: scale)
+            {
+                let message = "[dflash_nvfp4_scale_fit] layer=\(fitLayer) projection=\(projection)"
+                    + " rows=\(w.dim(0)) columns=\(w.dim(1)) prescale=\(scale)\n"
+                FileHandle.standardError.write(Data(message.utf8))
+                return fitted
+            }
             let scaled = (scale == 1.0) ? w : (w.asType(.float32) * scale).asType(.bfloat16)
             let ql = QuantizedLinear(
                 weight: scaled, bias: nil, groupSize: 16, bits: 4, mode: .nvfp4, globalScale: nil)
@@ -2823,12 +2964,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
             let guW = concatenated([gw, uw], axis: 0)
             let sGU = pickScale(guW)
-            gateUp.append(quantNVFP4(guW, scale: sGU))
+            gateUp.append(quantNVFP4(guW, scale: sGU, fitLayer: i, projection: "gate_up"))
             postAttnNormW.append(
                 (layer.postAttentionNorm.weight.asType(.float32) * (1.0 / sGU)).asType(.bfloat16))
 
             let sDown = pickScale(dw)
-            down.append(quantNVFP4(dw, scale: sDown))
+            down.append(quantNVFP4(dw, scale: sDown, fitLayer: i, projection: "down"))
             downInvScale.append(1.0 / sDown)
         }
         guard let lastKV = lastKVOpt, let lastQ = lastQOpt else { return nil }
@@ -4992,3 +5133,4 @@ extension MuseGlimmerDFlashDrafter {
         }
     }
 }
+private let gauntletRedraw_3b78bf8f_20261128T032428Z: Int = 0
