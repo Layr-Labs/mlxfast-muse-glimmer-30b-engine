@@ -1678,6 +1678,31 @@ template <
       }
     }
   } else {
+  // Weights and scales of this simdgroup's next K block are requested before
+  // the current block's dequant and MMAs, so their device latency overlaps
+  // the math instead of opening every iteration. Same bytes, same order, same
+  // products: only the load issue point moves.
+  uint4 ws_cur[TN][2][loads];
+  scale_bits_t ss_cur[TN][2];
+  const int kb0 = simd_gid * BK;
+  if (kb0 < K) {
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < 2; r++) {
+        const int row = 16 * t + 8 * r;
+        const device uint8_t* wt =
+            wl + row * static_cast<int64_t>(row_bytes) + kb0 / pack_factor;
+        const device uint8_t* st =
+            scales + row * static_cast<int64_t>(row_scales) + kb0 / group_size;
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          ws_cur[t][r][l] = *(const device uint4*)(wt + 16 * l);
+        }
+        ss_cur[t][r] = *(const device scale_bits_t*)st;
+      }
+    }
+  }
   for (int k = simd_gid * BK; k < K; k += WK * BK) {
     vec<T, 8> xs[2][4];
     STEEL_PRAGMA_UNROLL
@@ -1690,22 +1715,43 @@ template <
             : vec<T, 8>(0);
       }
     }
+    uint4 ws_nx[TN][2][loads];
+    scale_bits_t ss_nx[TN][2];
+    const int knx = k + WK * BK;
+    if (knx < K) {
+      STEEL_PRAGMA_UNROLL
+      for (short t = 0; t < TN; t++) {
+        STEEL_PRAGMA_UNROLL
+        for (short r = 0; r < 2; r++) {
+          const int row = 16 * t + 8 * r;
+          const device uint8_t* wt =
+              wl + row * static_cast<int64_t>(row_bytes) + knx / pack_factor;
+          const device uint8_t* st =
+              scales + row * static_cast<int64_t>(row_scales) + knx / group_size;
+          STEEL_PRAGMA_UNROLL
+          for (short l = 0; l < loads; l++) {
+            ws_nx[t][r][l] = *(const device uint4*)(wt + 16 * l);
+          }
+          ss_nx[t][r] = *(const device scale_bits_t*)st;
+        }
+      }
+    }
     uint4 ws[TN][2][loads];
     scale_bits_t ss[TN][2];
     STEEL_PRAGMA_UNROLL
     for (short t = 0; t < TN; t++) {
       STEEL_PRAGMA_UNROLL
       for (short r = 0; r < 2; r++) {
-        const int row = 16 * t + 8 * r;
-        const device uint8_t* wt =
-            wl + row * static_cast<int64_t>(row_bytes) + k / pack_factor;
-        const device uint8_t* st =
-            scales + row * static_cast<int64_t>(row_scales) + k / group_size;
         STEEL_PRAGMA_UNROLL
         for (short l = 0; l < loads; l++) {
-          ws[t][r][l] = *(const device uint4*)(wt + 16 * l);
+          ws[t][r][l] = ws_cur[t][r][l];
         }
-        ss[t][r] = *(const device scale_bits_t*)st;
+        ss[t][r] = ss_cur[t][r];
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < loads; l++) {
+          ws_cur[t][r][l] = ws_nx[t][r][l];
+        }
+        ss_cur[t][r] = ss_nx[t][r];
       }
     }
 
