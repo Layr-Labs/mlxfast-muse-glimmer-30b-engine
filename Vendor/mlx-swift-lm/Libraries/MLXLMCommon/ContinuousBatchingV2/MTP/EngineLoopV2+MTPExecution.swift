@@ -879,10 +879,16 @@ extension EngineLoopV2 {
         CBv2DraftRegime.activeVerifyTree = verifyTree
         CBv2DraftRegime.activeDynamicTreeK = useDynamicTree ? k : 0
         CBv2DraftRegime.activeDynamicTreeMeta = nil
+        CBv2DraftRegime.activeHistoryHint =
+            useDynamicTree
+            ? mtp.prepareHistoryHint(
+                for: verifyRows[0].rec.id, tokens: verifyRows[0].rec.tokens, maxLen: k)
+            : nil
         defer {
             CBv2DraftRegime.activeVerifyTree = nil
             CBv2DraftRegime.activeDynamicTreeK = 0
             CBv2DraftRegime.activeDynamicTreeMeta = nil
+            CBv2DraftRegime.activeHistoryHint = nil
         }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.

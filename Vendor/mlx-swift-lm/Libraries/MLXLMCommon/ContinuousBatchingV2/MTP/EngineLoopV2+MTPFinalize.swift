@@ -458,6 +458,7 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
+            mtp.observeHistoryOutcome(for: id, committed: outcome.committed)
             let emitted = Array(
                 outcome.committed.prefix(perRowWidth ? outcome.naturalEmitted : commonEmitted))
 

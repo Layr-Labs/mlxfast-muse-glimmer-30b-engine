@@ -150,6 +150,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_PROJ"] != "0"
     private static let nvfp4DrafterEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_NVFP4"] != "0"
+    /// `CBV2_DRAFTER_MLP_3BIT=1` enables 3-bit affine staged-NAX quantization of L0..L3 MLPs (`M=16`).
+    private static let drafterMLP3BitEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DRAFTER_MLP_3BIT"] == "1"
+    /// Group size for 3-bit affine L0..L3 drafter MLPs (`CBV2_DRAFTER_MLP_GS`, default 128).
+    private static let drafterMLPGroupSize: Int = {
+        if let raw = ProcessInfo.processInfo.environment["CBV2_DRAFTER_MLP_GS"],
+            let v = Int(raw), [32, 64, 128].contains(v)
+        {
+            return v
+        }
+        return 128
+    }()
 
     private struct NVFP4DrafterState {
         let fc: QuantizedLinear
@@ -173,10 +185,23 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 fusedContextKV.weight, fusedContextKV.scales,
                 lastKV.weight, lastKV.scales, lastQ.weight, lastQ.scales,
             ]
-            for ql in blockQKV { arr += [ql.weight, ql.scales] }
-            for ql in oProj { arr += [ql.weight, ql.scales] }
-            for ql in gateUp { arr += [ql.weight, ql.scales] }
-            for ql in down { arr += [ql.weight, ql.scales] }
+            if let b = fc.biases { arr.append(b) }
+            for ql in blockQKV {
+                arr += [ql.weight, ql.scales]
+                if let b = ql.biases { arr.append(b) }
+            }
+            for ql in oProj {
+                arr += [ql.weight, ql.scales]
+                if let b = ql.biases { arr.append(b) }
+            }
+            for ql in gateUp {
+                arr += [ql.weight, ql.scales]
+                if let b = ql.biases { arr.append(b) }
+            }
+            for ql in down {
+                arr += [ql.weight, ql.scales]
+                if let b = ql.biases { arr.append(b) }
+            }
             arr += inputNormWeightScaled
             arr += postAttnNormWeightScaled
             return arr
@@ -494,10 +519,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         ])
                         nvWarm += [o1[0], o1[1], o2[0]]
                     }
-                    let lastLayer = model.layers[c.hiddenLayers - 1]
+                    let lastIdx = c.hiddenLayers - 1
+                    let lastLayer = model.layers[lastIdx]
                     for rows in [c.blockSize, 1, 2, 3, 4, 5, 6, 7] {
                         let dh = MLXArray.zeros([1, rows, c.hiddenSize], dtype: .bfloat16)
                         let dq = MLXArray.zeros([1, rows, qW], dtype: .bfloat16)
+                        let mlpIdx = (rows == c.blockSize) ? 0 : lastIdx
                         if rows == c.blockSize {
                             nvWarm.append(nv.blockQKV[0](dh))
                             nvWarm.append(nv.lastKV(dh))
@@ -509,12 +536,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                                     posScalar: dummyPos, coefficients: epilogue.coefficients,
                                     qHeads: c.attentionHeads, rows: rows))
                         }
-                        let oOut = nv.oProj[0](dq)
+                        let oOut = nv.oProj[mlpIdx](dq)
                         let (hMid, mx) = Self.fusedAddRMSNorm(
-                            residual: dh, delta: oOut, weight: nv.postAttnNormWeightScaled[0],
-                            eps: lastLayer.postAttentionNorm.eps, deltaScale: nv.oInvScale[0])
-                        let gu = nv.gateUp[0](mx)
-                        let downOut = nv.down[0](Self.splitSiluMul(gu, scale: nv.downInvScale[0]))
+                            residual: dh, delta: oOut, weight: nv.postAttnNormWeightScaled[mlpIdx],
+                            eps: lastLayer.postAttentionNorm.eps, deltaScale: nv.oInvScale[mlpIdx])
+                        let gu = nv.gateUp[mlpIdx](mx)
+                        let downOut = nv.down[mlpIdx](Self.splitSiluMul(gu, scale: nv.downInvScale[mlpIdx]))
                         nvWarm += [hMid, downOut]
                     }
                     eval(nvWarm)
@@ -606,11 +633,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         private static let ospecZeroCopyEnabled: Bool =
             ProcessInfo.processInfo.environment["CBV2_OSPEC_ZEROCOPY"] != "0"
+        private static let ospecPromoteEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_OSPEC_PROMOTE"] != "0"
+
+        struct SpeculativeTailTicket {
+            let keysID: ObjectIdentifier
+            let valuesID: ObjectIdentifier
+            let anchor: Int
+            let first: Int
+            let base: Int
+            let startSlot: Int
+            let writtenRows: Int
+            let generation: UInt64
+        }
 
         private var keys: MLXArray?
         private var values: MLXArray?
         private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
         private var speculativeReadDeps: [MLXArray] = []
+        private var ringGeneration: UInt64 = 0
         private var basePosition = 0
         private(set) var firstPosition = 0
         private(set) var nextPosition = 0
@@ -747,6 +788,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         func restart(at position: Int) {
             precondition(position >= 0, "DFlash context position must not be negative")
+            ringGeneration &+= 1
             basePosition = position
             firstPosition = position
             nextPosition = position
@@ -771,12 +813,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// avoiding a full ring copy inside `speculateOutcomeBlock`.
         func writeSpeculativeTail(
             keys newKeys: MLXArray, values newValues: MLXArray
-        ) -> (keys: MLXArray, values: MLXArray)? {
+        ) -> (keys: MLXArray, values: MLXArray, ticket: SpeculativeTailTicket)? {
             let rows = newKeys.dim(2)
             guard Self.ospecZeroCopyEnabled, inPlaceRing, let keys, let values,
                 rows > 0, firstPosition == basePosition, count + rows <= window
             else { return nil }
             consumeReadBarriers()
+            ringGeneration &+= 1
             let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
             let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
             let params = MLXArray([Int32(count), Int32(rows)])
@@ -785,10 +828,39 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 window: window, headDimensions: headDimensions, rows: rows, layers: layers)
             let pair = depends(inputs: [keys, values], dependencies: [writeFence])
             let total = count + rows
+            let ticket = SpeculativeTailTicket(
+                keysID: ObjectIdentifier(keys), valuesID: ObjectIdentifier(values),
+                anchor: nextPosition, first: firstPosition, base: basePosition,
+                startSlot: count, writtenRows: rows, generation: ringGeneration)
             return (
                 pair[0][0..., 0..., 0 ..< total, 0...],
-                pair[1][0..., 0..., 0 ..< total, 0...]
+                pair[1][0..., 0..., 0 ..< total, 0...],
+                ticket
             )
+        }
+
+        /// Promotes a verified contiguous linear prefix `[0 ..< prefixCount)` that
+        /// `writeSpeculativeTail` already placed at `[count ..< count + prefixCount)`,
+        /// avoiding a duplicate `dflash_ring_write_inplace` dispatch on commit.
+        func promoteSpeculativePrefix(
+            ticket: SpeculativeTailTicket, count prefixCount: Int
+        ) -> Bool {
+            guard Self.ospecPromoteEnabled, inPlaceRing, let keys, let values,
+                ObjectIdentifier(keys) == ticket.keysID,
+                ObjectIdentifier(values) == ticket.valuesID,
+                ringGeneration == ticket.generation,
+                firstPosition == basePosition,
+                firstPosition == ticket.first,
+                basePosition == ticket.base,
+                nextPosition == ticket.anchor,
+                count == ticket.startSlot,
+                prefixCount > 0, prefixCount <= ticket.writtenRows,
+                count + prefixCount <= window
+            else { return false }
+            nextPosition += prefixCount
+            firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
+            return true
         }
 
         func recordSpeculativeRead(_ dep: MLXArray) {
@@ -857,6 +929,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             nextPosition = start + rows
             firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
         }
 
         var heldPositions: [Int] {
@@ -1023,6 +1096,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// Verify slot path `[0, ..., carrySlot]` committed for this outcome
         /// (length `accepted + 1`; nil falls back to linear `0...accepted`).
         var acceptedPath: [Int]? = nil
+        /// Ticket proving `[0 ..< depth + 1)` were already written into the
+        /// request's in-place ring at `[count ..< count + depth + 1)`, so a
+        /// confirmed linear prefix can be promoted without re-copying.
+        var tailTicket: FastInPlaceContext.SpeculativeTailTicket? = nil
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -2352,6 +2429,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ctxKeys = tail.keys
             ctxValues = tail.values
             usedZeroCopyTail = true
+            if !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.strictLowVerifyC3 {
+                speculation.tailTicket = tail.ticket
+            }
         } else {
             ctxKeys = concatenated([
                 ring[0][0..., 0..., 0 ..< existingCount, 0...],
@@ -2516,6 +2596,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.context.append(
                 keys: speculation.keys.take(idx, axis: 2),
                 values: speculation.values.take(idx, axis: 2))
+        } else if let ticket = speculation.tailTicket,
+            s.context.promoteSpeculativePrefix(ticket: ticket, count: accepted + 1)
+        {
+            // Verified linear prefix is already resident in the ring tail;
+            // `promoteSpeculativePrefix` advanced `nextPosition` in place.
         } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {
@@ -2822,14 +2907,32 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             oInvScale.append(1.0 / sO)
 
             let guW = concatenated([gw, uw], axis: 0)
-            let sGU = pickScale(guW)
-            gateUp.append(quantNVFP4(guW, scale: sGU))
-            postAttnNormW.append(
-                (layer.postAttentionNorm.weight.asType(.float32) * (1.0 / sGU)).asType(.bfloat16))
+            let use3BitMLP =
+                i < 4 && drafterMLP3BitEnabled
+                && c.hiddenSize % drafterMLPGroupSize == 0
+                && c.intermediateSize % drafterMLPGroupSize == 0
+            if use3BitMLP {
+                let guQL = QuantizedLinear(
+                    weight: guW, bias: nil, groupSize: drafterMLPGroupSize, bits: 3, mode: .affine)
+                eval([guQL.weight, guQL.scales] + (guQL.biases.map { [$0] } ?? []))
+                gateUp.append(guQL)
+                postAttnNormW.append(layer.postAttentionNorm.weight.asType(.bfloat16))
 
-            let sDown = pickScale(dw)
-            down.append(quantNVFP4(dw, scale: sDown))
-            downInvScale.append(1.0 / sDown)
+                let downQL = QuantizedLinear(
+                    weight: dw, bias: nil, groupSize: drafterMLPGroupSize, bits: 3, mode: .affine)
+                eval([downQL.weight, downQL.scales] + (downQL.biases.map { [$0] } ?? []))
+                down.append(downQL)
+                downInvScale.append(1.0)
+            } else {
+                let sGU = pickScale(guW)
+                gateUp.append(quantNVFP4(guW, scale: sGU))
+                postAttnNormW.append(
+                    (layer.postAttentionNorm.weight.asType(.float32) * (1.0 / sGU)).asType(.bfloat16))
+
+                let sDown = pickScale(dw)
+                down.append(quantNVFP4(dw, scale: sDown))
+                downInvScale.append(1.0 / sDown)
+            }
         }
         guard let lastKV = lastKVOpt, let lastQ = lastQOpt else { return nil }
         eval([encOutNormW] + inputNormW + postAttnNormW)
@@ -3667,7 +3770,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
     private static let fastDynTreeStage2Kernel = MLXFast.metalKernel(
         name: "dflash_fast_dyntree_s2",
-        inputNames: ["p_val", "p_idx", "p_sum", "tparams"],
+        inputNames: ["p_val", "p_idx", "p_sum", "tparams", "hist_in"],
         outputNames: ["tokens", "tree_meta"],
         source: """
             constexpr uint CHUNKS = 64;
@@ -3804,9 +3907,27 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
               int num_nodes = 1;
 
               if (dp_mode != 0) {
+                const int h_len = min(7, max(0, hist_in[0]));
+                const float h_p0 = float(hist_in[1]) * 1e-6f;
+                const float h_pc = float(hist_in[2]) * 1e-6f;
+                int h_tok[7];
+                for (int r = 0; r < 7; ++r) { h_tok[r] = hist_in[3 + r]; }
+                int h_agree = 0;
+                while (h_agree < R_ && h_agree < h_len && h_tok[h_agree] == row_ids[h_agree][0]) {
+                  h_agree += 1;
+                }
+                float h_chain_ev[7];
+                for (int r = 0; r < 7; ++r) { h_chain_ev[r] = 0.0f; }
+                if (h_agree > 0) {
+                  h_chain_ev[0] = h_p0;
+                  for (int r = 1; r < h_agree; ++r) {
+                    h_chain_ev[r] = h_chain_ev[r - 1] * h_pc;
+                  }
+                }
                 const int max_L = min(K_, R_);
-                const int min_L = min(max_L, (chain_bonus > 0.0f)
-                    ? 1 : max(2, K_ - max(0, max_leaves)));
+                const int min_L = min(max_L, (h_len > 0)
+                    ? max((chain_bonus > 0.0f) ? 1 : 2, K_ - max(0, max_leaves))
+                    : ((chain_bonus > 0.0f) ? 1 : max(2, K_ - max(0, max_leaves))));
                 float best_total = -1.0f;
                 int best_L = max_L;
                 int best_bcnt = 0;
@@ -3818,7 +3939,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 for (int L = max_L; L >= min_L; --L) {
                   float total = 0.0f;
                   for (int r = 0; r < L; ++r) {
-                    total += surv[r] * row_probs[r][0] * chain_bonus;
+                    const float c_ev = (r < h_agree)
+                        ? max(surv[r] * row_probs[r][0], h_chain_ev[r])
+                        : (surv[r] * row_probs[r][0]);
+                    total += c_ev * chain_bonus;
                   }
                   const int budget = min(K_ - L, max(0, max_leaves));
                   const int leaf_limit = min(L, max_leaf_depth);
@@ -3826,6 +3950,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   for (int r = 0; r < 7; ++r) {
                     for (int c = 0; c < 5; ++c) { used[r][c] = false; }
                   }
+                  const int h_div = h_agree;
+                  bool h_placed = false;
+                  int h_node_idx = -1;
+                  int h_next_pos = h_div;
                   int cur_bcnt = 0;
                   int cur_par[6];
                   int cur_dep[6];
@@ -3833,6 +3961,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                   float cur_ev[6];
                   int cur_bs[6];
                   bool cur_cont[6];
+                  int cur_hidx[6];
                   for (int b = 0; b < budget; ++b) {
                     float bev = -1.0f;
                     int bkind = -1, ba = -1, bb = -1;
@@ -3852,7 +3981,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     }
                     if (max_branch_len > 1 && cont_decay > 0.0f) {
                       for (int j = 0; j < cur_bcnt; ++j) {
-                        if (cur_bs[j] >= 1 && cur_bs[j] < max_branch_len
+                        if (cur_hidx[j] < 0 && cur_bs[j] >= 1 && cur_bs[j] < max_branch_len
                             && !cur_cont[j] && cur_dep[j] < R_) {
                           const int d = cur_dep[j];
                           if (row_ids[d][0] < ivocab) {
@@ -3867,6 +3996,56 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                         }
                       }
                     }
+                    if (h_len > 0 && !h_placed && h_div < h_len && h_div <= L
+                        && h_tok[h_div] >= 0 && h_tok[h_div] < ivocab) {
+                      int dup_j = -1;
+                      for (int j = 0; j < cur_bcnt; ++j) {
+                        if (cur_par[j] == h_div && cur_tok[j] == h_tok[h_div]) {
+                          dup_j = j;
+                          break;
+                        }
+                      }
+                      if (dup_j >= 0) {
+                        h_placed = true;
+                        h_node_idx = dup_j;
+                        cur_hidx[dup_j] = h_div;
+                        h_next_pos = h_div + 1;
+                      } else {
+                        const float h_base = (h_div == 0)
+                            ? h_p0 : (surv[min(h_div, R_ - 1)] * h_pc);
+                        float h_ev = h_base;
+                        int match_c = -1;
+                        if (h_div < R_) {
+                          const float base_w = surv[h_div] * leaf_mult[h_div];
+                          for (int c = 1; c < top_k_use; ++c) {
+                            if (row_ids[h_div][c] == h_tok[h_div]) {
+                              match_c = c;
+                              h_ev = max(h_ev, base_w * row_probs[h_div][c]);
+                              break;
+                            }
+                          }
+                        }
+                        if (h_ev > bev) {
+                          bev = h_ev;
+                          bkind = 3;
+                          ba = h_div;
+                          bb = match_c;
+                        }
+                      }
+                    }
+                    if (h_len > 0 && h_placed && h_node_idx >= 0 && h_next_pos < h_len
+                        && !cur_cont[h_node_idx] && cur_dep[h_node_idx] < K_) {
+                      const int ht = h_tok[h_next_pos];
+                      if (ht >= 0 && ht < ivocab) {
+                        const float ev = cur_ev[h_node_idx] * h_pc;
+                        if (ev > bev) {
+                          bev = ev;
+                          bkind = 4;
+                          ba = h_node_idx;
+                          bb = h_next_pos;
+                        }
+                      }
+                    }
                     if (bkind == 1 && bev > 0.0f) {
                       used[ba][bb] = true;
                       total += bev;
@@ -3876,6 +4055,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = 1;
                       cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = -1;
                       cur_bcnt += 1;
                     } else if (bkind == 2 && bev > 0.0f) {
                       cur_cont[ba] = true;
@@ -3886,6 +4066,34 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                       cur_ev[cur_bcnt] = bev;
                       cur_bs[cur_bcnt] = cur_bs[ba] + 1;
                       cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = -1;
+                      cur_bcnt += 1;
+                    } else if (bkind == 3 && bev > 0.0f) {
+                      if (bb >= 1 && ba < 7) { used[ba][bb] = true; }
+                      total += bev;
+                      cur_par[cur_bcnt] = ba;
+                      cur_dep[cur_bcnt] = ba + 1;
+                      cur_tok[cur_bcnt] = h_tok[ba];
+                      cur_ev[cur_bcnt] = bev;
+                      cur_bs[cur_bcnt] = 1;
+                      cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = ba;
+                      h_placed = true;
+                      h_node_idx = cur_bcnt;
+                      h_next_pos = ba + 1;
+                      cur_bcnt += 1;
+                    } else if (bkind == 4 && bev > 0.0f) {
+                      cur_cont[ba] = true;
+                      total += bev;
+                      cur_par[cur_bcnt] = L + 1 + ba;
+                      cur_dep[cur_bcnt] = cur_dep[ba] + 1;
+                      cur_tok[cur_bcnt] = h_tok[bb];
+                      cur_ev[cur_bcnt] = bev;
+                      cur_bs[cur_bcnt] = cur_bs[ba] + 1;
+                      cur_cont[cur_bcnt] = false;
+                      cur_hidx[cur_bcnt] = bb;
+                      h_node_idx = cur_bcnt;
+                      h_next_pos = bb + 1;
                       cur_bcnt += 1;
                     } else {
                       break;
@@ -4211,9 +4419,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return (partials[0], partials[1], partials[2])
     }
 
+    nonisolated(unsafe) private static let emptyHistoryHint: MLXArray = {
+        let a = MLXArray.zeros([10], type: Int32.self)
+        eval(a)
+        return a
+    }()
+
     private static func fastDynamicTreeStage2(
         _ pVal: MLXArray, _ pIdx: MLXArray, _ pSum: MLXArray,
-        k: Int, vocab: Int, params: MLXArray
+        k: Int, vocab: Int, params: MLXArray, historyHint: MLXArray? = nil
     ) -> (tokens: MLXArray, treeMeta: MLXArray) {
         let rows = pVal.dim(0)
         let chunks = 64
@@ -4230,7 +4444,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             dynTreeLock.withLock { dynTreeS2Cache[key] = made }
             launch = made
         }
-        let out = launch([pVal, pIdx, pSum, params])
+        let hint = historyHint ?? CBv2DraftRegime.activeHistoryHint ?? emptyHistoryHint
+        let out = launch([pVal, pIdx, pSum, params, hint])
         return (out[0], out[1])
     }
 
@@ -4520,6 +4735,8 @@ extension MuseGlimmerDFlashDrafter {
     private final class CompressedDraftHead: @unchecked Sendable {
         private static let enabled: Bool =
             ProcessInfo.processInfo.environment["CBV2_DRAFTER_XNOR_HEAD"] != "0"
+        private static let centeredEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_DRAFTER_XNOR_CENTER"] != "0"
 
         private static let header = """
             inline half dflash_xnor_e4m3(uint bits) {
@@ -4530,6 +4747,11 @@ extension MuseGlimmerDFlashDrafter {
 
             inline float dflash_xnor_e2m1_abs(uint nib) {
                 const uint p = (nib & 7u) << 9;
+                return float(as_type<half>(ushort(p)) * 16384.0h);
+            }
+
+            inline float dflash_xnor_e2m1_signed(uint nib) {
+                const uint p = ((nib & 7u) << 9) | ((nib & 8u) << 12);
                 return float(as_type<half>(ushort(p)) * 16384.0h);
             }
 
@@ -4577,9 +4799,78 @@ extension MuseGlimmerDFlashDrafter {
             }
             """
 
+        private static let colStatsKernel = MLXFast.metalKernel(
+            name: "dflash_xnor_col_stats",
+            inputNames: ["w", "scales"],
+            outputNames: ["col_mu", "col_rms", "col_inv_rms"],
+            source: """
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint g = threadgroup_position_in_grid.y;
+                if (g >= uint(K_ / 16)) { return; }
+
+                float s[16];
+                #pragma unroll
+                for (uint j = 0u; j < 16u; ++j) { s[j] = 0.0f; }
+                for (uint v = lid; v < uint(V_); v += 256u) {
+                    const uint2 qw = *(const device uint2*)(w + size_t(v) * size_t(K_ / 8) + size_t(g) * 2u);
+                    const float sc = float(dflash_xnor_e4m3(scales[size_t(v) * size_t(K_ / 16) + size_t(g)]));
+                    #pragma unroll
+                    for (uint n = 0u; n < 8u; ++n) {
+                        s[n] += dflash_xnor_e2m1_signed((qw.x >> (n * 4u)) & 0xFu) * sc;
+                        s[8u + n] += dflash_xnor_e2m1_signed((qw.y >> (n * 4u)) & 0xFu) * sc;
+                    }
+                }
+                threadgroup float sh_sg[8];
+                threadgroup float sh_mu[16];
+                for (uint j = 0u; j < 16u; ++j) {
+                    const float sg_s = simd_sum(s[j]);
+                    if (lane == 0u) { sh_sg[sg] = sg_s; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0u) {
+                        const float tot = simd_sum((lane < 8u) ? sh_sg[lane] : 0.0f);
+                        if (lane == 0u) { sh_mu[j] = tot / float(V_); }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                float sq[16];
+                #pragma unroll
+                for (uint j = 0u; j < 16u; ++j) { sq[j] = 0.0f; }
+                for (uint v = lid; v < uint(V_); v += 256u) {
+                    const uint2 qw = *(const device uint2*)(w + size_t(v) * size_t(K_ / 8) + size_t(g) * 2u);
+                    const float sc = float(dflash_xnor_e4m3(scales[size_t(v) * size_t(K_ / 16) + size_t(g)]));
+                    #pragma unroll
+                    for (uint n = 0u; n < 8u; ++n) {
+                        const float d0 = dflash_xnor_e2m1_signed((qw.x >> (n * 4u)) & 0xFu) * sc - sh_mu[n];
+                        const float d1 = dflash_xnor_e2m1_signed((qw.y >> (n * 4u)) & 0xFu) * sc - sh_mu[8u + n];
+                        sq[n] = fma(d0, d0, sq[n]);
+                        sq[8u + n] = fma(d1, d1, sq[8u + n]);
+                    }
+                }
+                for (uint j = 0u; j < 16u; ++j) {
+                    const float sg_sq = simd_sum(sq[j]);
+                    if (lane == 0u) { sh_sg[sg] = sg_sq; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0u) {
+                        const float tot_sq = simd_sum((lane < 8u) ? sh_sg[lane] : 0.0f);
+                        if (lane == 0u) {
+                            const float rms = sqrt(max(0.0f, tot_sq / float(V_)));
+                            const uint k_idx = g * 16u + j;
+                            col_mu[k_idx] = sh_mu[j];
+                            col_rms[k_idx] = (rms > 1e-6f) ? rms : 0.0f;
+                            col_inv_rms[k_idx] = (rms > 1e-6f) ? (1.0f / rms) : 0.0f;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                """,
+            header: header)
+
         private static let buildKernel = MLXFast.metalKernel(
             name: "dflash_build_xnor_index",
-            inputNames: ["w", "scales"],
+            inputNames: ["w", "scales", "col_mu", "col_inv_rms"],
             outputNames: ["w1_bits", "g256_sc"],
             source: """
                 const uint slot = thread_position_in_grid.x;
@@ -4607,16 +4898,31 @@ extension MuseGlimmerDFlashDrafter {
                         for (uint w2 = 0u; w2 < 2u; ++w2) {
                             const uint q = w_row[j * 4u + b2 * 2u + w2];
                             const uint bit_base = (b2 * 2u + w2) * 8u;
-                            float block_abs = 0.0f;
-                            #pragma unroll
-                            for (uint n = 0u; n < 8u; ++n) {
-                                const uint nib = (q >> (n * 4u)) & 0xFu;
-                                if ((nib & 8u) == 0u) {
-                                    bits |= (1u << (bit_base + n));
+                            if constexpr (CENTERED_) {
+                                const uint k_base = g * 256u + j * 32u + bit_base;
+                                #pragma unroll
+                                for (uint n = 0u; n < 8u; ++n) {
+                                    const uint nib = (q >> (n * 4u)) & 0xFu;
+                                    const float wv =
+                                        (dflash_xnor_e2m1_signed(nib) * sc - col_mu[k_base + n])
+                                        * col_inv_rms[k_base + n];
+                                    if (wv >= 0.0f) {
+                                        bits |= (1u << (bit_base + n));
+                                    }
+                                    l1_sum += fabs(wv);
                                 }
-                                block_abs += dflash_xnor_e2m1_abs(nib);
+                            } else {
+                                float block_abs = 0.0f;
+                                #pragma unroll
+                                for (uint n = 0u; n < 8u; ++n) {
+                                    const uint nib = (q >> (n * 4u)) & 0xFu;
+                                    if ((nib & 8u) == 0u) {
+                                        bits |= (1u << (bit_base + n));
+                                    }
+                                    block_abs += dflash_xnor_e2m1_abs(nib);
+                                }
+                                l1_sum += block_abs * sc;
                             }
-                            l1_sum += block_abs * sc;
                         }
                     }
                     out_w[j] = bits;
@@ -4629,7 +4935,7 @@ extension MuseGlimmerDFlashDrafter {
 
         private static let quantKernel = MLXFast.metalKernel(
             name: "dflash_xnor_quant_x2",
-            inputNames: ["x"],
+            inputNames: ["x", "col_rms"],
             outputNames: ["x_bits", "x_scale"],
             source: """
                 const uint lane = thread_index_in_simdgroup;
@@ -4640,7 +4946,9 @@ extension MuseGlimmerDFlashDrafter {
                 float sq = 0.0f;
                 #pragma unroll
                 for (uint j = 0u; j < 8u; ++j) {
-                    const float v = float(xr[j * 32u + lane]);
+                    const uint lk = j * 32u + lane;
+                    const float raw_v = float(xr[lk]);
+                    const float v = CENTERED_ ? (raw_v * col_rms[g * 256u + lk]) : raw_v;
                     vals[j] = v;
                     sq += v * v;
                 }
@@ -4778,6 +5086,18 @@ extension MuseGlimmerDFlashDrafter {
                 const float inv_t_log2e = 1.44269504f / row_T;
                 const device bfloat16_t* x_row = x + size_t(row) * size_t(K_);
 
+                constexpr bool USE_SHX = (K_ <= 8192);
+                threadgroup bfloat16_t sh_x[USE_SHX ? K_ : 1];
+                if constexpr (USE_SHX) {
+                    const uint lid = sg * 32u + lane;
+                    const device ushort4* x4 = (const device ushort4*)x_row;
+                    threadgroup ushort4* sx4 = (threadgroup ushort4*)sh_x;
+                    for (uint i = lid; i < uint(K_ / 4); i += 256u) {
+                        sx4[i] = x4[i];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
                 threadgroup float sh_v[16];
                 threadgroup int sh_i[16];
 
@@ -4794,57 +5114,81 @@ extension MuseGlimmerDFlashDrafter {
                     const device uint8_t* sc_0 = ok0 ? (scales + size_t(v0) * size_t(K_ / 16)) : nullptr;
                     const device uint2* w2_1 = ok1 ? (const device uint2*)(w + size_t(v1) * size_t(K_ / 8)) : nullptr;
                     const device uint8_t* sc_1 = ok1 ? (scales + size_t(v1) * size_t(K_ / 16)) : nullptr;
-                    for (uint b = lane; b < uint(K_ / 16); b += 32u) {
-                        const device bfloat16_t* xb = x_row + b * 16u;
-                        const float4 x0 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 0u))));
-                        const float4 x1 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 4u))));
-                        const float4 x2 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 8u))));
-                        const float4 x3 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 12u))));
-                        if (ok0) {
-                            const uint2 qw = w2_0[b];
-                            const float fs = float(dflash_xnor_e4m3(sc_0[b])) * 16384.0f;
-                            const uint q0 = qw.x;
-                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs;
-                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs;
-                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs;
-                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs;
-                            acc0 = fma(a0.x, x0.x, acc0); acc0 = fma(a1.x, x0.y, acc0);
-                            acc0 = fma(a2.x, x0.z, acc0); acc0 = fma(a3.x, x0.w, acc0);
-                            acc0 = fma(a0.y, x1.x, acc0); acc0 = fma(a1.y, x1.y, acc0);
-                            acc0 = fma(a2.y, x1.z, acc0); acc0 = fma(a3.y, x1.w, acc0);
-                            const uint q1 = qw.y;
-                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs;
-                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs;
-                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs;
-                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs;
-                            acc0 = fma(b0.x, x2.x, acc0); acc0 = fma(b1.x, x2.y, acc0);
-                            acc0 = fma(b2.x, x2.z, acc0); acc0 = fma(b3.x, x2.w, acc0);
-                            acc0 = fma(b0.y, x3.x, acc0); acc0 = fma(b1.y, x3.y, acc0);
-                            acc0 = fma(b2.y, x3.z, acc0); acc0 = fma(b3.y, x3.w, acc0);
-                        }
-                        if (ok1) {
-                            const uint2 qw = w2_1[b];
-                            const float fs = float(dflash_xnor_e4m3(sc_1[b])) * 16384.0f;
-                            const uint q0 = qw.x;
-                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs;
-                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs;
-                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs;
-                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs;
-                            acc1 = fma(a0.x, x0.x, acc1); acc1 = fma(a1.x, x0.y, acc1);
-                            acc1 = fma(a2.x, x0.z, acc1); acc1 = fma(a3.x, x0.w, acc1);
-                            acc1 = fma(a0.y, x1.x, acc1); acc1 = fma(a1.y, x1.y, acc1);
-                            acc1 = fma(a2.y, x1.z, acc1); acc1 = fma(a3.y, x1.w, acc1);
-                            const uint q1 = qw.y;
-                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs;
-                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs;
-                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs;
-                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs;
-                            acc1 = fma(b0.x, x2.x, acc1); acc1 = fma(b1.x, x2.y, acc1);
-                            acc1 = fma(b2.x, x2.z, acc1); acc1 = fma(b3.x, x2.w, acc1);
-                            acc1 = fma(b0.y, x3.x, acc1); acc1 = fma(b1.y, x3.y, acc1);
-                            acc1 = fma(b2.y, x3.z, acc1); acc1 = fma(b3.y, x3.w, acc1);
-                        }
+                    #define DFLASH_S2_ACC(BLK, QW0, SC0, QW1, SC1) { \\
+                        float4 x0, x1, x2, x3; \\
+                        if constexpr (USE_SHX) { \\
+                            const threadgroup ushort4* sx = (const threadgroup ushort4*)(sh_x + (BLK) * 16u); \\
+                            x0 = float4(as_type<vec<bfloat, 4>>(sx[0])); \\
+                            x1 = float4(as_type<vec<bfloat, 4>>(sx[1])); \\
+                            x2 = float4(as_type<vec<bfloat, 4>>(sx[2])); \\
+                            x3 = float4(as_type<vec<bfloat, 4>>(sx[3])); \\
+                        } else { \\
+                            const device bfloat16_t* xb = x_row + (BLK) * 16u; \\
+                            x0 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 0u)))); \\
+                            x1 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 4u)))); \\
+                            x2 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 8u)))); \\
+                            x3 = float4(as_type<vec<bfloat, 4>>(ushort4(*(const device packed_ushort4*)(xb + 12u)))); \\
+                        } \\
+                        if (ok0) { \\
+                            const float fs = float(dflash_xnor_e4m3(SC0)) * 16384.0f; \\
+                            const uint q0 = (QW0).x; \\
+                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs; \\
+                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs; \\
+                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs; \\
+                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs; \\
+                            acc0 = fma(a0.x, x0.x, acc0); acc0 = fma(a1.x, x0.y, acc0); \\
+                            acc0 = fma(a2.x, x0.z, acc0); acc0 = fma(a3.x, x0.w, acc0); \\
+                            acc0 = fma(a0.y, x1.x, acc0); acc0 = fma(a1.y, x1.y, acc0); \\
+                            acc0 = fma(a2.y, x1.z, acc0); acc0 = fma(a3.y, x1.w, acc0); \\
+                            const uint q1 = (QW0).y; \\
+                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs; \\
+                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs; \\
+                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs; \\
+                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs; \\
+                            acc0 = fma(b0.x, x2.x, acc0); acc0 = fma(b1.x, x2.y, acc0); \\
+                            acc0 = fma(b2.x, x2.z, acc0); acc0 = fma(b3.x, x2.w, acc0); \\
+                            acc0 = fma(b0.y, x3.x, acc0); acc0 = fma(b1.y, x3.y, acc0); \\
+                            acc0 = fma(b2.y, x3.z, acc0); acc0 = fma(b3.y, x3.w, acc0); \\
+                        } \\
+                        if (ok1) { \\
+                            const float fs = float(dflash_xnor_e4m3(SC1)) * 16384.0f; \\
+                            const uint q0 = (QW1).x; \\
+                            const float2 a0 = float2(as_type<half2>(((q0 & 0x00070007u) << 9) | ((q0 & 0x00080008u) << 12))) * fs; \\
+                            const float2 a1 = float2(as_type<half2>(((q0 & 0x00700070u) << 5) | ((q0 & 0x00800080u) << 8))) * fs; \\
+                            const float2 a2 = float2(as_type<half2>(((q0 & 0x07000700u) << 1) | ((q0 & 0x08000800u) << 4))) * fs; \\
+                            const float2 a3 = float2(as_type<half2>(((q0 & 0x70007000u) >> 3) | (q0 & 0x80008000u))) * fs; \\
+                            acc1 = fma(a0.x, x0.x, acc1); acc1 = fma(a1.x, x0.y, acc1); \\
+                            acc1 = fma(a2.x, x0.z, acc1); acc1 = fma(a3.x, x0.w, acc1); \\
+                            acc1 = fma(a0.y, x1.x, acc1); acc1 = fma(a1.y, x1.y, acc1); \\
+                            acc1 = fma(a2.y, x1.z, acc1); acc1 = fma(a3.y, x1.w, acc1); \\
+                            const uint q1 = (QW1).y; \\
+                            const float2 b0 = float2(as_type<half2>(((q1 & 0x00070007u) << 9) | ((q1 & 0x00080008u) << 12))) * fs; \\
+                            const float2 b1 = float2(as_type<half2>(((q1 & 0x00700070u) << 5) | ((q1 & 0x00800080u) << 8))) * fs; \\
+                            const float2 b2 = float2(as_type<half2>(((q1 & 0x07000700u) << 1) | ((q1 & 0x08000800u) << 4))) * fs; \\
+                            const float2 b3 = float2(as_type<half2>(((q1 & 0x70007000u) >> 3) | (q1 & 0x80008000u))) * fs; \\
+                            acc1 = fma(b0.x, x2.x, acc1); acc1 = fma(b1.x, x2.y, acc1); \\
+                            acc1 = fma(b2.x, x2.z, acc1); acc1 = fma(b3.x, x2.w, acc1); \\
+                            acc1 = fma(b0.y, x3.x, acc1); acc1 = fma(b1.y, x3.y, acc1); \\
+                            acc1 = fma(b2.y, x3.z, acc1); acc1 = fma(b3.y, x3.w, acc1); \\
+                        } \\
                     }
+                    constexpr uint NBLK = uint(K_ / 16);
+                    if (lane < NBLK) {
+                        uint2 n0 = ok0 ? w2_0[lane] : uint2(0u);
+                        uint8_t ns0 = ok0 ? sc_0[lane] : uint8_t(0u);
+                        uint2 n1 = ok1 ? w2_1[lane] : uint2(0u);
+                        uint8_t ns1 = ok1 ? sc_1[lane] : uint8_t(0u);
+                        uint b = lane;
+                        for (; b + 32u < NBLK; b += 32u) {
+                            const uint2 cur0 = n0, cur1 = n1;
+                            const uint8_t cs0 = ns0, cs1 = ns1;
+                            if (ok0) { n0 = w2_0[b + 32u]; ns0 = sc_0[b + 32u]; }
+                            if (ok1) { n1 = w2_1[b + 32u]; ns1 = sc_1[b + 32u]; }
+                            DFLASH_S2_ACC(b, cur0, cs0, cur1, cs1)
+                        }
+                        DFLASH_S2_ACC(b, n0, ns0, n1, ns1)
+                    }
+                    #undef DFLASH_S2_ACC
                     if (ok0) { acc0 = simd_sum(acc0); }
                     if (ok1) { acc1 = simd_sum(acc1); }
                 }
@@ -4897,10 +5241,12 @@ extension MuseGlimmerDFlashDrafter {
         let k256: Int
         let numTGs: Int
         let stride: Int
+        private let useCentered: Bool
         private let headWeight: MLXArray
         private let headScales: MLXArray
         private let w1Bits: MLXArray
         private let g256Sc: MLXArray
+        private let colRms: MLXArray
 
         private let lock = NSLock()
         private var launches: [Int: (
@@ -4909,7 +5255,7 @@ extension MuseGlimmerDFlashDrafter {
             stage2: MLXFast.MLXFastKernel.Launch
         )] = [:]
 
-        var residentArrays: [MLXArray] { [w1Bits, g256Sc] }
+        var residentArrays: [MLXArray] { [w1Bits, g256Sc, colRms] }
 
         init?(head: ModelOptWeightOnlyNVFP4Linear) {
             guard Self.enabled else { return nil }
@@ -4926,13 +5272,33 @@ extension MuseGlimmerDFlashDrafter {
             self.k256 = k / 256
             self.numTGs = tgs
             self.stride = st
+            self.useCentered = Self.centeredEnabled
             self.headWeight = head.weight
             self.headScales = head.weightScale
+            let colMu: MLXArray
+            let colInvRms: MLXArray
+            if self.useCentered {
+                let stats = Self.colStatsKernel(
+                    [head.weight, head.weightScale],
+                    template: [("V_", v), ("K_", k)],
+                    grid: (256, k / 16, 1),
+                    threadGroup: (256, 1, 1),
+                    outputShapes: [[k], [k], [k]],
+                    outputDTypes: [.float32, .float32, .float32])
+                colMu = stats[0]
+                self.colRms = stats[1]
+                colInvRms = stats[2]
+            } else {
+                colMu = MLXArray.zeros([1], dtype: .float32)
+                self.colRms = MLXArray.ones([1], dtype: .float32)
+                colInvRms = MLXArray.ones([1], dtype: .float32)
+            }
             let gridX = ((st + 63) / 64) * 64
             let built = Self.buildKernel(
-                [head.weight, head.weightScale],
+                [head.weight, head.weightScale, colMu, colInvRms],
                 template: [
                     ("V_", v), ("K_", k), ("K256_", k / 256), ("NUM_TGS_", tgs), ("STRIDE_", st),
+                    ("CENTERED_", self.useCentered),
                 ],
                 grid: (gridX, k / 256, tgs),
                 threadGroup: (64, 1, 4),
@@ -4940,7 +5306,7 @@ extension MuseGlimmerDFlashDrafter {
                 outputDTypes: [.uint32, .float16])
             self.w1Bits = built[0]
             self.g256Sc = built[1]
-            eval(self.w1Bits, self.g256Sc)
+            eval(self.w1Bits, self.g256Sc, self.colRms)
         }
 
         func dynamicTreePartials(
@@ -4958,7 +5324,10 @@ extension MuseGlimmerDFlashDrafter {
                 pair = hit
             } else {
                 let q = Self.quantKernel.prepare(
-                    template: [("R_", rows), ("K_", hidden), ("K256_", k256)],
+                    template: [
+                        ("R_", rows), ("K_", hidden), ("K256_", k256),
+                        ("CENTERED_", useCentered),
+                    ],
                     grid: (32, k256, rows),
                     threadGroup: (32, 1, 1),
                     outputShapes: [[k256, rows, 16], [k256, rows]],
@@ -4985,7 +5354,7 @@ extension MuseGlimmerDFlashDrafter {
                 lock.withLock { launches[rows] = made }
                 pair = made
             }
-            let qOut = pair.quant([x])
+            let qOut = pair.quant([x, colRms])
             let candIDs = pair.stage1([w1Bits, g256Sc, qOut[0], qOut[1]])[0]
             let s2Out = pair.stage2([candIDs, headWeight, headScales, x, params])
             return (s2Out[0], s2Out[1], s2Out[2])
