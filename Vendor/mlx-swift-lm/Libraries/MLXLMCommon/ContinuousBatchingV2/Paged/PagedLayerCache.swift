@@ -1953,7 +1953,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     queryStart: qStart, scale: scale, sinks: sinks, preparedMask: preparedMask))
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return CBv2AttentionV1.joinPrefillQueryBlocks(outputs, blockSize: blockSize)
     }
 
     /// Whether uniform query blocks may share one SDPA call: one source row,

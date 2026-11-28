@@ -789,7 +789,20 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return joinPrefillQueryBlocks(outputs, blockSize: blockSize)
+    }
+
+    /// Join query blocks in token order so the attention output projection can
+    /// flatten heads and channels without a layout copy.
+    static func joinPrefillQueryBlocks(_ outputs: [MLXArray], blockSize: Int) -> MLXArray {
+        if outputs.count == 1 { return outputs[0] }
+        guard blockSize > 1, let first = outputs.first, first.ndim == 4,
+            first.dim(0) == 1, first.dim(1) > 1, first.dim(3) > 1,
+            outputs.dropFirst().allSatisfy({ $0.ndim == 4 })
+        else { return concatenated(outputs, axis: 2) }
+
+        let tokenMajor = outputs.map { $0.transposed(0, 2, 1, 3) }
+        return concatenated(tokenMajor, axis: 1).transposed(0, 2, 1, 3)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
