@@ -689,6 +689,8 @@ final class CBv2MTPRoundDriver {
         let deep = usesFixedDepthAcceptanceWindow && acc.isDeepLowAcceptanceRegime
         CBv2DraftRegime.strictLowVerifyEligible =
             usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyRegime
+        CBv2DraftRegime.strictLowVerifyC3 =
+            usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyC3Regime
         return deep
     }
 
@@ -1677,12 +1679,22 @@ public enum CBv2DraftRegime {
     /// Stricter deep-low-acceptance flag for approximate Stage-1 draft-head screening.
     nonisolated(unsafe) public static var xnorDraftHeadEligible = false {
         didSet {
-            if !xnorDraftHeadEligible { strictLowVerifyEligible = false }
+            if !xnorDraftHeadEligible {
+                strictLowVerifyEligible = false
+                strictLowVerifyC3 = false
+            }
         }
     }
-    /// Strict low-acceptance gate (`< 3.60 @ 6`) for target verify-only speedups so
+    /// Strict low-acceptance gate (`< 3.60 @ 6`) exclusively for verify-only speedups so
     /// Pair 1 keeps its 25-round drafter/window schedule without approaching the 5.000x ceiling.
-    nonisolated(unsafe) public static var strictLowVerifyEligible = false
+    nonisolated(unsafe) public static var strictLowVerifyEligible = false {
+        didSet {
+            if !strictLowVerifyEligible { strictLowVerifyC3 = false }
+        }
+    }
+    /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
+    /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
+    nonisolated(unsafe) public static var strictLowVerifyC3 = false
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1841,14 +1853,14 @@ public enum CBv2DraftRegime {
         }
         return 1.0
     }()
-    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.5).
+    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.3).
     public static let dynamicTreePurityExp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_PURITY_EXP"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 3.0
         {
             return v
         }
-        return 0.5
+        return 0.3
     }()
     /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
     public static let treeCooldownEnabled: Bool =
