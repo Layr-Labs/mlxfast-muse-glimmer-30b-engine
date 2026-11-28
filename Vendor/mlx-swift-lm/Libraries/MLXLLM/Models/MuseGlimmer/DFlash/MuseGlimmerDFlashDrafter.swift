@@ -610,6 +610,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         private var keys: MLXArray?
         private var values: MLXArray?
         private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
+        private var committedWriteFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
         private var speculativeReadDeps: [MLXArray] = []
         private var basePosition = 0
         private(set) var firstPosition = 0
@@ -742,7 +743,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var arrays: [MLXArray] {
             guard let keys, let values else { return [] }
             return inPlaceRing
-                ? depends(inputs: [keys, values], dependencies: [writeFence]) : [keys, values]
+                ? depends(inputs: [keys, values], dependencies: [committedWriteFence]) : [keys, values]
         }
 
         func restart(at position: Int) {
@@ -756,6 +757,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             keys = nil
             values = nil
             writeFence = MLXArray.zeros([1], dtype: .int32)
+            committedWriteFence = writeFence
             speculativeReadDeps.removeAll(keepingCapacity: false)
             restart(at: 0)
         }
@@ -842,6 +844,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 writeFence = Self.ringWrite(
                     [nk, nv, keys!, values!, params, writeFence], dtype: dtype, kvHeads: kvHeads,
                     window: window, headDimensions: headDimensions, rows: rows, layers: layers)
+                committedWriteFence = writeFence
             } else {
                 var written = 0
                 while written < rows {

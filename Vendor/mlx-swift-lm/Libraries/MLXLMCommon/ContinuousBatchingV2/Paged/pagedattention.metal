@@ -690,7 +690,7 @@ inline bfloat16_t cbv2_bf16_cast_fp8(bfloat16_t yb, float m0, float m1, float bo
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int MAXPART,
     bool HAS_SOFTCAP, typename Cache, int BLOCK = 1, bool DYN_TREE = false,
-    bool APPEND = false, int OUT_GATE_MODE = 0>
+    bool APPEND = false, int OUT_GATE_MODE = 0, bool PHASED_MERGE = false>
 inline void paged_attention_onepass_impl(
     const device T* q,
     thread const Cache& cache,
@@ -916,6 +916,100 @@ inline void paged_attention_onepass_impl(
                 m[g] = m_new;
             }
         }
+    }
+
+    if constexpr (PHASED_MERGE) {
+        // Phased 1-head-at-a-time merge: red_smem needs only MAXPART * NSG * RSTRIDE floats
+        // (6.1 KB at mp=3, 8.1 KB at mp=4), enabling HPT=4 with 3+ TGs/core and 0-ULP parity.
+        for (int g = 0; g < HPT; g++) {
+            if (g > 0) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup float* mine = red_smem + (size_t)sgitg * RSTRIDE;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                mine[lane * EPT + e] = acc[g][e];
+            }
+            if (lane == 0) {
+                mine[D] = m[g];
+                mine[D + 1] = l[g];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (active && state == 0) {
+                threadgroup float* red = red_smem + (size_t)(part * NSG) * RSTRIDE;
+                float pm = -FLT_MAX;
+                for (int s = 0; s < NSG; s++) {
+                    pm = max(pm, red[(size_t)s * RSTRIDE + D]);
+                }
+                float w_s[NSG];
+                float pl = 0.0f;
+                for (int s = 0; s < NSG; s++) {
+                    const float ms = red[(size_t)s * RSTRIDE + D];
+                    const float ls = red[(size_t)s * RSTRIDE + D + 1];
+                    w_s[s] = exp2(ms - pm);
+                    pl += ls * w_s[s];
+                }
+                float p_out[EPT];
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    const int col = int(lane) + e * 32;
+                    float v = 0.0f;
+                    for (int s = 0; s < NSG; s++) {
+                        v += red[(size_t)s * RSTRIDE + col] * w_s[s];
+                    }
+                    p_out[e] = v;
+                }
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    red[int(lane) + e * 32] = p_out[e];
+                }
+                if (lane == 0) {
+                    red[D] = pm;
+                    red[D + 1] = pl;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (part == 0 && state == 0) {
+                float gm = -FLT_MAX;
+                for (int p = 0; p < parts; p++) {
+                    gm = max(gm, red_smem[(size_t)(p * NSG) * RSTRIDE + D]);
+                }
+                float gl = 0.0f;
+                float gacc[EPT];
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    gacc[e] = 0.0f;
+                }
+                for (int p = 0; p < parts; p++) {
+                    const threadgroup float* pp = red_smem + (size_t)(p * NSG) * RSTRIDE;
+                    const float ms = pp[D];
+                    const float ls = pp[D + 1];
+                    const float w = exp2(ms - gm);
+                    gl += ls * w;
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        gacc[e] += pp[lane * EPT + e] * w;
+                    }
+                }
+                const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+                const size_t ooff = ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + g)) * D;
+                device T* orow = out + ooff;
+#pragma unroll
+                for (int e = 0; e < EPT; e++) {
+                    T oval = T(gacc[e] * inv);
+                    if constexpr (OUT_GATE_MODE >= 1) {
+                        if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                            oval = oval * cbv2_bf16_sigmoid(out_gate[ooff + lane * EPT + e]);
+                            if constexpr (OUT_GATE_MODE == 2) {
+                                oval = cbv2_bf16_cast_fp8(oval, fp8_m0, fp8_m1, fp8_bound);
+                            }
+                        }
+                    }
+                    orow[lane * EPT + e] = oval;
+                }
+            }
+        }
+        return;
     }
 
     // Publish this (partition, state)'s online-softmax states.

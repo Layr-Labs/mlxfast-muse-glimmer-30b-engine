@@ -79,6 +79,9 @@ public enum PagedOnePassAttention {
     static let appendEnabled = environment["CBV2_ONEPASS_APPEND"] != "0"
     /// `CBV2_ONEPASS_OUTGATE=0`: keep separate BF16 `output * sigmoid(gate)` launch.
     public static let outputGateEnabled = environment["CBV2_ONEPASS_OUTGATE"] != "0"
+    /// `CBV2_ONEPASS_PHASED_HPT4=0`: disable strict-C3 phased HPT=4 (6.1 KB red_smem).
+    public static let phasedHPT4Enabled = environment["CBV2_ONEPASS_PHASED_HPT4"] != "0"
+    nonisolated(unsafe) private static var phasedHPT4ProbeFailed = false
     /// True once `warm` qualified at least one write-owning variant.
     static var appendWarmed: Bool { appendEnabled && lock.withLock { !appendVariants.isEmpty } }
     /// `MUSE_PAGED_ONEPASS_PROBE_FAIL=1`: the probe asks for a threadgroup no
@@ -154,11 +157,14 @@ public enum PagedOnePassAttention {
         outputs += PagedSegmentAttention.warmTwoPass(
             dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim,
             pageSize: pageSize, softcap: softcap, source: source)
-        variants: for useRec in [true, false] {
+        variants: for (useRec, usePhasedHPT4) in [(true, false), (false, false), (false, true)] {
+        if usePhasedHPT4 && (!phasedHPT4Enabled || gqa % 4 != 0) { continue }
         guard
-            let hpt = eligible(
-                headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1,
-                record: useRec)
+            let hpt = usePhasedHPT4
+                ? 4
+                : eligible(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, partitions: 1, rows: 1,
+                    record: useRec)
         else { continue }
         for bindings in PagedSegmentDispatchPlan.bindingClasses {
             let offsets = [Int64](repeating: Int64(pageElements), count: max(8, bindings))
@@ -171,18 +177,20 @@ public enum PagedOnePassAttention {
                         valueOffsets: MLXArray(offsets), records: MLXArray(record),
                         dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
                         simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                        source: source, probe: true, record: useRec)
+                        source: source, probe: true, record: useRec, phased: usePhasedHPT4)
                     eval(probed.fence, probed.out)
                     return true
                 }) ?? false
             if logs {
                 FileHandle.standardError.write(
                     Data(
-                    "[onepass] threadgroup probe record=\(useRec) bindings=\(bindings) held=\(held)\n"
+                    "[onepass] threadgroup probe record=\(useRec) phased4=\(usePhasedHPT4) bindings=\(bindings) held=\(held)\n"
                         .utf8))
             }
             guard held else {
-                if useRec {
+                if usePhasedHPT4 {
+                    phasedHPT4ProbeFailed = true
+                } else if useRec {
                     threadgroupProbeFailedRecord = true
                 } else {
                     threadgroupProbeFailedLow = true
@@ -199,12 +207,16 @@ public enum PagedOnePassAttention {
                             valueOffsets: MLXArray(offsets), records: MLXArray(record),
                             dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
                             simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                            source: source, probe: true, treeMeta: dummyTreeMeta, record: useRec)
+                            source: source, probe: true, treeMeta: dummyTreeMeta, record: useRec,
+                            phased: usePhasedHPT4)
                         eval(probed.fence, probed.out)
                         return true
                     }) ?? false
                 if !dynHeld {
-                    if useRec {
+                    if usePhasedHPT4 {
+                        phasedHPT4ProbeFailed = true
+                        continue variants
+                    } else if useRec {
                         dynTreeProbeFailedRecord = true
                     } else {
                         dynTreeProbeFailedLow = true
@@ -219,7 +231,7 @@ public enum PagedOnePassAttention {
                     valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
                     kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                     partitionTokens: ptok, softcap: softcap, source: source, maxPart: mp,
-                    forceMaxPart: true, record: useRec)
+                    forceMaxPart: true, record: useRec, phased: usePhasedHPT4)
                 outputs += [result.fence, result.out]
                 if warmDynTree && !dynTreeProbeFailedFor(record: useRec) {
                     let dynResult = segments(
@@ -228,10 +240,11 @@ public enum PagedOnePassAttention {
                         valueOffsets: MLXArray(offsets), records: MLXArray(record), dtype: dtype,
                         kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                         partitionTokens: ptok, softcap: softcap, source: source,
-                        treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec)
+                        treeMeta: dummyTreeMeta, maxPart: mp, forceMaxPart: true, record: useRec,
+                        phased: usePhasedHPT4)
                     outputs += [dynResult.fence, dynResult.out]
                 }
-                if appendEnabled {
+                if appendEnabled && !usePhasedHPT4 {
                     outputs += warmAppend(
                         q: q, storage: appendStorage, bindings: bindings, seqinfo: seqinfo,
                         params: params, previous: previous, valueOffsets: MLXArray(offsets),
@@ -250,7 +263,7 @@ public enum PagedOnePassAttention {
                             records: MLXArray(record), dtype: dtype, headDim: headDim, kvHeads: kvHeads,
                             gqa: gqa, pageSize: pageSize, hpt: hpt, simdgroups: nsg,
                             partitionTokens: ptok, softcap: softcap, source: source, maxPart: mp,
-                            treeMeta: nil, fp8Cast: fp8Pair)
+                            treeMeta: nil, fp8Cast: fp8Pair, phased: usePhasedHPT4)
                         if warmDynTree && !dynTreeProbeFailedFor(record: false) {
                             outputs += warmOutputGate(
                                 q: q, storage: storage, bindings: bindings, seqinfo: seqinfo,
@@ -258,7 +271,8 @@ public enum PagedOnePassAttention {
                                 records: MLXArray(record), dtype: dtype, headDim: headDim,
                                 kvHeads: kvHeads, gqa: gqa, pageSize: pageSize, hpt: hpt,
                                 simdgroups: nsg, partitionTokens: ptok, softcap: softcap,
-                                source: source, maxPart: mp, treeMeta: dummyTreeMeta, fp8Cast: fp8Pair)
+                                source: source, maxPart: mp, treeMeta: dummyTreeMeta, fp8Cast: fp8Pair,
+                                phased: usePhasedHPT4)
                         }
                     }
                 }
@@ -272,7 +286,7 @@ public enum PagedOnePassAttention {
         previous: MLXArray, valueOffsets: MLXArray, records: MLXArray, dtype: DType,
         headDim: Int, kvHeads: Int, gqa: Int, pageSize: Int, hpt: Int, simdgroups: Int,
         partitionTokens: Int, softcap: Bool, source: String, maxPart: Int, treeMeta: MLXArray?,
-        fp8Cast: (multipliers: MLXArray, overflowBound: MLXArray)?
+        fp8Cast: (multipliers: MLXArray, overflowBound: MLXArray)?, phased: Bool = false
     ) -> [MLXArray] {
         let mode = fp8Cast != nil ? 2 : 1
         let backing = [MLXArray](repeating: storage, count: bindings)
@@ -284,14 +298,15 @@ public enum PagedOnePassAttention {
                     dtype: dtype, kvHeads: kvHeads, pageSize: pageSize, hpt: hpt,
                     simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
                     source: source, probe: true, treeMeta: treeMeta, maxPart: maxPart,
-                    forceMaxPart: true, outputGate: q, fp8Cast: fp8Cast, record: false)
+                    forceMaxPart: true, outputGate: q, fp8Cast: fp8Cast, record: false,
+                    phased: phased)
                 eval(probed.fence, probed.out)
                 return true
             }) ?? false
         if logs {
             FileHandle.standardError.write(
                 Data(
-                    "[onepass] outgate probe mode=\(mode) dynTree=\(treeMeta != nil) bindings=\(bindings) maxpart=\(maxPart) held=\(held)\n"
+                    "[onepass] outgate probe mode=\(mode) dynTree=\(treeMeta != nil) phased=\(phased) bindings=\(bindings) maxpart=\(maxPart) held=\(held)\n"
                         .utf8))
         }
         guard held else { return [] }
@@ -301,7 +316,7 @@ public enum PagedOnePassAttention {
             kvHeads: kvHeads, pageSize: pageSize, hpt: hpt, simdgroups: simdgroups,
             partitionTokens: partitionTokens, softcap: softcap, source: source,
             treeMeta: treeMeta, maxPart: maxPart, forceMaxPart: true, outputGate: q,
-            fp8Cast: fp8Cast, record: false)
+            fp8Cast: fp8Cast, record: false, phased: phased)
         let key = OutGateKey(
             dtype: dtype, headDim: headDim, kvHeads: kvHeads, gqa: gqa, pageSize: pageSize,
             hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens, softcap: softcap,
@@ -353,11 +368,19 @@ public enum PagedOnePassAttention {
         return [result.fence, result.out]
     }
 
-    /// Heads per threadgroup: the largest divisor of `gqa` at or under the
-    /// requested count whose threadgroup memory fits Metal's limit.
+    /// Heads per threadgroup: on strict-C3 low-acceptance rounds, use phased HPT=4
+    /// (6.1 KB red_smem at mp=3, 8.1 KB at mp=4 -> 3+ TGs/core, half the KV DRAM reads).
     static func headsPerThreadgroup(
         headDim: Int, gqa: Int, simdgroups: Int, record: Bool = useRecordKernel
     ) -> Int? {
+        if !record && phasedHPT4Enabled && !phasedHPT4ProbeFailed
+            && CBv2DraftRegime.strictLowVerifyC3 && gqa % 4 == 0
+        {
+            let floats = maxPartitions * simdgroups * (headDim + 2)
+            if floats * 4 <= PagedAttentionKernel.threadgroupMemoryLimit {
+                return 4
+            }
+        }
         var hpt = min(gqa, requestedHeads)
         while hpt >= 1 {
             // The record kernel also holds q_smem and part_smem.
@@ -388,6 +411,10 @@ public enum PagedOnePassAttention {
 
     private static let scratch = """
         threadgroup float red_smem[MAXPART * NSG * HPT * (D + 2)];
+        """
+
+    private static let scratchPhased = """
+        threadgroup float red_smem[MAXPART * NSG * (D + 2)];
         """
 
     private static let scratchRecord = """
@@ -425,12 +452,18 @@ public enum PagedOnePassAttention {
     /// Records of a single-bucket plan are row-major with each row's own
     /// partition count, so (row, partition) is a prefix sum away.
     private static func segmentBody(
-        bindings: Int, appending: Bool = false, outGateMode: Int = 0, record: Bool = false
+        bindings: Int, appending: Bool = false, outGateMode: Int = 0, record: Bool = false,
+        phased: Bool = false
     ) -> String {
         let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
-        // The read-only source stays byte-identical; only the append or outGate variant adds arguments.
-        let extraTpl =
-            appending ? ", true" : (outGateMode > 0 ? ", false, \(outGateMode)" : "")
+        // The read-only source stays byte-identical; only the append, outGate, or phased variant adds arguments.
+        let extraTpl: String
+        if phased {
+            extraTpl = ", \(appending ? "true" : "false"), \(outGateMode), true"
+        } else {
+            extraTpl =
+                appending ? ", true" : (outGateMode > 0 ? ", false, \(outGateMode)" : "")
+        }
         let extraArgs =
             appending
             ? ", knew, vnew"
@@ -452,7 +485,7 @@ public enum PagedOnePassAttention {
             if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
                 fence[0] = previous[0] + 1;
             }
-            \(record ? scratchRecord : scratch)
+            \(record ? scratchRecord : (phased ? scratchPhased : scratch))
             cbv2::paged_attention_onepass_impl\(record ? "_rec" : "")<
                 T, D, S, GQA, HPT, NSG, PTOK, MAXPART, HAS_SOFTCAP,
                 cbv2::PagedSegmentAccessor<T, SEGMENTS, (BLOCK > 1)>, BLOCK, DYN_TREE\(extraTpl)>(
@@ -539,6 +572,7 @@ public enum PagedOnePassAttention {
         let append: Bool
         let outGateMode: Int
         let record: Bool
+        let phased: Bool
     }
 
     private struct AppendKey: Hashable {
@@ -627,7 +661,8 @@ public enum PagedOnePassAttention {
         pending: (keys: MLXArray, values: MLXArray)? = nil,
         outputGate: MLXArray? = nil,
         fp8Cast: (multipliers: MLXArray, overflowBound: MLXArray)? = nil,
-        record: Bool = useRecordKernel
+        record: Bool = useRecordKernel,
+        phased: Bool? = nil
     ) -> (fence: MLXArray, out: MLXArray) {
         let (b, qh, d) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let gqa = qh / kvHeads
@@ -636,6 +671,7 @@ public enum PagedOnePassAttention {
         let dynTree = treeMeta != nil
         let appending = pending != nil
         let outGateMode = (outputGate != nil) ? (fp8Cast != nil ? 2 : 1) : 0
+        let usePhased = phased ?? (!record && hpt == 4 && phasedHPT4Enabled)
         precondition(!(appending && dynTree), "the fused append serves linear rows only")
         precondition(!(appending && outGateMode > 0), "fused output gate serves pre-written rows only")
         precondition(!(record && outGateMode > 0), "fused output gate serves low-acceptance kernels only")
@@ -656,7 +692,7 @@ public enum PagedOnePassAttention {
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, outGateMode: outGateMode, record: record)
+                append: appending, outGateMode: outGateMode, record: record, phased: usePhased)
             if let hit = lock.withLock({ segLaunchCache[lkey] }) {
                 let outputs = hit(inputs)
                 return (outputs[0], outputs[1])
@@ -668,7 +704,7 @@ public enum PagedOnePassAttention {
                 "segments\(bindings)_kvh\(kvHeads)", dtype: dtype, headDim: d, pageSize: pageSize,
                 gqa: gqa, hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 softcap: softcap, maxPart: mp) + (appending ? "_append" : "")
-            + gateSuffix + (record ? "_rec" : "")
+            + gateSuffix + (usePhased ? "_phased" : "") + (record ? "_rec" : "")
         let kernel = lock.withLock { () -> MLXFast.MLXFastKernel in
             if let existing = kernels[kernelName] { return existing }
             if logs {
@@ -689,7 +725,7 @@ public enum PagedOnePassAttention {
                 outputNames: ["fence", "out"],
                 source: segmentBody(
                     bindings: bindings, appending: appending, outGateMode: outGateMode,
-                    record: record),
+                    record: record, phased: usePhased),
                 header: source, ensureRowContiguous: true,
                 mutableInputs: appending ? segmentNames : [])
             kernels[kernelName] = made
@@ -708,7 +744,7 @@ public enum PagedOnePassAttention {
                 dtype: dtype, b: b, qh: qh, d: d, kvHeads: kvHeads, pageSize: pageSize,
                 hpt: hpt, simdgroups: simdgroups, partitionTokens: partitionTokens,
                 maxPart: mp, softcap: softcap, bindings: bindings, dynTree: dynTree,
-                append: appending, outGateMode: outGateMode, record: record)
+                append: appending, outGateMode: outGateMode, record: record, phased: usePhased)
             let launch = kernel.prepare(
                 template: template,
                 grid: (kvHeads * (gqa / hpt) * tg, b, 1),

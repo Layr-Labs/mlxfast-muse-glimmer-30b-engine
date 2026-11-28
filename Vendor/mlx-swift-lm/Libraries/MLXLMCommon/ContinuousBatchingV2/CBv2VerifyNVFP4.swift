@@ -73,8 +73,8 @@ public enum CBv2VerifyNVFP4 {
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
-            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
-            if strictC3 && rows >= 7 && downTN1Env && wc {
+            // exact TGs, maxT=1024, register-lean rolling peeled PF=2) for rows >= 2.
+            if strictC3 && rows >= 2 && downTN1Env && wc {
                 let defaultPF = peeledPFEnv ? 2 : 0
                 let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
                 return (1, pf, wc, sv)
@@ -87,9 +87,9 @@ public enum CBv2VerifyNVFP4 {
             return (tn, pf, wc, sv)
         }
         // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
-        // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
-        // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
-        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding register-lean
+        // rolling peeled next-chunk weight+scale DRAM prefetch (PF=2) for rows >= 2.
+        let defaultPF = (strictC3 && rows >= 2 && peeledPFEnv && wc) ? 2 : 0
         let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
@@ -204,8 +204,9 @@ public enum CBv2VerifyNVFP4 {
                     }
                 }
             } else if constexpr (WC && PF == 2) {
-                // Branchless peeled next-chunk weight+scale DRAM prefetch with 4-block
-                // upfront activation loads (zero if(more) branches inside K-loop, maxT=1024).
+                // Register-lean branchless peeled next-chunk weight+scale DRAM prefetch:
+                // streams per-block xv[TM][2] from L1 (saving 12 regs vs xa[4][TM][2])
+                // and refills qb[block][t] in-place (saving 4 regs vs q[4][TN]), 0-ULP exact.
                 constexpr int STEP = WK * BK;
                 int k = int(sg) * BK;
                 if (k < K) {
@@ -229,25 +230,6 @@ public enum CBv2VerifyNVFP4 {
                     }
                     for (; k + STEP < K; k += STEP) {
                         const int kn = k + STEP;
-                        uint q[4][TN];
-                        ushort4 xa[4][TM][2];
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            const int b = k + 32 * block;
-                            const int bn = kn + 32 * block;
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                q[block][t] = qb[block][t];
-                                qb[block][t] = wl[t][bn / 8];
-                            }
-                            MO_WO_UNROLL
-                            for (short mt = 0; mt < TM; mt++) {
-                                MO_WO_UNROLL
-                                for (short j = 0; j < 2; j++) {
-                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
-                                }
-                            }
-                        }
                         half2 hs[TN][2];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
@@ -265,6 +247,22 @@ public enum CBv2VerifyNVFP4 {
                         }
                         MO_WO_UNROLL
                         for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            const int bn = kn + 32 * block;
+                            uint q[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                q[t] = qb[block][t];
+                                qb[block][t] = wl[t][bn / 8];
+                            }
+                            ushort4 xv[TM][2];
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xv[mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
                             half s[TN];
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
@@ -274,12 +272,12 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     bf[mt] = float2(
-                                        float(as_type<bfloat>(xa[block][mt][0][i])),
-                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                        float(as_type<bfloat>(xv[mt][0][i])),
+                                        float(as_type<bfloat>(xv[mt][1][i])));
                                 }
                                 MO_WO_UNROLL
                                 for (short t = 0; t < TN; t++) {
-                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
+                                    const float2 a = mo_wo_pair(q[t], i, s[t]);
                                     MO_WO_UNROLL
                                     for (short mt = 0; mt < TM; mt++) {
                                         mo_wo_mma(C[t][mt], a, bf[mt]);
@@ -290,18 +288,6 @@ public enum CBv2VerifyNVFP4 {
                     }
                     // Final peeled chunk (no next-chunk load).
                     {
-                        ushort4 xa[4][TM][2];
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            const int b = k + 32 * block;
-                            MO_WO_UNROLL
-                            for (short mt = 0; mt < TM; mt++) {
-                                MO_WO_UNROLL
-                                for (short j = 0; j < 2; j++) {
-                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
-                                }
-                            }
-                        }
                         half2 hs[TN][2];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) {
@@ -315,6 +301,15 @@ public enum CBv2VerifyNVFP4 {
                         }
                         MO_WO_UNROLL
                         for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            ushort4 xv[TM][2];
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xv[mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
                             half s[TN];
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
@@ -324,8 +319,8 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     bf[mt] = float2(
-                                        float(as_type<bfloat>(xa[block][mt][0][i])),
-                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                        float(as_type<bfloat>(xv[mt][0][i])),
+                                        float(as_type<bfloat>(xv[mt][1][i])));
                                 }
                                 MO_WO_UNROLL
                                 for (short t = 0; t < TN; t++) {
