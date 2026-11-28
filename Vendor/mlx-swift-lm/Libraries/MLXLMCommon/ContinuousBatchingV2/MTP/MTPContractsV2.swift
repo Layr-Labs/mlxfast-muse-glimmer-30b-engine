@@ -443,6 +443,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// Optional contiguous `[1, count]` int32 view of the current round's proposals.
+    /// The IDs match the preceding `count` calls to `draftStep` in order.
+    func stagedDraftTokens(
+        count: Int, requestState: any CBv2MTPRequestState
+    ) -> MLXArray?
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
@@ -484,6 +489,9 @@ extension CBv2MTPRequestStatefulDrafter {
     public var submitsEveryDraftStepEarly: Bool { false }
     public var requiresDraftHiddenEvaluation: Bool { true }
     public var draftShortlistSize: Int? { nil }
+    public func stagedDraftTokens(
+        count: Int, requestState: any CBv2MTPRequestState
+    ) -> MLXArray? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
