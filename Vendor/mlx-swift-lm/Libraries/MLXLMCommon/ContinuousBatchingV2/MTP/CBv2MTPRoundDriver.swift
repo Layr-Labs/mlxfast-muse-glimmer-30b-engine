@@ -1779,14 +1779,14 @@ public enum CBv2DraftRegime {
         }
         return 5
     }()
-    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.15).
+    /// Softmax temperature for GPU-dynamic tree scoring (`CBV2_DYN_TREE_TEMP`, default 0.11).
     public static let dynamicTreeTemp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TEMP"],
             let v = Float(raw), v.isFinite, v > 0.05, v <= 10.0
         {
             return v
         }
-        return 0.15
+        return 0.11
     }()
     /// Chain EV multiplier (`CBV2_DYN_TREE_BONUS`, default 1.0; `0.0` forces best EV leaf(s)).
     public static let dynamicTreeChainBonus: Float = {
