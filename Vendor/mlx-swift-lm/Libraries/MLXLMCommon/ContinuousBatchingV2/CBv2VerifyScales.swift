@@ -591,6 +591,16 @@ public enum CBv2VerifyScales {
     public static func nvfp4ReadoutTopTwo(
         _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float
     ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray)? {
+        guard let readout = nvfp4ReadoutTopTwo(
+            layer, x, outputMultiplier: outputMultiplier, softcap: softcap, includeTargetIDs: false)
+        else { return nil }
+        return (readout.ids, readout.values, readout.nonFinite)
+    }
+
+    package static func nvfp4ReadoutTopTwo(
+        _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float,
+        includeTargetIDs: Bool
+    ) -> CBv2TopTwoReadout? {
         guard fusedLMHeadEnabled, x.ndim == 3, x.dtype == .bfloat16,
             let l = layer as? ModelOptWeightOnlyNVFP4Linear
         else { return nil }
@@ -613,7 +623,7 @@ public enum CBv2VerifyScales {
             ])
             return cbv2FusedReadoutTopTwoMergePartials(
                 partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
-                batch: batch, width: width, chunks: plan.chunks)
+                batch: batch, width: width, chunks: plan.chunks, includeTargetIDs: includeTargetIDs)
         }
         guard inputs > 0, l.inputDimensions == inputs, outputs >= 8,
             rows > ModelOptWeightOnlyNVFP4RowExact.scalarRows,
@@ -652,7 +662,7 @@ public enum CBv2VerifyScales {
         ])
         return cbv2FusedReadoutTopTwoMergePartials(
             partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
-            batch: batch, width: width, chunks: chunks)
+            batch: batch, width: width, chunks: chunks, includeTargetIDs: includeTargetIDs)
     }
 
     private static let nvfp4Kernel = MLXFast.metalKernel(
