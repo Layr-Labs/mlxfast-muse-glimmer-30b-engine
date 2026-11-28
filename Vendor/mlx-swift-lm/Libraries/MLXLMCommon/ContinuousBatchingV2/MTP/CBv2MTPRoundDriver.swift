@@ -335,6 +335,112 @@ final class CBv2MTPRoundDriver {
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
     /// Optional per-request tree cooldown set when `CBV2_TREE_COOLDOWN=1`.
     private var treeCooldownRequests: Set<CBv2RequestID> = []
+
+    /// Per-request online-calibrated suffix n-gram proposer for strict-C3 dynamic trees.
+    private struct HistorySuffixCalibrator {
+        var hits = (0, 0, 0)
+        var trials = (0, 0, 0)
+        var contHits = 0
+        var contTrials = 0
+        var pending: (bucket: Int, tokens: [Int])? = nil
+    }
+    private var historyCalibrators: [CBv2RequestID: HistorySuffixCalibrator] = [:]
+
+    func prepareHistoryHint(for id: CBv2RequestID, tokens: [Int], maxLen: Int) -> MLXArray? {
+        guard CBv2DraftRegime.histTreeEnabled, CBv2DraftRegime.strictLowVerifyC3,
+            maxLen >= 1, tokens.count >= 4
+        else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let n = tokens.count
+        let lastTok = tokens[n - 1]
+        let prevTok = tokens[n - 2]
+        let scanStart = max(1, n - 2048)
+        var bestLen = 0
+        var bestPos = -1
+        let maxMatch = min(8, n - 1)
+        var i = n - 2
+        while i >= scanStart {
+            if tokens[i] == lastTok && tokens[i - 1] == prevTok {
+                var m = 2
+                while m < maxMatch && i - m >= 0 && tokens[i - m] == tokens[n - 1 - m] {
+                    m += 1
+                }
+                if m > bestLen {
+                    bestLen = m
+                    bestPos = i
+                    if bestLen == maxMatch { break }
+                }
+            }
+            i -= 1
+        }
+        guard bestLen >= 2, bestPos >= 0, bestPos + 1 < n else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let hCount = min(min(maxLen, 7), n - 1 - bestPos)
+        guard hCount >= 1 else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let hToks = Array(tokens[(bestPos + 1) ..< (bestPos + 1 + hCount)])
+        let bucket = bestLen >= 4 ? 2 : (bestLen == 3 ? 1 : 0)
+        var cal = historyCalibrators[id] ?? HistorySuffixCalibrator()
+        let (a0, b0, h0, t0): (Double, Double, Int, Int) =
+            switch bucket {
+            case 2: (3.5, 1.5, cal.hits.2, cal.trials.2)
+            case 1: (2.0, 2.5, cal.hits.1, cal.trials.1)
+            default: (1.0, 3.0, cal.hits.0, cal.trials.0)
+            }
+        let pInit = (a0 + Double(h0)) / (a0 + b0 + Double(t0))
+        let pCont = (3.5 + Double(cal.contHits)) / (5.0 + Double(cal.contTrials))
+        cal.pending = (bucket: bucket, tokens: hToks)
+        historyCalibrators[id] = cal
+        var payload = [Int32](repeating: 0, count: 10)
+        payload[0] = Int32(hCount)
+        payload[1] = Int32(max(0, min(1_000_000, Int((pInit * 1_000_000.0).rounded()))))
+        payload[2] = Int32(max(0, min(1_000_000, Int((pCont * 1_000_000.0).rounded()))))
+        for j in 0 ..< hCount {
+            payload[3 + j] = Int32(hToks[j])
+        }
+        return MLXArray(payload)
+    }
+
+    func observeHistoryOutcome(for id: CBv2RequestID, committed: [Int]) {
+        guard var cal = historyCalibrators[id], let prop = cal.pending else { return }
+        cal.pending = nil
+        if !committed.isEmpty && !prop.tokens.isEmpty {
+            let hit0 = committed[0] == prop.tokens[0]
+            switch prop.bucket {
+            case 2:
+                cal.trials.2 += 1
+                if hit0 { cal.hits.2 += 1 }
+            case 1:
+                cal.trials.1 += 1
+                if hit0 { cal.hits.1 += 1 }
+            default:
+                cal.trials.0 += 1
+                if hit0 { cal.hits.0 += 1 }
+            }
+            if hit0 {
+                let lim = min(prop.tokens.count, committed.count)
+                for j in 1 ..< lim {
+                    cal.contTrials += 1
+                    if committed[j] == prop.tokens[j] {
+                        cal.contHits += 1
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+        historyCalibrators[id] = cal
+    }
+
+    func clearHistoryCalibrator(for id: CBv2RequestID) {
+        historyCalibrators.removeValue(forKey: id)
+    }
     /// Plan-scoped: the confirmed post-verify speculation's lazy draft
     /// confidence for each row whose window this plan offered it to, kept
     /// until that round's finalize calibrates with it. Cleared every plan.
@@ -692,6 +798,22 @@ final class CBv2MTPRoundDriver {
         CBv2DraftRegime.strictLowVerifyC3 =
             usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyC3Regime
         return deep
+    }
+
+    /// A request that has committed at least `knownHighCommittedHundredths / 100`
+    /// tokens per speculative round over at least `knownHighMinRounds` rounds.
+    /// Host arithmetic over finalized rounds only.
+    static let knownHighMinRounds: Int = {
+        ProcessInfo.processInfo.environment["CBV2_KNOWN_HIGH_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+    }()
+    static let knownHighCommittedHundredths: Int = {
+        ProcessInfo.processInfo.environment["CBV2_KNOWN_HIGH_COMMITTED"].flatMap(Int.init) ?? 450
+    }()
+    func inKnownHighAcceptanceRegime(_ id: CBv2RequestID) -> Bool {
+        guard CBv2DraftRegime.knownHighRegate, usesFixedDepthAcceptanceWindow else { return false }
+        let acc = requestAcceptance[id] ?? initialRequestAcceptance
+        return acc.ceilingRounds >= Self.knownHighMinRounds
+            && acc.ceilingCommittedTokens * 100 >= Self.knownHighCommittedHundredths * acc.ceilingRounds
     }
 
     func shouldUseVerifyTree(for id: CBv2RequestID) -> Bool {
@@ -1216,6 +1338,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        historyCalibrators.removeValue(forKey: id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -1231,6 +1354,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        historyCalibrators.removeValue(forKey: id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1270,6 +1394,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
         treeCooldownRequests.removeAll(keepingCapacity: false)
+        historyCalibrators.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
@@ -1695,6 +1820,20 @@ public enum CBv2DraftRegime {
     /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
     /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
     nonisolated(unsafe) public static var strictLowVerifyC3 = false
+    /// Target-verify kernel selection runs the strict-low and clause-3 choices of the
+    /// bit-identical verify kernels in every round (`MLX_MUSE_VERIFY_UNGATE=0` restores the
+    /// regime gates). Drafter, tree, depth, acceptance and paged-attention choices keep
+    /// reading the flags above; the decode pacing floor bounds high-acceptance windows.
+    public static let verifyUngateEnv: Bool =
+        ProcessInfo.processInfo.environment["MLX_MUSE_VERIFY_UNGATE"] != "0"
+    /// `CBV2_KNOWN_HIGH_REGATE=1` keeps the record's verify kernels in rounds of a
+    /// request already known to be high-acceptance. Off by default.
+    nonisolated(unsafe) public static var highAcceptanceKnown = false
+    public static let knownHighRegate: Bool =
+        ProcessInfo.processInfo.environment["CBV2_KNOWN_HIGH_REGATE"] == "1"
+    public static var verifyUngate: Bool { verifyUngateEnv && !highAcceptanceKnown }
+    public static var verifyStrictLowKernels: Bool { verifyUngate || strictLowVerifyEligible }
+    public static var verifyC3Kernels: Bool { verifyUngate || strictLowVerifyC3 }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.
@@ -1703,6 +1842,12 @@ public enum CBv2DraftRegime {
     /// `[0] = packedPosDeltas`, `[1...8] = ancPacked[0...7]`, `[9...16] = depth[0...7]`,
     /// `[17] = packedParents`.
     nonisolated(unsafe) public static var activeDynamicTreeMeta: MLXArray? = nil
+    /// Optional `[10]` int32 host-matched prompt+history suffix hint for strict-C3 dynamic trees.
+    nonisolated(unsafe) public static var activeHistoryHint: MLXArray? = nil
+    /// History-assisted suffix merging in dynamic trees is off by default;
+    /// `CBV2_HIST_TREE=1` enables it.
+    public static let histTreeEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_HIST_TREE"] == "1"
     /// `CBV2_TREE_LOW=0` disables tree verification on low-acceptance rounds.
     public static let verifyTreeMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1
@@ -1710,11 +1855,12 @@ public enum CBv2DraftRegime {
     /// `CBV2_DYN_TREE=0` disables GPU-dynamic tree selection (falls back to static tree).
     public static let dynamicTreeEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DYN_TREE"] != "0"
-    /// `CBV2_LOW_ONLY_VERIFY=0` applies verify-path micro-speedups on high-acceptance rounds too.
-    /// Default (`true`) confines them to low-acceptance rounds so high-acceptance windows match
-    /// baseline latency below the decode speedup ceiling.
-    public static let lowOnlyVerifySpeedups: Bool =
-        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] != "0"
+    /// Verify-path speedups run in every round by default; the decode pacing floor
+    /// bounds high-acceptance windows. `CBV2_LOW_ONLY_VERIFY=1` confines them to
+    /// low-acceptance rounds.
+    public static let lowOnlyVerifySpeedupsEnv: Bool =
+        ProcessInfo.processInfo.environment["CBV2_LOW_ONLY_VERIFY"] == "1"
+    public static var lowOnlyVerifySpeedups: Bool { lowOnlyVerifySpeedupsEnv || highAcceptanceKnown }
     /// `CBV2_TREE_OLDPOL=1` forces k-wide accept/reject updates on tree rounds.
     /// Default (`false`) uses terminal-branch and chain-depth semantics so tree rounds preserve width.
     public static let treeOldAcceptancePolicy: Bool =
@@ -1826,7 +1972,7 @@ public enum CBv2DraftRegime {
     public static let dynamicTreeDPMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_DYN_TREE_DP"].flatMap(Int.init) ?? 1
     }()
-    /// Candidates per position considered in dynamic tree (`CBV2_DYN_TREE_TOPK`, 3...5, default 5).
+    /// Candidates per position considered in dynamic tree (`CBV2_DYN_TREE_TOPK`, 3...5, default 4).
     public static let dynamicTreeTopK: Int = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_TOPK"],
             let v = Int(raw), (3 ... 5).contains(v)
@@ -1853,14 +1999,14 @@ public enum CBv2DraftRegime {
         }
         return 1.0
     }()
-    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.5).
+    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.0).
     public static let dynamicTreePurityExp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_PURITY_EXP"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 3.0
         {
             return v
         }
-        return 0.5
+        return 0.0
     }()
     /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
     public static let treeCooldownEnabled: Bool =
