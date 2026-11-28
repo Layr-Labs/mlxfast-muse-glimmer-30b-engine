@@ -323,6 +323,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.modelCapabilities = modelCapabilities
         // Parameter buffers resident before the first step (memory only).
         CBv2ParameterResidency.prepare([model as AnyObject] + (mtpDrafter.map { [$0 as AnyObject] } ?? []))
+        if CBv2DecodeBufferPrewarm.enabled, mtpConfig.enabled, mtpConfig.maxDraftTokens > 0,
+            let prewarming = model as? any CBv2DecodeBufferPrewarming
+        {
+            prewarming.prewarmDecodeBuffers(verifyRows: mtpConfig.maxDraftTokens + 1)
+        }
         if let violation = Self.backendCapabilityViolation(
             capabilities: modelCapabilities, backend: backend)
         {
@@ -2267,4 +2272,15 @@ extension EngineV2 {
         case .float64: return "float64"
         }
     }
+}
+
+public protocol CBv2DecodeBufferPrewarming: AnyObject {
+    func prewarmDecodeBuffers(verifyRows: Int)
+}
+
+public enum CBv2DecodeBufferPrewarm {
+    public static let enabled: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return (env["MLX_MUSE_DECODE_PREWARM"] ?? env["MUSE_MLX_DECODE_PREWARM"]) != "0"
+    }()
 }

@@ -222,6 +222,14 @@ public enum CBv2VerifyScales {
             return float2(as_type<half2>(p)) * fs;
         }
 
+        // Exact 0-ULP IEEE-754 fold of 256.0h * 16384.0h = 2^22 into float32.
+        inline float2 cb_sc_e4m3x2_f22(uint x) {
+            const uint v = x & 0x007F007Fu;
+            const uint u = (v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7)
+                | ((x & 0x00800080u) << 8);
+            return float2(as_type<half2>(u)) * 4194304.0f;
+        }
+
         """
 
     private static let nvfp4TopTwoHeader = nvfp4Header + """
@@ -367,27 +375,54 @@ public enum CBv2VerifyScales {
                     xa[block][0] = *(const device ushort4*)(xr0 + b);
                     xa[block][1] = *(const device ushort4*)(xr1 + b);
                 }
-                half2 hs[TN][2];
-                MO_WO_UNROLL
-                for (short t = 0; t < TN; t++) {
-                    const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
-                    hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
-                    hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
-                }
-                MO_WO_UNROLL
-                for (short block = 0; block < 4; block++) {
-                    half s[TN];
+                if constexpr (F22_) {
+                    float2 hs[TN][2];
                     MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                    for (short t = 0; t < TN; t++) {
+                        const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                        hs[t][0] = cb_sc_e4m3x2_f22(sv.x >> scale_shift);
+                        hs[t][1] = cb_sc_e4m3x2_f22(sv.y >> scale_shift);
+                    }
                     MO_WO_UNROLL
-                    for (short i = 0; i < 4; i++) {
-                        const float2 bf = float2(
-                            float(as_type<bfloat>(xa[block][0][i])),
-                            float(as_type<bfloat>(xa[block][1][i])));
+                    for (short block = 0; block < 4; block++) {
+                        float s[TN];
                         MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) {
-                            const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
-                            mo_wo_mma(C[t], a, bf);
+                        for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xa[block][0][i])),
+                                float(as_type<bfloat>(xa[block][1][i])));
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = cb_sc_pair_f(qa[block][t], i, s[t]);
+                                mo_wo_mma(C[t], a, bf);
+                            }
+                        }
+                    }
+                } else {
+                    half2 hs[TN][2];
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        const uint2 sv = *(const device uint2*)(sl[t] + (k / 16));
+                        hs[t][0] = cb_sc_e4m3x2(sv.x >> scale_shift);
+                        hs[t][1] = cb_sc_e4m3x2(sv.y >> scale_shift);
+                    }
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        half s[TN];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                        MO_WO_UNROLL
+                        for (short i = 0; i < 4; i++) {
+                            const float2 bf = float2(
+                                float(as_type<bfloat>(xa[block][0][i])),
+                                float(as_type<bfloat>(xa[block][1][i])));
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                const float2 a = mo_wo_pair(qa[block][t], i, s[t]);
+                                mo_wo_mma(C[t], a, bf);
+                            }
                         }
                     }
                 }
@@ -542,6 +577,7 @@ public enum CBv2VerifyScales {
         let scaled: Bool
         let chunks: Int
         let tn: Int
+        let f22: Bool
     }
 
     private struct NVFP4TopTwoPlanKey: Hashable {
@@ -551,6 +587,7 @@ public enum CBv2VerifyScales {
         let dtype: DType
         let chunks: Int
         let tn: Int
+        let f22: Bool
     }
 
     private struct NVFP4TopTwoPlan {
@@ -571,14 +608,16 @@ public enum CBv2VerifyScales {
     public static let fusedLMHeadEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] != "0"
 
-    public static let fusedLMHeadChunks: Int = {
+    private static let fusedLMHeadChunksEnv: Int? = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_CHUNKS"],
             let v = Int(raw), [64, 128, 256, 512, 1024, 2048, 4096].contains(v)
         {
             return v
         }
-        return 2048
+        return nil
     }()
+
+    public static let fusedLMHeadChunks: Int = fusedLMHeadChunksEnv ?? 2048
 
     public static let fusedLMHeadTN: Int = {
         let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_TN"].flatMap(Int.init) ?? 1
@@ -591,6 +630,16 @@ public enum CBv2VerifyScales {
     public static func nvfp4ReadoutTopTwo(
         _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float
     ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray)? {
+        guard let readout = nvfp4ReadoutTopTwo(
+            layer, x, outputMultiplier: outputMultiplier, softcap: softcap, includeTargetIDs: false)
+        else { return nil }
+        return (readout.ids, readout.values, readout.nonFinite)
+    }
+
+    package static func nvfp4ReadoutTopTwo(
+        _ layer: any UnaryLayer, _ x: MLXArray, outputMultiplier: Float, softcap: Float,
+        includeTargetIDs: Bool
+    ) -> CBv2TopTwoReadout? {
         guard fusedLMHeadEnabled, x.ndim == 3, x.dtype == .bfloat16,
             let l = layer as? ModelOptWeightOnlyNVFP4Linear
         else { return nil }
@@ -602,10 +651,15 @@ public enum CBv2VerifyScales {
         let outputs = l.outputDimensions
         let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
         let minChunksFor16BitOffset = max(1, (outputs + 65_533) / 65_534)
-        let chunks = min(totalTiles, max(fusedLMHeadChunks, minChunksFor16BitOffset))
+        let strictC3 =
+            (!CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance)
+            && CBv2DraftRegime.strictLowVerifyC3
+        let requestedChunks = fusedLMHeadChunksEnv ?? (strictC3 ? 2048 : 4096)
+        let chunks = min(totalTiles, max(requestedChunks, minChunksFor16BitOffset))
+        let f22 = strictC3
         let pkey = NVFP4TopTwoPlanKey(
             id: ObjectIdentifier(l), rows: rows, inputs: inputs, dtype: x.dtype,
-            chunks: chunks, tn: tn)
+            chunks: chunks, tn: tn, f22: f22)
         if let plan = topTwoLock.withLockUnchecked({ $0.plans[pkey] }) {
             let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
             let partials = plan.launch([
@@ -613,7 +667,7 @@ public enum CBv2VerifyScales {
             ])
             return cbv2FusedReadoutTopTwoMergePartials(
                 partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
-                batch: batch, width: width, chunks: plan.chunks)
+                batch: batch, width: width, chunks: plan.chunks, includeTargetIDs: includeTargetIDs)
         }
         guard inputs > 0, l.inputDimensions == inputs, outputs >= 8,
             rows > ModelOptWeightOnlyNVFP4RowExact.scalarRows,
@@ -626,7 +680,7 @@ public enum CBv2VerifyScales {
         let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
         let key = NVFP4TopTwoLaunchKey(
             dtype: x.dtype, rows: rows, inputs: inputs, outputs: outputs,
-            scaled: true, chunks: chunks, tn: tn)
+            scaled: true, chunks: chunks, tn: tn, f22: f22)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = topTwoLock.withLockUnchecked({ $0.launches[key] }) {
             launch = hit
@@ -634,7 +688,7 @@ public enum CBv2VerifyScales {
             let made = nvfp4TopTwoKernel.prepare(
                 template: [
                     ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
-                    ("SCALED", true), ("C_", chunks), ("TN", tn),
+                    ("SCALED", true), ("C_", chunks), ("TN", tn), ("F22_", f22),
                 ],
                 grid: (32, 8, chunks), threadGroup: (32, 8, 1),
                 outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],
@@ -652,7 +706,7 @@ public enum CBv2VerifyScales {
         ])
         return cbv2FusedReadoutTopTwoMergePartials(
             partialIDs: partials[0], partialValues: partials[1], partialNF: partials[2],
-            batch: batch, width: width, chunks: chunks)
+            batch: batch, width: width, chunks: chunks, includeTargetIDs: includeTargetIDs)
     }
 
     private static let nvfp4Kernel = MLXFast.metalKernel(

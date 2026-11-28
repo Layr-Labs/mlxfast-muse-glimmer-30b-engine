@@ -684,6 +684,10 @@ private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
 }
 
+private final class CBv2DeferredPublish {
+    var publish: (() -> Void)?
+}
+
 /// Resume-exactly-once wrapper for a drain continuation: the engine queue
 /// (natural drain completion) and the shutdown-timeout timer race to
 /// resume it; whichever wins consumes the continuation, the loser no-ops.
@@ -1099,6 +1103,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     var launchClockNanos: UInt64 = 0
     var finalizeClockNanos: UInt64 = 0
     var boundaryClockNanos: UInt64 = 0
+    private var deferredFirstPublishes: [CBv2DeferredPublish] = []
 
     @inline(__always)
     private func boundaryFinishNanos() -> UInt64 {
@@ -5380,6 +5385,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         var committedPlainRows: [CBv2RequestID] = []
         let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
         var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
+        let defersFirstPublish =
+            nativeShutdownState == nil && step.mtpRound?.verify == nil
+            && step.sampledRows.count == 1 && step.participants.count == 1
+            && scheduler.runningCount == 1 && scheduler.waitingCount == 0
+        defer { flushDeferredFirstPublishes() }
 
         func finishPlainRow(_ id: CBv2RequestID, reason: CBv2FinishReason) {
             if mtpSeedIDs.contains(id) {
@@ -5473,6 +5483,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stream?.reserveEmission(
                     firstEmissionArmedNanos: firstToken ? readbackDoneNanos : 0)
                 let trackedLoop = nativeShutdownState == nil ? nil : self
+                let held = firstToken && defersFirstPublish ? CBv2DeferredPublish() : nil
                 enqueueDetokenization(owner: detokenizer) {
                     let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
                     let publish: () -> Void = {
@@ -5480,8 +5491,15 @@ public final class EngineLoopV2: @unchecked Sendable {
                             .delta(text: text, tokens: [token], logprobs: logprobs),
                             consumingReservation: true)
                     }
-                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
+                    if let held {
+                        held.publish = publish
+                    } else if let trackedLoop {
+                        _ = trackedLoop.nativeCommit(publish)
+                    } else {
+                        publish()
+                    }
                 }
+                if let held { deferredFirstPublishes.append(held) }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 var hostLoan: UUID?
@@ -5750,6 +5768,13 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Request completion
 
+    private func flushDeferredFirstPublishes() {
+        guard !deferredFirstPublishes.isEmpty else { return }
+        let pending = deferredFirstPublishes
+        deferredFirstPublishes.removeAll()
+        enqueueDetokenization { for held in pending { held.publish?() } }
+    }
+
     /// `nowNanos`: the caller's already-taken timing instant (a step
     /// boundary finishing several rows shares ONE read). Absent, the
     /// in-progress finalize / launch read is reused; a fresh read is the
@@ -5761,6 +5786,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ id: CBv2RequestID, reason: CBv2FinishReason, nowNanos: UInt64? = nil,
         now: ContinuousClock.Instant? = nil
     ) {
+        flushDeferredFirstPublishes()
         if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
         defer { nativeShutdownState?.endCommit() }
         // Ids are legally reusable after finish: drop the per-id capacity

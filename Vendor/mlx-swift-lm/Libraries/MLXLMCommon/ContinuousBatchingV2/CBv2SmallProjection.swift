@@ -996,7 +996,7 @@ public enum CBv2SmallProjection {
                 }
             }
             body += """
-                cbv2_sp_fp8_tm4<T, K, V, (K >= 16384)>(m, ws, in_v, y, nseg, nout, lt, sg, sl, sp_tgp);
+                cbv2_sp_fp8_tm4<T, K, V, true>(m, ws, in_v, y, nseg, nout, lt, sg, sl, sp_tgp);
                 """
             let name = "cbv2_small_fp8_" + stableName(body)
             let kernel = MLXFast.metalKernel(
@@ -1311,8 +1311,8 @@ public enum CBv2SmallProjection {
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1456,8 +1456,8 @@ public enum CBv2SmallProjection {
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -2028,7 +2028,7 @@ public enum CBv2SmallProjection {
             return nil
         }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2

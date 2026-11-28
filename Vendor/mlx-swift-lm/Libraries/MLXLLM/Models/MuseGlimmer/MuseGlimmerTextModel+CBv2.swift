@@ -358,7 +358,9 @@ extension MuseGlimmerTextModel {
                 h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
             }
             if capture.contains(index) { captured[index] = h }
-            if flushLayer > 0 && index + 1 == flushLayer {
+            if (flushLayer > 0 && index + 1 == flushLayer)
+                || (lowVerify && MuseGlimmerVerifyProjections.lowFlushLayers.contains(index + 1))
+            {
                 asyncEval(h, layerInput)
             }
         }
@@ -373,11 +375,9 @@ extension MuseGlimmerTextModel {
         return (verifyOutputLogits(trunk.normed), trunk.hidden)
     }
 
-    func fusedVerifyForwardScoredWithMTPHidden(_ tokens: MLXArray, cache: [KVCache])
-        -> (
-            topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, hidden: MLXArray
-        )?
-    {
+    func fusedVerifyForwardScoredWithMTPHidden(
+        _ tokens: MLXArray, cache: [KVCache], includeTargetIDs: Bool
+    ) -> (readout: CBv2TopTwoReadout, lastHidden: MLXArray)? {
         guard lmHead is ModelOptWeightOnlyNVFP4Linear,
             let trunk = fusedVerifyTrunk(tokens, cache: cache),
             verifyRows(trunk.normed) != nil
@@ -386,7 +386,7 @@ extension MuseGlimmerTextModel {
         if lowVerify, let fused = CBv2VerifyScales.nvfp4ReadoutTopTwo(
             lmHead, trunk.normed,
             outputMultiplier: configuration.outputMultiplier,
-            softcap: configuration.finalLogitSoftcapping)
+            softcap: configuration.finalLogitSoftcapping, includeTargetIDs: includeTargetIDs)
         {
             if MuseGlimmerVerifyProjections.selfTest,
                 let product = CBv2VerifyScales.product(lmHead, trunk.normed),
@@ -402,7 +402,7 @@ extension MuseGlimmerTextModel {
                     kind: "nvfp4.lm_head.fused_top2",
                     rows: MuseGlimmerNumerics.rows(trunk.normed))
             }
-            return (fused.ids, fused.values, fused.nonFinite, trunk.hidden)
+            return (fused, trunk.hidden)
         }
         let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear
         guard let product = (MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled ? nvHead.flatMap({ CBv2VerifyNVFP4.product($0, trunk.normed) }) : nil)
@@ -413,8 +413,8 @@ extension MuseGlimmerTextModel {
         let scored = cbv2FusedReadoutTopTwoAndNonFinite(
             product,
             outputMultiplier: configuration.outputMultiplier,
-            softcap: configuration.finalLogitSoftcapping)
-        return (scored.ids, scored.values, scored.nonFinite, trunk.hidden)
+            softcap: configuration.finalLogitSoftcapping, includeTargetIDs: includeTargetIDs)
+        return (scored, trunk.hidden)
     }
     /// `MuseGlimmerTextAttention`'s CBv2 branch with the q/k norms, the
     /// query scale and RoPE in one dispatch (`VerifyFusedQK`).
@@ -673,7 +673,7 @@ extension MuseGlimmerTextModel {
                 return projected
             }
         }
-        if lowVerify && CBv2DraftRegime.strictLowVerifyC3, verifyRows(gu[0]) != nil,
+        if lowVerify && CBv2DraftRegime.verifyC3Kernels, verifyRows(gu[0]) != nil,
             let act = VerifyFusedNorms.fusedSiluProduct(gate: gu[0], up: gu[1])
         {
             if MuseGlimmerVerifyProjections.selfTest {
@@ -727,17 +727,26 @@ extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyForwarding {
     }
 }
 
-extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyReadoutForwarding {
+extension MuseGlimmerCBv2Adapter: CBv2FusedVerifyTargetForwarding {
     public func fusedVerifyForwardScoredWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> (
         topTwoIDs: MLXArray, topTwoValues: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray
     )? {
-        let kv = caches.compactMap { $0 as? KVCache }
-        guard kv.count == caches.count,
-            let result = target.fusedVerifyForwardScoredWithMTPHidden(tokens, cache: kv)
+        guard let result = fusedVerifyForwardReadoutWithHidden(
+            tokens: tokens, caches: caches, includeTargetIDs: false)
         else { return nil }
-        return (result.topTwoIDs, result.topTwoValues, result.nonFinite, result.hidden)
+        let readout = result.readout
+        return (readout.ids, readout.values, readout.nonFinite, result.lastHidden)
+    }
+
+    package func fusedVerifyForwardReadoutWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], includeTargetIDs: Bool
+    ) -> (readout: CBv2TopTwoReadout, lastHidden: MLXArray)? {
+        let kv = caches.compactMap { $0 as? KVCache }
+        guard kv.count == caches.count else { return nil }
+        return target.fusedVerifyForwardScoredWithMTPHidden(
+            tokens, cache: kv, includeTargetIDs: includeTargetIDs)
     }
 }
 
@@ -777,6 +786,10 @@ enum MuseGlimmerVerifyProjections {
     static let midTrunkFlushLayer: Int = {
         if let raw = environment["CBV2_MID_TRUNK_FLUSH"], let v = Int(raw) { return v }
         return 16
+    }()
+    static let lowFlushLayers: Set<Int> = {
+        let raw = environment["CBV2_LOW_FLUSH"] ?? "1,8,26,38"
+        return Set(raw.split(separator: ",").compactMap { Int($0) })
     }()
     static let nvfp4GroupedQKVGMode: Int =
         environment["CBV2_NVFP4_QKVG_GROUPED"].flatMap(Int.init) ?? 1
@@ -1041,6 +1054,73 @@ extension MuseGlimmerTextModel {
     /// 8 rows) on zeros, so no verify window compiles one while it is served.
     /// Called from `warmFusedVerifyKernels` (once per model); changes no
     /// weight, cache or numerics state.
+    func prewarmVerifyBuffers(rows: Int) {
+        guard VerifyFusedNorms.enabled, rows >= 1, rows <= MuseGlimmerVerifyProjections.maximumRows,
+            let first = model.layers.first
+        else { return }
+        let dtype = activationDType
+        let width = first.inputLayerNorm.weight.dim(-1)
+        guard VerifyFusedNorms.supports(width: width, rows: rows, dtype: dtype) else { return }
+        let saved = (
+            CBv2DraftRegime.lowAcceptance, CBv2DraftRegime.xnorDraftHeadEligible,
+            CBv2DraftRegime.strictLowVerifyEligible, CBv2DraftRegime.strictLowVerifyC3
+        )
+        CBv2DraftRegime.lowAcceptance = false
+        CBv2DraftRegime.xnorDraftHeadEligible = false
+        CBv2DraftRegime.strictLowVerifyEligible = false
+        CBv2DraftRegime.strictLowVerifyC3 = false
+        defer {
+            (
+                CBv2DraftRegime.lowAcceptance, CBv2DraftRegime.xnorDraftHeadEligible,
+                CBv2DraftRegime.strictLowVerifyEligible, CBv2DraftRegime.strictLowVerifyC3
+            ) = saved
+        }
+        let layers = model.layers
+        var h = MLXArray.zeros([1, rows, width], dtype: dtype)
+        var layerInput = first.inputLayerNorm(h)
+        var captured = [MLXArray]()
+        for (index, layer) in layers.enumerated() {
+            let a = layer.selfAttention
+            let p = verifyAttentionProjections(
+                [a.queryProj, a.keyProj, a.valueProj, a.gateProj], layerInput)
+            var standIn = p[0].reshaped([1, rows, -1])
+            if p.count > 3, p[3].size == p[0].size {
+                standIn = MuseGlimmerFusion.sigmoidGate([standIn, p[3].reshaped(standIn.shape)])[0]
+            }
+            let attention = verifyOutputProjection(a.outputProj, standIn).reshaped([1, rows, width])
+            let post = layer.postAttentionLayerNorm
+            let pre = layer.preFeedforwardLayerNorm
+            let (mid, feedInput) = VerifyFusedNorms.fusedAddNormNorm(
+                residual: h, x: attention, w1: post.weight, eps1: post.eps,
+                w2: pre.weight, eps2: pre.eps, fastVec: false)
+            let feed = groupedVerifyFeed(layer.mlp, feedInput)
+            if index + 1 < layers.count {
+                let postFF = layer.postFeedforwardLayerNorm
+                let next = layers[index + 1].inputLayerNorm
+                (h, layerInput) = VerifyFusedNorms.fusedAddNormNorm(
+                    residual: mid, x: feed, w1: postFF.weight, eps1: postFF.eps,
+                    w2: next.weight, eps2: next.eps, fastVec: false)
+            } else {
+                h = layer.postFeedforwardLayerNorm.addedTo(mid, feed)
+            }
+            if mtpHiddenLayerIDs.contains(index) { captured.append(h) }
+        }
+        var outputs = [model.norm(h)]
+        if captured.count > 1 { outputs.append(concatenated(captured, axis: -1)) }
+        if let nvHead = lmHead as? ModelOptWeightOnlyNVFP4Linear,
+            let product = (MuseGlimmerVerifyProjections.nvfp4LMHeadEnabled
+                ? CBv2VerifyNVFP4.product(nvHead, outputs[0]) : nil)
+                ?? CBv2VerifyScales.product(lmHead, outputs[0])
+        {
+            let scored = cbv2FusedReadoutTopTwoAndNonFinite(
+                product,
+                outputMultiplier: configuration.outputMultiplier,
+                softcap: configuration.finalLogitSoftcapping, includeTargetIDs: true)
+            outputs += [scored.ids, scored.values, scored.nonFinite]
+        }
+        eval(outputs)
+    }
+
     func warmVerifyProjections(dtype: DType) {
         guard routesVerifyProjections, numerics.exactWindows else { return }
         func key(_ layers: [any UnaryLayer]) -> String {
@@ -1177,13 +1257,19 @@ extension MuseGlimmerTextModel {
                 })
             if CBv2VerifyScales.fusedLMHeadEnabled {
                 var fusedWarm = [MLXArray]()
-                for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-                    if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
-                        lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
-                        outputMultiplier: configuration.outputMultiplier,
-                        softcap: configuration.finalLogitSoftcapping)
-                    {
-                        fusedWarm += [res.ids, res.values, res.nonFinite]
+                for c3Mode in [false, true] {
+                    CBv2DraftRegime.lowAcceptance = true
+                    CBv2DraftRegime.xnorDraftHeadEligible = true
+                    CBv2DraftRegime.strictLowVerifyEligible = c3Mode
+                    CBv2DraftRegime.strictLowVerifyC3 = c3Mode
+                    for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                        if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+                            lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
+                            outputMultiplier: configuration.outputMultiplier,
+                            softcap: configuration.finalLogitSoftcapping, includeTargetIDs: true)
+                        {
+                            fusedWarm += [res.ids, res.values, res.nonFinite]
+                        }
                     }
                 }
                 if !fusedWarm.isEmpty { eval(fusedWarm) }
@@ -1191,7 +1277,7 @@ extension MuseGlimmerTextModel {
             let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
                 MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
                 outputMultiplier: configuration.outputMultiplier,
-                softcap: configuration.finalLogitSoftcapping)
+                softcap: configuration.finalLogitSoftcapping, includeTargetIDs: true)
             eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
         }
     }
