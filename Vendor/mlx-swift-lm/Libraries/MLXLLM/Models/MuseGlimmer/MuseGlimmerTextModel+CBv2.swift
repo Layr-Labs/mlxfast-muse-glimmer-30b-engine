@@ -94,8 +94,8 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
 
 /// A multi-row teacher-forced forward is read at its last position only. Every
 /// row runs each layer's attention and writes its K/V; the last layer's
-/// gate and output projections, feed-forward half, final norm and readout run
-/// on the last row. Exact windows give a row the bytes it gets alone.
+/// feed-forward half, the final norm and the readout run on the last row. Exact
+/// windows give a row the bytes it gets alone, so the logits do not change.
 extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
     /// Layers of the multi-row teacher-forced forward that take MLX's prompt
     /// arithmetic (one GEMM per projection over all rows), the arithmetic the
@@ -162,51 +162,16 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 asyncEval([h])
                 continue
             }
-            let x = layer.inputLayerNorm(h)
-            let attended: MLXArray
-            if numerics.isExact(x), let attending = cache[index] as? any CBv2AttendingLayerCache {
-                let attention = lastPositionAttention(
-                    layer.selfAttention, x, cache: attending, ropeOffsets: ropeOffsets)
-                attended = layer.postAttentionLayerNorm.addedTo(
-                    h[0..., (h.dim(1) - 1)..., 0...], attention)
-            } else {
-                attended = layer.postAttentionLayerNorm.addedTo(
-                    h,
-                    layer.selfAttention(
-                        x, mask: .none, cache: cache[index], ropeOffsets: ropeOffsets))
-            }
+            let attended = layer.postAttentionLayerNorm.addedTo(
+                h,
+                layer.selfAttention(
+                    layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                    ropeOffsets: ropeOffsets))
             let row = attended[0..., (attended.dim(1) - 1)..., 0...]
             h = layer.postFeedforwardLayerNorm.addedTo(
                 row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
         }
         return outputLogits(model.norm(h))
-    }
-
-    private func lastPositionAttention(
-        _ a: MuseGlimmerTextAttention, _ x: MLXArray,
-        cache: any CBv2AttendingLayerCache, ropeOffsets: MLXArray?
-    ) -> MLXArray {
-        let (batch, length) = (x.dim(0), x.dim(1))
-        var queries = numerics.project(a.queryProj, x).reshaped(batch, length, a.heads, a.headDimensions)
-        var keys = numerics.project(a.keyProj, x).reshaped(batch, length, a.kvHeads, a.headDimensions)
-        let values = numerics.project(a.valueProj, x)
-            .reshaped(batch, length, a.kvHeads, a.headDimensions).transposed(0, 2, 1, 3)
-        queries = a.qkNorm(queries)
-        queries = (queries.asType(.float32) * a.qkScaleFactor)
-            .asType(queries.dtype).transposed(0, 2, 1, 3)
-        keys = a.qkNorm(keys).transposed(0, 2, 1, 3)
-        if let rope = a.rope {
-            let offsets = ropeOffsets ?? (cache.positionOffsets + 0)
-            queries = rope(queries, offset: offsets)
-            keys = rope(keys, offset: offsets)
-        }
-        let output = cache.updateAndAttend(
-            queries: queries, keys: keys, values: values, scale: a.scale, sinks: nil)
-        let row = output[0..., 0..., (length - 1)..., 0...].transposed(0, 2, 1, 3)
-        let gate = numerics.project(a.gateProj, x[0..., (length - 1)..., 0...])
-            .reshaped(batch, 1, a.heads, a.headDimensions)
-        let gated = MuseGlimmerFusion.sigmoidGate([row, gate])[0].reshaped(batch, 1, -1)
-        return numerics.project(a.outputProj, gated)
     }
 }
 
@@ -560,13 +525,6 @@ extension MuseGlimmerTextModel {
             residual: zero, x: zero, w1: post.weight, eps1: post.eps,
             w2: pre.weight, eps2: pre.eps, fastVec: true)
         warm += [normsScalar.h, normsScalar.y, normsVec.h, normsVec.y]
-        let interWidth = configuration.intermediateSize
-        for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-            let zg = MLXArray.zeros([1, r, interWidth], dtype: dtype)
-            if let sp = VerifyFusedNorms.fusedSiluProduct(gate: zg, up: zg) {
-                warm.append(sp)
-            }
-        }
         let dummyMu = MLXArray([Float(1), Float(1)])
         let dummyBound = MLXArray([Float(448)])
         let normsCast = VerifyFusedNorms.fusedAddNormNormCastFP8(
@@ -673,13 +631,15 @@ extension MuseGlimmerTextModel {
                 return projected
             }
         }
-        if lowVerify && CBv2DraftRegime.strictLowVerifyC3, verifyRows(gu[0]) != nil,
+        // ArthurOstapenko 41a222d2: vectorized bf16 silu(gate) * up on strict-low verify
+        // rounds whose down_proj is not FP8 (bit-identical to compiledSiluProduct).
+        if CBv2DraftRegime.deepLowVerify, let rows = verifyRows(gu[0]),
             let act = VerifyFusedNorms.fusedSiluProduct(gate: gu[0], up: gu[1])
         {
             if MuseGlimmerVerifyProjections.selfTest {
-                let refAct = compiledSiluProduct(gu[0], gu[1])
                 MuseGlimmerVerifyProjections.requireEqualBits(
-                    [act], [refAct], kind: "silu_prod", rows: MuseGlimmerNumerics.rows(gu[0]))
+                    [act], [compiledSiluProduct(gu[0], gu[1])],
+                    kind: "bf16.silu_mul", rows: rows)
             }
             return verifyDownProjection(mlp.downProj, act)
         }
@@ -1063,12 +1023,10 @@ extension MuseGlimmerTextModel {
         let prevLow = CBv2DraftRegime.lowAcceptance
         let prevBroad = CBv2DraftRegime.xnorDraftHeadEligible
         let prevStrict = CBv2DraftRegime.strictLowVerifyEligible
-        let prevC3 = CBv2DraftRegime.strictLowVerifyC3
         defer {
             CBv2DraftRegime.lowAcceptance = prevLow
             CBv2DraftRegime.xnorDraftHeadEligible = prevBroad
             CBv2DraftRegime.strictLowVerifyEligible = prevStrict
-            CBv2DraftRegime.strictLowVerifyC3 = prevC3
         }
         // Batch-verify NaN-free FP8 weights & non-overflowing output scales once at boot
         // (0 ms per-step overhead) so strict-low FP8 projections can use branchless half2+float2 decode.
@@ -1116,13 +1074,10 @@ extension MuseGlimmerTextModel {
                     let width = inputs(group[0])
                 else { continue }
                 var outputs = [MLXArray]()
-                for (lowAcc, strictMode, c3Mode) in [
-                    (false, false, false), (true, false, false), (true, true, false), (true, true, true),
-                ] {
+                for (lowAcc, strictMode) in [(false, false), (true, false), (true, true)] {
                     CBv2DraftRegime.lowAcceptance = lowAcc
                     CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
                     CBv2DraftRegime.strictLowVerifyEligible = strictMode
-                    CBv2DraftRegime.strictLowVerifyC3 = c3Mode
                     for rows in 1 ... MuseGlimmerVerifyProjections.maximumRows {
                         let x = MLXArray.zeros([1, rows, width], dtype: dtype)
                         switch site {
@@ -1152,6 +1107,9 @@ extension MuseGlimmerTextModel {
                             }
                         default:
                             outputs.append(verifyDownProjection(group[0], x))
+                            if strictMode, let act = VerifyFusedNorms.fusedSiluProduct(gate: x, up: x) {
+                                outputs.append(act)
+                            }
                             if lowAcc, let fp8 = group[0] as? ModelOptCalibratedLinear,
                                 let preCast = VerifyFusedNorms.fusedSiluProductCastFP8(
                                     gate: x, up: x, layer: fp8)
@@ -1177,22 +1135,34 @@ extension MuseGlimmerTextModel {
                 })
             if CBv2VerifyScales.fusedLMHeadEnabled {
                 var fusedWarm = [MLXArray]()
-                for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
-                    if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
-                        lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
-                        outputMultiplier: configuration.outputMultiplier,
-                        softcap: configuration.finalLogitSoftcapping)
-                    {
-                        fusedWarm += [res.ids, res.values, res.nonFinite]
+                // Warm both lm_head top-2 variants (strict-low lazy activation loads and
+                // wide stage 2, and the record schedule) so no JIT compile lands in a timed window.
+                for (lowAcc, strictMode) in [(false, false), (true, false), (true, true)] {
+                    CBv2DraftRegime.lowAcceptance = lowAcc
+                    CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
+                    CBv2DraftRegime.strictLowVerifyEligible = strictMode
+                    for r in 1 ... MuseGlimmerVerifyProjections.maximumRows {
+                        if let res = CBv2VerifyScales.nvfp4ReadoutTopTwo(
+                            lmHead, MLXArray.zeros([1, r, width], dtype: dtype),
+                            outputMultiplier: configuration.outputMultiplier,
+                            softcap: configuration.finalLogitSoftcapping)
+                        {
+                            fusedWarm += [res.ids, res.values, res.nonFinite]
+                        }
                     }
                 }
                 if !fusedWarm.isEmpty { eval(fusedWarm) }
             }
-            let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
-                MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
-                outputMultiplier: configuration.outputMultiplier,
-                softcap: configuration.finalLogitSoftcapping)
-            eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            for (lowAcc, strictMode) in [(false, false), (true, true)] {
+                CBv2DraftRegime.lowAcceptance = lowAcc
+                CBv2DraftRegime.xnorDraftHeadEligible = lowAcc
+                CBv2DraftRegime.strictLowVerifyEligible = strictMode
+                let fusedWarm = cbv2FusedReadoutTopTwoAndNonFinite(
+                    MLXArray.zeros([1, 1, configuration.vocabularySize], dtype: .bfloat16),
+                    outputMultiplier: configuration.outputMultiplier,
+                    softcap: configuration.finalLogitSoftcapping)
+                eval(fusedWarm.ids, fusedWarm.values, fusedWarm.nonFinite)
+            }
         }
     }
 }

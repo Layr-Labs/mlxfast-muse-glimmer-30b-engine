@@ -627,7 +627,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_THRESHOLD"].flatMap(Double.init) ?? 0.55
     }()
     static let deepLowEarlyCommittedMinRounds: Int = {
-        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 3
+        ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_MIN_ROUNDS"].flatMap(Int.init) ?? 5
     }()
     static let deepLowEarlyCommittedHundredths: Int = {
         ProcessInfo.processInfo.environment["CBV2_DEEP_LOW_EARLY_COMMITTED"].flatMap(Int.init) ?? 305
@@ -674,17 +674,6 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
                 && ceilingRounds >= Self.deepLowCommittedMinRounds
                 && ceilingCommittedTokens * 100
                     < Self.strictLowVerifyCommittedHundredths * ceilingRounds)
-    }
-
-    /// Clause-3-only strict low-acceptance gate (`inLowAcceptanceRegime && rounds >= 6
-    /// && avg < 3.60`) for Wave 17+ target-verify speedups: guarantees zero early-dip
-    /// leakage onto high-acceptance Pair 1 (keeping Pair 1 locked at ~4.966x) while
-    /// giving sustained low-acceptance Pair 2 & Pair 3 full coverage.
-    var isStrictLowVerifyC3Regime: Bool {
-        inLowAcceptanceRegime
-            && ceilingRounds >= Self.deepLowCommittedMinRounds
-            && ceilingCommittedTokens * 100
-                < Self.strictLowVerifyCommittedHundredths * ceilingRounds
     }
 
     /// Acceptance ceiling: a per-request rate limiter on committed tokens

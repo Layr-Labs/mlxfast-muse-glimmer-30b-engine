@@ -43,10 +43,13 @@ public enum CBv2VerifyNVFP4 {
     private static let env = ProcessInfo.processInfo.environment
     private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
-    private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
-    private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
+    private static let guFragmentsEnv: Int? = env["CBV2_NVFP4_GU_TN"].flatMap(Int.init)
+    private static let downMinPFRowsEnv: Int =
+        env["CBV2_NVFP4_DOWN_PF_MIN_ROWS"].flatMap(Int.init) ?? 5
+    private static let downMinTN2RowsEnv: Int =
+        env["CBV2_NVFP4_DOWN_TN2_MIN_ROWS"].flatMap(Int.init) ?? 5
 
     /// Tests and benchmarks pin a geometry here (nil: `geometry(rows:inputs:)`).
     nonisolated(unsafe) public static var geometryOverride: Geometry?
@@ -69,32 +72,24 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         if inputs >= 16384 {
-            // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
-            // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
-            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
-            if strictC3 && rows >= 7 && downTN1Env && wc {
-                let defaultPF = peeledPFEnv ? 2 : 0
-                let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
-                return (1, pf, wc, sv)
-            }
             // MLP down (K = 19968): WC + PF=1 + SV=1 on low-acceptance verify rows;
             // keep high-acceptance Pair 1 at PF=0 to stay safely below the decode ceiling.
-            let tn = rows >= 7 ? 2 : 1
-            let defaultPF = (lowVerify && wc) ? (downPrefetchEnv ?? (rows >= 8 ? 1 : 0)) : 0
+            let minTN2 = (lowVerify && wc) ? downMinTN2RowsEnv : 7
+            let tn = rows >= minTN2 ? 2 : 1
+            let defaultPF =
+                (lowVerify && wc)
+                ? (downPrefetchEnv ?? (rows >= downMinPFRowsEnv ? 1 : 0))
+                : 0
             let pf = prefetchEnv ?? defaultPF
             return (tn, pf, wc, sv)
         }
-        // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
-        // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
-        // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
-        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
-        let pf = prefetchEnv ?? defaultPF
-        return (1, pf, wc, sv)
+        let tn = (lowVerify && wc && rows >= 5 && guFragmentsEnv == 2) ? 2 : 1
+        let pf = prefetchEnv ?? 0
+        return (tn, pf, wc, sv)
     }
 
-    static let tileHelper = """
+    private static let e4m3x2Helper = """
 
         inline half2 cbv2_vn_e4m3x2(uint x) {
             const uint v = x & 0x007F007Fu;
@@ -102,6 +97,9 @@ public enum CBv2VerifyNVFP4 {
                 | ((x & 0x00800080u) << 8);
             return as_type<half2>(u) * half2(256.0h);
         }
+        """
+
+    static let tileHelper = e4m3x2Helper + """
 
         // One tile of 8 * TN outputs of one projection: the stock matrix
         // kernel's arithmetic (see CBv2VerifyNVFP4).
@@ -150,19 +148,11 @@ public enum CBv2VerifyNVFP4 {
             if constexpr (WC && PF == 0) {
                 for (int k = int(sg) * BK; k < K; k += WK * BK) {
                     uint qa[4][TN];
-                    ushort4 xa[4][TM][2];
                     MO_WO_UNROLL
                     for (short block = 0; block < 4; block++) {
                         const int b = k + 32 * block;
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) { qa[block][t] = wl[t][b / 8]; }
-                        MO_WO_UNROLL
-                        for (short mt = 0; mt < TM; mt++) {
-                            MO_WO_UNROLL
-                            for (short j = 0; j < 2; j++) {
-                                xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
-                            }
-                        }
                     }
                     half2 hs[TN][2];
                     MO_WO_UNROLL
@@ -180,6 +170,15 @@ public enum CBv2VerifyNVFP4 {
                     }
                     MO_WO_UNROLL
                     for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        ushort4 xv[TM][2];
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                xv[mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                            }
+                        }
                         half s[TN];
                         MO_WO_UNROLL
                         for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
@@ -189,8 +188,8 @@ public enum CBv2VerifyNVFP4 {
                             MO_WO_UNROLL
                             for (short mt = 0; mt < TM; mt++) {
                                 bf[mt] = float2(
-                                    float(as_type<bfloat>(xa[block][mt][0][i])),
-                                    float(as_type<bfloat>(xa[block][mt][1][i])));
+                                    float(as_type<bfloat>(xv[mt][0][i])),
+                                    float(as_type<bfloat>(xv[mt][1][i])));
                             }
                             MO_WO_UNROLL
                             for (short t = 0; t < TN; t++) {
@@ -198,142 +197,6 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     mo_wo_mma(C[t][mt], a, bf[mt]);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if constexpr (WC && PF == 2) {
-                // Branchless peeled next-chunk weight+scale DRAM prefetch with 4-block
-                // upfront activation loads (zero if(more) branches inside K-loop, maxT=1024).
-                constexpr int STEP = WK * BK;
-                int k = int(sg) * BK;
-                if (k < K) {
-                    uint qb[4][TN];
-                    uint2 sb[TN];
-                    MO_WO_UNROLL
-                    for (short block = 0; block < 4; block++) {
-                        const int b = k + 32 * block;
-                        MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) { qb[block][t] = wl[t][b / 8]; }
-                    }
-                    MO_WO_UNROLL
-                    for (short t = 0; t < TN; t++) {
-                        if constexpr (SV) {
-                            sb[t] = *(const device uint2*)(sl[t] + (k / 16));
-                        } else {
-                            sb[t] = uint2(
-                                uint(sl[t][k / 16]) | (uint(sl[t][k / 16 + 2]) << 16),
-                                uint(sl[t][k / 16 + 4]) | (uint(sl[t][k / 16 + 6]) << 16));
-                        }
-                    }
-                    for (; k + STEP < K; k += STEP) {
-                        const int kn = k + STEP;
-                        uint q[4][TN];
-                        ushort4 xa[4][TM][2];
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            const int b = k + 32 * block;
-                            const int bn = kn + 32 * block;
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                q[block][t] = qb[block][t];
-                                qb[block][t] = wl[t][bn / 8];
-                            }
-                            MO_WO_UNROLL
-                            for (short mt = 0; mt < TM; mt++) {
-                                MO_WO_UNROLL
-                                for (short j = 0; j < 2; j++) {
-                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
-                                }
-                            }
-                        }
-                        half2 hs[TN][2];
-                        MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) {
-                            if constexpr (SV) {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
-                                sb[t] = *(const device uint2*)(sl[t] + (kn / 16));
-                            } else {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
-                                sb[t] = uint2(
-                                    uint(sl[t][kn / 16]) | (uint(sl[t][kn / 16 + 2]) << 16),
-                                    uint(sl[t][kn / 16 + 4]) | (uint(sl[t][kn / 16 + 6]) << 16));
-                            }
-                        }
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            half s[TN];
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
-                            MO_WO_UNROLL
-                            for (short i = 0; i < 4; i++) {
-                                float2 bf[TM];
-                                MO_WO_UNROLL
-                                for (short mt = 0; mt < TM; mt++) {
-                                    bf[mt] = float2(
-                                        float(as_type<bfloat>(xa[block][mt][0][i])),
-                                        float(as_type<bfloat>(xa[block][mt][1][i])));
-                                }
-                                MO_WO_UNROLL
-                                for (short t = 0; t < TN; t++) {
-                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
-                                    MO_WO_UNROLL
-                                    for (short mt = 0; mt < TM; mt++) {
-                                        mo_wo_mma(C[t][mt], a, bf[mt]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Final peeled chunk (no next-chunk load).
-                    {
-                        ushort4 xa[4][TM][2];
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            const int b = k + 32 * block;
-                            MO_WO_UNROLL
-                            for (short mt = 0; mt < TM; mt++) {
-                                MO_WO_UNROLL
-                                for (short j = 0; j < 2; j++) {
-                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
-                                }
-                            }
-                        }
-                        half2 hs[TN][2];
-                        MO_WO_UNROLL
-                        for (short t = 0; t < TN; t++) {
-                            if constexpr (SV) {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
-                            } else {
-                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
-                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
-                            }
-                        }
-                        MO_WO_UNROLL
-                        for (short block = 0; block < 4; block++) {
-                            half s[TN];
-                            MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
-                            MO_WO_UNROLL
-                            for (short i = 0; i < 4; i++) {
-                                float2 bf[TM];
-                                MO_WO_UNROLL
-                                for (short mt = 0; mt < TM; mt++) {
-                                    bf[mt] = float2(
-                                        float(as_type<bfloat>(xa[block][mt][0][i])),
-                                        float(as_type<bfloat>(xa[block][mt][1][i])));
-                                }
-                                MO_WO_UNROLL
-                                for (short t = 0; t < TN; t++) {
-                                    const float2 a = mo_wo_pair(qb[block][t], i, s[t]);
-                                    MO_WO_UNROLL
-                                    for (short mt = 0; mt < TM; mt++) {
-                                        mo_wo_mma(C[t][mt], a, bf[mt]);
-                                    }
                                 }
                             }
                         }
@@ -505,46 +368,117 @@ public enum CBv2VerifyNVFP4 {
             }
             }
 
-            constexpr int tile_elems = TN * TM * 2;
-            if (sg > 0) {
-                threadgroup float* p = partials + (sg - 1) * tile_elems * 32 + simd_lid;
-                MO_WO_UNROLL
-                for (short t = 0; t < TN; t++) {
+            constexpr int frag_elems = TM * 2;
+            constexpr int frag_stride = 7 * frag_elems * 32;
+            if constexpr (TN == 2 && WC) {
+                if (sg != 0u) {
+                    threadgroup float* p0 =
+                        partials + (sg - 1u) * frag_elems * 32 + simd_lid;
                     MO_WO_UNROLL
                     for (short mt = 0; mt < TM; mt++) {
+                        p0[(mt * 2 + 0) * 32] = C[0][mt][0];
+                        p0[(mt * 2 + 1) * 32] = C[0][mt][1];
+                    }
+                }
+                if (sg != 1u) {
+                    const uint slot = (sg == 0u) ? 0u : (sg - 1u);
+                    threadgroup float* p1 =
+                        partials + frag_stride + slot * frag_elems * 32 + simd_lid;
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        p1[(mt * 2 + 0) * 32] = C[1][mt][0];
+                        p1[(mt * 2 + 1) * 32] = C[1][mt][1];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg < 2u) {
+                    const uint t = sg;
+                    float2 acc[TM];
+                    if (t == 0u) {
                         MO_WO_UNROLL
-                        for (short j = 0; j < 2; j++) {
-                            p[((t * TM + mt) * 2 + j) * 32] = C[t][mt][j];
+                        for (short mt = 0; mt < TM; mt++) { acc[mt] = C[0][mt]; }
+                        for (int s = 0; s < WK - 1; s++) {
+                            const threadgroup float* p =
+                                partials + s * frag_elems * 32 + simd_lid;
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                acc[mt][0] += p[(mt * 2 + 0) * 32];
+                                acc[mt][1] += p[(mt * 2 + 1) * 32];
+                            }
+                        }
+                    } else {
+                        const threadgroup float* p0 = partials + frag_stride + simd_lid;
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            acc[mt][0] = p0[(mt * 2 + 0) * 32] + C[1][mt][0];
+                            acc[mt][1] = p0[(mt * 2 + 1) * 32] + C[1][mt][1];
+                        }
+                        for (int s = 1; s < WK - 1; s++) {
+                            const threadgroup float* p =
+                                partials + frag_stride + s * frag_elems * 32 + simd_lid;
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                acc[mt][0] += p[(mt * 2 + 0) * 32];
+                                acc[mt][1] += p[(mt * 2 + 1) * 32];
+                            }
+                        }
+                    }
+                    const int out = y_col + fm + 8 * int(t);
+                    if (out < N) {
+                        MO_WO_UNROLL
+                        for (short mt = 0; mt < TM; mt++) {
+                            MO_WO_UNROLL
+                            for (short j = 0; j < 2; j++) {
+                                if (8 * mt + fn + j < V) {
+                                    y[size_t(8 * mt + fn + j) * N + out] =
+                                        mo_wo_result<T>(acc[mt][j], SCALED, tensor_scale0);
+                                }
+                            }
                         }
                     }
                 }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-                for (int s = 0; s < WK - 1; s++) {
-                    const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+            } else {
+                constexpr int tile_elems = TN * TM * 2;
+                if (sg > 0) {
+                    threadgroup float* p = partials + (sg - 1) * tile_elems * 32 + simd_lid;
                     MO_WO_UNROLL
                     for (short t = 0; t < TN; t++) {
                         MO_WO_UNROLL
                         for (short mt = 0; mt < TM; mt++) {
                             MO_WO_UNROLL
                             for (short j = 0; j < 2; j++) {
-                                C[t][mt][j] += p[((t * TM + mt) * 2 + j) * 32];
+                                p[((t * TM + mt) * 2 + j) * 32] = C[t][mt][j];
                             }
                         }
                     }
                 }
-                MO_WO_UNROLL
-                for (short mt = 0; mt < TM; mt++) {
-                    MO_WO_UNROLL
-                    for (short j = 0; j < 2; j++) {
-                        if (8 * mt + fn + j < V) {
-                            device T* yr = y + size_t(8 * mt + fn + j) * N;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0) {
+                    for (int s = 0; s < WK - 1; s++) {
+                        const threadgroup float* p = partials + s * tile_elems * 32 + simd_lid;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
                             MO_WO_UNROLL
-                            for (short t = 0; t < TN; t++) {
-                                const int out = y_col + fm + 8 * t;
-                                if (out < N) {
-                                    yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    C[t][mt][j] += p[((t * TM + mt) * 2 + j) * 32];
+                                }
+                            }
+                        }
+                    }
+                    MO_WO_UNROLL
+                    for (short mt = 0; mt < TM; mt++) {
+                        MO_WO_UNROLL
+                        for (short j = 0; j < 2; j++) {
+                            if (8 * mt + fn + j < V) {
+                                device T* yr = y + size_t(8 * mt + fn + j) * N;
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const int out = y_col + fm + 8 * t;
+                                    if (out < N) {
+                                        yr[out] = mo_wo_result<T>(C[t][mt][j], SCALED, tensor_scale0);
+                                    }
                                 }
                             }
                         }

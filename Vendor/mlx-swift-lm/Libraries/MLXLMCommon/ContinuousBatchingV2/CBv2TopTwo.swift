@@ -408,12 +408,15 @@ private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
     outputNames: ["top_ids", "top_values", "non_finite"],
     source: """
         constexpr uint CHUNKS = uint(C_);
+        constexpr uint TG = uint(TG_);
+        constexpr uint NSG = TG / 32u;
         const uint lid = thread_position_in_threadgroup.x;
         const uint row = threadgroup_position_in_grid.y;
         const uint lane = lid & 31u;
+        const uint sg = lid >> 5;
         darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
         uint nf = 0u;
-        for (uint chunk = lid; chunk < CHUNKS; chunk += 64u) {
+        for (uint chunk = lid; chunk < CHUNKS; chunk += TG) {
             const uint base = (row * CHUNKS + chunk) * 2;
             darkbloom_qwen35_mtp_top2_insert(
                 local, partial_values[base], uint(partial_ids[base]));
@@ -424,23 +427,27 @@ private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
 
         cbv2_reduce_simd_readout_top2(local, lane);
         nf = simd_max(nf);
-        threadgroup darkbloom_qwen35_mtp_top2_state second_group[1];
-        threadgroup uint second_nf[1];
-        if (lid == 32u) {
-            second_group[0] = local;
-            second_nf[0] = nf;
+        threadgroup darkbloom_qwen35_mtp_top2_state sg_states[NSG];
+        threadgroup uint sg_nf[NSG];
+        if (lane == 0u) {
+            sg_states[sg] = local;
+            sg_nf[sg] = nf;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (lid == 0) {
-            cbv2_merge_readout_top2(local, second_group[0]);
-            nf |= second_nf[0];
-            const uint output_base = row * 2;
-            top_ids[output_base] = int(local.first_id);
-            top_ids[output_base + 1] = int(local.second_id);
-            top_values[output_base] = local.first_value;
-            top_values[output_base + 1] = local.second_value;
-            non_finite[row] = nf != 0u ? 1 : 0;
+        if (sg == 0u) {
+            local = (lane < NSG) ? sg_states[lane] : darkbloom_qwen35_mtp_top2_empty();
+            nf = (lane < NSG) ? sg_nf[lane] : 0u;
+            cbv2_reduce_simd_readout_top2(local, lane);
+            nf = simd_max(nf);
+            if (lane == 0u) {
+                const uint output_base = row * 2;
+                top_ids[output_base] = int(local.first_id);
+                top_ids[output_base + 1] = int(local.second_id);
+                top_values[output_base] = local.first_value;
+                top_values[output_base + 1] = local.second_value;
+                non_finite[row] = nf != 0u ? 1 : 0;
+            }
         }
     """,
     header: cbv2FusedReadoutTopTwoHeader
@@ -464,6 +471,7 @@ private struct CBv2ReadoutLaunchKey: Hashable {
     let rows: Int
     let vocab: Int
     let chunks: Int
+    let tg: Int
 }
 
 private let cbv2ReadoutLaunchLock = NSLock()
@@ -473,25 +481,37 @@ nonisolated(unsafe) private var cbv2ReadoutLaunchCache:
 private struct CBv2ReadoutStage2Key: Hashable {
     let rows: Int
     let chunks: Int
+    let tg: Int
 }
 
 nonisolated(unsafe) private var cbv2ReadoutStage2Cache:
     [CBv2ReadoutStage2Key: MLXFast.MLXFastKernel.Launch] = [:]
+
+private let cbv2TopTwoStage2WideEnabled =
+    ProcessInfo.processInfo.environment["CBV2_TOPTWO_WIDE_S2"] != "0"
+
+private func cbv2Stage2Threads(chunks: Int) -> Int {
+    guard cbv2TopTwoStage2WideEnabled, CBv2DraftRegime.deepLowVerify else { return 64 }
+    if chunks >= 512 { return 512 }
+    if chunks >= 256 { return 256 }
+    return 64
+}
 
 internal func cbv2FusedReadoutTopTwoMergePartials(
     partialIDs: MLXArray, partialValues: MLXArray, partialNF: MLXArray,
     batch: Int, width: Int, chunks: Int
 ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
     let rows = batch * width
-    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks)
+    let tg = cbv2Stage2Threads(chunks: chunks)
+    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks, tg: tg)
     let s2: MLXFast.MLXFastKernel.Launch
     if let hit = cbv2ReadoutLaunchLock.withLock({ cbv2ReadoutStage2Cache[key] }) {
         s2 = hit
     } else {
         let made = cbv2FusedReadoutTopTwoStage2.prepare(
-            template: [("C_", chunks)],
-            grid: (64, rows, 1),
-            threadGroup: (64, 1, 1),
+            template: [("C_", chunks), ("TG_", tg)],
+            grid: (tg, rows, 1),
+            threadGroup: (tg, 1, 1),
             outputShapes: [[rows, 2], [rows, 2], [rows]],
             outputDTypes: [.int32, .float32, .int32])
         cbv2ReadoutLaunchLock.withLock { cbv2ReadoutStage2Cache[key] = made }
@@ -515,9 +535,10 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
     let rows = batch * width
     precondition(rows > 0 && vocab >= 2)
     let chunks = max(64, (vocab - 1) / 65_536 + 1)
+    let tg = cbv2Stage2Threads(chunks: chunks)
     let params = cbv2CachedReadoutParams(outputMultiplier: outputMultiplier, softcap: softcap)
     let flat = rawProduct.reshaped([rows, vocab])
-    let key = CBv2ReadoutLaunchKey(rows: rows, vocab: vocab, chunks: chunks)
+    let key = CBv2ReadoutLaunchKey(rows: rows, vocab: vocab, chunks: chunks, tg: tg)
     let launches: (s1: MLXFast.MLXFastKernel.Launch, s2: MLXFast.MLXFastKernel.Launch)
     if let hit = cbv2ReadoutLaunchLock.withLock({ cbv2ReadoutLaunchCache[key] }) {
         launches = hit
@@ -529,9 +550,9 @@ public func cbv2FusedReadoutTopTwoAndNonFinite(
             outputShapes: [[rows, chunks, 2], [rows, chunks, 2], [rows, chunks]],
             outputDTypes: [.int32, .float32, .int32])
         let s2 = cbv2FusedReadoutTopTwoStage2.prepare(
-            template: [("C_", chunks)],
-            grid: (64, rows, 1),
-            threadGroup: (64, 1, 1),
+            template: [("C_", chunks), ("TG_", tg)],
+            grid: (tg, rows, 1),
+            threadGroup: (tg, 1, 1),
             outputShapes: [[rows, 2], [rows, 2], [rows]],
             outputDTypes: [.int32, .float32, .int32])
         launches = (s1, s2)
