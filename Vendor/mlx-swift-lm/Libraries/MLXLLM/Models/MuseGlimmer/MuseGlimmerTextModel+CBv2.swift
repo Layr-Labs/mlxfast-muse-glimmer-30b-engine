@@ -90,6 +90,51 @@ extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
     // Packed prefill keeps the protocol's fail-closed default.
 }
 
+
+extension MuseGlimmerTextAttention {
+    func lastRowAttention(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        ropeOffsets: MLXArray?, numerics: MuseGlimmerNumerics
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let n = numerics
+        var queries = n.project(queryProj, x).reshaped(batch, length, heads, headDimensions)
+        var keys = n.project(keyProj, x).reshaped(batch, length, kvHeads, headDimensions)
+        var values = n.project(valueProj, x).reshaped(batch, length, kvHeads, headDimensions)
+
+        queries = qkNorm(queries)
+        queries = (queries.asType(.float32) * qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        keys = qkNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+
+        var output: MLXArray
+        if let attending = cache as? any CBv2AttendingLayerCache {
+            if let rope {
+                let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
+                queries = rope(queries, offset: offsets)
+                keys = rope(keys, offset: offsets)
+            }
+            output = attending.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        } else {
+            if let rope {
+                let offset = cache?.offset ?? 0
+                queries = rope(queries, offset: offset)
+                keys = rope(keys, offset: offset)
+            }
+            output = attentionWithCacheUpdate(
+                queries: queries, keys: keys, values: values, cache: cache, scale: scale,
+                mask: mask)
+        }
+        output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        let outputRow = output[0..., (length - 1)..., 0...]
+        let inputRow = x[0..., (length - 1)..., 0...]
+        let gated = MuseGlimmerFusion.sigmoidGate([outputRow, n.project(gateProj, inputRow)])[0]
+        return n.project(outputProj, gated)
+    }
+}
+
 // MARK: - Teacher-forced readout
 
 /// A multi-row teacher-forced forward is read at its last position only. Every
@@ -162,14 +207,24 @@ extension MuseGlimmerTextModel: CBv2LastPositionLogitsForwardable {
                 asyncEval([h])
                 continue
             }
-            let attended = layer.postAttentionLayerNorm.addedTo(
-                h,
-                layer.selfAttention(
+            if numerics.isExact(h) {
+                let attentionRow = layer.selfAttention.lastRowAttention(
                     layer.inputLayerNorm(h), mask: .none, cache: cache[index],
-                    ropeOffsets: ropeOffsets))
-            let row = attended[0..., (attended.dim(1) - 1)..., 0...]
-            h = layer.postFeedforwardLayerNorm.addedTo(
-                row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
+                    ropeOffsets: ropeOffsets, numerics: numerics)
+                let residualRow = h[0..., (h.dim(1) - 1)..., 0...]
+                let attended = layer.postAttentionLayerNorm.addedTo(residualRow, attentionRow)
+                h = layer.postFeedforwardLayerNorm.addedTo(
+                    attended, layer.mlp(layer.preFeedforwardLayerNorm(attended)))
+            } else {
+                let attended = layer.postAttentionLayerNorm.addedTo(
+                    h,
+                    layer.selfAttention(
+                        layer.inputLayerNorm(h), mask: .none, cache: cache[index],
+                        ropeOffsets: ropeOffsets))
+                let row = attended[0..., (attended.dim(1) - 1)..., 0...]
+                h = layer.postFeedforwardLayerNorm.addedTo(
+                    row, layer.mlp(layer.preFeedforwardLayerNorm(row)))
+            }
         }
         return outputLogits(model.norm(h))
     }

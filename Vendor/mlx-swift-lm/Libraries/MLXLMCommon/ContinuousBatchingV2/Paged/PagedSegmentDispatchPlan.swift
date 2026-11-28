@@ -77,21 +77,34 @@ struct PagedSegmentDispatchPlan {
         func flush() {
             guard !pending.isEmpty else { return }
             let ids = segments.sorted()
-            let binding = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
+            let singleSegment = ids.count == 1
+            let binding =
+                singleSegment
+                ? [Int: Int]()
+                : Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
             var records: [Int32] = []
             records.reserveCapacity(pending.count * Self.recordStride)
             for item in pending {
-                let writer = item.write.map {
-                    (binding[layout.segmentIndex(page: $0)]!, layout.localPage($0))
-                }
+                let writerBinding =
+                    singleSegment
+                    ? 0
+                    : (item.write.map { binding[layout.segmentIndex(page: $0)]! } ?? 0)
+                let writerLocal = item.write.map { layout.localPage($0) } ?? 0
                 var record: [Int32] = [
                     Int32(item.row), Int32(item.partition), Int32(item.firstPage),
-                    Int32(item.pages.count), Int32(writer?.0 ?? 0), Int32(writer?.1 ?? 0),
+                    Int32(item.pages.count), Int32(writerBinding), Int32(writerLocal),
                     Int32(maxPartitions), 0,
                 ]
-                for page in item.pages {
-                    record.append(Int32(binding[layout.segmentIndex(page: page)]!))
-                    record.append(Int32(layout.localPage(page)))
+                if singleSegment {
+                    for page in item.pages {
+                        record.append(0)
+                        record.append(Int32(layout.localPage(page)))
+                    }
+                } else {
+                    for page in item.pages {
+                        record.append(Int32(binding[layout.segmentIndex(page: page)]!))
+                        record.append(Int32(layout.localPage(page)))
+                    }
                 }
                 record.append(contentsOf: repeatElement(0, count: Self.recordStride - record.count))
                 records.append(contentsOf: record)
@@ -129,9 +142,25 @@ struct PagedSegmentDispatchPlan {
                     precondition(
                         writer == pages.last, "fused write must target the newest attended page")
                 }
-                let needed = Set(pages.map { layout.segmentIndex(page: $0) })
+                var needed = Set<Int>()
+                if let firstPage = pages.first {
+                    let firstSegment = layout.segmentIndex(page: firstPage)
+                    var uniform = true
+                    for page in pages.dropFirst() where layout.segmentIndex(page: page) != firstSegment {
+                        uniform = false
+                        break
+                    }
+                    if uniform {
+                        needed = [firstSegment]
+                    }
+                }
+                if needed.isEmpty {
+                    for page in pages { needed.insert(layout.segmentIndex(page: page)) }
+                }
                 precondition(needed.count <= Self.maximumBindings)
-                if segments.union(needed).count > Self.maximumBindings { flush() }
+                if segments.count + needed.count > Self.maximumBindings {
+                    if segments.union(needed).count > Self.maximumBindings { flush() }
+                }
                 segments.formUnion(needed)
                 pending.append(
                     Item(
