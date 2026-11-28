@@ -37,7 +37,8 @@ extension EngineLoopV2 {
     /// A window position whose target logits hold NaN or infinity scores
     /// `CBv2NonFiniteLogits.invalidTarget`, so finalize can refuse to commit it.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], draftTokenBlock: MLXArray?, rows: [CBv2MTPRowWork],
+        driver mtp: CBv2MTPRoundDriver
     ) throws -> (
         scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -331,7 +332,9 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularColumnsAsRows = false
                 }
             }
-            let tokens = concatenated(columns, axis: 1)
+            let tokens =
+                draftTokenBlock.map { concatenated([columns[0], $0], axis: 1) }
+                ?? concatenated(columns, axis: 1)
             // A native paged rectangular step plans the whole window as one
             // attention owner; its reads must finish construction before sealing.
             let nativePagedWork = CBv2NativePagedMTPWork.current
