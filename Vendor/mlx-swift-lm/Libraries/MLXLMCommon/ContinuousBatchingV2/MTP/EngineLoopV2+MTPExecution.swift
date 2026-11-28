@@ -857,11 +857,15 @@ extension EngineLoopV2 {
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        var draftTokenBlock: MLXArray?
         var assistantEvalTargets: [MLXArray] = []
         // Low-acceptance rounds draft with the drafter's cheaper form.
         CBv2DraftRegime.lowAcceptance =
             batch == 1 && mtp.inLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.lowAcceptance = false }
+        CBv2DraftRegime.highAcceptanceKnown =
+            batch == 1 && mtp.inKnownHighAcceptanceRegime(verifyRows[0].rec.id)
+        defer { CBv2DraftRegime.highAcceptanceKnown = false }
         CBv2DraftRegime.xnorDraftHeadEligible =
             batch == 1 && mtp.inDeepLowAcceptanceRegime(verifyRows[0].rec.id)
         defer { CBv2DraftRegime.xnorDraftHeadEligible = false }
@@ -879,10 +883,16 @@ extension EngineLoopV2 {
         CBv2DraftRegime.activeVerifyTree = verifyTree
         CBv2DraftRegime.activeDynamicTreeK = useDynamicTree ? k : 0
         CBv2DraftRegime.activeDynamicTreeMeta = nil
+        CBv2DraftRegime.activeHistoryHint =
+            useDynamicTree
+            ? mtp.prepareHistoryHint(
+                for: verifyRows[0].rec.id, tokens: verifyRows[0].rec.tokens, maxLen: k)
+            : nil
         defer {
             CBv2DraftRegime.activeVerifyTree = nil
             CBv2DraftRegime.activeDynamicTreeK = 0
             CBv2DraftRegime.activeDynamicTreeMeta = nil
+            CBv2DraftRegime.activeHistoryHint = nil
         }
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             // Opted-in drafters only; every other drafter's round is unchanged.
@@ -967,6 +977,11 @@ extension EngineLoopV2 {
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
             }
+            if batch == 1, k > 1, mtp.config.verificationMode == .rectangularExact,
+                let requestState = rowMetadata[0].assistantState
+            {
+                draftTokenBlock = stateful.stagedDraftTokens(count: k, requestState: requestState)
+            }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
             var draftInput = seedColumn
@@ -990,7 +1005,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = draftTokenBlock ?? stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -1006,7 +1021,8 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, draftTokenBlock: draftTokenBlock, rows: verifyRows,
+            driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
