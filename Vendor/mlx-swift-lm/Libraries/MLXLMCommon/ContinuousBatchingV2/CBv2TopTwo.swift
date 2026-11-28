@@ -446,6 +446,62 @@ private let cbv2FusedReadoutTopTwoStage2 = MLXFast.metalKernel(
     header: cbv2FusedReadoutTopTwoHeader
 )
 
+private let cbv2FirstReadoutHeader = cbv2TopTwoHeader + """
+    struct cbv2_first_readout_state {
+        float value;
+        uint id;
+        uint valid;
+    };
+
+    inline void cbv2_keep_first_readout(
+        thread cbv2_first_readout_state& state, float value, uint id
+    ) {
+        if (!state.valid || darkbloom_qwen35_mtp_top2_better(value, id, state.value, state.id)) {
+            state = {value, id, 1u};
+        }
+    }
+    """
+
+private let cbv2FusedReadoutTopOneStage2 = MLXFast.metalKernel(
+    name: "cbv2_fused_readout_top1_s2",
+    inputNames: ["partial_ids", "partial_values", "partial_nf"],
+    outputNames: ["top_ids", "top_values", "non_finite"],
+    source: """
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = lid & 31u;
+        cbv2_first_readout_state local = {0.0f, 0u, 0u};
+        uint nf = 0u;
+        for (uint chunk = lid; chunk < uint(C_); chunk += 64u) {
+            const uint index = row * uint(C_) + chunk;
+            cbv2_keep_first_readout(local, partial_values[index], uint(partial_ids[index]));
+            nf |= uint(partial_nf[index]);
+        }
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            const float value = simd_shuffle_down(local.value, offset);
+            const uint id = simd_shuffle_down(local.id, offset);
+            const uint valid = simd_shuffle_down(local.valid, offset);
+            if (lane < offset && valid) { cbv2_keep_first_readout(local, value, id); }
+        }
+        nf = simd_max(nf);
+        threadgroup cbv2_first_readout_state second_group[1];
+        threadgroup uint second_nf[1];
+        if (lid == 32u) {
+            second_group[0] = local;
+            second_nf[0] = nf;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            const cbv2_first_readout_state other = second_group[0];
+            if (other.valid) { cbv2_keep_first_readout(local, other.value, other.id); }
+            top_ids[row] = int(local.id);
+            top_values[row] = local.value;
+            non_finite[row] = (nf | second_nf[0]) != 0u ? 1 : 0;
+        }
+    """,
+    header: cbv2FirstReadoutHeader
+)
+
 private let cbv2ReadoutParamsLock = NSLock()
 nonisolated(unsafe) private var cbv2ReadoutParamsCache: [UInt64: MLXArray] = [:]
 
@@ -473,6 +529,7 @@ nonisolated(unsafe) private var cbv2ReadoutLaunchCache:
 private struct CBv2ReadoutStage2Key: Hashable {
     let rows: Int
     let chunks: Int
+    let firstOnly: Bool
 }
 
 nonisolated(unsafe) private var cbv2ReadoutStage2Cache:
@@ -480,27 +537,29 @@ nonisolated(unsafe) private var cbv2ReadoutStage2Cache:
 
 internal func cbv2FusedReadoutTopTwoMergePartials(
     partialIDs: MLXArray, partialValues: MLXArray, partialNF: MLXArray,
-    batch: Int, width: Int, chunks: Int
+    batch: Int, width: Int, chunks: Int, firstOnly: Bool = false
 ) -> (ids: MLXArray, values: MLXArray, nonFinite: MLXArray) {
     let rows = batch * width
-    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks)
+    let ranks = firstOnly ? 1 : 2
+    let key = CBv2ReadoutStage2Key(rows: rows, chunks: chunks, firstOnly: firstOnly)
     let s2: MLXFast.MLXFastKernel.Launch
     if let hit = cbv2ReadoutLaunchLock.withLock({ cbv2ReadoutStage2Cache[key] }) {
         s2 = hit
     } else {
-        let made = cbv2FusedReadoutTopTwoStage2.prepare(
+        let kernel = firstOnly ? cbv2FusedReadoutTopOneStage2 : cbv2FusedReadoutTopTwoStage2
+        let made = kernel.prepare(
             template: [("C_", chunks)],
             grid: (64, rows, 1),
             threadGroup: (64, 1, 1),
-            outputShapes: [[rows, 2], [rows, 2], [rows]],
+            outputShapes: [[rows, ranks], [rows, ranks], [rows]],
             outputDTypes: [.int32, .float32, .int32])
         cbv2ReadoutLaunchLock.withLock { cbv2ReadoutStage2Cache[key] = made }
         s2 = made
     }
     let outputs = s2([partialIDs, partialValues, partialNF])
     return (
-        outputs[0].reshaped([batch, width, 2]),
-        outputs[1].reshaped([batch, width, 2]),
+        outputs[0].reshaped([batch, width, ranks]),
+        outputs[1].reshaped([batch, width, ranks]),
         outputs[2].reshaped([batch, width])
     )
 }
