@@ -691,6 +691,11 @@ final class CBv2MTPRoundDriver {
             usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyRegime
         CBv2DraftRegime.strictLowVerifyC3 =
             usesFixedDepthAcceptanceWindow && acc.isStrictLowVerifyC3Regime
+        CBv2DraftRegime.earlyLowVerify =
+            usesFixedDepthAcceptanceWindow && CBv2DraftRegime.earlyLowVerifyHundredths > 0
+            && acc.ceilingRounds >= 2
+            && acc.ceilingCommittedTokens * 100
+                < CBv2DraftRegime.earlyLowVerifyHundredths * acc.ceilingRounds
         return deep
     }
 
@@ -1695,6 +1700,26 @@ public enum CBv2DraftRegime {
     /// Clause-3-only strict low-acceptance gate (`inLow && rounds >= 6 && avg < 3.60`) for
     /// Wave 17+ target-verify speedups with zero early-dip exposure on Pair 1.
     nonisolated(unsafe) public static var strictLowVerifyC3 = false
+    /// Early-low verify-kernel tier: at least 2 ceiling rounds and fewer than 3.00 committed tokens
+    /// per round so far (`CBV2_EARLY_LOW_VERIFY_HUNDREDTHS`, default 300; 0 disables). It
+    /// selects only target-verify kernels (the bit-identical schedules of the low, strict-low
+    /// and clause-3 tiers), so the low-acceptance requests get them before the clause-3 tier
+    /// (6 rounds, < 3.60) switches on. The high-acceptance request commits about 5 tokens per
+    /// round and never enters. Drafter, tree, depth, acceptance and paged-attention choices
+    /// keep reading the flags above.
+    nonisolated(unsafe) public static var earlyLowVerify = false
+    public static let earlyLowVerifyHundredths: Int = {
+        let env = ProcessInfo.processInfo.environment
+        return env["CBV2_EARLY_LOW_VERIFY_HUNDREDTHS"].flatMap(Int.init) ?? 300
+    }()
+    /// Target-verify kernel selection only: the low-acceptance (`lowVerify`) tier.
+    public static var verifyLowKernels: Bool {
+        earlyLowVerify || !lowOnlyVerifySpeedups || lowAcceptance
+    }
+    /// Target-verify kernel selection only: the strict-low (`strictLowVerifyEligible`) tier.
+    public static var verifyStrictLowKernels: Bool { earlyLowVerify || strictLowVerifyEligible }
+    /// Target-verify kernel selection only: the clause-3 (`strictLowVerifyC3`) tier.
+    public static var verifyC3Kernels: Bool { earlyLowVerify || strictLowVerifyC3 }
     /// Active static multi-leaf tree for the current low-acceptance round (nil = linear or dynamic).
     nonisolated(unsafe) public static var activeVerifyTree: CBv2VerifyTree? = nil
     /// Active GPU-dynamic tree draft count (`3...7`), or `0` when inactive.

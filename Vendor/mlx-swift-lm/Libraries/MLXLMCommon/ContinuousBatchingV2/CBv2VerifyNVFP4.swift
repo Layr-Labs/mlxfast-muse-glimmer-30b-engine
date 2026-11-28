@@ -69,7 +69,7 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         if inputs >= 16384 {
             // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
             // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
@@ -693,7 +693,7 @@ public enum CBv2VerifyNVFP4 {
             takes(weight: weight, blockScales: blockScales, tensorScale: tensorScale, inputs: inputs)
         else { return nil }
         let outputs = weight.dim(0)
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         if !lowVerify {
             return Record.product(
                 x, weight: weight, blockScales: blockScales, tensorScale: tensorScale)
@@ -718,7 +718,7 @@ public enum CBv2VerifyNVFP4 {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         if !lowVerify { return Record.product(layer, x) }
         let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let id = ObjectIdentifier(layer)
@@ -772,7 +772,7 @@ public enum CBv2VerifyNVFP4 {
         let inputs = x.dim(-1)
         guard inputs > 0 else { return nil }
         let rows = x.size / inputs
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
         if !lowVerify { return Record.products(nv, x) }
         let s = schedule(rows: rows, inputs: inputs, lowVerify: lowVerify)
         let pkey = PlanKey(
@@ -852,7 +852,7 @@ public enum CBv2VerifyNVFP4 {
 extension CBv2VerifyNVFP4 {
     /// The record's (c95a27f5) NVFP4 verify tile, launch geometry and host path,
     /// verbatim except for the kernel names. High-acceptance verify rounds
-    /// (`CBv2DraftRegime.lowOnlyVerifySpeedups && !CBv2DraftRegime.lowAcceptance`)
+    /// (`!CBv2DraftRegime.verifyLowKernels`)
     /// take it so their timing stays the record's; low-acceptance rounds keep the
     /// whole-chunk / vectorized-scale tiles.
     enum Record {

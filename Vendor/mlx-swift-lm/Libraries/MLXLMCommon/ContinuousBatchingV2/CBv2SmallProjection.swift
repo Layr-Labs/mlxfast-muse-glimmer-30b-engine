@@ -43,7 +43,7 @@ public enum CBv2SmallProjection {
     // MARK: FP8
 
     /// The record's (c95a27f5) helper, verbatim: high-acceptance verify rounds
-    /// (`CBv2DraftRegime.lowOnlyVerifySpeedups && !CBv2DraftRegime.lowAcceptance`)
+    /// (`!CBv2DraftRegime.verifyLowKernels`)
     /// launch these kernels so their timing stays the record's.
     static let fp8HelperRec = """
 
@@ -1310,9 +1310,9 @@ public enum CBv2SmallProjection {
         sharedInput: Bool
     ) -> [MLXArray] {
         let inputs = flat.dim(-1)
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1455,9 +1455,9 @@ public enum CBv2SmallProjection {
         guard inputs > 0, !layers.isEmpty else { return nil }
         let rows = preCast.size / inputs
         guard (1 ... maximumRows).contains(rows) else { return nil }
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
+        let strictLow = lowVerify && CBv2DraftRegime.verifyStrictLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1611,7 +1611,7 @@ public enum CBv2SmallProjection {
     // MARK: Dense BF16/FP16
 
     /// The record's (c95a27f5) helper, verbatim: high-acceptance verify rounds
-    /// (`CBv2DraftRegime.lowOnlyVerifySpeedups && !CBv2DraftRegime.lowAcceptance`)
+    /// (`!CBv2DraftRegime.verifyLowKernels`)
     /// launch these kernels so their timing stays the record's.
     static let denseHelperRec = """
 
@@ -2027,8 +2027,8 @@ public enum CBv2SmallProjection {
         guard (1 ... maximumRows).contains(rows), ModelOptRowExact.geometryOverride == nil else {
             return nil
         }
-        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
-        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let lowVerify = CBv2DraftRegime.verifyLowKernels
+        let strictC3 = lowVerify && CBv2DraftRegime.verifyC3Kernels
         let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
