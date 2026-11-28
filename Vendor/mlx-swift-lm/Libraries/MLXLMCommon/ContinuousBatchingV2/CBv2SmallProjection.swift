@@ -657,6 +657,218 @@ public enum CBv2SmallProjection {
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
             }
         }
+
+        // Single-body TM=4 RG=1 pure-SPLIT FP8 kernel (branchless DV_MODE=2, VO=true,
+        // optional peeled 1-ahead weight prefetch for K >= 16384). Halves activation loads,
+        // shuffle trees, and barrier joins per weight byte (256t/TG, 1 KB smem, 0-ULP exact).
+        template <typename T, int K, int V, bool PEEL>
+        inline void cbv2_sp_fp8_tm4(
+            const device uint8_t* mat, float weight_scale, const device T* in_vec,
+            device T* out_vec, int N, int NOUT, int tile, uint simd_gid, uint simd_lid,
+            threadgroup float* tgp) {
+            constexpr int TM = 4;
+            constexpr int BN = 8;
+            constexpr int TN = 4;
+            constexpr int blockN = BN * 32 * TN;
+            constexpr int n_iter = K / blockN;
+            constexpr int leftover = K - blockN * n_iter;
+            constexpr int P = V * TM;
+            static_assert(P <= 32, "at most 32 values per lane");
+            constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
+            constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
+            constexpr uint LOW = (1u << SH) - 1u;
+            const float dscale = weight_scale * 256.0f;
+            const uint g = simd_gid;
+            const int orig_row = tile * TM;
+            const bool active = orig_row < N;
+            const int out_row = active ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
+            int bn = (32 * int(g) + int(simd_lid)) * TN;
+            const device uint8_t* rows = mat + size_t(out_row) * K;
+            float r[P2];
+            CBV2_SP_UNROLL
+            for (int i = 0; i < P2; i++) { r[i] = 0; }
+            if constexpr (PEEL && n_iter > 0) {
+                uint wq[TM];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    wq[tm] = *(const device uint*)(rows + tm * K + bn);
+                }
+                for (int it = 0; it < n_iter - 1; it++) {
+                    uint wn[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wn[tm] = *(const device uint*)(rows + tm * K + bn + blockN);
+                    }
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = wq[tm];
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += inter[tm][tn] * a;
+                            }
+                        }
+                    }
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) { wq[tm] = wn[tm]; }
+                    bn += blockN;
+                }
+                T inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const uint w = wq[tm];
+                    const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                    const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                    const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                    const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                    inter[tm][0] = static_cast<T>(f02.x);
+                    inter[tm][1] = static_cast<T>(f13.x);
+                    inter[tm][2] = static_cast<T>(f02.y);
+                    inter[tm][3] = static_cast<T>(f13.y);
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                    }
+                }
+                bn += blockN;
+            } else {
+                for (int it = 0; it < n_iter; it++) {
+                    uint wq[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wq[tm] = *(const device uint*)(rows + tm * K + bn);
+                    }
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = wq[tm];
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += inter[tm][tn] * a;
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+            }
+            if constexpr (leftover > 0) {
+                if (bn + TN <= K) {
+                    uint wq[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wq[tm] = *(const device uint*)(rows + tm * K + bn);
+                    }
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        const uint w = wq[tm];
+                        const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                        const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                        const float2 f02 = float2(as_type<half2>(lo)) * dscale;
+                        const float2 f13 = float2(as_type<half2>(hi)) * dscale;
+                        inter[tm][0] = static_cast<T>(f02.x);
+                        inter[tm][1] = static_cast<T>(f13.x);
+                        inter[tm][2] = static_cast<T>(f02.y);
+                        inter[tm][3] = static_cast<T>(f13.y);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = *(const device ushort4*)(in_vec + v * K + bn);
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += inter[tm][tn] * a;
+                            }
+                        }
+                    }
+                } else {
+                    const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                    T inter[TM][TN];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            if (bn + tn < K) {
+                                const uint8_t code = rows[tm * K + bn + tn];
+                                const float decoded =
+                                    (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                                inter[tm][tn] = static_cast<T>(decoded * weight_scale);
+                            } else {
+                                inter[tm][tn] = T(0);
+                            }
+                        }
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += inter[tm][tn] * a;
+                            }
+                        }
+                    }
+                }
+            }
+            const ushort lid = ushort(simd_lid);
+            cbv2_sp_tree_step<P2, 16>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 2 ? P2 / 2 : 1), 8>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 4 ? P2 / 4 : 1), 4>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 8 ? P2 / 8 : 1), 2>(r, lid);
+            cbv2_sp_tree_step<(P2 >= 16 ? P2 / 16 : 1), 1>(r, lid);
+            const bool holds = (simd_lid & LOW) == 0;
+            const int i = int(simd_lid >> SH);
+            if (holds) { tgp[g * 32 + i] = r[0]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (g == 0 && holds && i < P && active) {
+                float result = r[0];
+                for (int s = 1; s < BN; s++) {
+                    result += tgp[s * 32 + i];
+                }
+                out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
+            }
+        }
         """
 
     /// One segment of a dispatch: `rows` output rows of weight `weight`
@@ -684,6 +896,7 @@ public enum CBv2SmallProjection {
         var rowsOuter: Bool
         var rowGroups: Int
         var coopOProj: Bool
+        var tm4Split: Bool = false
         var weights: Int
         var outputs: Int
         var segments: [FP8Segment]
@@ -729,6 +942,66 @@ public enum CBv2SmallProjection {
             let kernel = MLXFast.metalKernel(
                 name: name, inputNames: inputNames, outputNames: outputNames, source: body,
                 header: ModelOptActivationKernels.header + fp8HelperRec)
+            fp8Kernels[shape] = kernel
+            return kernel
+        }
+        if shape.tm4Split {
+            var body = """
+                threadgroup float sp_tgp[8 * 32];
+                const int tg = int(threadgroup_position_in_grid.y);
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint sl = thread_index_in_simdgroup;
+                const device uint8_t* m;
+                float ws;
+                const device T* in_v;
+                device T* y;
+                int nseg;
+                int nout;
+                int lt;
+
+                """
+            if shape.segments.count == 1 {
+                let s = shape.segments[0]
+                body += """
+                    m = m\(s.weight) + size_t(\(s.row0)) * K;
+                    ws = ws\(s.weight)[0];
+                    in_v = xc + size_t(\(s.input)) * V * K;
+                    y = y\(s.output) + \(s.column0);
+                    nseg = \(s.rows);
+                    nout = \(s.outputWidth);
+                    lt = tg;
+
+                    """
+            } else {
+                var offset = 0
+                for (index, s) in shape.segments.enumerated() {
+                    let end = offset + s.tiles(rowGroups: 1)
+                    let cond =
+                        index == 0
+                        ? "if (tg < \(end))"
+                        : (index + 1 == shape.segments.count ? "else" : "else if (tg < \(end))")
+                    body += """
+                        \(cond) {
+                            m = m\(s.weight) + size_t(\(s.row0)) * K;
+                            ws = ws\(s.weight)[0];
+                            in_v = xc + size_t(\(s.input)) * V * K;
+                            y = y\(s.output) + \(s.column0);
+                            nseg = \(s.rows);
+                            nout = \(s.outputWidth);
+                            lt = tg - \(offset);
+                        }
+
+                        """
+                    offset = end
+                }
+            }
+            body += """
+                cbv2_sp_fp8_tm4<T, K, V, (K >= 16384)>(m, ws, in_v, y, nseg, nout, lt, sg, sl, sp_tgp);
+                """
+            let name = "cbv2_small_fp8_" + stableName(body)
+            let kernel = MLXFast.metalKernel(
+                name: name, inputNames: inputNames, outputNames: outputNames, source: body,
+                header: ModelOptActivationKernels.header + fp8Helper)
             fp8Kernels[shape] = kernel
             return kernel
         }
@@ -793,6 +1066,15 @@ public enum CBv2SmallProjection {
     /// `CBV2_FP8_OPROJ_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT (o_proj) strict-low verify rows.
     public static let coopOProjEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FP8_OPROJ_COOP"] != "0"
+    /// `CBV2_DENSE_COOP=0` disables 4 KB double-buffered cooperative s_av on non-SPLIT dense BF16 (q/gate) strict-low verify rows.
+    public static let coopDenseEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_DENSE_COOP"] != "0"
+    /// `CBV2_FP8_TM4=0` disables single-body TM=4 RG=1 pure-SPLIT FP8 verify kernels on strict-C3 low-acceptance rows >= 5.
+    public static let fp8TM4Enabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_TM4"] != "0"
+    /// `CBV2_FP8_FUSED_GU_SILU=0` disables fused TM=4 FP8 `gate_up + SiLU + FP8 cast` on strict-C3 low-acceptance rows >= 5.
+    public static let fp8FusedGateUpSiluEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_FP8_FUSED_GU_SILU"] != "0"
 
     /// `CBV2_FP8_RG`: row-groups per threadgroup for pure-SPLIT FP8/dense verify tiles at rows >= 5 (1, 2, or 4; default 4).
     public static let fp8RowGroups: Int = {
@@ -865,6 +1147,279 @@ public enum CBv2SmallProjection {
         var dense: [DenseGroupPlanKey: DenseGroupPlan] = [:]
         var sharedCast: [SharedCastKey: (multipliers: MLXArray, overflowBound: MLXArray)?] = [:]
         var branchlessSafe: Set<ObjectIdentifier> = []
+        var fusedGULaunches: [FP8FusedGULaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var fusedGUPlans: [FP8FusedGUPlanKey: FP8FusedGUPlan] = [:]
+    }
+
+    private struct FP8FusedGULaunchKey: Hashable {
+        let inputs: Int
+        let rows: Int
+        let outputs: Int
+    }
+
+    private struct FP8FusedGUPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let downID: ObjectIdentifier
+        let inputs: Int
+        let rows: Int
+    }
+
+    private struct FP8FusedGUPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let outputs: Int
+    }
+
+    static let fusedSiluCastHeader = """
+
+        inline bfloat16_t cbv2_sp_bf16_sigmoid(bfloat16_t x) {
+            const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            const bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t one = bfloat16_t(1.0f);
+            const bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+
+        inline bfloat16_t cbv2_sp_bf16_cast_fp8(
+            bfloat16_t yb, float m0, float m1, float bound, float nan_value
+        ) {
+            const float scaled = static_cast<float>(yb) * m0;
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+            return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+        }
+
+        """
+
+    static let fp8FusedGateUpSiluSource = """
+        constexpr int TM = 4;
+        constexpr int BN = 8;
+        constexpr int TN = 4;
+        constexpr int blockN = BN * 32 * TN;
+        constexpr int n_iter = K / blockN;
+        constexpr int leftover = K - blockN * n_iter;
+        static_assert(V >= 5 && V <= 8, "5..8 rows");
+        constexpr int P2 = 32;
+        threadgroup float sp_tgp[8 * 32];
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint g = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        const int out_row = tile * 2;
+        int bn = (32 * int(g) + int(sl)) * TN;
+        const float ws_g = ws0[0];
+        const float ws_u = ws1[0];
+        const float dscale0 = ws_g * 256.0f;
+        const float dscale1 = ws_u * 256.0f;
+        const device uint8_t* r0 = m0 + size_t(out_row) * K;
+        const device uint8_t* r1 = m1 + size_t(out_row) * K;
+        float r[P2];
+        CBV2_SP_UNROLL
+        for (int i = 0; i < P2; i++) { r[i] = 0.0f; }
+        for (int it = 0; it < n_iter; it++) {
+            uint wq[TM];
+            wq[0] = *(const device uint*)(r0 + bn);
+            wq[1] = *(const device uint*)(r0 + K + bn);
+            wq[2] = *(const device uint*)(r1 + bn);
+            wq[3] = *(const device uint*)(r1 + K + bn);
+            bfloat16_t inter[TM][TN];
+            CBV2_SP_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                const uint w = wq[tm];
+                const float ds = (tm < 2) ? dscale0 : dscale1;
+                const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                const float2 f02 = float2(as_type<half2>(lo)) * ds;
+                const float2 f13 = float2(as_type<half2>(hi)) * ds;
+                inter[tm][0] = static_cast<bfloat16_t>(f02.x);
+                inter[tm][1] = static_cast<bfloat16_t>(f13.x);
+                inter[tm][2] = static_cast<bfloat16_t>(f02.y);
+                inter[tm][3] = static_cast<bfloat16_t>(f13.y);
+            }
+            CBV2_SP_UNROLL
+            for (int v = 0; v < V; v++) {
+                const ushort4 av_v = *(const device ushort4*)(xc + size_t(v) * K + bn);
+                CBV2_SP_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    const float a = static_cast<float>(as_type<bfloat16_t>(av_v[tn]));
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        r[v * TM + tm] += inter[tm][tn] * a;
+                    }
+                }
+            }
+            bn += blockN;
+        }
+        if constexpr (leftover > 0) {
+            if (bn + TN <= K) {
+                uint wq[TM];
+                wq[0] = *(const device uint*)(r0 + bn);
+                wq[1] = *(const device uint*)(r0 + K + bn);
+                wq[2] = *(const device uint*)(r1 + bn);
+                wq[3] = *(const device uint*)(r1 + K + bn);
+                bfloat16_t inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const uint w = wq[tm];
+                    const float ds = (tm < 2) ? dscale0 : dscale1;
+                    const uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+                    const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
+                    const float2 f02 = float2(as_type<half2>(lo)) * ds;
+                    const float2 f13 = float2(as_type<half2>(hi)) * ds;
+                    inter[tm][0] = static_cast<bfloat16_t>(f02.x);
+                    inter[tm][1] = static_cast<bfloat16_t>(f13.x);
+                    inter[tm][2] = static_cast<bfloat16_t>(f02.y);
+                    inter[tm][3] = static_cast<bfloat16_t>(f13.y);
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    const ushort4 av_v = *(const device ushort4*)(xc + size_t(v) * K + bn);
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = static_cast<float>(as_type<bfloat16_t>(av_v[tn]));
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                    }
+                }
+            } else {
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                bfloat16_t inter[TM][TN];
+                CBV2_SP_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    const device uint8_t* src_row = (tm < 2) ? (r0 + size_t(tm) * K) : (r1 + size_t(tm - 2) * K);
+                    const float ws_cur = (tm < 2) ? ws_g : ws_u;
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        if (bn + tn < K) {
+                            const uint8_t code = src_row[bn + tn];
+                            const float decoded =
+                                (code & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(code);
+                            inter[tm][tn] = static_cast<bfloat16_t>(decoded * ws_cur);
+                        } else {
+                            inter[tm][tn] = bfloat16_t(0);
+                        }
+                    }
+                }
+                CBV2_SP_UNROLL
+                for (int v = 0; v < V; v++) {
+                    CBV2_SP_UNROLL
+                    for (int tn = 0; tn < TN; tn++) {
+                        const float a = bn + tn < K ? static_cast<float>(xc[size_t(v) * K + bn + tn]) : 0.0f;
+                        CBV2_SP_UNROLL
+                        for (int tm = 0; tm < TM; tm++) {
+                            r[v * TM + tm] += inter[tm][tn] * a;
+                        }
+                    }
+                }
+            }
+        }
+        const ushort lid = ushort(sl);
+        cbv2_sp_tree_step<32, 16>(r, lid);
+        cbv2_sp_tree_step<16, 8>(r, lid);
+        cbv2_sp_tree_step<8, 4>(r, lid);
+        cbv2_sp_tree_step<4, 2>(r, lid);
+        cbv2_sp_tree_step<2, 1>(r, lid);
+        sp_tgp[g * 32u + sl] = r[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g == 0u) {
+            float result = r[0];
+            for (int s = 1; s < BN; s++) {
+                result += sp_tgp[s * 32 + int(sl)];
+            }
+            const bfloat16_t val = static_cast<bfloat16_t>(result);
+            const ushort partner_bits = simd_shuffle_xor(as_type<ushort>(val), ushort(2));
+            if (int(sl) < V * 4 && (sl & 2u) == 0u) {
+                const bfloat16_t uval = as_type<bfloat16_t>(partner_bits);
+                const bfloat16_t act = (val * cbv2_sp_bf16_sigmoid(val)) * uval;
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                y[size_t(sl >> 2) * N + out_row + int(sl & 1u)] =
+                    cbv2_sp_bf16_cast_fp8(act, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_value);
+            }
+        }
+        """
+
+    private static let fp8FusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "cbv2_small_fp8_fused_gu_silu_cast",
+        inputNames: ["m0", "ws0", "m1", "ws1", "xc", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fp8FusedGateUpSiluSource,
+        header: ModelOptActivationKernels.header + fp8Helper + fusedSiluCastHeader)
+
+    /// Fused TM=4 FP8 `fp8Cast(silu(gate(preCast)) * up(preCast))` for pure-SPLIT
+    /// FP8 MLPs on strict-C3 low-acceptance verify rounds (`rows in 5...8`).
+    /// Reads each input activation once for both `gate` and `up` (2 gate rows + 2 up rows
+    /// per threadgroup, joined via `simd_shuffle_xor(2)`), eliminating the intermediate
+    /// `[V, N]` gate/up round-trip and the separate `fusedSiluProductCastFP8` dispatch.
+    public static func fp8FusedGateUpSiluCastFP8(
+        gate: ModelOptCalibratedLinear, up: ModelOptCalibratedLinear, preCast: MLXArray,
+        downLayer: ModelOptCalibratedLinear
+    ) -> MLXArray? {
+        guard fp8FusedGateUpSiluEnabled, branchlessDVEnabled,
+            rowsPerThreadOverride == nil, prefetchOverride == nil,
+            ModelOptRowExact.geometryOverride == nil
+        else { return nil }
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        guard lowVerify, CBv2DraftRegime.strictLowVerifyC3 else { return nil }
+        let inputs = preCast.dim(-1)
+        guard inputs > 0, preCast.dtype == .bfloat16 else { return nil }
+        let rows = preCast.size / inputs
+        guard (5 ... maximumRows).contains(rows) else { return nil }
+        let pkey = FP8FusedGUPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up),
+            downID: ObjectIdentifier(downLayer), inputs: inputs, rows: rows)
+        if let plan = fastLock.withLockUnchecked({ $0.fusedGUPlans[pkey] }) {
+            var args = plan.weightArrays
+            args += [preCast.reshaped(rows, inputs), plan.fp8Mu, plan.fp8Bound]
+            let raw = plan.launch(args)[0]
+            if preCast.ndim == 3 {
+                return raw.reshaped(preCast.dim(0), preCast.dim(1), plan.outputs)
+            }
+            return raw.reshaped(Array(preCast.shape.dropLast()) + [plan.outputs])
+        }
+        guard fp8Takes(gate, inputs: inputs, dtype: .bfloat16),
+            fp8Takes(up, inputs: inputs, dtype: .bfloat16),
+            gate.outputDimensions == up.outputDimensions,
+            gate.outputDimensions >= 2, gate.outputDimensions % 2 == 0,
+            allBranchlessSafe([gate, up]),
+            fp8Runs(gate).allSatisfy(\.split), fp8Runs(up).allSatisfy(\.split),
+            downLayer.format == .fp8,
+            let downConstants = downLayer.graphConstants,
+            case .fp8(let fp8Mu, let fp8Bound) = downConstants.storage
+        else { return nil }
+        let outputs = gate.outputDimensions
+        let lkey = FP8FusedGULaunchKey(inputs: inputs, rows: rows, outputs: outputs)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = fastLock.withLockUnchecked({ $0.fusedGULaunches[lkey] }) {
+            launch = hit
+        } else {
+            let tiles = outputs / 2
+            let made = fp8FusedGateUpSiluKernel.prepare(
+                template: [("K", inputs), ("V", rows), ("N", outputs)],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [.bfloat16])
+            fastLock.withLockUnchecked { $0.fusedGULaunches[lkey] = made }
+            launch = made
+        }
+        let weightArrays = [
+            gate.weight, gate.graphConstants!.outputScale,
+            up.weight, up.graphConstants!.outputScale,
+        ]
+        let plan = FP8FusedGUPlan(
+            launch: launch, weightArrays: weightArrays, fp8Mu: fp8Mu, fp8Bound: fp8Bound,
+            outputs: outputs)
+        fastLock.withLockUnchecked { $0.fusedGUPlans[pkey] = plan }
+        var args = weightArrays
+        args += [preCast.reshaped(rows, inputs), fp8Mu, fp8Bound]
+        let raw = launch(args)[0]
+        if preCast.ndim == 3 {
+            return raw.reshaped(preCast.dim(0), preCast.dim(1), outputs)
+        }
+        return raw.reshaped(Array(preCast.shape.dropLast()) + [outputs])
     }
 
     private static let fastLock = OSAllocatedUnfairLock(initialState: FastFP8CacheBox())
@@ -991,6 +1546,7 @@ public enum CBv2SmallProjection {
         let rowGroups: Int
         let dvMode: Int
         let coopOProj: Bool
+        let tm4Split: Bool
         let lowVerify: Bool
         let sharedInput: Bool
     }
@@ -1010,6 +1566,7 @@ public enum CBv2SmallProjection {
         let dtype: DType
         let rowsOuter: Bool
         let rowGroups: Int
+        let coop: Bool
         let lowVerify: Bool
     }
 
@@ -1031,6 +1588,7 @@ public enum CBv2SmallProjection {
         let inputs = flat.dim(-1)
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1040,6 +1598,9 @@ public enum CBv2SmallProjection {
         let dvMode: Int =
             useBranchlessDV ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let allowCoopOProj = strictLow && coopOProjEnabled && rows >= 2
+        let allowTM4Split =
+            strictC3 && fp8TM4Enabled && rows >= 5 && rows <= 8 && dvMode == 2 && useRowsOuter
+            && rowsPerThreadOverride == nil && prefetchOverride == nil
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         let canUseFastPlan =
             lowVerify && rowsPerThreadOverride == nil && prefetchOverride == nil
@@ -1049,7 +1610,8 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: flat.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, dvMode: dvMode,
-                coopOProj: allowCoopOProj, lowVerify: lowVerify, sharedInput: sharedInput)
+                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, lowVerify: lowVerify,
+                sharedInput: sharedInput)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 var args = plan.weightArrays
                 args.append(cast)
@@ -1074,13 +1636,18 @@ public enum CBv2SmallProjection {
                                 rows: rows, split: run.split, lowVerify: lowVerify)))
                 }
             }
-            let rg = segments.allSatisfy(\.split) ? targetRG : 1
-            let coopActive = allowCoopOProj && segments.contains(where: { !$0.split })
+            let tm4Active =
+                allowTM4Split && segments.allSatisfy { $0.split && $0.rows % 4 == 0 }
+            if tm4Active {
+                for idx in segments.indices { segments[idx].tm = 4 }
+            }
+            let rg = tm4Active ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
+            let coopActive = !tm4Active && allowCoopOProj && segments.contains(where: { !$0.split })
             let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive) ? 0 : dvMode
             let shape = FP8Shape(
                 dvMode: effectiveDVMode, rowsOuter: useRowsOuter, rowGroups: rg,
-                coopOProj: coopActive, weights: layers.count, outputs: layers.count,
-                segments: segments)
+                coopOProj: coopActive, tm4Split: tm4Active, weights: layers.count,
+                outputs: layers.count, segments: segments)
             let outputDims = layers.map(\.outputDimensions)
             let launchKey = FP8LaunchKey(
                 shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
@@ -1123,13 +1690,18 @@ public enum CBv2SmallProjection {
             }
         }
         arrays.append(cast)
-        let rg = segments.allSatisfy(\.split) ? targetRG : 1
-        let coopActive = allowCoopOProj && segments.contains(where: { !$0.split })
+        let tm4Active =
+            allowTM4Split && segments.allSatisfy { $0.split && $0.rows % 4 == 0 }
+        if tm4Active {
+            for idx in segments.indices { segments[idx].tm = 4 }
+        }
+        let rg = tm4Active ? 1 : (segments.allSatisfy(\.split) ? targetRG : 1)
+        let coopActive = !tm4Active && allowCoopOProj && segments.contains(where: { !$0.split })
         let effectiveDVMode = (dvMode == 2 && !useRowsOuter && !coopActive) ? 0 : dvMode
         let shape = FP8Shape(
             dvMode: effectiveDVMode, rowsOuter: useRowsOuter, rowGroups: rg,
-            coopOProj: coopActive, weights: layers.count, outputs: layers.count,
-            segments: segments, record: !lowVerify)
+            coopOProj: coopActive, tm4Split: tm4Active, weights: layers.count,
+            outputs: layers.count, segments: segments, record: !lowVerify)
         let outputDims = layers.map(\.outputDimensions)
         let launchKey = FP8LaunchKey(
             shape: shape, dtype: flat.dtype, inputs: inputs, rows: rows, outputs: outputDims)
@@ -1161,6 +1733,7 @@ public enum CBv2SmallProjection {
         guard (1 ... maximumRows).contains(rows) else { return nil }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
         let strictLow = lowVerify && CBv2DraftRegime.strictLowVerifyEligible
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1170,6 +1743,9 @@ public enum CBv2SmallProjection {
         let dvMode: Int =
             useBranchlessDV ? 2 : ((vectorDecode || (vectorDecodeEnv && lowVerify)) ? 1 : 0)
         let allowCoopOProj = strictLow && coopOProjEnabled && rows >= 2
+        let allowTM4Split =
+            strictC3 && fp8TM4Enabled && rows >= 5 && rows <= 8 && dvMode == 2 && useRowsOuter
+            && rowsPerThreadOverride == nil && prefetchOverride == nil
         let targetRG = (lowVerify && rows >= 2) ? fp8RowGroups : 1
         if rowsPerThreadOverride == nil && prefetchOverride == nil
             && ModelOptRowExact.geometryOverride == nil
@@ -1178,7 +1754,8 @@ public enum CBv2SmallProjection {
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: preCast.dtype,
                 rowsOuter: useRowsOuter, rowGroups: targetRG, dvMode: dvMode,
-                coopOProj: allowCoopOProj, lowVerify: lowVerify, sharedInput: true)
+                coopOProj: allowCoopOProj, tm4Split: allowTM4Split, lowVerify: lowVerify,
+                sharedInput: true)
             if let plan = fastLock.withLockUnchecked({ $0.fp8[planKey] }) {
                 let flat = preCast.reshaped(rows, inputs)
                 var args = plan.weightArrays
@@ -1433,7 +2010,7 @@ public enum CBv2SmallProjection {
 
     static let denseHelper = """
 
-        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int PF, bool VO, int RG>
+        template <typename T, int K, int V, int TM, bool SPLIT, int N, int NOUT, int PF, bool VO, int RG, bool COOP = false>
         inline void cbv2_sp_dense(
             const device T* mat, const device T* in_vec, device T* out_vec,
             int tile, uint simd_gid, uint simd_lid, threadgroup float* tgp) {
@@ -1444,13 +2021,16 @@ public enum CBv2SmallProjection {
             constexpr int leftover = K - blockN * n_iter;
             constexpr int P = V * TM;
             static_assert(P <= 32, "at most 32 values per lane");
+            static_assert(!COOP || V <= 8, "coop s_av requires V <= 8");
             constexpr int P2 = P <= 1 ? 1 : P <= 2 ? 2 : P <= 4 ? 4 : P <= 8 ? 8 : P <= 16 ? 16 : 32;
             constexpr int SH = P2 == 1 ? 5 : P2 == 2 ? 4 : P2 == 4 ? 3 : P2 == 8 ? 2 : P2 == 16 ? 1 : 0;
             constexpr uint LOW = (1u << SH) - 1u;
             const uint rg = SPLIT ? (simd_gid / 8u) : 0u;
             const uint g = SPLIT ? (simd_gid % 8u) : 0u;
             const int orig_row = SPLIT ? (tile * RG + int(rg)) * TM : (tile * 8 + int(simd_gid)) * TM;
-            if (!SPLIT && orig_row >= N) { return; }
+            if constexpr (!SPLIT && !(COOP && V >= 2)) {
+                if (orig_row >= N) { return; }
+            }
             const bool active = orig_row < N;
             const int out_row = active ? (orig_row + TM <= N ? orig_row : N - TM) : (N - TM);
             int bn = (32 * int(g) + int(simd_lid)) * TN;
@@ -1459,6 +2039,43 @@ public enum CBv2SmallProjection {
             CBV2_SP_UNROLL
             for (int i = 0; i < P2; i++) { r[i] = 0; }
             constexpr int PD = PF <= 1 ? 1 : (PF >= n_iter ? (n_iter > 0 ? n_iter : 1) : PF);
+            if constexpr (COOP && !SPLIT && V >= 2 && n_iter > 0) {
+                // Double-buffered 4 KB cooperative s_av across all 8 simdgroups
+                // (8x fewer device activation loads, 1 barrier/iter, maxT = 1024).
+                threadgroup ushort4* s_av = (threadgroup ushort4*)tgp;
+                constexpr int BUF_STRIDE = V * 32;
+                if (int(simd_gid) < V) {
+                    s_av[simd_gid * 32u + simd_lid] =
+                        *(const device ushort4*)(in_vec + simd_gid * K + bn);
+                }
+                for (int it = 0; it < n_iter; it++) {
+                    const int cur = it & 1;
+                    const int nxt = cur ^ 1;
+                    ushort4 wq[TM];
+                    CBV2_SP_UNROLL
+                    for (int tm = 0; tm < TM; tm++) {
+                        wq[tm] = *(const device ushort4*)(rows + tm * K + bn);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (it + 1 < n_iter && int(simd_gid) < V) {
+                        s_av[nxt * BUF_STRIDE + simd_gid * 32u + simd_lid] =
+                            *(const device ushort4*)(in_vec + simd_gid * K + bn + blockN);
+                    }
+                    CBV2_SP_UNROLL
+                    for (int v = 0; v < V; v++) {
+                        const ushort4 av_v = s_av[cur * BUF_STRIDE + v * 32 + simd_lid];
+                        CBV2_SP_UNROLL
+                        for (int tn = 0; tn < TN; tn++) {
+                            const float a = static_cast<float>(as_type<T>(av_v[tn]));
+                            CBV2_SP_UNROLL
+                            for (int tm = 0; tm < TM; tm++) {
+                                r[v * TM + tm] += as_type<T>(wq[tm][tn]) * a;
+                            }
+                        }
+                    }
+                    bn += blockN;
+                }
+            } else {
             for (int i0 = 0; i0 < n_iter; i0 += PD) {
               ushort4 wblk[PD][TM];
               CBV2_SP_UNROLL
@@ -1511,6 +2128,7 @@ public enum CBv2SmallProjection {
                 }
                 bn += blockN;
               }
+            }
             }
             if constexpr (leftover > 0) {
               if (bn + TN <= K) {
@@ -1570,7 +2188,7 @@ public enum CBv2SmallProjection {
                 for (int s = 1; s < BN; s++) { result += row_tgp[s * 32 + i]; }
                 out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(result);
               }
-            } else if (holds && i < P) {
+            } else if (holds && i < P && active) {
               out_vec[(i / TM) * NOUT + out_row + (i % TM)] = static_cast<T>(r[0]);
             }
         }
@@ -1589,6 +2207,7 @@ public enum CBv2SmallProjection {
     struct DenseShape: Hashable {
         var rowsOuter: Bool
         var rowGroups: Int
+        var coop: Bool = false
         var segments: [DenseSegment]
         /// The record's kernel source (high-acceptance verify rounds).
         var record: Bool = false
@@ -1641,8 +2260,12 @@ public enum CBv2SmallProjection {
             return made
         }
         let rg = shape.rowGroups
+        let tgpDecl =
+            shape.coop
+            ? "alignas(8) threadgroup float sp_tgp[(\(rg) * 8 * 32) > (2 * V * 64) ? (\(rg) * 8 * 32) : (2 * V * 64)];"
+            : "threadgroup float sp_tgp[\(rg) * 8 * 32];"
         var body = """
-            threadgroup float sp_tgp[\(rg) * 8 * 32];
+            \(tgpDecl)
             const int tg = int(threadgroup_position_in_grid.y);
             const uint sg = simdgroup_index_in_threadgroup;
             const uint sl = thread_index_in_simdgroup;
@@ -1651,9 +2274,10 @@ public enum CBv2SmallProjection {
         var offset = 0
         for (i, s) in shape.segments.enumerated() {
             let end = offset + s.tiles(rowGroups: rg)
+            let segCoop = shape.coop && !s.split
             body += """
                 \(i == 0 ? "" : "else ")if (tg < \(end)) {
-                    cbv2_sp_dense<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.rows), \(s.prefetch), \(shape.rowsOuter), \(rg)>(
+                    cbv2_sp_dense<T, K, V, \(s.tm), \(s.split), \(s.rows), \(s.rows), \(s.prefetch), \(shape.rowsOuter), \(rg), \(segCoop)>(
                         m\(i), xc, y\(i), tg - \(offset), sg, sl, sp_tgp);
                 }
 
@@ -1680,6 +2304,8 @@ public enum CBv2SmallProjection {
             return nil
         }
         let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let allowCoop = strictC3 && coopDenseEnabled && rows >= 2
         let useRowsOuter =
             rowsOuter || fp8RowsOuterMode == 2
             || (fp8RowsOuterMode == 1 && rows >= 5 && lowVerify)
@@ -1689,7 +2315,7 @@ public enum CBv2SmallProjection {
             let planKey = DenseGroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: x.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, lowVerify: lowVerify)
+                rowsOuter: useRowsOuter, rowGroups: targetRG, coop: allowCoop, lowVerify: lowVerify)
             if let plan = fastLock.withLockUnchecked({ $0.dense[planKey] }) {
                 var args = plan.weightArrays
                 args.append(x.reshaped(rows, inputs))
@@ -1719,8 +2345,10 @@ public enum CBv2SmallProjection {
             weightArrays.append(layer.weight)
         }
         let rg = segments.allSatisfy(\.split) ? targetRG : 1
+        let coopActive = allowCoop && segments.contains(where: { !$0.split })
         let shape = DenseShape(
-            rowsOuter: useRowsOuter, rowGroups: rg, segments: segments, record: !lowVerify)
+            rowsOuter: useRowsOuter, rowGroups: rg, coop: coopActive, segments: segments,
+            record: !lowVerify)
         let launchKey = DenseLaunchKey(shape: shape, dtype: x.dtype, inputs: inputs, rows: rows)
         let launch: MLXFast.MLXFastKernel.Launch
         if let hit = lock.withLock({ denseLaunchCache[launchKey] }) {
@@ -1740,7 +2368,7 @@ public enum CBv2SmallProjection {
             let planKey = DenseGroupPlanKey(
                 id0: ObjectIdentifier(layers[0]), idLast: ObjectIdentifier(layers[layers.count - 1]),
                 count: layers.count, inputs: inputs, rows: rows, dtype: x.dtype,
-                rowsOuter: useRowsOuter, rowGroups: targetRG, lowVerify: lowVerify)
+                rowsOuter: useRowsOuter, rowGroups: targetRG, coop: allowCoop, lowVerify: lowVerify)
             let plan = DenseGroupPlan(
                 launch: launch, weightArrays: weightArrays, outputDims: outputDims)
             fastLock.withLockUnchecked { $0.dense[planKey] = plan }

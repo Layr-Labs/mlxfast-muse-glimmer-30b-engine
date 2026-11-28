@@ -43,6 +43,9 @@ public enum CBv2VerifyNVFP4 {
     private static let env = ProcessInfo.processInfo.environment
     private static let prefetchEnv: Int? = env["CBV2_NVFP4_PF"].flatMap(Int.init)
     private static let downPrefetchEnv: Int? = env["CBV2_NVFP4_DOWN_PF"].flatMap(Int.init)
+    private static let downTN1Env: Bool = env["CBV2_NVFP4_DOWN_TN1"] != "0"
+    private static let peeledPFEnv: Bool = env["CBV2_NVFP4_PEELED_PF"] != "0"
+    public static let fusedGateUpSiluEnabled: Bool = env["CBV2_NVFP4_FUSED_GU_SILU"] != "0"
     private static let wholeChunkEnv: Bool? = env["CBV2_NVFP4_WHOLE_CHUNK"].map { $0 != "0" }
     private static let scaleVecEnv: Bool? = env["CBV2_NVFP4_SV"].map { $0 != "0" }
 
@@ -67,7 +70,16 @@ public enum CBv2VerifyNVFP4 {
         }
         let wc = wholeChunkEnv ?? lowVerify
         let sv = scaleVecEnv ?? wc
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
         if inputs >= 16384 {
+            // Strict-C3 M5-Max-native schedule: un-halve mlp.down (K=19968, N=6656)
+            // from TN=2 PF=1 (416 TGs = 6.5/core, maxT=832) to TN=1 PF=2 (832 = 13*64
+            // exact TGs, maxT=1024, branchless peeled next-chunk DRAM prefetch + 4-block X).
+            if strictC3 && rows >= 7 && downTN1Env && wc {
+                let defaultPF = peeledPFEnv ? 2 : 0
+                let pf = prefetchEnv ?? (downPrefetchEnv ?? defaultPF)
+                return (1, pf, wc, sv)
+            }
             // MLP down (K = 19968): WC + PF=1 + SV=1 on low-acceptance verify rows;
             // keep high-acceptance Pair 1 at PF=0 to stay safely below the decode ceiling.
             let tn = rows >= 7 ? 2 : 1
@@ -75,7 +87,11 @@ public enum CBv2VerifyNVFP4 {
             let pf = prefetchEnv ?? defaultPF
             return (tn, pf, wc, sv)
         }
-        let pf = prefetchEnv ?? 0
+        // Strict-C3 M5-Max-native schedule for K < 16384 (gate_up 6.73 GB, qkvg 0.44 GB, o 0.30 GB):
+        // keep FULL TN=1 grid (4992 / 1088 / 832 TGs) and maxT=1024 while adding branchless peeled
+        // next-chunk weight+scale DRAM prefetch (PF=2) to overlap DRAM latency with 16 MMAs.
+        let defaultPF = (strictC3 && rows == 8 && peeledPFEnv && wc) ? 2 : 0
+        let pf = prefetchEnv ?? defaultPF
         return (1, pf, wc, sv)
     }
 
@@ -183,6 +199,142 @@ public enum CBv2VerifyNVFP4 {
                                 MO_WO_UNROLL
                                 for (short mt = 0; mt < TM; mt++) {
                                     mo_wo_mma(C[t][mt], a, bf[mt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (WC && PF == 2) {
+                // Branchless peeled next-chunk weight+scale DRAM prefetch with 4-block
+                // upfront activation loads (zero if(more) branches inside K-loop, maxT=1024).
+                constexpr int STEP = WK * BK;
+                int k = int(sg) * BK;
+                if (k < K) {
+                    uint qb[4][TN];
+                    uint2 sb[TN];
+                    MO_WO_UNROLL
+                    for (short block = 0; block < 4; block++) {
+                        const int b = k + 32 * block;
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) { qb[block][t] = wl[t][b / 8]; }
+                    }
+                    MO_WO_UNROLL
+                    for (short t = 0; t < TN; t++) {
+                        if constexpr (SV) {
+                            sb[t] = *(const device uint2*)(sl[t] + (k / 16));
+                        } else {
+                            sb[t] = uint2(
+                                uint(sl[t][k / 16]) | (uint(sl[t][k / 16 + 2]) << 16),
+                                uint(sl[t][k / 16 + 4]) | (uint(sl[t][k / 16 + 6]) << 16));
+                        }
+                    }
+                    for (; k + STEP < K; k += STEP) {
+                        const int kn = k + STEP;
+                        uint q[4][TN];
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            const int bn = kn + 32 * block;
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) {
+                                q[block][t] = qb[block][t];
+                                qb[block][t] = wl[t][bn / 8];
+                            }
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                                sb[t] = *(const device uint2*)(sl[t] + (kn / 16));
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                                sb[t] = uint2(
+                                    uint(sl[t][kn / 16]) | (uint(sl[t][kn / 16 + 2]) << 16),
+                                    uint(sl[t][kn / 16 + 4]) | (uint(sl[t][kn / 16 + 6]) << 16));
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(q[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Final peeled chunk (no next-chunk load).
+                    {
+                        ushort4 xa[4][TM][2];
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            const int b = k + 32 * block;
+                            MO_WO_UNROLL
+                            for (short mt = 0; mt < TM; mt++) {
+                                MO_WO_UNROLL
+                                for (short j = 0; j < 2; j++) {
+                                    xa[block][mt][j] = *(const device ushort4*)(xr[mt][j] + b);
+                                }
+                            }
+                        }
+                        half2 hs[TN][2];
+                        MO_WO_UNROLL
+                        for (short t = 0; t < TN; t++) {
+                            if constexpr (SV) {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x >> scale_shift);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y >> scale_shift);
+                            } else {
+                                hs[t][0] = cbv2_vn_e4m3x2(sb[t].x);
+                                hs[t][1] = cbv2_vn_e4m3x2(sb[t].y);
+                            }
+                        }
+                        MO_WO_UNROLL
+                        for (short block = 0; block < 4; block++) {
+                            half s[TN];
+                            MO_WO_UNROLL
+                            for (short t = 0; t < TN; t++) { s[t] = hs[t][block / 2][block % 2]; }
+                            MO_WO_UNROLL
+                            for (short i = 0; i < 4; i++) {
+                                float2 bf[TM];
+                                MO_WO_UNROLL
+                                for (short mt = 0; mt < TM; mt++) {
+                                    bf[mt] = float2(
+                                        float(as_type<bfloat>(xa[block][mt][0][i])),
+                                        float(as_type<bfloat>(xa[block][mt][1][i])));
+                                }
+                                MO_WO_UNROLL
+                                for (short t = 0; t < TN; t++) {
+                                    const float2 a = mo_wo_pair(qb[block][t], i, s[t]);
+                                    MO_WO_UNROLL
+                                    for (short mt = 0; mt < TM; mt++) {
+                                        mo_wo_mma(C[t][mt], a, bf[mt]);
+                                    }
                                 }
                             }
                         }
@@ -475,6 +627,256 @@ public enum CBv2VerifyNVFP4 {
     private final class CacheBox: @unchecked Sendable {
         var launches: [LaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
         var plans: [PlanKey: Plan] = [:]
+        var fusedGULaunches: [FusedGULaunchKey: MLXFast.MLXFastKernel.Launch] = [:]
+        var fusedGUPlans: [FusedGUPlanKey: FusedGUPlan] = [:]
+    }
+
+    private struct FusedGULaunchKey: Hashable {
+        let rows: Int
+        let inputs: Int
+        let outputs: Int
+        let castFP8: Bool
+    }
+
+    private struct FusedGUPlanKey: Hashable {
+        let gateID: ObjectIdentifier
+        let upID: ObjectIdentifier
+        let downID: ObjectIdentifier?
+        let rows: Int
+        let inputs: Int
+    }
+
+    private struct FusedGUPlan {
+        let launch: MLXFast.MLXFastKernel.Launch
+        let weightArrays: [MLXArray]
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let outputs: Int
+        let castFP8: Bool
+    }
+
+    nonisolated(unsafe) private static let dummyFP8Mu: MLXArray = {
+        let a = MLXArray([Float(1), Float(1)])
+        eval(a)
+        return a
+    }()
+    nonisolated(unsafe) private static let dummyFP8Bound: MLXArray = {
+        let a = MLXArray([Float(448)])
+        eval(a)
+        return a
+    }()
+
+    static let fusedGateUpSiluHeader = """
+
+        inline bfloat16_t cbv2_vn_bf16_sigmoid(bfloat16_t x) {
+            const bfloat16_t ax = (x < bfloat16_t(0.0f)) ? -x : x;
+            const bfloat16_t ey = static_cast<bfloat16_t>(metal::precise::exp(static_cast<float>(ax)));
+            const bfloat16_t one = bfloat16_t(1.0f);
+            const bfloat16_t y = one / (one + ey);
+            return (x < bfloat16_t(0.0f)) ? y : (one - y);
+        }
+
+        inline bfloat16_t cbv2_vn_bf16_cast_fp8(
+            bfloat16_t yb, float m0, float m1, float bound, float nan_value
+        ) {
+            const float scaled = static_cast<float>(yb) * m0;
+            const uint8_t bits = modelopt_e4m3_bits(scaled);
+            const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound;
+            return static_cast<bfloat16_t>(invalid ? nan_value : decoded * m1);
+        }
+
+        """
+
+    static let fusedGateUpSiluSource = """
+        constexpr int WK = 8;
+        constexpr int BK = 128;
+        constexpr int row_bytes = K / 2;
+        constexpr int row_scales = K / 16;
+        static_assert(K % BK == 0, "whole chunks only");
+        static_assert(V >= 1 && V <= 8, "1..8 rows");
+        threadgroup float partials[7 * 4 * 32];
+        const int tile = int(threadgroup_position_in_grid.y);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        const short qid = sl / 4;
+        const short fm = (qid & 4) + ((sl / 2) % 4);
+        const short fn = (qid & 2) * 2 + (sl % 2) * 2;
+        const uint scale_shift = (fn & 4u) << 1;
+        const int out_row = tile * 8 + fm;
+        const int row = min(out_row, N - 1);
+        const device bfloat16_t* xr0 = x + size_t(min(int(fn), V - 1)) * K + 4 * fm;
+        const device bfloat16_t* xr1 = x + size_t(min(int(fn + 1), V - 1)) * K + 4 * fm;
+        const device uint* wl0 = (const device uint*)(
+            (const device uint8_t*)w0 + size_t(row) * row_bytes + 2 * fn);
+        const device uint* wl1 = (const device uint*)(
+            (const device uint8_t*)w1 + size_t(row) * row_bytes + 2 * fn);
+        const device uint8_t* sl0 = sc0 + size_t(row) * row_scales;
+        const device uint8_t* sl1 = sc1 + size_t(row) * row_scales;
+        float2 C0 = float2(0), C1 = float2(0);
+        for (int k = int(sg) * BK; k < K; k += WK * BK) {
+            const uint2 sv0 = *(const device uint2*)(sl0 + (k / 16));
+            const uint2 sv1 = *(const device uint2*)(sl1 + (k / 16));
+            const half2 hs0_0 = cbv2_vn_e4m3x2(sv0.x >> scale_shift);
+            const half2 hs0_1 = cbv2_vn_e4m3x2(sv0.y >> scale_shift);
+            const half2 hs1_0 = cbv2_vn_e4m3x2(sv1.x >> scale_shift);
+            const half2 hs1_1 = cbv2_vn_e4m3x2(sv1.y >> scale_shift);
+            MO_WO_UNROLL
+            for (short half_k = 0; half_k < 2; half_k++) {
+                uint q0[2], q1[2];
+                ushort4 xa[2][2];
+                MO_WO_UNROLL
+                for (short bi = 0; bi < 2; bi++) {
+                    const int b = k + 32 * (half_k * 2 + bi);
+                    q0[bi] = wl0[b / 8];
+                    q1[bi] = wl1[b / 8];
+                    xa[bi][0] = *(const device ushort4*)(xr0 + b);
+                    xa[bi][1] = *(const device ushort4*)(xr1 + b);
+                }
+                const half2 h0 = (half_k == 0) ? hs0_0 : hs0_1;
+                const half2 h1 = (half_k == 0) ? hs1_0 : hs1_1;
+                MO_WO_UNROLL
+                for (short bi = 0; bi < 2; bi++) {
+                    const half s0 = h0[bi], s1 = h1[bi];
+                    MO_WO_UNROLL
+                    for (short i = 0; i < 4; i++) {
+                        const float2 bf = float2(
+                            float(as_type<bfloat>(xa[bi][0][i])),
+                            float(as_type<bfloat>(xa[bi][1][i])));
+                        mo_wo_mma(C0, mo_wo_pair(q0[bi], i, s0), bf);
+                        mo_wo_mma(C1, mo_wo_pair(q1[bi], i, s1), bf);
+                    }
+                }
+            }
+        }
+        if (sg > 0u) {
+            threadgroup float* p = partials + (sg - 1u) * 4u * 32u + sl;
+            p[0] = C0[0];
+            p[32] = C0[1];
+            p[64] = C1[0];
+            p[96] = C1[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u && out_row < N) {
+            for (int s = 0; s < WK - 1; s++) {
+                const threadgroup float* p = partials + s * 4 * 32 + sl;
+                C0[0] += p[0];
+                C0[1] += p[32];
+                C1[0] += p[64];
+                C1[1] += p[96];
+            }
+            const float t0 = ts0[0], t1 = ts1[0];
+            const float nan_v = metal::numeric_limits<float>::quiet_NaN();
+            if (fn < V) {
+                const bfloat16_t g0 = mo_wo_result<bfloat16_t>(C0[0], true, t0);
+                const bfloat16_t u0 = mo_wo_result<bfloat16_t>(C1[0], true, t1);
+                bfloat16_t o0 = (g0 * cbv2_vn_bf16_sigmoid(g0)) * u0;
+                if constexpr (CAST_FP8) {
+                    o0 = cbv2_vn_bf16_cast_fp8(o0, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_v);
+                }
+                y[size_t(fn) * N + out_row] = o0;
+            }
+            if (fn + 1 < V) {
+                const bfloat16_t g1 = mo_wo_result<bfloat16_t>(C0[1], true, t0);
+                const bfloat16_t u1 = mo_wo_result<bfloat16_t>(C1[1], true, t1);
+                bfloat16_t o1 = (g1 * cbv2_vn_bf16_sigmoid(g1)) * u1;
+                if constexpr (CAST_FP8) {
+                    o1 = cbv2_vn_bf16_cast_fp8(o1, fp8_mu[0], fp8_mu[1], fp8_bd[0], nan_v);
+                }
+                y[size_t(fn + 1) * N + out_row] = o1;
+            }
+        }
+        """
+
+    private static let fusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_nvfp4_fused_gu_silu",
+        inputNames: ["w0", "sc0", "ts0", "w1", "sc1", "ts1", "x", "fp8_mu", "fp8_bd"],
+        outputNames: ["y"],
+        source: fusedGateUpSiluSource,
+        header: ModelOptWeightOnlyNVFP4RowExact.header + ModelOptActivationKernels.header
+            + tileHelper + fusedGateUpSiluHeader)
+
+    /// Fused NVFP4 `silu(gate(x)) * up(x)` (optionally pre-cast to FP8 for an FP8 `downProj`),
+    /// 0-ULP bit-exact to separate `products([gate, up], x)` + `silu(g)*u` (+ FP8 cast).
+    /// Active strictly on `strictLowVerifyC3` low-acceptance verify rounds (`rows in 5...8`).
+    public static func fusedGateUpSilu(
+        gate: ModelOptWeightOnlyNVFP4Linear, up: ModelOptWeightOnlyNVFP4Linear, x: MLXArray,
+        fp8Down: ModelOptCalibratedLinear? = nil
+    ) -> (act: MLXArray, preCastFP8: Bool)? {
+        guard fusedGateUpSiluEnabled, geometryOverride == nil else { return nil }
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        guard lowVerify, CBv2DraftRegime.strictLowVerifyC3 else { return nil }
+        let inputs = x.dim(-1)
+        guard inputs > 0, x.dtype == .bfloat16 else { return nil }
+        let rows = x.size / inputs
+        guard (5 ... maximumRows).contains(rows) else { return nil }
+        let downID = fp8Down.map(ObjectIdentifier.init)
+        let pkey = FusedGUPlanKey(
+            gateID: ObjectIdentifier(gate), upID: ObjectIdentifier(up), downID: downID,
+            rows: rows, inputs: inputs)
+        if let plan = cacheLock.withLockUnchecked({ $0.fusedGUPlans[pkey] }) {
+            var args = plan.weightArrays
+            args += [x.reshaped(rows, inputs), plan.fp8Mu, plan.fp8Bound]
+            let raw = plan.launch(args)[0]
+            let act =
+                x.ndim == 3
+                ? raw.reshaped(x.dim(0), x.dim(1), plan.outputs)
+                : raw.reshaped(Array(x.shape.dropLast()) + [plan.outputs])
+            return (act, plan.castFP8)
+        }
+        guard supports(rows: rows, inputs: inputs, dtype: x.dtype),
+            gate.inputDimensions == inputs, up.inputDimensions == inputs,
+            gate.outputDimensions == up.outputDimensions,
+            takes(weight: gate.weight, blockScales: gate.weightScale, tensorScale: gate.weightScale2, inputs: inputs),
+            takes(weight: up.weight, blockScales: up.weightScale, tensorScale: up.weightScale2, inputs: inputs)
+        else { return nil }
+        let fp8Mu: MLXArray
+        let fp8Bound: MLXArray
+        let castFP8: Bool
+        if let fp8Down, fp8Down.format == .fp8,
+            let constants = fp8Down.graphConstants,
+            case .fp8(let mu, let bd) = constants.storage
+        {
+            fp8Mu = mu
+            fp8Bound = bd
+            castFP8 = true
+        } else {
+            fp8Mu = dummyFP8Mu
+            fp8Bound = dummyFP8Bound
+            castFP8 = false
+        }
+        let outputs = gate.weight.dim(0)
+        let lkey = FusedGULaunchKey(rows: rows, inputs: inputs, outputs: outputs, castFP8: castFP8)
+        let launch: MLXFast.MLXFastKernel.Launch
+        if let hit = cacheLock.withLockUnchecked({ $0.fusedGULaunches[lkey] }) {
+            launch = hit
+        } else {
+            let tiles = (outputs + 7) / 8
+            let made = fusedGateUpSiluKernel.prepare(
+                template: [
+                    ("V", rows), ("K", inputs), ("N", outputs), ("CAST_FP8", castFP8),
+                ],
+                grid: (32, 8 * tiles, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[rows, outputs]], outputDTypes: [.bfloat16])
+            cacheLock.withLockUnchecked { $0.fusedGULaunches[lkey] = made }
+            launch = made
+        }
+        let weightArrays = [
+            gate.weight, gate.weightScale, gate.weightScale2.reshaped(1),
+            up.weight, up.weightScale, up.weightScale2.reshaped(1),
+        ]
+        let plan = FusedGUPlan(
+            launch: launch, weightArrays: weightArrays, fp8Mu: fp8Mu, fp8Bound: fp8Bound,
+            outputs: outputs, castFP8: castFP8)
+        cacheLock.withLockUnchecked { $0.fusedGUPlans[pkey] = plan }
+        var args = weightArrays
+        args += [x.reshaped(rows, inputs), fp8Mu, fp8Bound]
+        let raw = launch(args)[0]
+        let act =
+            x.ndim == 3
+            ? raw.reshaped(x.dim(0), x.dim(1), outputs)
+            : raw.reshaped(Array(x.shape.dropLast()) + [outputs])
+        return (act, castFP8)
     }
 
     private static let cacheLock = OSAllocatedUnfairLock(initialState: CacheBox())
