@@ -577,7 +577,7 @@ public enum CBv2VerifyScales {
         {
             return v
         }
-        return 2048
+        return 4096
     }()
 
     public static let fusedLMHeadTN: Int = {

@@ -150,6 +150,18 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_FUSED_PROJ"] != "0"
     private static let nvfp4DrafterEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DRAFTER_NVFP4"] != "0"
+    private static let dflashNAXCustomEnabled: Bool = {
+        guard ProcessInfo.processInfo.environment["CBV2_DRAFTER_NAX_CUSTOM"] != "0" else {
+            return false
+        }
+        if ProcessInfo.processInfo.environment["CBV2_DRAFTER_NAX_CUSTOM"] == "1" {
+            return true
+        }
+        let arch = GPU.deviceInfo().architecture.lowercased()
+        guard let gIdx = arch.range(of: "_g")?.upperBound else { return false }
+        let digits = arch[gIdx...].prefix(while: \.isNumber)
+        return (Int(digits) ?? 0) >= 17
+    }()
 
     private struct NVFP4DrafterState {
         let fc: QuantizedLinear
@@ -166,6 +178,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let downInvScale: [Float]
         let inputNormWeightScaled: [MLXArray]
         let postAttnNormWeightScaled: [MLXArray]
+        var useCustomNAX: Bool
 
         var residentArrays: [MLXArray] {
             var arr: [MLXArray] = [
@@ -234,7 +247,68 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         draftHead = (target as? MuseGlimmerTextModel)?.lmHead as? ModelOptWeightOnlyNVFP4Linear
         // Build deep-low `.nvfp4` 4b-g16 prescaled drafter BEFORE `requantize8BitLayers`
         // so `encoder.fc` and `self_attn` quantize from pristine 8-bit weights with zero double-quant.
-        nvfp4Drafter = Self.buildNVFP4Drafter(model)
+        var builtNV = Self.buildNVFP4Drafter(model)
+        if var nv = builtNV, Self.dflashNAXCustomEnabled,
+            c.hiddenSize % 128 == 0, c.intermediateSize % 384 == 0,
+            c.contextWidth % 640 == 0, (c.attentionHeads * c.headDimensions) % 256 == 0,
+            c.hiddenSize % 32 == 0, c.intermediateSize % 16 == 0
+        {
+            let probeOK: Bool = {
+                do {
+                    try MLX.withError { errors in
+                        let qW = c.attentionHeads * c.headDimensions
+                        let dh16 = MLXArray.zeros([1, c.blockSize, c.hiddenSize], dtype: .bfloat16)
+                        let dq16 = MLXArray.zeros([1, c.blockSize, qW], dtype: .bfloat16)
+                        let dh7 = MLXArray.zeros([1, 7, c.hiddenSize], dtype: .bfloat16)
+                        let dq7 = MLXArray.zeros([1, 7, qW], dtype: .bfloat16)
+                        let df8 = MLXArray.zeros([8, c.contextWidth], dtype: .bfloat16)
+                        let oP16 = Self.dflashNAXSplitK(
+                            dq16, layer: nv.oProj[0], rows: c.blockSize, splitK: 2)
+                        let (h16, m16) = Self.fusedAddRMSNormSplitK(
+                            residual: dh16, partials: oP16,
+                            weight: nv.postAttnNormWeightScaled[0],
+                            eps: model.layers[0].postAttentionNorm.eps,
+                            deltaScale: nv.oInvScale[0])
+                        let act16 = Self.dflashNAXFusedGateUpSilu(
+                            m16, layer: nv.gateUp[0], rows: c.blockSize,
+                            outScale: nv.downInvScale[0])
+                        let dP16 = Self.dflashNAXSplitK(
+                            act16, layer: nv.down[0], rows: c.blockSize, splitK: 3)
+                        let (hNext16, xNext16) = Self.fusedAddRMSNormSplitK(
+                            residual: h16, partials: dP16,
+                            weight: nv.inputNormWeightScaled[1],
+                            eps: model.layers[1].inputNorm.eps)
+                        let oP7 = Self.dflashNAXSplitK(
+                            dq7, layer: nv.oProj[0], rows: 7, splitK: 2)
+                        let (h7, m7) = Self.fusedAddRMSNormSplitK(
+                            residual: dh7, partials: oP7,
+                            weight: nv.postAttnNormWeightScaled[0],
+                            eps: model.layers[0].postAttentionNorm.eps,
+                            deltaScale: nv.oInvScale[0])
+                        let act7 = Self.dflashNAXFusedGateUpSilu(
+                            m7, layer: nv.gateUp[0], rows: 7,
+                            outScale: nv.downInvScale[0])
+                        let dP7 = Self.dflashNAXSplitK(
+                            act7, layer: nv.down[0], rows: 7, splitK: 3)
+                        let (hNext7, xNext7) = Self.fusedAddRMSNormSplitK(
+                            residual: h7, partials: dP7,
+                            weight: model.norm.weight, eps: model.norm.eps)
+                        let fcP = Self.dflashNAXSplitK(
+                            df8, layer: nv.fc, rows: 8, splitK: 5)
+                        let fcNorm = Self.fusedRMSNormSplitK(
+                            partials: fcP, weight: nv.encOutputNormWeightScaled, eps: nv.fcEps)
+                        eval(hNext16, xNext16, hNext7, xNext7, fcNorm)
+                        try errors.check()
+                    }
+                    return true
+                } catch {
+                    return false
+                }
+            }()
+            nv.useCustomNAX = probeOK
+            builtNV = nv
+        }
+        nvfp4Drafter = builtNV
         Self.requantize8BitLayers(model)
         lowMLP = Self.lowAcceptanceMLP(model)
         let fused = Self.buildFusedAttentionProjections(model)
@@ -509,13 +583,33 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                                     posScalar: dummyPos, coefficients: epilogue.coefficients,
                                     qHeads: c.attentionHeads, rows: rows))
                         }
-                        let oOut = nv.oProj[0](dq)
-                        let (hMid, mx) = Self.fusedAddRMSNorm(
-                            residual: dh, delta: oOut, weight: nv.postAttnNormWeightScaled[0],
-                            eps: lastLayer.postAttentionNorm.eps, deltaScale: nv.oInvScale[0])
-                        let gu = nv.gateUp[0](mx)
-                        let downOut = nv.down[0](Self.splitSiluMul(gu, scale: nv.downInvScale[0]))
-                        nvWarm += [hMid, downOut]
+                        if nv.useCustomNAX {
+                            let oP = Self.dflashNAXSplitK(
+                                dq, layer: nv.oProj[0], rows: rows, splitK: 2)
+                            let (hMid, mx) = Self.fusedAddRMSNormSplitK(
+                                residual: dh, partials: oP,
+                                weight: nv.postAttnNormWeightScaled[0],
+                                eps: lastLayer.postAttentionNorm.eps,
+                                deltaScale: nv.oInvScale[0])
+                            let act = Self.dflashNAXFusedGateUpSilu(
+                                mx, layer: nv.gateUp[0], rows: rows,
+                                outScale: nv.downInvScale[0])
+                            let dP = Self.dflashNAXSplitK(
+                                act, layer: nv.down[0], rows: rows, splitK: 3)
+                            let (hNext, xNext) = Self.fusedAddRMSNormSplitK(
+                                residual: hMid, partials: dP,
+                                weight: nv.inputNormWeightScaled[1],
+                                eps: lastLayer.inputNorm.eps)
+                            nvWarm += [hNext, xNext]
+                        } else {
+                            let oOut = nv.oProj[0](dq)
+                            let (hMid, mx) = Self.fusedAddRMSNorm(
+                                residual: dh, delta: oOut, weight: nv.postAttnNormWeightScaled[0],
+                                eps: lastLayer.postAttentionNorm.eps, deltaScale: nv.oInvScale[0])
+                            let gu = nv.gateUp[0](mx)
+                            let downOut = nv.down[0](Self.splitSiluMul(gu, scale: nv.downInvScale[0]))
+                            nvWarm += [hMid, downOut]
+                        }
                     }
                     eval(nvWarm)
                     // Warm strided-ring SDPA on deep-low NVFP4 path for both 32-aligned and unaligned ctxLen,
@@ -606,11 +700,25 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         private static let ospecZeroCopyEnabled: Bool =
             ProcessInfo.processInfo.environment["CBV2_OSPEC_ZEROCOPY"] != "0"
+        private static let ospecPromoteEnabled: Bool =
+            ProcessInfo.processInfo.environment["CBV2_OSPEC_PROMOTE"] != "0"
+
+        struct SpeculativeTailTicket {
+            let keysID: ObjectIdentifier
+            let valuesID: ObjectIdentifier
+            let anchor: Int
+            let first: Int
+            let base: Int
+            let startSlot: Int
+            let writtenRows: Int
+            let generation: UInt64
+        }
 
         private var keys: MLXArray?
         private var values: MLXArray?
         private var writeFence: MLXArray = MLXArray.zeros([1], dtype: .int32)
         private var speculativeReadDeps: [MLXArray] = []
+        private var ringGeneration: UInt64 = 0
         private var basePosition = 0
         private(set) var firstPosition = 0
         private(set) var nextPosition = 0
@@ -747,6 +855,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
 
         func restart(at position: Int) {
             precondition(position >= 0, "DFlash context position must not be negative")
+            ringGeneration &+= 1
             basePosition = position
             firstPosition = position
             nextPosition = position
@@ -771,12 +880,13 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// avoiding a full ring copy inside `speculateOutcomeBlock`.
         func writeSpeculativeTail(
             keys newKeys: MLXArray, values newValues: MLXArray
-        ) -> (keys: MLXArray, values: MLXArray)? {
+        ) -> (keys: MLXArray, values: MLXArray, ticket: SpeculativeTailTicket)? {
             let rows = newKeys.dim(2)
             guard Self.ospecZeroCopyEnabled, inPlaceRing, let keys, let values,
                 rows > 0, firstPosition == basePosition, count + rows <= window
             else { return nil }
             consumeReadBarriers()
+            ringGeneration &+= 1
             let nk = newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype)
             let nv = newValues.dtype == dtype ? newValues : newValues.asType(dtype)
             let params = MLXArray([Int32(count), Int32(rows)])
@@ -785,10 +895,39 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 window: window, headDimensions: headDimensions, rows: rows, layers: layers)
             let pair = depends(inputs: [keys, values], dependencies: [writeFence])
             let total = count + rows
+            let ticket = SpeculativeTailTicket(
+                keysID: ObjectIdentifier(keys), valuesID: ObjectIdentifier(values),
+                anchor: nextPosition, first: firstPosition, base: basePosition,
+                startSlot: count, writtenRows: rows, generation: ringGeneration)
             return (
                 pair[0][0..., 0..., 0 ..< total, 0...],
-                pair[1][0..., 0..., 0 ..< total, 0...]
+                pair[1][0..., 0..., 0 ..< total, 0...],
+                ticket
             )
+        }
+
+        /// Promotes a verified contiguous linear prefix `[0 ..< prefixCount)` that
+        /// `writeSpeculativeTail` already placed at `[count ..< count + prefixCount)`,
+        /// avoiding a duplicate `dflash_ring_write_inplace` dispatch on commit.
+        func promoteSpeculativePrefix(
+            ticket: SpeculativeTailTicket, count prefixCount: Int
+        ) -> Bool {
+            guard Self.ospecPromoteEnabled, inPlaceRing, let keys, let values,
+                ObjectIdentifier(keys) == ticket.keysID,
+                ObjectIdentifier(values) == ticket.valuesID,
+                ringGeneration == ticket.generation,
+                firstPosition == basePosition,
+                firstPosition == ticket.first,
+                basePosition == ticket.base,
+                nextPosition == ticket.anchor,
+                count == ticket.startSlot,
+                prefixCount > 0, prefixCount <= ticket.writtenRows,
+                count + prefixCount <= window
+            else { return false }
+            nextPosition += prefixCount
+            firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
+            return true
         }
 
         func recordSpeculativeRead(_ dep: MLXArray) {
@@ -857,6 +996,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             }
             nextPosition = start + rows
             firstPosition = max(firstPosition, nextPosition - window)
+            ringGeneration &+= 1
         }
 
         var heldPositions: [Int] {
@@ -1023,6 +1163,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// Verify slot path `[0, ..., carrySlot]` committed for this outcome
         /// (length `accepted + 1`; nil falls back to linear `0...accepted`).
         var acceptedPath: [Int]? = nil
+        /// Ticket proving `[0 ..< depth + 1)` were already written into the
+        /// request's in-place ring at `[count ..< count + depth + 1)`, so a
+        /// confirmed linear prefix can be promoted without re-copying.
+        var tailTicket: FastInPlaceContext.SpeculativeTailTicket? = nil
     }
 
     /// What `takeSpeculation` applied at a round's draft index 0.
@@ -1674,6 +1818,452 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             """,
         ensureRowContiguous: true)
 
+    private static let dflashNAXHeader = """
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        inline float dflash_nax_e4m3_f(uint8_t bits) {
+          uint16_t v = bits & 127u;
+          uint16_t sign_bit = uint16_t((bits >> 7) & 1u) << 15;
+          uint16_t u = (v << 7) | (((v + 1u) >> 7) << 14) | sign_bit;
+          return float(as_type<half>(u)) * 4194304.0f;
+        }
+
+        inline metal::vec<bfloat16_t, 4> dflash_nax_dequant4(uint q, float fs) {
+          const uint lo = (q & 0x000fu) | ((q & 0x00f0u) << 12);
+          const uint hi = ((q >> 8) & 0x000fu) | ((q & 0xf000u) << 4);
+          const float2 a = float2(as_type<half2>(
+              ((lo & 0x00070007u) << 9) | ((lo & 0x00080008u) << 12))) * fs;
+          const float2 b = float2(as_type<half2>(
+              ((hi & 0x00070007u) << 9) | ((hi & 0x00080008u) << 12))) * fs;
+          return metal::vec<bfloat16_t, 4>(
+              bfloat16_t(a.x), bfloat16_t(a.y), bfloat16_t(b.x), bfloat16_t(b.y));
+        }
+
+        inline void dflash_nax_mma_16x32x16(
+            thread metal::vec<float, 8>& c0,
+            thread metal::vec<float, 8>& c1,
+            const thread metal::vec<bfloat16_t, 8>& a,
+            const thread metal::vec<bfloat16_t, 8>& b0,
+            const thread metal::vec<bfloat16_t, 8>& b1) {
+          constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+              16, 32, 16, false, true, true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+          auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat16_t, bfloat16_t, float>();
+          auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat16_t, bfloat16_t, float>();
+          auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(ct_a)>,
+              metal::remove_addrspace_t<decltype(ct_b)>,
+              float>();
+          #pragma unroll
+          for (short i = 0; i < 8; i++) { ct_a[i] = a[i]; }
+          #pragma unroll
+          for (short i = 0; i < 8; i++) { ct_b[i] = b0[i]; ct_b[8 + i] = b1[i]; }
+          #pragma unroll
+          for (short i = 0; i < 8; i++) { ct_c[i] = c0[i]; ct_c[8 + i] = c1[i]; }
+          gemm_op.run(ct_a, ct_b, ct_c);
+          #pragma unroll
+          for (short i = 0; i < 8; i++) { c0[i] = ct_c[i]; c1[i] = ct_c[8 + i]; }
+        }
+
+        template <int K, int M, int WK>
+        inline void dflash_nax_accum_join(
+            const device bfloat16_t* xp,
+            const device uint8_t* wl0,
+            const device uint8_t* wl1,
+            const device uint8_t* sl0,
+            const device uint8_t* sl1,
+            int k_start,
+            int k_end,
+            short fm,
+            uint simd_gid,
+            ushort lane,
+            threadgroup float* Ps,
+            thread metal::vec<float, 8>& c0,
+            thread metal::vec<float, 8>& c1) {
+          constexpr int BK = 128;
+          constexpr int row_bytes = K / 2;
+          constexpr int row_scales = K / 16;
+          c0 = metal::vec<float, 8>(0.0f);
+          c1 = metal::vec<float, 8>(0.0f);
+          const int k0 = k_start + int(simd_gid) * BK;
+          uint4 ws_cur[2][2];
+          ushort ss_cur[2][2];
+          if (k0 < k_end) {
+            #pragma unroll
+            for (short r = 0; r < 2; r++) {
+              const int64_t rb = int64_t(8 * r) * int64_t(row_bytes);
+              const int64_t rs = int64_t(8 * r) * int64_t(row_scales);
+              ws_cur[0][r] = *(const device uint4*)(wl0 + rb + k0 / 2);
+              ss_cur[0][r] = *(const device ushort*)(sl0 + rs + k0 / 16);
+              ws_cur[1][r] = *(const device uint4*)(wl1 + rb + k0 / 2);
+              ss_cur[1][r] = *(const device ushort*)(sl1 + rs + k0 / 16);
+            }
+          }
+          const bool x_row0 = int(fm) < M;
+          const bool x_row1 = int(fm) + 8 < M;
+          for (int k = k0; k < k_end; k += WK * BK) {
+            metal::vec<bfloat16_t, 8> xs0[4];
+            if constexpr (M <= 8) {
+              #pragma unroll
+              for (short i = 0; i < 4; i++) {
+                xs0[i] = x_row0
+                    ? *(const device metal::vec<bfloat16_t, 8>*)(xp + k + 8 * i)
+                    : metal::vec<bfloat16_t, 8>(0);
+              }
+            }
+            uint4 ws_next[2][2];
+            ushort ss_next[2][2];
+            const int kn = k + WK * BK;
+            if (kn < k_end) {
+              #pragma unroll
+              for (short r = 0; r < 2; r++) {
+                const int64_t rb = int64_t(8 * r) * int64_t(row_bytes);
+                const int64_t rs = int64_t(8 * r) * int64_t(row_scales);
+                ws_next[0][r] = *(const device uint4*)(wl0 + rb + kn / 2);
+                ss_next[0][r] = *(const device ushort*)(sl0 + rs + kn / 16);
+                ws_next[1][r] = *(const device uint4*)(wl1 + rb + kn / 2);
+                ss_next[1][r] = *(const device ushort*)(sl1 + rs + kn / 16);
+              }
+            }
+            float sc0[2][2];
+            float sc1[2][2];
+            #pragma unroll
+            for (short t = 0; t < 2; t++) {
+              #pragma unroll
+              for (short r = 0; r < 2; r++) {
+                sc0[t][r] = dflash_nax_e4m3_f(uint8_t(ss_cur[t][r]));
+                sc1[t][r] = dflash_nax_e4m3_f(uint8_t(ss_cur[t][r] >> 8));
+              }
+            }
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+              metal::vec<bfloat16_t, 8> xr0;
+              metal::vec<bfloat16_t, 8> xr1;
+              if constexpr (M <= 8) {
+                xr0 = xs0[i];
+                xr1 = metal::vec<bfloat16_t, 8>(0);
+              } else {
+                xr0 = x_row0
+                    ? *(const device metal::vec<bfloat16_t, 8>*)(xp + k + 8 * i)
+                    : metal::vec<bfloat16_t, 8>(0);
+                xr1 = x_row1
+                    ? *(const device metal::vec<bfloat16_t, 8>*)(xp + 8 * int64_t(K) + k + 8 * i)
+                    : metal::vec<bfloat16_t, 8>(0);
+              }
+              #pragma unroll
+              for (short sub = 0; sub < 2; sub++) {
+                metal::vec<bfloat16_t, 8> a;
+                #pragma unroll
+                for (short j = 0; j < 4; j++) {
+                  a[j] = xr0[4 * sub + j];
+                  a[4 + j] = (M <= 8) ? bfloat16_t(0) : xr1[4 * sub + j];
+                }
+                metal::vec<bfloat16_t, 8> b0;
+                metal::vec<bfloat16_t, 8> b1;
+                #pragma unroll
+                for (short r = 0; r < 2; r++) {
+                  const uint q0 = ws_cur[0][r][i] >> (16 * sub);
+                  const uint q1 = ws_cur[1][r][i] >> (16 * sub);
+                  const float s0 = (i < 2) ? sc0[0][r] : sc1[0][r];
+                  const float s1 = (i < 2) ? sc0[1][r] : sc1[1][r];
+                  const metal::vec<bfloat16_t, 4> v0 = dflash_nax_dequant4(q0, s0);
+                  const metal::vec<bfloat16_t, 4> v1 = dflash_nax_dequant4(q1, s1);
+                  #pragma unroll
+                  for (short j = 0; j < 4; j++) {
+                    b0[4 * r + j] = v0[j];
+                    b1[4 * r + j] = v1[j];
+                  }
+                }
+                dflash_nax_mma_16x32x16(c0, c1, a, b0, b1);
+              }
+            }
+            #pragma unroll
+            for (short t = 0; t < 2; t++) {
+              #pragma unroll
+              for (short r = 0; r < 2; r++) {
+                ws_cur[t][r] = ws_next[t][r];
+                ss_cur[t][r] = ss_next[t][r];
+              }
+            }
+          }
+          constexpr uint SLICE = (M <= 8) ? 256u : 512u;
+          if (simd_gid > 0u) {
+            threadgroup float* dst = Ps + (simd_gid - 1u) * SLICE + lane;
+            #pragma unroll
+            for (short j = 0; j < 4; j++) {
+              dst[j * 32u] = c0[j];
+              dst[(4 + j) * 32u] = c1[j];
+            }
+            if constexpr (M > 8) {
+              #pragma unroll
+              for (short j = 0; j < 4; j++) {
+                dst[(8 + j) * 32u] = c0[4 + j];
+                dst[(12 + j) * 32u] = c1[4 + j];
+              }
+            }
+          }
+          threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+          if (simd_gid == 0u) {
+            for (uint sg = 0u; sg < uint(WK - 1); sg++) {
+              const threadgroup float* src = Ps + sg * SLICE + lane;
+              #pragma unroll
+              for (short j = 0; j < 4; j++) {
+                c0[j] += src[j * 32u];
+                c1[j] += src[(4 + j) * 32u];
+              }
+              if constexpr (M > 8) {
+                #pragma unroll
+                for (short j = 0; j < 4; j++) {
+                  c0[4 + j] += src[(8 + j) * 32u];
+                  c1[4 + j] += src[(12 + j) * 32u];
+                }
+              }
+            }
+          }
+        }
+        """
+
+    private static let dflashNAXFusedGateUpSiluKernel = MLXFast.metalKernel(
+        name: "dflash_nax_fused_gu_silu",
+        inputNames: ["x", "w", "scales", "params"],
+        outputNames: ["y"],
+        source: """
+            constexpr int WK = 4;
+            constexpr int K = K_;
+            constexpr int NH = NH_;
+            constexpr int M = M_;
+            const uint tid_x = threadgroup_position_in_grid.x;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const ushort lane = thread_index_in_simdgroup;
+            const short qid = short(lane >> 2);
+            const short fm = (qid & 4) | short((lane >> 1) & 3);
+            const short fn = ((qid & 2) | short(lane & 1)) * 4;
+            const int k_lane = 8 * int(fn);
+            const int y_col = int(tid_x) * 16;
+            const device uint8_t* w_bytes = (const device uint8_t*)w;
+            const device uint8_t* wl0 = w_bytes + int64_t(y_col + fm) * int64_t(K / 2) + k_lane / 2;
+            const device uint8_t* wl1 = w_bytes + int64_t(NH + y_col + fm) * int64_t(K / 2) + k_lane / 2;
+            const device uint8_t* sl0 = scales + int64_t(y_col + fm) * int64_t(K / 16) + k_lane / 16;
+            const device uint8_t* sl1 = scales + int64_t(NH + y_col + fm) * int64_t(K / 16) + k_lane / 16;
+            const device bfloat16_t* xp = x + int64_t(fm) * int64_t(K) + k_lane;
+            threadgroup float Ps[(WK - 1) * ((M <= 8) ? 256 : 512)];
+            vec<float, 8> c0;
+            vec<float, 8> c1;
+            dflash_nax_accum_join<K, M, WK>(
+                xp, wl0, wl1, sl0, sl1, 0, K, fm, simd_gid, lane, Ps, c0, c1);
+            if (simd_gid == 0u) {
+              const float out_scale = params[0];
+              if (int(fm) < M) {
+                vec<bfloat16_t, 4> o0;
+                #pragma unroll
+                for (short j = 0; j < 4; j++) {
+                  const float g = c0[j];
+                  const float s = 1.0f / (1.0f + metal::fast::exp(metal::abs(g)));
+                  const float sig = (g < 0.0f) ? s : (1.0f - s);
+                  o0[j] = bfloat16_t((g * sig * c1[j]) * out_scale);
+                }
+                *(device vec<bfloat16_t, 4>*)(y + size_t(fm) * size_t(NH) + size_t(y_col + fn)) = o0;
+              }
+              if constexpr (M > 8) {
+                if (int(fm) + 8 < M) {
+                  vec<bfloat16_t, 4> o1;
+                  #pragma unroll
+                  for (short j = 0; j < 4; j++) {
+                    const float g = c0[4 + j];
+                    const float s = 1.0f / (1.0f + metal::fast::exp(metal::abs(g)));
+                    const float sig = (g < 0.0f) ? s : (1.0f - s);
+                    o1[j] = bfloat16_t((g * sig * c1[4 + j]) * out_scale);
+                  }
+                  *(device vec<bfloat16_t, 4>*)(
+                      y + size_t(fm + 8) * size_t(NH) + size_t(y_col + fn)) = o1;
+                }
+              }
+            }
+            """,
+        header: dflashNAXHeader,
+        ensureRowContiguous: true)
+
+    private static let dflashNAXSplitKKernel = MLXFast.metalKernel(
+        name: "dflash_nax_splitk",
+        inputNames: ["x", "w", "scales"],
+        outputNames: ["y"],
+        source: """
+            constexpr int WK = 4;
+            constexpr int K = K_;
+            constexpr int N = N_;
+            constexpr int M = M_;
+            constexpr int K_SPLIT = K / SPLIT_K_;
+            const uint tid_x = threadgroup_position_in_grid.x;
+            const uint split_id = threadgroup_position_in_grid.y;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const ushort lane = thread_index_in_simdgroup;
+            const short qid = short(lane >> 2);
+            const short fm = (qid & 4) | short((lane >> 1) & 3);
+            const short fn = ((qid & 2) | short(lane & 1)) * 4;
+            const int k_lane = 8 * int(fn);
+            const int y_col = int(tid_x) * 32;
+            const device uint8_t* w_bytes = (const device uint8_t*)w;
+            const device uint8_t* wl0 = w_bytes + int64_t(y_col + fm) * int64_t(K / 2) + k_lane / 2;
+            const device uint8_t* wl1 = w_bytes + int64_t(y_col + 16 + fm) * int64_t(K / 2) + k_lane / 2;
+            const device uint8_t* sl0 = scales + int64_t(y_col + fm) * int64_t(K / 16) + k_lane / 16;
+            const device uint8_t* sl1 = scales + int64_t(y_col + 16 + fm) * int64_t(K / 16) + k_lane / 16;
+            const device bfloat16_t* xp = x + int64_t(fm) * int64_t(K) + k_lane;
+            const int k_start = int(split_id) * K_SPLIT;
+            threadgroup float Ps[(WK - 1) * ((M <= 8) ? 256 : 512)];
+            vec<float, 8> c0;
+            vec<float, 8> c1;
+            dflash_nax_accum_join<K, M, WK>(
+                xp, wl0, wl1, sl0, sl1, k_start, k_start + K_SPLIT, fm, simd_gid, lane, Ps, c0, c1);
+            if (simd_gid == 0u) {
+              const size_t split_base = size_t(split_id) * size_t(M) * size_t(N);
+              if (int(fm) < M) {
+                device float* row0 = y + split_base + size_t(fm) * size_t(N) + size_t(y_col + fn);
+                *(device vec<float, 4>*)(row0) = vec<float, 4>(c0[0], c0[1], c0[2], c0[3]);
+                *(device vec<float, 4>*)(row0 + 16) = vec<float, 4>(c1[0], c1[1], c1[2], c1[3]);
+              }
+              if constexpr (M > 8) {
+                if (int(fm) + 8 < M) {
+                  device float* row1 =
+                      y + split_base + size_t(fm + 8) * size_t(N) + size_t(y_col + fn);
+                  *(device vec<float, 4>*)(row1) = vec<float, 4>(c0[4], c0[5], c0[6], c0[7]);
+                  *(device vec<float, 4>*)(row1 + 16) = vec<float, 4>(c1[4], c1[5], c1[6], c1[7]);
+                }
+              }
+            }
+            """,
+        header: dflashNAXHeader,
+        ensureRowContiguous: true)
+
+    private static let addRmsNormSplitKKernel = MLXFast.metalKernel(
+        name: "dflash_add_rmsnorm_splitk",
+        inputNames: ["res", "partials", "w", "params"],
+        outputNames: ["h_out", "y_out"],
+        source: """
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            constexpr uint D4 = uint(D_) / 4u;
+            constexpr uint MAX_IT = (D4 + 255u) / 256u;
+            constexpr size_t SPLIT_STRIDE = size_t(M_) * size_t(D4);
+            const device vec<bfloat16_t, 4>* r4 =
+                (const device vec<bfloat16_t, 4>*)(res + size_t(row) * D_);
+            const device vec<float, 4>* p4 =
+                (const device vec<float, 4>*)partials + size_t(row) * size_t(D4);
+            const device vec<bfloat16_t, 4>* w4 = (const device vec<bfloat16_t, 4>*)w;
+            device vec<bfloat16_t, 4>* h4 =
+                (device vec<bfloat16_t, 4>*)(h_out + size_t(row) * D_);
+            device vec<bfloat16_t, 4>* y4 =
+                (device vec<bfloat16_t, 4>*)(y_out + size_t(row) * D_);
+            const float dscale = SCALE_DELTA_ ? params[1] : 1.0f;
+            float buf[MAX_IT][4];
+            float sum = 0.0f;
+            uint it = 0u;
+            for (uint i = lid; i < D4; i += 256u) {
+                const vec<bfloat16_t, 4> rv = r4[i];
+                vec<float, 4> acc = p4[i];
+                #pragma unroll
+                for (int s = 1; s < SPLIT_K_; ++s) {
+                    acc += p4[size_t(s) * SPLIT_STRIDE + i];
+                }
+                if (SCALE_DELTA_) { acc *= dscale; }
+                vec<bfloat16_t, 4> hv;
+                #pragma unroll
+                for (uint k = 0; k < 4; ++k) {
+                    const bfloat16_t h = rv[k] + static_cast<bfloat16_t>(acc[k]);
+                    hv[k] = h;
+                    const float fv = float(h);
+                    buf[it][k] = fv;
+                    sum += fv * fv;
+                }
+                h4[i] = hv;
+                it++;
+            }
+            sum = simd_sum(sum);
+            threadgroup float sh[8];
+            if (lane == 0u) { sh[sg] = sum; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                float v = (lane < 8u) ? sh[lane] : 0.0f;
+                v = simd_sum(v);
+                if (lane == 0u) { sh[0] = metal::precise::rsqrt(v / float(D_) + params[0]); }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = sh[0];
+            it = 0u;
+            for (uint i = lid; i < D4; i += 256u) {
+                const vec<bfloat16_t, 4> wv = w4[i];
+                vec<bfloat16_t, 4> yv;
+                #pragma unroll
+                for (uint k = 0; k < 4; ++k) {
+                    yv[k] = wv[k] * static_cast<bfloat16_t>(buf[it][k] * inv);
+                }
+                y4[i] = yv;
+                it++;
+            }
+            """,
+        ensureRowContiguous: true)
+
+    private static let rmsNormSplitKKernel = MLXFast.metalKernel(
+        name: "dflash_rmsnorm_splitk",
+        inputNames: ["partials", "w", "params"],
+        outputNames: ["y_out"],
+        source: """
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            constexpr uint D4 = uint(D_) / 4u;
+            constexpr uint MAX_IT = (D4 + 255u) / 256u;
+            constexpr size_t SPLIT_STRIDE = size_t(M_) * size_t(D4);
+            const device vec<float, 4>* p4 =
+                (const device vec<float, 4>*)partials + size_t(row) * size_t(D4);
+            const device vec<bfloat16_t, 4>* w4 = (const device vec<bfloat16_t, 4>*)w;
+            device vec<bfloat16_t, 4>* y4 =
+                (device vec<bfloat16_t, 4>*)(y_out + size_t(row) * D_);
+            float buf[MAX_IT][4];
+            float sum = 0.0f;
+            uint it = 0u;
+            for (uint i = lid; i < D4; i += 256u) {
+                vec<float, 4> acc = p4[i];
+                #pragma unroll
+                for (int s = 1; s < SPLIT_K_; ++s) {
+                    acc += p4[size_t(s) * SPLIT_STRIDE + i];
+                }
+                #pragma unroll
+                for (uint k = 0; k < 4; ++k) {
+                    const float fv = acc[k];
+                    buf[it][k] = fv;
+                    sum += fv * fv;
+                }
+                it++;
+            }
+            sum = simd_sum(sum);
+            threadgroup float sh[8];
+            if (lane == 0u) { sh[sg] = sum; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                float v = (lane < 8u) ? sh[lane] : 0.0f;
+                v = simd_sum(v);
+                if (lane == 0u) { sh[0] = metal::precise::rsqrt(v / float(D_) + params[0]); }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = sh[0];
+            it = 0u;
+            for (uint i = lid; i < D4; i += 256u) {
+                const vec<bfloat16_t, 4> wv = w4[i];
+                vec<bfloat16_t, 4> yv;
+                #pragma unroll
+                for (uint k = 0; k < 4; ++k) {
+                    yv[k] = wv[k] * static_cast<bfloat16_t>(buf[it][k] * inv);
+                }
+                y4[i] = yv;
+                it++;
+            }
+            """,
+        ensureRowContiguous: true)
+
     private static let zeroCopyBlockTailEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_DFLASH_ZEROCOPY_BLK"] != "0"
 
@@ -1888,6 +2478,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var blkKVRing: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var addNorm: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var splitSilu: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var naxFusedGU: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var naxSplitK: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var addNormSplitK: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
+        var rmsNormSplitK: [UInt64: MLXFast.MLXFastKernel.Launch] = [:]
         var epsScaleArr: [UInt64: MLXArray] = [:]
         var scaleArr: [UInt32: MLXArray] = [:]
     }
@@ -2010,6 +2604,123 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         return launch([gu, paramsArr])[0]
     }
 
+    private static func dflashNAXFusedGateUpSilu(
+        _ x: MLXArray, layer: QuantizedLinear, rows: Int, outScale: Float
+    ) -> MLXArray {
+        let k = layer.weight.dim(1) * 8
+        let nHalf = layer.weight.dim(0) / 2
+        let key = (UInt64(rows) << 40) | (UInt64(k) << 20) | UInt64(nHalf)
+        let (launch, paramsArr): (MLXFast.MLXFastKernel.Launch, MLXArray) =
+            drafterLaunchLock.withLockUnchecked { box in
+                let p: MLXArray
+                if let hit = box.scaleArr[outScale.bitPattern] {
+                    p = hit
+                } else {
+                    let a = MLXArray([outScale])
+                    eval(a)
+                    box.scaleArr[outScale.bitPattern] = a
+                    p = a
+                }
+                if let hit = box.naxFusedGU[key] { return (hit, p) }
+                let made = dflashNAXFusedGateUpSiluKernel.prepare(
+                    template: [("K_", k), ("NH_", nHalf), ("M_", rows)],
+                    grid: (32 * (nHalf / 16), 4, 1),
+                    threadGroup: (32, 4, 1),
+                    outputShapes: [[1, rows, nHalf]],
+                    outputDTypes: [.bfloat16])
+                box.naxFusedGU[key] = made
+                return (made, p)
+            }
+        return launch([x, layer.weight, layer.scales, paramsArr])[0]
+    }
+
+    private static func dflashNAXSplitK(
+        _ x: MLXArray, layer: QuantizedLinear, rows: Int, splitK: Int
+    ) -> MLXArray {
+        let k = layer.weight.dim(1) * 8
+        let n = layer.weight.dim(0)
+        let key = (UInt64(splitK) << 48) | (UInt64(rows) << 36) | (UInt64(k) << 18) | UInt64(n)
+        let launch: MLXFast.MLXFastKernel.Launch = drafterLaunchLock.withLockUnchecked { box in
+            if let hit = box.naxSplitK[key] { return hit }
+            let made = dflashNAXSplitKKernel.prepare(
+                template: [("K_", k), ("N_", n), ("M_", rows), ("SPLIT_K_", splitK)],
+                grid: (32 * (n / 32), 4 * splitK, 1),
+                threadGroup: (32, 4, 1),
+                outputShapes: [[splitK, rows, n]],
+                outputDTypes: [.float32])
+            box.naxSplitK[key] = made
+            return made
+        }
+        return launch([x, layer.weight, layer.scales])[0]
+    }
+
+    private static func fusedAddRMSNormSplitK(
+        residual: MLXArray, partials: MLXArray, weight: MLXArray, eps: Float,
+        deltaScale: Float = 1.0
+    ) -> (h: MLXArray, y: MLXArray) {
+        let splitK = partials.dim(0)
+        let rows = residual.dim(1)
+        let d = residual.dim(2)
+        let scaled = deltaScale != 1.0
+        let key =
+            (UInt64(splitK) << 48) | (UInt64(rows) << 32) | (UInt64(d) << 1) | (scaled ? 1 : 0)
+        let pKey = (UInt64(eps.bitPattern) << 32) | UInt64(deltaScale.bitPattern)
+        let (launch, paramsArr): (MLXFast.MLXFastKernel.Launch, MLXArray) =
+            drafterLaunchLock.withLockUnchecked { box in
+                let p: MLXArray
+                if let hit = box.epsScaleArr[pKey] {
+                    p = hit
+                } else {
+                    let a = MLXArray([eps, deltaScale])
+                    eval(a)
+                    box.epsScaleArr[pKey] = a
+                    p = a
+                }
+                if let hit = box.addNormSplitK[key] { return (hit, p) }
+                let made = addRmsNormSplitKKernel.prepare(
+                    template: [
+                        ("D_", d), ("M_", rows), ("SPLIT_K_", splitK), ("SCALE_DELTA_", scaled),
+                    ],
+                    grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, rows, d], [1, rows, d]],
+                    outputDTypes: [.bfloat16, .bfloat16])
+                box.addNormSplitK[key] = made
+                return (made, p)
+            }
+        let out = launch([residual, partials, weight, paramsArr])
+        return (out[0], out[1])
+    }
+
+    private static func fusedRMSNormSplitK(
+        partials: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray {
+        let splitK = partials.dim(0)
+        let rows = partials.dim(1)
+        let d = partials.dim(2)
+        let key = (UInt64(splitK) << 48) | (UInt64(rows) << 32) | UInt64(d)
+        let (launch, paramsArr): (MLXFast.MLXFastKernel.Launch, MLXArray) =
+            drafterLaunchLock.withLockUnchecked { box in
+                let p: MLXArray
+                if let hit = box.scaleArr[eps.bitPattern] {
+                    p = hit
+                } else {
+                    let a = MLXArray([eps])
+                    eval(a)
+                    box.scaleArr[eps.bitPattern] = a
+                    p = a
+                }
+                if let hit = box.rmsNormSplitK[key] { return (hit, p) }
+                let made = rmsNormSplitKKernel.prepare(
+                    template: [("D_", d), ("M_", rows), ("SPLIT_K_", splitK)],
+                    grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[rows, d]],
+                    outputDTypes: [.bfloat16])
+                box.rmsNormSplitK[key] = made
+                return (made, p)
+            }
+        return launch([partials, weight, paramsArr])[0]
+    }
+
     private struct ContextKeyEpilogue {
         let kvHeads: Int
         let weights: [MLXArray]
@@ -2089,9 +2800,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             position <= Int(Int32.max) - rows
         {
             let act = features.dtype == .bfloat16 ? features : features.asType(.bfloat16)
-            let fcOut = nv.fc(act)
-            let ctx = MLXFast.rmsNorm(
-                fcOut, weight: nv.encOutputNormWeightScaled, eps: nv.fcEps)
+            let ctx: MLXArray
+            if nv.useCustomNAX && rows <= 16 {
+                let fcPartials = Self.dflashNAXSplitK(act, layer: nv.fc, rows: rows, splitK: 5)
+                ctx = Self.fusedRMSNormSplitK(
+                    partials: fcPartials, weight: nv.encOutputNormWeightScaled, eps: nv.fcEps)
+            } else {
+                let fcOut = nv.fc(act)
+                ctx = MLXFast.rmsNorm(
+                    fcOut, weight: nv.encOutputNormWeightScaled, eps: nv.fcEps)
+            }
             let allKV = nv.fusedContextKV(ctx)
             if allKV.dtype == .bfloat16 {
                 return epilogue.applyFusedKV(allKV, rows: rows, position: position, treeMeta: treeMeta)
@@ -2352,6 +3070,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             ctxKeys = tail.keys
             ctxValues = tail.values
             usedZeroCopyTail = true
+            if !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.strictLowVerifyC3 {
+                speculation.tailTicket = tail.ticket
+            }
         } else {
             ctxKeys = concatenated([
                 ring[0][0..., 0..., 0 ..< existingCount, 0...],
@@ -2516,6 +3237,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.context.append(
                 keys: speculation.keys.take(idx, axis: 2),
                 values: speculation.values.take(idx, axis: 2))
+        } else if let ticket = speculation.tailTicket,
+            s.context.promoteSpeculativePrefix(ticket: ticket, count: accepted + 1)
+        {
+            // Verified linear prefix is already resident in the ring tail;
+            // `promoteSpeculativePrefix` advanced `nextPosition` in place.
         } else if accepted == speculation.depth {
             s.context.append(keys: speculation.keys, values: speculation.values)
         } else {
@@ -2838,7 +3564,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             fusedContextKV: fusedContextKV, blockQKV: blockQKV, lastKV: lastKV, lastQ: lastQ,
             oProj: oProj, oInvScale: oInvScale, gateUp: gateUp, down: down,
             downInvScale: downInvScale, inputNormWeightScaled: inputNormW,
-            postAttnNormWeightScaled: postAttnNormW)
+            postAttnNormWeightScaled: postAttnNormW, useCustomNAX: false)
     }
 
     private static let drafterLayer4NAX: Bool =
@@ -2958,21 +3684,41 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                     1, block, c.attentionHeads * c.headDimensions,
                 ])
                 if useNVFP4, let nv {
-                    let attnOut = nv.oProj[index](attnFlat)
-                    let (hMid, mx) = Self.fusedAddRMSNorm(
-                        residual: hidden, delta: attnOut,
-                        weight: nv.postAttnNormWeightScaled[index],
-                        eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
-                    let gu = nv.gateUp[index](mx)
-                    let mlpOut = nv.down[index](
-                        Self.splitSiluMul(gu, scale: nv.downInvScale[index]))
                     let nextLayer = model.layers[index + 1]
-                    let (hNext, xNext) = Self.fusedAddRMSNorm(
-                        residual: hMid, delta: mlpOut,
-                        weight: nv.inputNormWeightScaled[index + 1],
-                        eps: nextLayer.inputNorm.eps)
-                    hidden = hNext
-                    nextX = xNext
+                    if nv.useCustomNAX {
+                        let oP = Self.dflashNAXSplitK(
+                            attnFlat, layer: nv.oProj[index], rows: block, splitK: 2)
+                        let (hMid, mx) = Self.fusedAddRMSNormSplitK(
+                            residual: hidden, partials: oP,
+                            weight: nv.postAttnNormWeightScaled[index],
+                            eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
+                        let act = Self.dflashNAXFusedGateUpSilu(
+                            mx, layer: nv.gateUp[index], rows: block,
+                            outScale: nv.downInvScale[index])
+                        let dP = Self.dflashNAXSplitK(
+                            act, layer: nv.down[index], rows: block, splitK: 3)
+                        let (hNext, xNext) = Self.fusedAddRMSNormSplitK(
+                            residual: hMid, partials: dP,
+                            weight: nv.inputNormWeightScaled[index + 1],
+                            eps: nextLayer.inputNorm.eps)
+                        hidden = hNext
+                        nextX = xNext
+                    } else {
+                        let attnOut = nv.oProj[index](attnFlat)
+                        let (hMid, mx) = Self.fusedAddRMSNorm(
+                            residual: hidden, delta: attnOut,
+                            weight: nv.postAttnNormWeightScaled[index],
+                            eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
+                        let gu = nv.gateUp[index](mx)
+                        let mlpOut = nv.down[index](
+                            Self.splitSiluMul(gu, scale: nv.downInvScale[index]))
+                        let (hNext, xNext) = Self.fusedAddRMSNorm(
+                            residual: hMid, delta: mlpOut,
+                            weight: nv.inputNormWeightScaled[index + 1],
+                            eps: nextLayer.inputNorm.eps)
+                        hidden = hNext
+                        nextX = xNext
+                    }
                 } else {
                     let attnOut = attention.oProj(attnFlat)
                     if useFusedAddNorm {
@@ -3077,18 +3823,36 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 ])
                 let result: MLXArray
                 if useNVFP4, let nv {
-                    let attnOut = nv.oProj[index](attnFlat)
-                    let (hMid, mx) = Self.fusedAddRMSNorm(
-                        residual: hidden[0..., active, 0...], delta: attnOut,
-                        weight: nv.postAttnNormWeightScaled[index],
-                        eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
-                    let gu = nv.gateUp[index](mx)
-                    let mlpOut = nv.down[index](
-                        Self.splitSiluMul(gu, scale: nv.downInvScale[index]))
-                    let (_, normed) = Self.fusedAddRMSNorm(
-                        residual: hMid, delta: mlpOut, weight: model.norm.weight,
-                        eps: model.norm.eps)
-                    result = normed.reshaped([draftCount, c.hiddenSize])
+                    if nv.useCustomNAX {
+                        let oP = Self.dflashNAXSplitK(
+                            attnFlat, layer: nv.oProj[index], rows: draftCount, splitK: 2)
+                        let (hMid, mx) = Self.fusedAddRMSNormSplitK(
+                            residual: hidden[0..., active, 0...], partials: oP,
+                            weight: nv.postAttnNormWeightScaled[index],
+                            eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
+                        let act = Self.dflashNAXFusedGateUpSilu(
+                            mx, layer: nv.gateUp[index], rows: draftCount,
+                            outScale: nv.downInvScale[index])
+                        let dP = Self.dflashNAXSplitK(
+                            act, layer: nv.down[index], rows: draftCount, splitK: 3)
+                        let (_, normed) = Self.fusedAddRMSNormSplitK(
+                            residual: hMid, partials: dP, weight: model.norm.weight,
+                            eps: model.norm.eps)
+                        result = normed.reshaped([draftCount, c.hiddenSize])
+                    } else {
+                        let attnOut = nv.oProj[index](attnFlat)
+                        let (hMid, mx) = Self.fusedAddRMSNorm(
+                            residual: hidden[0..., active, 0...], delta: attnOut,
+                            weight: nv.postAttnNormWeightScaled[index],
+                            eps: layer.postAttentionNorm.eps, deltaScale: nv.oInvScale[index])
+                        let gu = nv.gateUp[index](mx)
+                        let mlpOut = nv.down[index](
+                            Self.splitSiluMul(gu, scale: nv.downInvScale[index]))
+                        let (_, normed) = Self.fusedAddRMSNorm(
+                            residual: hMid, delta: mlpOut, weight: model.norm.weight,
+                            eps: model.norm.eps)
+                        result = normed.reshaped([draftCount, c.hiddenSize])
+                    }
                 } else if useFusedAddNorm {
                     let attnOut = attention.oProj(attnFlat)
                     let (hMid, mx) = Self.fusedAddRMSNorm(
