@@ -335,6 +335,112 @@ final class CBv2MTPRoundDriver {
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
     /// Optional per-request tree cooldown set when `CBV2_TREE_COOLDOWN=1`.
     private var treeCooldownRequests: Set<CBv2RequestID> = []
+
+    /// Per-request online-calibrated suffix n-gram proposer for strict-C3 dynamic trees.
+    private struct HistorySuffixCalibrator {
+        var hits = (0, 0, 0)
+        var trials = (0, 0, 0)
+        var contHits = 0
+        var contTrials = 0
+        var pending: (bucket: Int, tokens: [Int])? = nil
+    }
+    private var historyCalibrators: [CBv2RequestID: HistorySuffixCalibrator] = [:]
+
+    func prepareHistoryHint(for id: CBv2RequestID, tokens: [Int], maxLen: Int) -> MLXArray? {
+        guard CBv2DraftRegime.histTreeEnabled, CBv2DraftRegime.strictLowVerifyC3,
+            maxLen >= 1, tokens.count >= 4
+        else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let n = tokens.count
+        let lastTok = tokens[n - 1]
+        let prevTok = tokens[n - 2]
+        let scanStart = max(1, n - 2048)
+        var bestLen = 0
+        var bestPos = -1
+        let maxMatch = min(8, n - 1)
+        var i = n - 2
+        while i >= scanStart {
+            if tokens[i] == lastTok && tokens[i - 1] == prevTok {
+                var m = 2
+                while m < maxMatch && i - m >= 0 && tokens[i - m] == tokens[n - 1 - m] {
+                    m += 1
+                }
+                if m > bestLen {
+                    bestLen = m
+                    bestPos = i
+                    if bestLen == maxMatch { break }
+                }
+            }
+            i -= 1
+        }
+        guard bestLen >= 2, bestPos >= 0, bestPos + 1 < n else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let hCount = min(min(maxLen, 7), n - 1 - bestPos)
+        guard hCount >= 1 else {
+            historyCalibrators[id]?.pending = nil
+            return nil
+        }
+        let hToks = Array(tokens[(bestPos + 1) ..< (bestPos + 1 + hCount)])
+        let bucket = bestLen >= 4 ? 2 : (bestLen == 3 ? 1 : 0)
+        var cal = historyCalibrators[id] ?? HistorySuffixCalibrator()
+        let (a0, b0, h0, t0): (Double, Double, Int, Int) =
+            switch bucket {
+            case 2: (3.5, 1.5, cal.hits.2, cal.trials.2)
+            case 1: (2.0, 2.5, cal.hits.1, cal.trials.1)
+            default: (1.0, 3.0, cal.hits.0, cal.trials.0)
+            }
+        let pInit = (a0 + Double(h0)) / (a0 + b0 + Double(t0))
+        let pCont = (3.5 + Double(cal.contHits)) / (5.0 + Double(cal.contTrials))
+        cal.pending = (bucket: bucket, tokens: hToks)
+        historyCalibrators[id] = cal
+        var payload = [Int32](repeating: 0, count: 10)
+        payload[0] = Int32(hCount)
+        payload[1] = Int32(max(0, min(1_000_000, Int((pInit * 1_000_000.0).rounded()))))
+        payload[2] = Int32(max(0, min(1_000_000, Int((pCont * 1_000_000.0).rounded()))))
+        for j in 0 ..< hCount {
+            payload[3 + j] = Int32(hToks[j])
+        }
+        return MLXArray(payload)
+    }
+
+    func observeHistoryOutcome(for id: CBv2RequestID, committed: [Int]) {
+        guard var cal = historyCalibrators[id], let prop = cal.pending else { return }
+        cal.pending = nil
+        if !committed.isEmpty && !prop.tokens.isEmpty {
+            let hit0 = committed[0] == prop.tokens[0]
+            switch prop.bucket {
+            case 2:
+                cal.trials.2 += 1
+                if hit0 { cal.hits.2 += 1 }
+            case 1:
+                cal.trials.1 += 1
+                if hit0 { cal.hits.1 += 1 }
+            default:
+                cal.trials.0 += 1
+                if hit0 { cal.hits.0 += 1 }
+            }
+            if hit0 {
+                let lim = min(prop.tokens.count, committed.count)
+                for j in 1 ..< lim {
+                    cal.contTrials += 1
+                    if committed[j] == prop.tokens[j] {
+                        cal.contHits += 1
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+        historyCalibrators[id] = cal
+    }
+
+    func clearHistoryCalibrator(for id: CBv2RequestID) {
+        historyCalibrators.removeValue(forKey: id)
+    }
     /// Plan-scoped: the confirmed post-verify speculation's lazy draft
     /// confidence for each row whose window this plan offered it to, kept
     /// until that round's finalize calibrates with it. Cleared every plan.
@@ -1216,6 +1322,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        historyCalibrators.removeValue(forKey: id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -1231,6 +1338,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
         planDraftConfidence.removeValue(forKey: id)
         treeCooldownRequests.remove(id)
+        historyCalibrators.removeValue(forKey: id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -1270,6 +1378,7 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeAll(keepingCapacity: false)
         planDraftConfidence.removeAll(keepingCapacity: false)
         treeCooldownRequests.removeAll(keepingCapacity: false)
+        historyCalibrators.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
@@ -1703,6 +1812,11 @@ public enum CBv2DraftRegime {
     /// `[0] = packedPosDeltas`, `[1...8] = ancPacked[0...7]`, `[9...16] = depth[0...7]`,
     /// `[17] = packedParents`.
     nonisolated(unsafe) public static var activeDynamicTreeMeta: MLXArray? = nil
+    /// Optional `[10]` int32 host-matched prompt+history suffix hint for strict-C3 dynamic trees.
+    nonisolated(unsafe) public static var activeHistoryHint: MLXArray? = nil
+    /// `CBV2_HIST_TREE=0` disables calibrated history-assisted suffix merging in dynamic trees.
+    public static let histTreeEnabled: Bool =
+        ProcessInfo.processInfo.environment["CBV2_HIST_TREE"] != "0"
     /// `CBV2_TREE_LOW=0` disables tree verification on low-acceptance rounds.
     public static let verifyTreeMode: Int = {
         ProcessInfo.processInfo.environment["CBV2_TREE_LOW"].flatMap(Int.init) ?? 1
