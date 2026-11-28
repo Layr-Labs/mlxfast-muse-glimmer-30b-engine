@@ -571,14 +571,16 @@ public enum CBv2VerifyScales {
     public static let fusedLMHeadEnabled: Bool =
         ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD"] != "0"
 
-    public static let fusedLMHeadChunks: Int = {
+    private static let fusedLMHeadChunksOverride: Int? = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_CHUNKS"],
             let v = Int(raw), [64, 128, 256, 512, 1024, 2048, 4096].contains(v)
         {
             return v
         }
-        return 2048
+        return nil
     }()
+
+    public static let fusedLMHeadChunks: Int = fusedLMHeadChunksOverride ?? 2048
 
     public static let fusedLMHeadTN: Int = {
         let raw = ProcessInfo.processInfo.environment["CBV2_FUSED_LMHEAD_TN"].flatMap(Int.init) ?? 1
@@ -602,7 +604,10 @@ public enum CBv2VerifyScales {
         let outputs = l.outputDimensions
         let totalTiles = max(1, (outputs + 8 * tn - 1) / (8 * tn))
         let minChunksFor16BitOffset = max(1, (outputs + 65_533) / 65_534)
-        let chunks = min(totalTiles, max(fusedLMHeadChunks, minChunksFor16BitOffset))
+        let lowVerify = !CBv2DraftRegime.lowOnlyVerifySpeedups || CBv2DraftRegime.lowAcceptance
+        let strictC3 = lowVerify && CBv2DraftRegime.strictLowVerifyC3
+        let preferredChunks = fusedLMHeadChunksOverride ?? (strictC3 ? 2048 : 4096)
+        let chunks = min(totalTiles, max(preferredChunks, minChunksFor16BitOffset))
         let pkey = NVFP4TopTwoPlanKey(
             id: ObjectIdentifier(l), rows: rows, inputs: inputs, dtype: x.dtype,
             chunks: chunks, tn: tn)
