@@ -1853,14 +1853,14 @@ public enum CBv2DraftRegime {
         }
         return 1.0
     }()
-    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.5).
+    /// Continuous leaf purity exponent `pow(surv[r], purityExp)` for `r >= 1` (`CBV2_DYN_TREE_PURITY_EXP`, default 0.3).
     public static let dynamicTreePurityExp: Float = {
         if let raw = ProcessInfo.processInfo.environment["CBV2_DYN_TREE_PURITY_EXP"],
             let v = Float(raw), v.isFinite, v >= 0.0, v <= 3.0
         {
             return v
         }
-        return 0.5
+        return 0.3
     }()
     /// Optional host-side cooldown after full-chain tree hit (`CBV2_TREE_COOLDOWN=1`).
     public static let treeCooldownEnabled: Bool =
